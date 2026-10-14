@@ -134,6 +134,7 @@ the serve log (taken from `arm.json` instead). The serve's human-readable `req#N
 (prompt, output, cache, TTFT, decode, `mtp accepted a/b`) are parsed and cross-checked against
 the request log for every request.
 
+New measurements: monotonic output/tool latency, n/median/p90/max, thinking and parser diagnostics.
 **What three seeds resolve.** The first run on this tree (v0.1.1 against v0.2.0, two RTX 5070 Ti,
 `--profile agentic`, seeds 42-44, about 47 min per arm) resolved a 1-2 % difference only in the
 engine rows: prefill tok/s on the requests with no cache hit in either arm (+1.2 to +2.0 % per

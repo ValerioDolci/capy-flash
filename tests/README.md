@@ -108,6 +108,12 @@ python3 -m pytest \
   tests/test_serve_corpus.py
 ```
 
+Agentic measurement tests (no GPU):
+
+```bash
+python3.11 -m unittest discover -s tests -p test_agentic_measurement.py
+```
+
 The Python suites exercise conversion and encoded output, without running model inference.
 The maintained environment uses Python 3.11 with the dependencies for those suites. C++ binding and Engine tests
 cover consumption of their resulting representation.
