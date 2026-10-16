@@ -207,6 +207,8 @@ def load_arm(run_dir, arm):
                 "computed": res.get("computed_prefill_tokens") or 0,
                 "completion": res.get("completion_tokens") or 0,
                 "thinking": res.get("model_thinking_tokens") or 0,
+                "thinking_observed": res.get("model_thinking_tokens") is not None,
+                "tool_call_parse": res.get("tool_call_parse"),
                 "path": res.get("prefix_reuse_path") or "unknown",
                 "finish_server": res.get("finish_reason"),
                 "ttft": t.get("ttft"), "prefill_s": t.get("prefill") or 0.0,
@@ -391,6 +393,65 @@ def phases(A):
     return {name: (t[b] - t[a] if a in t and b in t else None) for name, a, b, _ in PHASES}
 
 
+def latency_distribution(values):
+    return {"n": len(values), "median": median(values), "p90": pct(values, 0.9),
+            "max": max(values) if values else None}
+
+
+def agentic_measurements(requests):
+    """Summarize latency and coverage."""
+    rows = [r for r in requests if r["cls"] != "aborted"]
+    observed = [r for r in rows if r.get("client_latency_seconds") is not None]
+    complete = [r for r in observed if r["status"] == "ok" and r["stream_complete"]]
+    diagnostics = [r["tool_call_parse"] for r in rows if r.get("tool_call_parse") is not None]
+    token_rows = [r for r in rows if r.get("server") is not None and r.get("thinking_observed")
+                  and r.get("thinking") is not None and r.get("completion") is not None]
+    completion = sum(r["completion"] for r in token_rows)
+    fallback = {}
+    for d in diagnostics:
+        reason = d["fallback_reason"]
+        if reason != "none":
+            fallback[reason] = fallback.get(reason, 0) + 1
+    latency = {}
+    for key in ("first_output", "first_reasoning", "first_content", "first_tool_delta",
+                "tool_ready", "response_end"):
+        values = [r["client_latency_seconds"][key] for r in complete
+                  if r["client_latency_seconds"].get(key) is not None]
+        latency[key] = latency_distribution(values)
+    return {
+        "requests": len(rows), "instrumented_requests": len(observed),
+        "complete_requests": len(complete),
+        "client_errors": sum(r["status"] == "error" for r in rows),
+        "incomplete_streams": sum(not r["stream_complete"] for r in observed),
+        "tool_ready_requests": latency["tool_ready"]["n"],
+        "without_tool_calls": sum(not r["tool_calls"] for r in complete),
+        "valid_tool_calls": sum(r.get("valid_tool_calls") or 0 for r in complete),
+        "invalid_tool_calls": sum(r.get("invalid_tool_calls") or 0 for r in complete),
+        "terminal_tool_requests": sum(r.get("valid_tool_calls") is not None for r in complete),
+        "parser_observed_requests": len(diagnostics),
+        "parser_marker_requests": sum(d["marker_seen"] for d in diagnostics),
+        "parser_fallbacks": fallback,
+        "parser_fallback_requests": sum(fallback.values()),
+        "schema_mismatch_arguments": sum(d["schema_mismatch_arguments"] for d in diagnostics),
+        "token_observed_requests": len(token_rows),
+        "thinking_fraction": sum(r["thinking"] for r in token_rows) / completion
+                             if completion else None,
+        "latency_seconds": latency,
+    }
+
+
+def paired_tool_readiness(arm_requests):
+    """Compare requests ready in every arm."""
+    ready = {arm: {r["seed"]: r["client_latency_seconds"]["tool_ready"] for r in requests
+                   if r["cls"] != "aborted" and r["status"] == "ok"
+                   and r.get("stream_complete")
+                   and (r.get("client_latency_seconds") or {}).get("tool_ready") is not None}
+             for arm, requests in arm_requests.items()}
+    common = set.intersection(*(set(rows) for rows in ready.values())) if ready else set()
+    return sorted(common), {arm: latency_distribution([rows[seed] for seed in sorted(common)])
+                            for arm, rows in ready.items()}
+
+
 def metrics(A, cold_seeds):
     rows = [r for r in A["requests"] if r.get("server") and r["cls"] != "aborted"]
     cont = [r for r in rows if r["cls"] in CONTINUING]
@@ -404,6 +465,7 @@ def metrics(A, cold_seeds):
     th = sum(r["hit"] for r in rows)
     m = {
         "n": len(rows),
+        "agentic": agentic_measurements(A["requests"]),
         "n_failed": sum(1 for r in A["requests"] if r["cls"] != "aborted" and not r.get("server")),
         "ttft_mean": mean([r["ttft"] for r in rows]),
         "ttft_median": median([r["ttft"] for r in rows]),
@@ -579,6 +641,25 @@ def headline_specs(c):
         ("Phase 4, A wraps up alone (min)", ("phases", "wrap_up"), f1, "rel", 60.0),
         ("Average TTFT without queue wait (s)", ("service_ttft_mean",), f2, "rel", None),
         ("Workload requests without a request_done record", ("n_failed",), f0, "abs", None),
+        ("Client requests with tool readiness observed", ("agentic", "tool_ready_requests"),
+         f0, "abs", None),
+        ("Tool-ready requests common to every arm",
+         ("agentic", "paired_tool_ready_latency_seconds", "n"), f0, "abs", None),
+        ("Client time to terminal JSON-object tool, median (s, common requests)",
+         ("agentic", "paired_tool_ready_latency_seconds", "median"), f2, "rel", None),
+        ("Client time to terminal JSON-object tool, p90 (s, common requests)",
+         ("agentic", "paired_tool_ready_latency_seconds", "p90"), f2, "rel", None),
+        ("Client time to terminal JSON-object tool, maximum (s, common requests)",
+         ("agentic", "paired_tool_ready_latency_seconds", "max"), f2, "rel", None),
+        ("Complete measured streams without tool calls",
+         ("agentic", "without_tool_calls"), f0, "abs", None),
+        ("Measured incomplete streams", ("agentic", "incomplete_streams"), f0, "abs", None),
+        ("Parser diagnostics observed (requests)",
+         ("agentic", "parser_observed_requests"), f0, "abs", None),
+        ("Parser fallback requests (inspect coverage)",
+         ("agentic", "parser_fallback_requests"), f0, "abs", None),
+        ("Model thinking / completion tokens (token-weighted)",
+         ("agentic", "thinking_fraction"), ppct, "pp", None),
     ]
 
 
@@ -720,6 +801,34 @@ def pressure_table(arms, ms):
     return "\n".join(L)
 
 
+def agentic_table(measured):
+    L = ["Client latencies use monotonic time from sending the request, including queue, "
+         "prefill and transport. Only status=ok streams with a finish reason and [DONE] enter "
+         "the distributions. Tool ready requires terminal tool_calls confirmation, identity "
+         "and JSON-object arguments; it does not validate the tool schema or execution.", "",
+         "Coverage: %d requests; %d instrumented; %d complete; %d client errors; "
+         "%d incomplete streams. %d complete streams had no tool calls. Intentionally aborted "
+         "workload requests are excluded." % (
+             measured["requests"], measured["instrumented_requests"],
+             measured["complete_requests"], measured["client_errors"],
+             measured["incomplete_streams"], measured["without_tool_calls"]), "",
+         "| Client milestone | n | Median s | p90 s | Maximum s |",
+         "|---|---:|---:|---:|---:|"]
+    for name, stats in measured["latency_seconds"].items():
+        L.append("| %s | %d | %s | %s | %s |" % (
+            name, stats["n"], f2(stats["median"]), f2(stats["p90"]), f2(stats["max"])))
+    L += ["", "Terminal tool requests: %d; JSON-object calls: %d; invalid identity/JSON calls: "
+          "%d. Parser coverage: %d requests; markers: %d; fallback reasons: %s; "
+          "schema-mismatch arguments: %d. Thinking token coverage: %d requests; "
+          "token-weighted thinking fraction: %s." % (
+              measured["terminal_tool_requests"], measured["valid_tool_calls"],
+              measured["invalid_tool_calls"], measured["parser_observed_requests"],
+              measured["parser_marker_requests"], json.dumps(measured["parser_fallbacks"], sort_keys=True),
+              measured["schema_mismatch_arguments"], measured["token_observed_requests"],
+              ppct(measured["thinking_fraction"]))]
+    return "\n".join(L)
+
+
 def per_request(A):
     L = ["| Tag | Class | Prompt | Cached | Prefilled | Path | Queue s | TTFT s | Out | Decode tok/s | Finish |",
          "|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -731,6 +840,17 @@ def per_request(A):
             r["tag"], r["cls"], " (copy)" if r["copy"] else "", ntok(r["prompt"]), ntok(r["hit"]),
             ntok(r["computed"]), r["path"], f1(r["queue_s"]), f2(r["ttft"]), ntok(r["completion"]),
             ntok(r["completion"] / r["decode_s"]) if r["decode_s"] else "n/a", r["finish_server"]))
+    L += ["", "Client milestones (seconds from send; n/a means unobserved):", "",
+          "| Tag | Status | Complete | First output | Reasoning | Content | Tool delta | Tool ready | End | Parser fallback |",
+          "|---|---|---|---:|---:|---:|---:|---:|---:|---|"]
+    for r in sorted(A["requests"], key=lambda r: r.get("t_send") or 0):
+        latency = r.get("client_latency_seconds") or {}
+        diagnostics = r.get("tool_call_parse") or {}
+        L.append("| %s | %s | %s | %s | %s |" % (
+            r["tag"], r["status"], r.get("stream_complete", "n/a"),
+            " | ".join(f2(latency.get(key)) for key in (
+                "first_output", "first_reasoning", "first_content", "first_tool_delta",
+                "tool_ready", "response_end")), diagnostics.get("fallback_reason", "n/a")))
     return "\n".join(L)
 
 
@@ -872,7 +992,11 @@ def main(argv):
     cold = {s for s in served[0] if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096
                                         for d in served)}
     ms = {a: metrics(A[a], cold) for a in arms}
-    summary = dict({"config": cfg, "cold_seeds": sorted(cold)}, **ms)
+    tool_seeds, tool_distributions = paired_tool_readiness({a: A[a]["requests"] for a in arms})
+    for a in arms:
+        ms[a]["agentic"]["paired_tool_ready_latency_seconds"] = tool_distributions[a]
+    summary = dict({"config": cfg, "cold_seeds": sorted(cold),
+                    "tool_ready_common_seeds": tool_seeds}, **ms)
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1)
 
@@ -1026,6 +1150,12 @@ def main(argv):
         L.append("- Serve load time to /health (s): %s."
                  % per_arm(lambda m: m["load_seconds"], f1))
     L.append("")
+    L.append("## Agentic output and tool measurements\n")
+    L.append("Headline tool latency comparisons use only the %d logical requests with tool "
+             "readiness observed in every arm. The tables below keep each arm's full distribution "
+             "and coverage, including requests excluded from that comparison.\n" % len(tool_seeds))
+    for a in arms:
+        L.append("### %s\n\n%s\n" % (LABEL[a], agentic_table(ms[a]["agentic"])))
     L.append("## Phases\n")
     L.append("| Phase | What runs | %s |" % " | ".join("%s (min)" % SHORT[a] for a in arms))
     L.append("|---|---|" + "---|" * len(arms))

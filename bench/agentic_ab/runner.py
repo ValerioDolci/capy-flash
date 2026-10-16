@@ -335,6 +335,11 @@ class Result:
         self.usage = None
         self.error = None
         self.t_send = self.t_first = self.t_done = None
+        self.client_latency_seconds = dict.fromkeys(
+            ("first_output", "first_reasoning", "first_content", "first_tool_delta",
+             "tool_ready", "response_end"))
+        self.stream_complete = False
+        self.valid_tool_calls = self.invalid_tool_calls = None
 
     def assistant_message(self):
         msg = {"role": "assistant", "content": self.content}
@@ -345,6 +350,19 @@ class Result:
                                   "function": {"name": tc["name"], "arguments": tc["arguments"]}}
                                  for tc in self.tool_calls]
         return msg
+
+
+def valid_tool_call(call):
+    """Check identity and JSON, not schema."""
+    def reject_constant(value):
+        raise ValueError("non-JSON constant: " + value)
+
+    if not call["id"] or not call["name"]:
+        return False
+    try:
+        return isinstance(json.loads(call["arguments"], parse_constant=reject_constant), dict)
+    except ValueError:
+        return False
 
 
 class ArmClient:
@@ -383,6 +401,7 @@ class ArmClient:
         conn = http.client.HTTPConnection(HOST, PORT, timeout=REQUEST_TIMEOUT_S)
         timer = None
         calls = {}
+        start_ns = time.perf_counter_ns()
         try:
             r.t_send = time.time()
             conn.request("POST", "/v1/chat/completions", body=data,
@@ -406,12 +425,22 @@ class ArmClient:
                     continue
                 payload = line[5:].strip()
                 if payload == "[DONE]":
+                    r.stream_complete = r.finish is not None
                     break
+                elapsed = (time.perf_counter_ns() - start_ns) / 1e9
                 ev = json.loads(payload)
                 if ev.get("usage"):
                     r.usage = ev["usage"]
                 for ch in ev.get("choices") or []:
                     d = ch.get("delta") or {}
+                    for field, key in (("reasoning_content", "first_reasoning"),
+                                       ("content", "first_content"),
+                                       ("tool_calls", "first_tool_delta")):
+                        if d.get(field) and r.client_latency_seconds[key] is None:
+                            r.client_latency_seconds[key] = elapsed
+                    if (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")) \
+                            and r.client_latency_seconds["first_output"] is None:
+                        r.client_latency_seconds["first_output"] = elapsed
                     if (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")) \
                             and r.t_first is None:
                         r.t_first = time.time()
@@ -426,12 +455,18 @@ class ArmClient:
                         e["arguments"] += fn.get("arguments") or ""
                     if ch.get("finish_reason"):
                         r.finish = ch["finish_reason"]
+                        if r.finish == "tool_calls":
+                            r.valid_tool_calls = sum(valid_tool_call(c) for c in calls.values())
+                            r.invalid_tool_calls = len(calls) - r.valid_tool_calls
+                            if r.valid_tool_calls and r.client_latency_seconds["tool_ready"] is None:
+                                r.client_latency_seconds["tool_ready"] = elapsed
             r.tool_calls = [calls[k] for k in sorted(calls)]
             r.status = "ok"
         except Exception as e:  # noqa: BLE001 - every failure is recorded, never raised
             r.status = "aborted" if abort_after else "error"
             r.error = "%s: %s" % (type(e).__name__, e)
         finally:
+            r.client_latency_seconds["response_end"] = (time.perf_counter_ns() - start_ns) / 1e9
             r.t_done = time.time()
             if timer:
                 timer.cancel()
@@ -445,6 +480,10 @@ class ArmClient:
                "status": res.status,
                "error": res.error, "finish": res.finish, "usage": res.usage,
                "t_send": res.t_send, "t_first": res.t_first, "t_done": res.t_done,
+               "client_latency_seconds": res.client_latency_seconds,
+               "stream_complete": res.stream_complete,
+               "valid_tool_calls": res.valid_tool_calls,
+               "invalid_tool_calls": res.invalid_tool_calls,
                "messages": len(messages), "tool_calls": len(res.tool_calls),
                "content_chars": len(res.content), "reasoning_chars": len(res.reasoning),
                "tool_argument_chars": sum(len(t["arguments"]) for t in res.tool_calls)}
