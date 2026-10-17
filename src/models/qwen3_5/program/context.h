@@ -65,6 +65,8 @@ struct PrefillContext {
     // Tensor-parallel width 2 under MTP: rank 1's column of the StateImage rank 0's
     // `rewrite_checkpoint_hidden` names (the same slot of rank 1's mirror pool).
     Tensor* peer_rewrite_checkpoint_hidden = nullptr;
+    // Text-only suffixes retain the multimodal prefix's position offset across fresh cards.
+    std::int32_t rope_delta = 0;
 };
 
 struct OrdinaryBatchContext {

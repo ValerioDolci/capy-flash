@@ -605,7 +605,9 @@ public:
           storage1_(storage1) {}
 
     // Prefills the prompt chunk by chunk, as the Program does, and returns rank 0's logits.
-    std::vector<float> prefill(std::span<const int> prompt) {
+    // `rope_delta` is the offset a cached multimodal prefix leaves; the Program passes the
+    // sequence's to every chunk, including the text-only ones that continue it.
+    std::vector<float> prefill(std::span<const int> prompt, std::int32_t rope_delta = 0) {
         // Like the Program, enter with rank 0's device current: the single-device schedule
         // launches on the current device.
         CUDA_CHECK(cudaSetDevice(execution_.dev[0]->device));
@@ -614,7 +616,7 @@ public:
             exec::TextContext card(*execution_.dev[0], rank0_, *storage0_.work,
                                    qwen::PagedKVCacheView{}, *storage0_.state, *storage0_.round,
                                    storage0_.prefill_hidden, chunk_, base, {},
-                                   &storage0_.decoder->text_kv, nullptr, tp_);
+                                   &storage0_.decoder->text_kv, nullptr, tp_, rope_delta);
             const auto result = card.prefill_chunk(
                 prompt, base, static_cast<std::uint32_t>(prompt.size()) - base, true);
             require(result.processed_tokens != 0, "prefill made no progress");
@@ -889,6 +891,21 @@ int parity() {
                 "decode step " + std::to_string(step));
         token = static_cast<int>(argmax(reference_logits, domain));
     }
+    // The second chunk continues a text-only suffix after a multimodal prefix: it must honor the
+    // prefix's rope delta. Each prefill starts from fresh state, since decode leaves some behind.
+    const auto prefill_with_delta = [&](std::int32_t rope_delta) {
+        RankStorage fresh(*execution.dev[0], config, rows, KvCacheStorage::BFloat16, kWorkspace);
+        return Runner(execution, reference, fresh, kChunk, nullptr, nullptr)
+            .prefill(prompt, rope_delta);
+    };
+    const auto unshifted = prefill_with_delta(0);
+    require(prefill_with_delta(0) == unshifted, "prefill is not repeatable");
+    const auto shifted = prefill_with_delta(33);
+    float moved        = 0.0F;
+    for (std::size_t i = 0; i < domain; ++i) {
+        moved = std::max(moved, std::abs(shifted[i] - unshifted[i]));
+    }
+    require(moved > 0.0F, "a later prefill chunk ignored the rope delta");
     gather_columns(execution, events, reference, rank0, rank1, *reference_storage.work,
                    *storage0.work, *storage1.work, domain);
     std::cout << "qwen3_5 tensor-parallel Text parity passed\n";

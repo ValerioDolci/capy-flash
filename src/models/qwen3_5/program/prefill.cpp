@@ -92,7 +92,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.tp);
+                     state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
@@ -124,7 +124,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.tp);
+                     state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
@@ -200,7 +200,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                          state.text_kv, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk,
                          state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                         state.execution.tp);
+                         state.execution.tp, state.rope_delta);
         card.set_qwen4_runtime(state.execution.qwen4);
         card.qwen4_logits_from_hidden(hidden, peer_hidden, logits);
     } else if (state.execution.tp != nullptr) {
@@ -1178,6 +1178,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             0,
             dflash_prefill_host_ingress,
             peer_rewrite_capture_hidden_ptr};
+        schedule_state.rope_delta = sequence.rope_delta;
         // Forced tokens of another lane may have repointed the prefill KV row scalars since this
         // lane's bind; every prefill step publishes its own rows on every rank.
         publish_kv_rows(sequence);

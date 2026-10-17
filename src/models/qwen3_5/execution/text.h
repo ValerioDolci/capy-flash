@@ -76,7 +76,7 @@ public:
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
-                const TpExecution* tp                      = nullptr);
+                const TpExecution* tp = nullptr, std::int32_t rope_delta = 0);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
