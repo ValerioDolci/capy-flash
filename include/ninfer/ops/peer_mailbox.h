@@ -40,6 +40,12 @@
 // FAULTS. A poller that waits too long for its peer (kPeerSpinLimit, qualified below the 2 s display
 // watchdog by test_allreduce) gives up, skips its combine and sets a sticky hang word;
 // hang_reported() exposes it to the owner, which fails that round and every later one.
+//
+// ENTRY. A rank may reach its first captured exchange only after the peer has finished every
+// cross-device copy still owed from it: under WSL2 an outstanding copy stalls behind the peer's
+// spinning exchange kernel (issue #1) and the pair waits on each other until the spin limit. The
+// MTP draft phase ends its staged collectives with such a rendezvous; the DFlash2 draft share adds
+// its own (execution/tp2/draft_tp2.inc).
 
 #include "core/device.h" // ExecutionContext
 

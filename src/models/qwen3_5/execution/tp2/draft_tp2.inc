@@ -302,6 +302,15 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
         pull(state.frame.proposal_q.slice(2, 0, batch_size),
              peer.proposal_q.slice(2, 0, batch_size));
     }
+    // The round continues into the target forward's captured mailbox exchanges, and a rank that
+    // reaches its first exchange spins on the peer. Under WSL2 the peer's outstanding pull from
+    // this device stalls behind that spin (issue #1), so the target's inbound copies must be
+    // complete before either rank enters the mailbox phase: the rendezvous the MTP path gets from
+    // its draft phase's staged collectives.
+    CUDA_CHECK(cudaEventRecord(events.pull_done(static_cast<int>(target)), stream));
+    ScopedCurrentDevice::select(ec.dev[source]->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ec.dev[source]->stream,
+                                   events.pull_done(static_cast<int>(target)), 0));
     // Rank 1 derives its verification inputs from its drafts with the same Op as rank 0.
     ScopedCurrentDevice::select(ec.dev[1]->device);
     Tensor verify_ids = peer.verify_ids.slice(1, 0, batch_size);
