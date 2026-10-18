@@ -148,9 +148,10 @@ struct TpExecution {
     // BF16 [hidden, prefill_chunk] on rank 1: the final-normed prefill chunk, which rank 1's
     // half of the MTP input projection contracts.
     Tensor prefill_hidden;
-    // The captured MTP draft phase keeps its all-reduces on the staged copies even when the
-    // pinned-host mailbox carries the target forward's (ops::PeerEvents::StagedScope). Set by the
-    // Program when the mailbox hung in a full MTP round (WSL2) or by NINFER_TP_MAILBOX_DRAFT=copies.
+    // The captured MTP or masked-draft (DFlash2) draft phase keeps its all-reduces on the staged
+    // copies even when the pinned-host mailbox carries the target forward's
+    // (ops::PeerEvents::StagedScope). Set by the Program when the mailbox hung in a full
+    // speculative round (WSL2) or by NINFER_TP_MAILBOX_DRAFT=copies.
     bool staged_draft_collectives = false;
 
     [[nodiscard]] bool complete() const noexcept {

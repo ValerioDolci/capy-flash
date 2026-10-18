@@ -478,13 +478,14 @@ bool ProgramImpl::degrade_peer_mailbox() {
                                previous + ")";
     tp_transport_status.fallback +=
         (tp_transport_status.fallback.empty() ? "" : "; then ") + reason;
-    if (speculative_backend == SpeculativeBackend::Mtp &&
+    if ((speculative_backend == SpeculativeBackend::Mtp ||
+         is_masked_draft_backend(speculative_backend)) &&
         !tp_execution->staged_draft_collectives) {
         tp_execution->staged_draft_collectives = true;
         peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel, wide_slot_bytes);
         peer_mailbox->set_release_dependents(release_dependents);
         peer_events->attach_mailbox(&*peer_mailbox);
-        tp_transport_status.transport = "mailbox, MTP draft on copies";
+        tp_transport_status.transport = "mailbox, draft on copies";
         return true;
     }
     tp_execution->staged_draft_collectives = false;
