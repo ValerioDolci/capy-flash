@@ -887,6 +887,15 @@ struct TpTransportStatus {
     // NINFER_TP_SELECTOR=primary, NINFER_TP_DRAFT_HEAD=primary or Vision on rank 1) or "rank 0"
     // (NINFER_TP_DRAFTER=primary); empty otherwise.
     std::string drafter;
+
+    // The eager (uncaptured) split all-reduces' transport, the prefill-overlap lanes: "host
+    // staging" (pinned-host HostExchange, T56: no P2P or elastic KV) or "device-to-device"
+    // (DirectExchange pulls, P2P-granted boards); empty when no split transport is attached
+    // (NINFER_TP_HOST_EXCHANGE=0) or at tp 1.
+    std::string eager_exchange;
+    // The pipelined prefill's exchange slice width in tokens (NINFER_TP_PREFILL_SLICE; unset takes
+    // the default); "0" disables the slicing.
+    std::string prefill_slice;
 };
 
 class Program {

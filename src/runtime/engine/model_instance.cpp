@@ -459,6 +459,8 @@ ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext&
     summary.tp_mailbox_slot_bytes = instance->program->tp_transport().slot_bytes;
     summary.tp_proposal_head      = instance->program->tp_transport().proposal_head;
     summary.tp_drafter            = instance->program->tp_transport().drafter;
+    summary.tp_eager_exchange     = instance->program->tp_transport().eager_exchange;
+    summary.tp_prefill_slice      = instance->program->tp_transport().prefill_slice;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

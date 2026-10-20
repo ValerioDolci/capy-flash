@@ -130,6 +130,62 @@ HostExchange* eager_host_exchange(const ExecutionContext& ec, const PeerEvents& 
     return exchange;
 }
 
+// EAGER DIRECT EXCHANGE SELECTION (the P2P boards' T68 counterpart): the DirectExchange attached
+// to `events` when it serves this pair and neither rank's stream is capturing; otherwise the
+// split form is unavailable for this pair.
+DirectExchange* eager_direct_exchange(const ExecutionContext& ec, const PeerEvents& events) {
+    DirectExchange* exchange = events.direct_exchange();
+    if (exchange == nullptr || !exchange->serves(ec)) { return nullptr; }
+    for (int rank = 0; rank < 2; ++rank) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ec.dev[rank]->stream, &status));
+        if (status != cudaStreamCaptureStatusNone) { return nullptr; }
+    }
+    return exchange;
+}
+
+// The PipelinedExchange lanes, per device pair (one pair per process): one extra stream per rank
+// plus the events that order the lanes against each other and against the rank streams.
+struct ExchangeLanes {
+    std::array<int, 2> device{-1, -1};
+    std::array<cudaStream_t, 2> stream{nullptr, nullptr};
+    // Recorded on lane r after lane r's inbound pull finished: the peer's lane waits on it before
+    // its combine overwrites the buffer that lane r was reading.
+    std::array<cudaEvent_t, 2> pulled{nullptr, nullptr};
+    // One per exchange index, per rank, recorded on lane r after r's combine; a rank stream
+    // waits on its own to read (or reuse) the buffer.
+    std::array<std::vector<cudaEvent_t>, 2> done;
+
+    static cudaEvent_t event_at(std::vector<cudaEvent_t>& pool, std::size_t index) {
+        while (pool.size() <= index) {
+            cudaEvent_t event = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            pool.push_back(event);
+        }
+        return pool[index];
+    }
+
+    cudaEvent_t done_event(int rank, int index) {
+        return event_at(done[static_cast<std::size_t>(rank)], static_cast<std::size_t>(index));
+    }
+};
+
+ExchangeLanes& exchange_lanes(const ExecutionContext& ec) {
+    static ExchangeLanes lanes;
+    if (lanes.stream[0] == nullptr) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec.dev[r]->device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&lanes.stream[r], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lanes.pulled[r], cudaEventDisableTiming));
+            lanes.device[r] = ec.dev[r]->device;
+        }
+    }
+    require(lanes.device[0] == ec.dev[0]->device && lanes.device[1] == ec.dev[1]->device,
+            "PipelinedExchange: one device pair per process");
+    return lanes;
+}
+
 } // namespace
 
 PeerMailbox* detail::captured_mailbox_for(std::size_t bytes, const ExecutionContext& ec,
@@ -913,32 +969,230 @@ void HostExchange::sum_finish(int lane_index, const ExecutionContext& ec) {
     lane.active  = false;
 }
 
+DirectExchange::DirectExchange(const ExecutionContext& ec) {
+    require_two_devices(
+        ec, "DirectExchange: requires an ExecutionContext with two distinct devices");
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        devices_[r] = ec.dev[rank]->device;
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&pull_[r], cudaStreamNonBlocking));
+        for (Lane& lane : lanes_) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&lane.begun[r], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lane.received[r], cudaEventDisableTiming));
+        }
+    }
+}
+
+DirectExchange::~DirectExchange() {
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = -1; }
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (devices_[rank] < 0 || cudaSetDevice(devices_[rank]) != cudaSuccess) { continue; }
+        if (pull_[rank] != nullptr) {
+            (void)cudaStreamSynchronize(pull_[rank]);
+            (void)cudaStreamDestroy(pull_[rank]);
+        }
+        for (Lane& lane : lanes_) {
+            for (cudaEvent_t e : {lane.begun[rank], lane.received[rank]}) {
+                if (e != nullptr) { (void)cudaEventDestroy(e); }
+            }
+        }
+    }
+    // The pull streams read peer memory: drain both devices before the operands go.
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (devices_[rank] >= 0 && cudaSetDevice(devices_[rank]) == cudaSuccess) {
+            (void)cudaDeviceSynchronize();
+        }
+    }
+    if (previous >= 0) { (void)cudaSetDevice(previous); }
+}
+
+bool DirectExchange::serves(const ExecutionContext& ec) const noexcept {
+    return ec.tp == 2 && ec.dev[0].has_value() && ec.dev[1].has_value() &&
+           ec.dev[0]->device == devices_[0] && ec.dev[1]->device == devices_[1];
+}
+
+void DirectExchange::sum_begin(int lane_index, const std::array<Tensor, 2>& buffer,
+                               const std::array<Tensor, 2>& staging, const ExecutionContext& ec) {
+    require(serves(ec), "DirectExchange: serves another device pair");
+    require(lane_index >= 0 && lane_index < kSumLanes, "DirectExchange: sum lane out of range");
+    Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
+    require(!lane.active, "DirectExchange: sum_begin on an open lane");
+    const std::size_t bytes = buffer[0].bytes();
+    require(bytes > 0 && buffer[1].bytes() == bytes && staging[0].bytes() == bytes &&
+                staging[1].bytes() == bytes,
+            "DirectExchange: sum operands must share one size");
+    const CurrentDeviceGuard guard;
+    // Phase A: both operands are complete on the ranks' streams; publish it before any wait
+    // observes it (the three-phase issue order in the header).
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaEventRecord(lane.begun[r], ec.dev[rank]->stream));
+    }
+    // Phase B: each rank pulls the peer's operand into its own staging on its private stream.
+    // The wait on the OWN begun[r] orders the pull after the main stream's previous use of
+    // staging[r] (this lane's previous combine); the wait on the peer's begun[1-r] on its
+    // operand's completion. One copy per lane: there is no second leg to ping-pong.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r    = static_cast<std::size_t>(rank);
+        const auto peer = static_cast<std::size_t>(1 - rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(pull_[r], lane.begun[r], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(pull_[r], lane.begun[peer], 0));
+        CUDA_CHECK(pull_peer(staging[r].data, buffer[peer].data, bytes, pull_[r]));
+        CUDA_CHECK(cudaEventRecord(lane.received[r], pull_[r]));
+    }
+    lane.buffer  = buffer;
+    lane.staging = staging;
+    lane.active  = true;
+}
+
+void DirectExchange::sum_finish(int lane_index, const ExecutionContext& ec) {
+    require(serves(ec), "DirectExchange: serves another device pair");
+    require(lane_index >= 0 && lane_index < kSumLanes, "DirectExchange: sum lane out of range");
+    Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
+    require(lane.active, "DirectExchange: sum_finish without sum_begin");
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        const cudaStream_t stream = ec.dev[rank]->stream;
+        // Inbound data complete, and the peer's pull has finished reading buffer[r]: the combine
+        // may overwrite it and every buffer of the lane reused.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, lane.received[r], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, lane.received[1 - r], 0));
+        Tensor accumulator = lane.buffer[r];
+        detail::residual_add_launch(lane.staging[r], accumulator, stream);
+    }
+    lane.buffer  = {};
+    lane.staging = {};
+    lane.active  = false;
+}
+
 bool allreduce_sum_split_available(const ExecutionContext& ec, const PeerEvents& events) {
     if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value() || !events.live()) {
         return false;
     }
     const CurrentDeviceGuard guard;
-    return eager_host_exchange(ec, events) != nullptr;
+    return eager_host_exchange(ec, events) != nullptr ||
+           eager_direct_exchange(ec, events) != nullptr;
 }
 
 void allreduce_sum_begin(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                          const ExecutionContext& ec, const PeerEvents& events, int lane) {
     detail::require_allreduce_sum_arguments(buffer, staging, ec, events);
-    HostExchange* exchange = nullptr;
-    {
-        const CurrentDeviceGuard guard;
-        exchange = eager_host_exchange(ec, events);
+    const CurrentDeviceGuard guard;
+    if (HostExchange* exchange = eager_host_exchange(ec, events)) {
+        exchange->sum_begin(lane, buffer, staging, ec);
+        return;
     }
-    require(exchange != nullptr,
-            "allreduce_sum_begin: needs an eager HostExchange and uncaptured streams");
-    exchange->sum_begin(lane, buffer, staging, ec);
+    if (DirectExchange* exchange = eager_direct_exchange(ec, events)) {
+        exchange->sum_begin(lane, buffer, staging, ec);
+        return;
+    }
+    require(false,
+            "allreduce_sum_begin: needs an eager split transport and uncaptured streams");
 }
 
 void allreduce_sum_finish(const ExecutionContext& ec, const PeerEvents& events, int lane) {
-    HostExchange* exchange = events.host_exchange();
-    require(exchange != nullptr && exchange->sum_open(lane),
-            "allreduce_sum_finish: the lane has no open call");
-    exchange->sum_finish(lane, ec);
+    if (HostExchange* exchange = events.host_exchange()) {
+        require(exchange->sum_open(lane), "allreduce_sum_finish: the lane has no open call");
+        exchange->sum_finish(lane, ec);
+        return;
+    }
+    if (DirectExchange* exchange = events.direct_exchange()) {
+        require(exchange->sum_open(lane), "allreduce_sum_finish: the lane has no open call");
+        exchange->sum_finish(lane, ec);
+        return;
+    }
+    require(false, "allreduce_sum_finish: the lane has no open call");
+}
+
+PipelinedExchange::PipelinedExchange(const ExecutionContext& ec, const PeerEvents& events)
+    : ec_(&ec), events_(&events) {
+    require_two_devices(ec, "PipelinedExchange: requires two distinct devices");
+    require(events.live(), "PipelinedExchange: events must be live");
+    require(events.pipeline_ == nullptr, "PipelinedExchange: a scope is already open");
+    const CurrentDeviceGuard guard;
+    exchange_lanes(ec);
+    // The lanes are never captured: the scope orders the rank streams' exchanges against lane
+    // work that lives outside any graph.
+    for (int rank = 0; rank < 2; ++rank) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ec.dev[rank]->stream, &status));
+        require(status == cudaStreamCaptureStatusNone,
+                "PipelinedExchange: the rank streams are not capturable");
+    }
+    events.pipeline_ = this;
+}
+
+PipelinedExchange::~PipelinedExchange() {
+    events_->pipeline_ = nullptr;
+    if (issued_ == 0) {
+        return;
+    }
+    try {
+        join();
+    } catch (...) {
+        // The lanes can only outlive the rank streams' view of them if a CUDA call failed, in
+        // which case the next call on either stream reports it.
+    }
+}
+
+void PipelinedExchange::wait(int index) const {
+    require(index >= 0 && index < issued_, "PipelinedExchange::wait: index out of range");
+    const CurrentDeviceGuard guard;
+    ExchangeLanes& lanes = exchange_lanes(*ec_);
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec_->dev[r]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ec_->dev[r]->stream, lanes.done_event(rank, index), 0));
+    }
+}
+
+void PipelinedExchange::join() const {
+    wait(issued_ - 1);
+}
+
+void PipelinedExchange::enqueue(const std::array<Tensor, 2>& buffer,
+                                const std::array<Tensor, 2>& staging) {
+    const std::size_t bytes = buffer[0].bytes();
+    require(bytes > 0, "PipelinedExchange: an empty exchange desynchronizes the indices");
+    const CurrentDeviceGuard guard;
+    ExchangeLanes& lanes = exchange_lanes(*ec_);
+    const int index      = issued_;
+
+    // Phase A publishes the staged path's inputs-ready events. Phase B runs on the lanes: each
+    // lane waits for both operands (its own wait also orders the lane's combine after the rank
+    // GEMM that produced its own operand), pulls the peer's, and records its pull-done. Phase C
+    // combines only after the peer's pull finished reading the buffer it overwrites. Phase B
+    // completes for both lanes before either phase C is issued, so no wait snapshots a record
+    // the peer has not yet made.
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec_->dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaEventRecord(events_->inputs_ready(rank), local.stream));
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r    = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec_->dev[r]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], events_->inputs_ready(1 - rank), 0));
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], events_->inputs_ready(rank), 0));
+        CUDA_CHECK(pull_peer(staging[r].data, buffer[1 - rank].data, bytes, lanes.stream[r]));
+        CUDA_CHECK(cudaEventRecord(lanes.pulled[r], lanes.stream[r]));
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec_->dev[r]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], lanes.pulled[1 - rank], 0));
+        Tensor accumulator = buffer[rank];
+        detail::residual_add_launch(staging[rank], accumulator, lanes.stream[r]);
+        CUDA_CHECK(cudaEventRecord(lanes.done_event(rank, index), lanes.stream[r]));
+    }
+    ++issued_;
 }
 
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
@@ -961,6 +1215,13 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         }
         return;
     }
+    // Pipelined transport: an open PipelinedExchange scope takes the exchange onto its lanes and
+    // returns at once (the caller orders its later work against the exchange's index).
+    if (PipelinedExchange* pipeline = events.pipeline()) {
+        pipeline->enqueue(buffer, staging);
+        return;
+    }
+
 
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {

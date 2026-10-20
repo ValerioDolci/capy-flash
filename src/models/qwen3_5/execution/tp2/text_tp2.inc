@@ -9,8 +9,10 @@
 #include "core/device_scope.h"
 #include "models/qwen3_5/execution/tp2/exchange_prefetch.h"
 #include "models/qwen3_5/execution/tp2/split.h"
+#include "models/qwen3_5/execution/tp2/prefill_slice.h"
 
 #include <array>
+#include <optional>
 #include <variant>
 #include <cstdlib>
 #include <string_view>
@@ -457,8 +459,20 @@ void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
         ops::sigmoid_mul(gate, a[r], s);
     });
 
-    attention_output_split({a[0].view({q_width, T}), a[1].view({q_width, T})}, p, x, staging, ws,
-                           execution, *tp_->events, exchange_lane);
+    const RankTensors mixed{a[0].view({q_width, T}), a[1].view({q_width, T})};
+    if (tp_->events->pipeline() != nullptr) {
+        // Exchange slice of the layer's scope (the FFN of slice s starts the moment it lands,
+        // mlp_tail_tp2): the output projection of each slice is issued on its own and the sum
+        // arrives behind the compute of the later slices.
+        for_each_exchange_slice(T, [&](std::int32_t first, std::int32_t count) {
+            attention_output_split(column_slice(mixed, first, count), p,
+                                   column_slice(x, first, count),
+                                   column_slice(staging, first, count), ws, execution,
+                                   *tp_->events);
+        });
+        return;
+    }
+    attention_output_split(mixed, p, x, staging, ws, execution, *tp_->events, exchange_lane);
 }
 
 void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Phase ph,
@@ -625,8 +639,16 @@ void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Pha
         ops::gated_rmsnorm(o[r], p[r]->norm, gate, config_.rms_norm_eps, on[r], rank_stream(rank));
     });
 
-    gdn_output_split({on[0].view({value_width, T}), on[1].view({value_width, T})}, p, x, staging,
-                     ws, execution, *tp_->events, exchange_lane);
+    const RankTensors mixed{on[0].view({value_width, T}), on[1].view({value_width, T})};
+    if (tp_->events->pipeline() != nullptr) {
+        for_each_exchange_slice(T, [&](std::int32_t first, std::int32_t count) {
+            gdn_output_split(column_slice(mixed, first, count), p,
+                            column_slice(x, first, count),
+                            column_slice(staging, first, count), ws, execution, *tp_->events);
+        });
+        return;
+    }
+    gdn_output_split(mixed, p, x, staging, ws, execution, *tp_->events, exchange_lane);
 }
 
 void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTensors& staging,
@@ -636,6 +658,24 @@ void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTe
     RankTensors h;
     for (std::size_t r = 0; r < 2; ++r) {
         h[r] = workspace::post_mixer_hidden(*ws[r], config_, x[r].ne[1]);
+    }
+    if (ops::PipelinedExchange* pipeline = tp_->events->pipeline()) {
+        // Slice s's mixer sum is exchange s of the layer's scope: its FFN starts the moment it
+        // lands, while the exchanges of the later slices are still in flight.
+        int mixer_exchange = 0;
+        for_each_exchange_slice(x[0].ne[1], [&](std::int32_t first, std::int32_t count) {
+            pipeline->wait(mixer_exchange++);
+            RankTensors xs = column_slice(x, first, count);
+            RankTensors hs = column_slice(h, first, count);
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::rmsnorm(xs[r], w[r]->post_attention_norm, config_.rms_norm_eps, true,
+                             hs[r], rank_stream(rank));
+            });
+            ffn_split(hs, {&w[0]->ffn, &w[1]->ffn}, xs, column_slice(staging, first, count), ws,
+                      execution, *tp_->events);
+        });
+        return;
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -650,6 +690,11 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
     const bool prefill  = ph == Phase::Prefill;
     const auto& layers0 = parameters_.text.layers;
     const auto& layers1 = tp_->parameters->text.layers;
+    // Prefill only: slice the layer's exchanges (ops::PipelinedExchange) so each slice's
+    // all-reduces move while the compute of the later slices runs; a chunk shorter than two
+    // slices stays one exchange per row-parallel GEMM.
+    const std::int32_t slice    = ph == Phase::Prefill ? exchange_slice_for(x[0].ne[1]) : 0;
+    const bool pipelined        = slice > 0 && x[0].ne[1] >= 2 * slice;
     for (std::size_t layer = 0; layer < layers0.size(); ++layer) {
         const RankBlocks block{&layers0[layer], &layers1[layer]};
         const bool full = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -663,6 +708,12 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
             full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
         try {
+            // Declared before the layer's kernels are issued, joined before the layer output is
+            // read: the output is the sum only once the layer's last FFN exchange has landed.
+            std::optional<ops::PipelinedExchange> exchange;
+            if (pipelined) {
+                exchange.emplace(*tp_->execution, *tp_->events);
+            }
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -700,6 +751,9 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                     stage_exchange_prefetch(*tp_->events, *tp_->execution, x[0].bytes(), hint);
                 }
                 mlp_tail_tp2(block, x, staging);
+            }
+            if (exchange) {
+                exchange->join();
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x[0], ctx_.stream);

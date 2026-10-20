@@ -72,9 +72,13 @@ std::optional<CudaCompletionEvent> peer_context_completion_;
 // graph families, whose kernels address its slab: both are destroyed first.
 std::optional<ops::PeerMailbox> peer_mailbox;
 // The eager all-reduces' pinned-host transport (T56: prefill chunks), attached to peer_events
-// without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=0 / =1 force it off / on). Declared
-// before peer_events, which points to it.
+// without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=1 forces it on). Declared before
+// peer_events, which points to it.
 std::optional<ops::HostExchange> host_exchange;
+// The eager split transport with P2P: the prefill-overlap lanes pull the peer's operand
+// device-to-device on private streams. Attached when NINFER_TP_HOST_EXCHANGE is unset. Declared
+// before peer_events, which points to it.
+std::optional<ops::DirectExchange> direct_exchange;
 std::optional<ops::PeerEvents> peer_events;
 std::optional<DecodeGraphPeerBridge> graph_bridge;
 std::optional<execution::TpExecution> tp_execution;

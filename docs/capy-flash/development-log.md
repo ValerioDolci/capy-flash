@@ -437,3 +437,56 @@ per generated token worse (7.74 -> 7.79 s per 1k tokens); the prompt's targets c
 cost decode instead (all 148.9, 32 per layer 151.5); frequencies only 153.9 tok/s, TTFT 0.577 s, 7.65 s per 1k
 tokens. The replayed policy on the T194 routing agrees on the residency (targets 6.66 M CPU experts, frequencies
 only 7.13 M, T211 7.25 M) but not on the price of the copies, which only the GPU shows.
+
+**T212**: direct P2P prefill overlap. The half-chunk overlap split of the prefill (T56)
+existed only in the host-staging transport, so boards with peer access (driver patch, issue #3) ran the
+one-call driver-staged eager copies and lost the overlap: 7,987 / 7,684 / 5,410 tok/s (4k / 16k / 64k
+cold prefill) vs 8,466 / 8,322 / 5,746 for host staging, 2x 5070 Ti PHB, 27B profile, uncapped clocks at
+~3,180 MHz. `ops::DirectExchange` (`allreduce.cu`) carries the split on peer memory: two lanes (one per
+2,048-token half-chunk), a non-blocking pull stream per rank, and begun/received events per half: each
+rank publishes its half on the main stream, pulls the peer's half device-to-device, and the combine
+(the same `residual_add` body) is ordered after the received halves, so the pull overlaps the peer's
+remaining GEMM. Auto-select: direct lanes with P2P and no `--elastic`; host staging without P2P or with
+`--elastic` (the lent workspace is VMM memory a UVA pull cannot read); `NINFER_TP_HOST_EXCHANGE=0` / `1`
+keep their old meaning (no split transport / host staging forced). Bit-identity: the op suite checks all
+three transports against the FP32-widened RNE-bf16 oracle (odd byte sizes, tiny lanes; a graph capture
+stays staged), and a 27B tp2 serve gave byte-identical greedy outputs (reasoning plus content) on all
+three. Measured (27B, live flags, cold prefill, max_tokens = 1): 11,685 / 11,114 / 6,926 tok/s = +47 / +45 /
+28 % over the one-call copies and +38 / +34 / +21 % over host staging.
+This is the first prefill measurement on the peer-access pair (driver 615.71.09 P2P patch, issue #3);
+the raw one-way rates of the two transports are equal (P2P D2D ~ H2D + D2H ~ 28.5-28.9 GB/s), so the
+gain is the overlap, not the copy.
+
+**T213**: per-slice pipelined prefill. The T212 half-chunk overlap
+splits each eager prefill all-reduce into two half-chunk lanes when a split transport
+is attached (the P2P default); a chunk under 768 tokens (the overlap's halves must
+each hold at least 384) and any chunk with `NINFER_TP_PREFILL_OVERLAP=0` take the
+alternative path, `run_layers_tp2`, where this entry's pipeline runs.
+`ops::PipelinedExchange` (`allreduce.cu`) subdivides the chunk into slices:
+`NINFER_TP_PREFILL_SLICE` (tokens per slice, default 1024; `0` keeps the one-call
+exchange), halved toward 128 by `prefill_slice.h` (`for_each_exchange_slice`,
+`column_slice`) until a chunk holds at least four slices (short prompts and the
+prompt's last chunk pipeline as well). `run_layers_tp2` opens a per-layer scope when
+a chunk holds at least two slices: each eager all-reduce of the layer (the attention/GDN
+output split and the FFN split) is issued per slice on the pipeline's own lane
+streams, a slice's pull (`pull_peer`, device-to-device with P2P) and combine land and
+its FFN starts while the later slices are still in flight, and the scope `join()`s at
+the layer's end so the output is complete before the next layer reads it. Prefill
+only — decode stays on the captured mailbox. Bit-identity: the per-slice combine is
+the same `residual_add` body as the whole-tensor path, so the result is the same bits;
+the op suite checks the sliced lanes against the FP32-widened RNE-bf16 oracle, and a
+27B tp2 serve gave byte-identical greedy outputs (512 reasoning tokens, a fixed seeded
+1,500-word prompt) across the one-call, per-slice, host-staging and direct P2P
+configurations. Measured (27B, tp2, the
+per-slice 9,392 / 9,352 / 6,614 tok/s, +12 / +16 / +13 % over the one-call copies
+(`NINFER_TP_HOST_EXCHANGE=0 NINFER_TP_PREFILL_SLICE=0`, 8,381 / 8,061 / 5,876) — and
+25 / 22 / 14 % behind the T212 half-chunk direct lanes (12,449 / 11,954 / 7,730), the
+P2P default, on which this pipeline is inactive except on the sub-768-token tail
+chunks. At a 1,024-token prefill chunk (a separate OC run) the half-chunk split narrows
+to 512-token lanes and the direct lane's margin over the pipeline (four 256-token
+slices per chunk) narrows to +21/+21/+2 % (10,486/10,331/6,340 vs 8,651/8,553/6,188
+tok/s); at locked cores the 64k margin flips to the pipeline (4,813 vs 4,466 tok/s).
+The per-slice pull is a driver-staged copy
+without P2P, where the fine-grained overlap is not measured to help, so
+non-peer-access boards should set `NINFER_TP_PREFILL_SLICE=0` (the default host
+staging half-chunk overlap remains their prefill overlap).

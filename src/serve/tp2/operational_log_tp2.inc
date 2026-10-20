@@ -58,6 +58,15 @@ void log_tensor_parallel(spdlog::logger& logger, const GenerationService& servic
         if (!load.tp_drafter.empty()) {
             logger.info("tensor parallel | DFlash2 drafter: {}", load.tp_drafter);
         }
+        if (!load.tp_eager_exchange.empty()) {
+            logger.info("tensor parallel | eager all-reduces (prefill overlap): {}",
+                        load.tp_eager_exchange);
+        }
+        if (!load.tp_prefill_slice.empty()) {
+            logger.info("tensor parallel | prefill exchange slices: {} tokens per slice "
+                        "(NINFER_TP_PREFILL_SLICE; 0 disables the slicing)",
+                        load.tp_prefill_slice);
+        }
     }
     // Measured against the planned per-device allowance, to calibrate the tp 2 constants.
     // An overrun only uses device memory the KV sizing left unreserved, so it warns instead

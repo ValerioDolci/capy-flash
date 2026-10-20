@@ -1304,6 +1304,14 @@ struct LoadSummary {
     // tp 2 DFlash2: where the drafter runs, "split (...)" (both ranks, the default) or "rank 0"
     // (NINFER_TP_DRAFTER=primary); empty otherwise.
     std::string tp_drafter;
+    // tp 2: the transport of the eager (uncaptured) split all-reduces, the prefill-overlap
+    // lanes: "host staging" (pinned-host buffers, T56) or "device-to-device" (DirectExchange
+    // pulls, P2P-granted boards); empty when no split transport is attached
+    // (NINFER_TP_HOST_EXCHANGE=0) or at tp 1.
+    std::string tp_eager_exchange;
+    // tp 2: the pipelined prefill's exchange slice width in tokens (NINFER_TP_PREFILL_SLICE;
+    // unset takes the default); "0" disables the slicing. Empty at tp 1.
+    std::string tp_prefill_slice;
     ContextCostSummary context_cost;
 };
 

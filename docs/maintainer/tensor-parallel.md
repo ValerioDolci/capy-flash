@@ -265,6 +265,34 @@ that every launch runs on both devices (an eager call would spin without a partn
 and the one-sided pulls (logits, acceptance results, draft tokens, Vision embeddings) are copies by
 nature. With direct P2P the staged path is a direct copy, so the Engine keeps it there.
 
+Eager calls (every prefill and warmup) are never captured, so `construct_tensor_parallel` gives
+them their own transport, attached to the `PeerEvents` before the first prefill. The prefill
+overlap split runs each eager all-reduce of the column-parallel prefill as a `sum_begin` /
+`sum_finish` pair over the 2048-token half-chunk: a rank publishes its half with an event, pulls
+the peer's half, and the combine on the main stream is ordered after the received halves, so the
+pull overlaps the peer's remaining half-chunk GEMM. Two transports implement the lanes.
+`ops::HostExchange` ([`allreduce.cu`](../../src/ops/common/allreduce.cu)) stages both halves
+through pinned-host buffers in 2 MiB chunked ping-pong legs; it is the automatic choice without
+P2P and under `--elastic` (the lent workspace is VMM memory a UVA pull cannot read).
+`ops::DirectExchange` pulls each half directly device-to-device on its own non-blocking stream,
+waiting on both halves' publish events before pulling and recording a received event per half; it
+is the automatic choice with P2P and no `--elastic` — the default on peer-access boards.
+`NINFER_TP_HOST_EXCHANGE=0` attaches no split transport (eager all-reduces stay one-call copies),
+`1` forces host staging; auto selects by P2P and `--elastic` only. All three transports run the
+same `residual_add` combine body as §4.1, so they are bit-identical; the startup log names the
+attached choice.
+
+The prefill can slice the exchange finer than the 2048-token half-chunk:
+`NINFER_TP_PREFILL_SLICE` (tokens per slice, default 1024; `0` off, the half-chunk split). When a
+prefill chunk holds at least two slices, `run_layers_tp2` opens a per-layer
+`ops::PipelinedExchange` scope, and each eager all-reduce of the layer (the attention/GDN output
+split and the FFN split) is issued per slice on the pipeline's own lane streams: a slice's combine
+lands and its FFN starts while the later slices are still in flight, and the scope `join()`s at the
+layer's end so the output is complete before the next layer reads it. Prefill only — decode stays on
+the captured mailbox. Each slice's pull is the same `pull_peer` (device-to-device with P2P, driver
+staged without), so the fine-grained overlap pays off on peer-access boards; without P2P the
+per-slice staging overhead is not measured to help, so set `NINFER_TP_PREFILL_SLICE=0` there.
+
 ### 4.4 Startup probe
 
 Right after creating the mailbox, before any decode graph is captured,
@@ -300,10 +328,12 @@ hang word at `prepare_graphs`' synchronizations while the MTP draft phase is on 
 ### 4.6 Reporting and the standalone probe
 
 `Program::tp_transport()` returns a `TpTransportStatus`, which `construct_model_on` copies into
-`LoadSummary::tp_transport`, `tp_mailbox_probe_ms` and `tp_mailbox_fallback` (reasons joined by
-`"; then "`; [`types.h`](../../include/ninfer/types.h)). `ninfer-serve` logs a `tensor parallel`
+`LoadSummary::tp_transport`, `tp_mailbox_probe_ms`, `tp_mailbox_fallback` (reasons joined by
+`"; then "`) and `tp_eager_exchange` (the attached split-transport name, empty when `NINFER_TP_HOST_EXCHANGE=0`) ([`types.h`](../../include/ninfer/types.h)).
+`ninfer-serve` logs a `tensor parallel`
 line with `p2p on` or `p2p off (host-staged copies)`, a `captured all-reduces: … | mailbox probe X ms`
-line, and a warning whenever the mailbox was dropped or narrowed
+line, an `eager all-reduces (prefill overlap): device-to-device | host staging` line when a split
+transport is attached, and a warning whenever the mailbox was dropped or narrowed
 ([`operational_log.cpp`](../../src/serve/operational_log.cpp)); the timeout error names the
 transport and the probe time. [`tools/tp2/mailbox_probe.cu`](../../tools/tp2/mailbox_probe.cu) runs
 the same check without the engine or a model (nvcc and the CUDA runtime only; it includes the

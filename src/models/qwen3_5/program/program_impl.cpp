@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/tp2/prefill_slice.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include "core/device_scope.h"

@@ -821,6 +821,43 @@ int main(int argc, char** argv) {
     }
 
     {
+        // The P2P boards' eager split lanes: DirectExchange pulls the peer's operand
+        // device-to-device on private streams. Same schedule, same oracle (RNE_bf16 after the
+        // first call, doubled exactly after) as the host lanes, so passing here is bit-identity
+        // with both the host lanes and the one-call path. Skipped without peer access.
+        if (ops::enable_peer_access(ec)) {
+            ops::DirectExchange direct(ec);
+            ops::PeerEvents direct_events(ec);
+            direct_events.attach_direct_exchange(&direct);
+            failures += run_split_lane_case("split lanes direct [2560,96] 32+64 x3 + sum", kHidden,
+                                            96, 32, 3, 321u, ec, direct_events);
+            // Odd column counts: odd lane bytes, the pull and the residual add unaligned.
+            failures += run_split_lane_case("split lanes direct [2560,101] 37+64 x2 + sum", kHidden,
+                                            101, 37, 2, 322u, ec, direct_events);
+            // Tiny lanes: one chunk's worth of bytes per pull.
+            failures += run_split_lane_case("split lanes direct [17,5] 2+3 x2 + sum", 17, 5, 2, 2, 324u,
+                                            ec, direct_events);
+            // Prefill-sized halves, as the Program's overlap issues them.
+            failures += run_split_lane_case("split lanes direct [2560,2048] 1024+1024 x2 + sum",
+                                            kHidden, 2048, 1024, 2, 325u, ec, direct_events);
+            // One-call sums keep the plain peer pull with only the direct exchange attached.
+            failures +=
+                run_eager_case("direct exchange [2560,48]", kHidden, 48, 327u, true, ec, direct_events);
+            failures += run_eager_case("direct exchange [2560] fp32 only", kHidden, 1, 329u, false,
+                                       ec, direct_events);
+            if (!ops::allreduce_sum_split_available(ec, direct_events)) {
+                std::cerr << "split all-reduce unavailable with a direct exchange\n";
+                ++failures;
+            }
+            // A capture ignores the DirectExchange: the staged nodes, as without it.
+            failures += run_captured_case("captured with direct exchange stays staged", kHidden, 1, 5,
+                                          0, ec, direct_events, nullptr);
+        } else {
+            std::cout << "note: direct lanes skipped (no peer access)\n";
+        }
+    }
+
+    {
         // T62: the pipelined prefill exchange, every payload, uneven per-rank groups, many
         // 4 KiB chunks per group, back to back, then a pull() through the same pinned buffers.
         using Payload = ops::HostExchange::Payload;

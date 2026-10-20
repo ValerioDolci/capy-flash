@@ -94,6 +94,8 @@ namespace ninfer::ops {
 
 class PeerMailbox; // see ops/peer_mailbox.h
 class HostExchange;
+class DirectExchange;
+class PipelinedExchange;
 
 // Probes cudaDeviceCanAccessPeer in both directions and enables peer access on both devices only
 // when both directions report support; a device that already had peer access enabled is left
@@ -185,12 +187,84 @@ public:
 
     [[nodiscard]] HostExchange* host_exchange() const noexcept { return host_exchange_; }
 
+    // Selects `exchange` (null: none) as the transport of this pair's EAGER split-phase summing
+    // all-reduces on P2P-granted boards: allreduce_sum_begin() / allreduce_sum_finish() pull the
+    // peer's operand device-to-device on the exchange's private streams while the ranks' streams
+    // run the caller's overlapped work. It must serve the ExecutionContext these events were
+    // created for.
+    void attach_direct_exchange(DirectExchange* exchange) noexcept { direct_exchange_ = exchange; }
+
+    [[nodiscard]] DirectExchange* direct_exchange() const noexcept { return direct_exchange_; }
+
+    // The open PipelinedExchange scope of this pair (null: none). While one is open, eager
+    // allreduce_sum() calls are issued on its exchange lanes instead of the ranks' own streams.
+    // Mutable through a const instance: the scope claims the pair when it opens and releases it
+    // when it closes.
+    [[nodiscard]] PipelinedExchange* pipeline() const noexcept { return pipeline_; }
+
 private:
+    friend class PipelinedExchange;
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
-    PeerMailbox* mailbox_        = nullptr;
-    HostExchange* host_exchange_ = nullptr;
-    mutable int staged_scopes_   = 0;
+    PeerMailbox* mailbox_            = nullptr;
+    HostExchange* host_exchange_     = nullptr;
+    DirectExchange* direct_exchange_ = nullptr;
+    mutable int staged_scopes_       = 0;
+    mutable PipelinedExchange* pipeline_ = nullptr;
+};
+
+/**
+ * Scope that moves this pair's eager staged all-reduces off the ranks' own streams.
+ *
+ * A staged all-reduce of prefill size (BF16 [hidden, tokens]) moves more bytes over the links than
+ * the compute it separates, and issued on the rank's stream it also stops that stream. While a
+ * scope is open, allreduce_sum() instead runs the pull and the local combine on one exchange lane
+ * per rank (a second stream on each device, kept for the process) and returns at once, so the
+ * caller's next kernels on the ranks' streams run while the payload is in flight. Exchanges run
+ * in issue order on the lanes, unbounded in flight. The transfer is the staged path's UVA
+ * device-to-device pull and the combine is the same residual_add body, so the arithmetic and the
+ * bytes moved are the staged path's; a caller that issues the same operands column window by
+ * column window gets the bits of one call over the whole (every window is a whole set of output
+ * columns of the row-parallel GEMMs).
+ *
+ * On P2P-granted boards the pull is a direct asynchronous device-to-device copy. Without peer
+ * access the driver stages the same copy through host memory and blocks the calling host thread
+ * for its duration, so there the lanes serialize the host as well: the result stays correct, but
+ * the overlap they exist for does not (disable the feature there, see the caller's environment
+ * variable).
+ *
+ * The caller owns the ordering against its own later work: `buffer[r]` holds the sum only after
+ * exchange `index` completed, so before reading (or overwriting) it on the rank streams it calls
+ * wait(index), or join() for every exchange issued so far. `staging[r]` belongs to the lanes until
+ * then. The destructor joins. One scope per PeerEvents at a time; not usable under stream
+ * capture. Issued from the single engine thread, like every other collective.
+ */
+class PipelinedExchange {
+public:
+    PipelinedExchange(const ExecutionContext& ec, const PeerEvents& events);
+    ~PipelinedExchange();
+
+    PipelinedExchange(const PipelinedExchange&)            = delete;
+    PipelinedExchange& operator=(const PipelinedExchange&) = delete;
+    PipelinedExchange(PipelinedExchange&&)                 = delete;
+    PipelinedExchange& operator=(PipelinedExchange&&)      = delete;
+
+    // Number of all-reduces issued in this scope; the next one gets this index.
+    [[nodiscard]] int issued() const noexcept { return issued_; }
+
+    // Orders both rank streams after exchange `index`.
+    void wait(int index) const;
+
+    // Orders both rank streams after every exchange issued so far.
+    void join() const;
+
+    // allreduce_sum()'s body while the scope is open.
+    void enqueue(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging);
+
+private:
+    const ExecutionContext* ec_;
+    const PeerEvents* events_;
+    int issued_ = 0;
 };
 
 /**
@@ -368,6 +442,70 @@ private:
     std::array<cudaStream_t, 2> lane_receive_{nullptr, nullptr};
 };
 
+/**
+ * Eager transport of the split-phase summing all-reduce on P2P-granted boards: HostExchange's two
+ * lanes with the host hop removed. Each rank pulls the peer's operand directly into its own
+ * staging with a device-to-device copy on a private stream, so the work the caller enqueues on
+ * the ranks' streams between sum_begin and sum_finish runs while the bytes move (the prefill
+ * overlap). Same contract and bits as HostExchange::sum_begin / sum_finish: the local combine is
+ * the same residual_add body, and each lane's post-condition -- the rank's stream ordered after
+ * every copy of the lane -- is the same.
+ *
+ * Lane choreography, per rank r (both ranks run the same calls in the same order):
+ *
+ *   sum_begin(lane, ...)   rank r's stream records lane.begun[r] (its operand buffer[r] is
+ *                          complete); rank r's pull stream waits lane.begun[r] (its own stream
+ *                          has passed the lane's previous combine) and lane.begun[1-r] (the
+ *                          peer's operand is complete), copies buffer[1-r] -> staging[r]
+ *                          device-to-device, and records lane.received[r] after the copy.
+ *                          Nothing else is enqueued on the ranks' streams.
+ *   sum_finish(lane, ec)   rank r's stream waits lane.received[r] (its inbound data) and
+ *                          lane.received[1-r] (the peer's pull has finished reading buffer[r],
+ *                          so the combine may overwrite it) and combines buffer[r] +=
+ *                          staging[r].
+ *
+ * One copy per lane: the host transport's intra-lane chunk ping-pong exists only because its two
+ * legs run in opposite directions on the links; a single pull has nothing to interleave.
+ *
+ * Eager only: select it from eager_direct_exchange(), which also requires that neither rank's
+ * stream is capturing. The lanes' state is allocated once in the constructor; keep the instance
+ * alive for as long as the PeerEvents it is attached to.
+ */
+class DirectExchange {
+public:
+    explicit DirectExchange(const ExecutionContext& ec);
+    ~DirectExchange();
+
+    DirectExchange(const DirectExchange&)            = delete;
+    DirectExchange& operator=(const DirectExchange&) = delete;
+
+    [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept;
+
+    // Split-phase summing all-reduce, same contract and bits as HostExchange::sum_begin /
+    // sum_finish; the transfer is a direct device-to-device pull on the lane's private stream.
+    void sum_begin(int lane, const std::array<Tensor, 2>& buffer,
+                   const std::array<Tensor, 2>& staging, const ExecutionContext& ec);
+    void sum_finish(int lane, const ExecutionContext& ec);
+
+    [[nodiscard]] bool sum_open(int lane) const noexcept {
+        return lane >= 0 && lane < kSumLanes && lanes_[static_cast<std::size_t>(lane)].active;
+    }
+
+    static constexpr int kSumLanes = 2;
+
+private:
+    struct Lane {
+        bool active          = false;
+        std::array<Tensor, 2> buffer, staging;
+        std::array<cudaEvent_t, 2> begun{nullptr, nullptr};
+        std::array<cudaEvent_t, 2> received{nullptr, nullptr};
+    };
+
+    std::array<int, 2> devices_{-1, -1};
+    std::array<Lane, kSumLanes> lanes_;
+    std::array<cudaStream_t, 2> pull_{nullptr, nullptr};
+};
+
 // T68: the HostExchange attached to `events` when it serves `ec` and neither rank's stream is
 // capturing (the eager collectives' own selection); null otherwise (callers keep their UVA copy).
 HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& events);
@@ -396,11 +534,12 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
                    const ExecutionContext& ec, const PeerEvents& events);
 
 /**
- * Split-phase allreduce_sum() on `lane` of the eager HostExchange attached to `events`
- * (HostExchange::sum_begin / sum_finish): identical arguments, result and bits, but the transfer
- * runs on the exchange's own streams between the two calls, so work the caller enqueues in
- * between overlaps it. allreduce_sum_split_available() tells whether the split form can run (an
- * eager HostExchange serving `ec` is attached and neither stream is capturing); begin throws
+ * Split-phase allreduce_sum() on `lane` of the eager split transport attached to `events`
+ * (HostExchange::sum_begin / sum_finish with a HostExchange, DirectExchange::sum_begin /
+ * sum_finish with a DirectExchange): identical arguments, result and bits, but the transfer runs
+ * on the transport's own streams between the two calls, so work the caller enqueues in between
+ * overlaps it. allreduce_sum_split_available() tells whether the split form can run (an eager
+ * split transport serving `ec` is attached and neither stream is capturing); begin throws
  * otherwise. The caller completes every begun lane with allreduce_sum_finish() before reading
  * `buffer` or reusing `staging`, and does not touch either in between.
  */

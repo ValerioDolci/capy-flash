@@ -189,16 +189,30 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             // faster than two host hops (issue #3, P2P board: prefill 5.3k tok/s direct vs 2.0k
             // through the host). So with P2P the direct copy stays, except with elastic KV, whose
             // lent workspace is VMM memory the peer pull cannot read (T64/T68; startup.cpp keeps
-            // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=0 / =1 force either way.
+            // the lending on that assumption). The v0.6.0 prefill overlap needs a split transport:
+            // with P2P that is now the DirectExchange lanes (device-to-device pulls on private
+            // streams, same bits as the host lanes), so the auto policy is host without P2P or
+            // with elastic KV, direct otherwise. NINFER_TP_HOST_EXCHANGE=1 forces the host
+            // staging; =0 no split transport at all (the one-call direct / driver-staged copies,
+            // the no-overlap A/B arm).
             // enable_peer_access() only reports here: the Engine enabled it already, idempotently.
             const char* host_exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
             const std::string_view forced = host_exchange_env ? host_exchange_env : "";
-            const bool host_exchange_auto =
-                !ops::enable_peer_access(*execution_context) || plan.elastic_kv.enabled;
-            if (forced != "0" && (forced == "1" || host_exchange_auto)) {
+            const bool peer_access = ops::enable_peer_access(*execution_context);
+            if (forced == "0") {
+                // No eager split transport: the one-call collectives keep the plain peer pull
+                // (direct with P2P, driver-staged without).
+            } else if (forced == "1" || !peer_access || plan.elastic_kv.enabled) {
                 host_exchange.emplace(*execution_context);
                 peer_events->attach_host_exchange(&*host_exchange);
+                tp_transport_status.eager_exchange = "host staging";
+            } else {
+                direct_exchange.emplace(*execution_context);
+                peer_events->attach_direct_exchange(&*direct_exchange);
+                tp_transport_status.eager_exchange = "device-to-device";
             }
+            tp_transport_status.prefill_slice =
+                std::to_string(execution::prefill_exchange_slice_tokens());
             if (use_cuda_graph) {
                 graph_bridge.emplace(execution_context->dev[0]->device,
                                      execution_context->dev[1]->device);
