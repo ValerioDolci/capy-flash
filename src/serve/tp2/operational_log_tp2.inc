@@ -9,15 +9,21 @@ void log_tensor_parallel(spdlog::logger& logger, const GenerationService& servic
                          const ninfer::EngineOptions& engine,
                          const ninfer::ContextCacheOptions& cache,
                          const ninfer::MemorySummary& memory) {
+    // The Host tiers are off unless --host-state-slots / --host-kv-mib (or --profile 27b) set them.
+    const bool host =
+        cache.enabled && (cache.host_state_slots != 0 || cache.host_kv_capacity_bytes != 0);
     logger.info("tensor parallel | tp 2 on devices {},{} | p2p {} | KV, StateImages and "
-                "runtime reserved per rank | Host context-cache tiers off (rank 1 state has "
-                "no Host replica) | {} Device checkpoint StateImages; a prefill checkpoint that "
-                "finds them full first reclaims idle private continuations and is skipped "
-                "only when none can be released (raise --device-state-slots for many "
-                "conversations)",
+                "runtime reserved per rank | {} Device checkpoint StateImages | {}",
                 engine.devices.at(0), engine.devices.at(1),
                 service.load_summary().peer_access ? "on" : "off (host-staged copies)",
-                cache.enabled ? *cache.device_state_slots : 0U);
+                cache.enabled ? *cache.device_state_slots : 0U,
+                host ? "Host cache backed on both ranks: " +
+                           std::to_string(cache.host_state_slots) + " Host StateImages, " +
+                           std::to_string(cache.host_kv_capacity_bytes >> 20U) + " MiB Host KV"
+                     : std::string("Host context-cache tiers off; a prefill checkpoint that finds "
+                                   "the Device StateImages full first reclaims idle private "
+                                   "continuations and is skipped only when none can be released "
+                                   "(raise --device-state-slots for many conversations)"));
     {
         const LoadSummary& load = service.load_summary();
         if (!load.tp_transport.empty()) {

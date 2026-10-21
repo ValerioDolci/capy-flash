@@ -931,7 +931,7 @@ target 必须先建立 replacement，或同时删除该 checkpoint。
 Placement 只在 admission、capture、finish 或显式 inactive release 的 resource boundary 改变。普通 decode
 不运行周期性 promotion/demotion。
 
-没有 Host StateImage 层时（`host_state_slots == 0`；tp 2 始终如此），private prefill capture（TurnClosure
+没有 Host StateImage 层时（`host_state_slots == 0`；tp 2 默认如此，`--host-state-slots` 或 `--profile 27b` 可启用），private prefill capture（TurnClosure
 rewrite、long anchor）不规划 pressure，也无法把 checkpoint 快照到 Host。此时 Device State pool 已满的
 private capture 先按固定顺序回收：只考虑没有 LiveSession、没有 active edge 的 idle private continuation，
 retention weight 最低者优先，同一权重内最早 admitted 者优先，逐个释放并重新评估，直到 capture 可行或
