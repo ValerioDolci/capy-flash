@@ -145,18 +145,18 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     ids.function_calls.resize(outcome.tool_calls.size());
     ids.call_ids.resize(outcome.tool_calls.size());
     for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        const bool custom                     = is_custom_tool(request, call.name);
         if (ids.function_calls[index].empty()) {
-            ids.function_calls[index] = new_openai_response_item_id("fc");
+            ids.function_calls[index] = new_openai_response_item_id(custom ? "ctc" : "fc");
         }
         if (ids.call_ids[index].empty()) {
             ids.call_ids[index] = new_openai_response_item_id("call");
         }
-        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
-        const bool custom                     = is_custom_tool(request, call.name);
-        Json item                             = {{"id", ids.function_calls[index]},
-                                                 {"type", custom ? "custom_tool_call" : "function_call"},
-                                                 {"status", "completed"},
-                                                 {"call_id", ids.call_ids[index]}};
+        Json item = {{"id", ids.function_calls[index]},
+                     {"type", custom ? "custom_tool_call" : "function_call"},
+                     {"status", "completed"},
+                     {"call_id", ids.call_ids[index]}};
         if (custom) {
             item["input"] = custom_tool_input(call.arguments_json);
         } else {

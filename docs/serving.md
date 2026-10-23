@@ -606,11 +606,11 @@ The normal lifecycle is:
 
 Function arguments use `response.function_call_arguments.delta` and `.done`; custom tool inputs use
 `response.custom_tool_call_input.delta` and `.done`, with the whole input sent in a single delta at
-its end. IDs, output indices,
-and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
-does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+its end. IDs, output indices, and content indices remain stable, and concatenated deltas equal the
+terminal Item. Responses SSE does not emit the Chat Completions `[DONE]` sentinel. With tools
+enabled, ordinary answer text still streams immediately; only an ambiguous `<tool_call>` suffix or
+the structured tool region is held. Malformed tool markup is flushed back as ordinary text without
+losing bytes.
 
 ### Local response state and resources
 

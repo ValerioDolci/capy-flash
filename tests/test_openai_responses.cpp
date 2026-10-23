@@ -1020,6 +1020,7 @@ int test_custom_tool_round_trip() {
         make_openai_response_object("resp_custom", 1, source, {}, outcome);
     failures += check(built.output_items.size() == 1 &&
                           built.output_items[0].at("type") == "custom_tool_call" &&
+                          built.output_items[0].at("id").get<std::string>().starts_with("ctc") &&
                           built.output_items[0].at("input") == "*** Begin Patch",
                       "the Engine's function-path call leaves as a custom_tool_call Item");
 
