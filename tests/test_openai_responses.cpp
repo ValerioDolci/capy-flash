@@ -1099,11 +1099,21 @@ int test_codex_cli_compatibility() {
 
     Json hosted_only = body;
     hosted_only.erase("tool_choice");
-    hosted_only["tools"] = Json::array({Json{{"type", "computer_use"}, {"display_width", 1024}}});
+    hosted_only["tools"] = Json::array({Json{{"type", "web_search_preview"}}});
     const OpenAIResponsesCreateRequest only_hosted =
         parse_openai_responses_create_request(hosted_only, limits());
     failures += check(only_hosted.prompt.generation.tools.empty() && only_hosted.tools.empty(),
-                      "an all-hosted tool list parses to no Engine tools");
+                      "an all-web-search tool list parses to no Engine tools");
+    for (const char* kept :
+         {"local_shell", "computer_use", "file_search", "code_interpreter", "image_generation"}) {
+        Json executor_backed     = body;
+        executor_backed["tools"] = Json::array({Json{{"type", kept}}});
+        failures +=
+            check(api_code([&] {
+                      (void)parse_openai_responses_create_request(executor_backed, limits());
+                  }) == "tool_type_not_supported",
+                  std::string(kept) + " is not dropped silently");
+    }
 
     Json logprobs       = body;
     logprobs["include"] = Json::array({"message.output_text.logprobs"});

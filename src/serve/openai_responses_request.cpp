@@ -878,9 +878,11 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
 
     static const std::unordered_set<std::string> namespace_members = {"type", "name", "description",
                                                                       "tools"};
-    static const std::unordered_set<std::string> hosted_types      = {
-        "web_search",           "web_search_preview", "file_search",      "computer_use",
-        "computer_use_preview", "code_interpreter",   "image_generation", "local_shell"};
+    // Only provider-side web search is dropped: a request can lose it without the model losing a
+    // capability the client executes (local_shell, computer_use) or one that changes what the
+    // answer is grounded on (file_search, code_interpreter); those still 400.
+    static const std::unordered_set<std::string> dropped_hosted_types = {"web_search",
+                                                                         "web_search_preview"};
     std::unordered_set<std::string> declared_names;
     std::unordered_set<std::string> namespace_names;
     const auto append_function = [&](ParsedFunctionTool parsed) {
@@ -907,11 +909,11 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                 append_function(parse_custom_tool(item, std::nullopt, {}, out.tool_identities)));
             continue;
         }
-        if (hosted_types.contains(type)) {
-            // Hosted tools run on the serving provider's executor, which NInfer does not have.
-            // Codex CLI attaches them unconditionally: drop them from the prompt instead of
-            // rejecting, so the model simply never sees them. Unknown executor-backed types
-            // still 400 below.
+        if (dropped_hosted_types.contains(type)) {
+            // Web search runs on the serving provider's executor, which NInfer does not have.
+            // Codex CLI attaches it unconditionally: drop it from the prompt instead of
+            // rejecting, so the model simply never sees it. Other executor-backed types still
+            // 400 below.
             continue;
         }
         if (type != "namespace") {
