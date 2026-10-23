@@ -722,11 +722,17 @@ Completions: `high` and `max` render as `xhigh`, `low` and `medium` pass through
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
-`strict:true`, active single-call enforcement, tools that exclude direct model
-calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
-required constraint or executor is absent. `defer_loading:true` keeps a tool out of the prompt
-until a `tool_reference` block in some `tool_result` content names it via `tool_name`; the block
-itself renders nothing. `tool_result` preserves text/image order and marks
+`strict:true`, active single-call enforcement, tools that exclude direct model calls,
+Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their required
+constraint or executor is absent. Client-side tool search (Claude Code's `ToolSearch`) is
+accepted: a `defer_loading:true` tool stays out of the prompt until a `tool_reference` block in
+some `tool_result` content names it via `tool_name`; from then on it renders in the tool list like
+any other tool, and the block itself renders nothing. A `tool_reference` whose `tool_name` is
+missing, malformed, or not declared in `tools` fails with `invalid_tool_reference`; a top-level
+`tool_reference` (Anthropic's server-side search) stays rejected. The tool list sits at the start
+of the Qwen system prompt, so a newly loaded tool changes the prompt from there on: the next
+request re-prefills the whole conversation instead of reusing the cached prefix (Anthropic expands
+the reference inline, which keeps the prefix). `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
