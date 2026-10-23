@@ -693,10 +693,16 @@ int test_namespace_tools() {
     Json nested_custom                 = body;
     nested_custom["tool_choice"]       = "auto";
     nested_custom["tools"][0]["tools"] = Json::array({Json{{"type", "custom"}, {"name", "raw"}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(nested_custom, limits());
-                      }) == "tool_type_not_supported",
-                      "namespace custom tools remain explicitly unsupported");
+    const OpenAIResponsesCreateRequest lowered_custom =
+        parse_openai_responses_create_request(nested_custom, limits());
+    failures += check(lowered_custom.prompt.generation.tools.size() == 2 &&
+                          lowered_custom.prompt.generation.tools[0].name == "mcp__clock__raw" &&
+                          lowered_custom.prompt.generation.tools[1].name == "mcp__weather__now" &&
+                          lowered_custom.prompt.generation.tools[0].input_schema_json.find(
+                              "\"input\"") != std::string::npos,
+                      "namespace custom tools lower to a single-input Engine function");
+    failures += check(lowered_custom.tools[0]["tools"][0].at("type") == "custom",
+                      "the wire tool list keeps the nested custom tool shape");
 
     Json oversized           = body;
     oversized["tool_choice"] = "auto";
@@ -980,6 +986,89 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_custom_tool_round_trip() {
+    Json patch_tool = {
+        {"type", "custom"},
+        {"name", "apply_patch"},
+        {"description", "Apply a patch"},
+        {"format", Json{{"type", "grammar"}, {"syntax", "lark"}, {"definition", "start: /.+/"}}}};
+    Json source_body = {{"model", "m"},
+                        {"input", "patch it"},
+                        {"store", false},
+                        {"tool_choice", "auto"},
+                        {"tools", Json::array({patch_tool})}};
+    const OpenAIResponsesCreateRequest source =
+        parse_openai_responses_create_request(source_body, limits());
+    int failures = 0;
+    failures += check(source.prompt.generation.tools.size() == 1 &&
+                          source.prompt.generation.tools[0].name == "apply_patch" &&
+                          source.prompt.generation.tools[0].input_schema_json.find("\"input\"") !=
+                              std::string::npos,
+                      "custom tool lowers to a one-parameter Engine function");
+    failures += check(source.prompt.generation.tools[0].description.find("lark grammar") !=
+                          std::string::npos,
+                      "grammar definition reaches the model as prompt text");
+    failures += check(source.tools.size() == 1 && source.tools[0].at("type") == "custom" &&
+                          source.tools[0].contains("format"),
+                      "wire tool list echoes the custom entry unchanged");
+
+    GenerationOutcome outcome;
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "apply_patch", .arguments_json = R"({"input":"*** Begin Patch"})"});
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_custom", 1, source, {}, outcome);
+    failures += check(built.output_items.size() == 1 &&
+                          built.output_items[0].at("type") == "custom_tool_call" &&
+                          built.output_items[0].at("input") == "*** Begin Patch",
+                      "the Engine's function-path call leaves as a custom_tool_call Item");
+
+    OpenAIResponsesEventStream encoder("resp_custom_stream", 1, source, {});
+    (void)encoder.start();
+    const OpenAIResponsesStreamFinish stream_finish = encoder.finish(outcome);
+    bool saw_delta                                  = false;
+    bool saw_done                                   = false;
+    for (const std::string& event : stream_finish.events_before_terminal) {
+        const Json payload = parse_event(event);
+        if (payload.at("type") == "response.custom_tool_call_input.delta") {
+            saw_delta = payload.at("delta") == "*** Begin Patch";
+        }
+        if (payload.at("type") == "response.custom_tool_call_input.done") {
+            saw_done = payload.at("input") == "*** Begin Patch";
+        }
+    }
+    failures += check(saw_delta && saw_done,
+                      "custom input streams as one whole-input delta followed by done");
+
+    const std::string call_id = built.output_items[0].at("call_id").get<std::string>();
+    Json result_item          = {
+        {"type", "custom_tool_call_output"}, {"call_id", call_id}, {"output", "ok"}};
+    Json input = Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "patch it"}},
+                              built.output_items[0], result_item});
+    input.push_back(Json{{"type", "message"}, {"role", "user"}, {"content", "Continue"}});
+    Json replay_body = {{"model", "m"}, {"input", std::move(input)}, {"store", false}};
+    const OpenAIResponsesCreateRequest replay =
+        parse_openai_responses_create_request(replay_body, limits());
+    failures += check(replay.prompt.input_turns.size() == 4 &&
+                          replay.prompt.input_turns[1].tool_calls[0].name == "apply_patch" &&
+                          replay.prompt.input_turns[1].tool_calls[0].arguments_json ==
+                              R"({"input":"*** Begin Patch"})" &&
+                          replay.prompt.input_turns[2].tool_call_id == call_id,
+                      "custom_tool_call and its output replay as function-path history turns");
+    failures += check(replay.prompt.input_items[1].at("type") == "custom_tool_call" &&
+                          replay.prompt.input_items[2].at("type") == "custom_tool_call_output",
+                      "canonical Items keep the custom wire types");
+
+    Json broken = {
+        {"type", "custom_tool_call"}, {"call_id", "c1"}, {"name", "apply_patch"}, {"input", 3}};
+    Json broken_body = {{"model", "m"}, {"input", Json::array({broken})}, {"store", false}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(broken_body, limits());
+                      }).status == 400,
+                      "non-string custom_tool_call input is rejected");
+    return failures;
+}
+
 int test_codex_cli_compatibility() {
     // The shape Codex CLI sends on every request: encrypted-reasoning include, a summary tier,
     // and hosted tools it attaches whether the gateway can run them or not.
@@ -994,8 +1083,8 @@ int test_codex_cli_compatibility() {
                        {"tool_choice", "auto"},
                        {"tools", Json::array({Json{{"type", "web_search"}, {"name", "ws"}},
                                               Json{{"type", "function"},
-                                                  {"name", "shell"},
-                                                  {"parameters", Json{{"type", "object"}}}})}};
+                                                   {"name", "shell"},
+                                                   {"parameters", Json{{"type", "object"}}}}})}};
     int failures    = 0;
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
@@ -1004,44 +1093,46 @@ int test_codex_cli_compatibility() {
                       "hosted web_search tool is dropped, function tools survive");
     failures += check(request.tools.size() == 1 && request.tools[0].at("name") == "shell",
                       "wire tool list reports only the function tool");
-    failures += check(request.prompt.generation.reasoning_effort == RequestedReasoningEffort::Medium,
-                      "reasoning effort honored next to an ignored summary");
+    failures +=
+        check(request.prompt.generation.reasoning_effort == RequestedReasoningEffort::Medium,
+              "reasoning effort honored next to an ignored summary");
 
-    Json hosted_only      = body;
+    Json hosted_only = body;
     hosted_only.erase("tool_choice");
-    hosted_only["tools"]  = Json::array({Json{{"type", "computer_use"}, {"display_width", 1024}}});
+    hosted_only["tools"] = Json::array({Json{{"type", "computer_use"}, {"display_width", 1024}}});
     const OpenAIResponsesCreateRequest only_hosted =
         parse_openai_responses_create_request(hosted_only, limits());
     failures += check(only_hosted.prompt.generation.tools.empty() && only_hosted.tools.empty(),
                       "an all-hosted tool list parses to no Engine tools");
 
-    Json logprobs      = body;
+    Json logprobs       = body;
     logprobs["include"] = Json::array({"message.output_text.logprobs"});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(logprobs, limits());
                       }) == "include_not_supported",
                       "include values beyond encrypted_content remain unsupported");
-    Json mixed      = body;
-    mixed["include"] = Json::array({"reasoning.encrypted_content", "web_search_call.action.sources"});
+    Json mixed = body;
+    mixed["include"] =
+        Json::array({"reasoning.encrypted_content", "web_search_call.action.sources"});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(mixed, limits());
                       }) == "include_not_supported",
                       "one unusable include value rejects the whole request");
 
-    Json odd_summary           = body;
-    odd_summary["reasoning"]   = Json{{"summary", "yolo"}};
+    Json odd_summary         = body;
+    odd_summary["reasoning"] = Json{{"summary", "yolo"}};
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(odd_summary, limits());
                       }) == "reasoning_option_not_supported",
                       "unknown reasoning.summary tier is rejected");
-    Json typed_summary       = body;
+    Json typed_summary         = body;
     typed_summary["reasoning"] = Json{{"summary", true}};
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(typed_summary, limits());
                       }) == "reasoning_option_not_supported",
                       "non-string reasoning.summary is rejected");
 
-    Json unknown_executor  = body;
+    Json unknown_executor     = body;
     unknown_executor["tools"] = Json::array({Json{{"type", "browser_invoker"}, {"name", "b"}}});
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(unknown_executor, limits());
@@ -1063,6 +1154,7 @@ int main() {
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
     failures += test_explicit_rejections();
+    failures += test_custom_tool_round_trip();
     failures += test_codex_cli_compatibility();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

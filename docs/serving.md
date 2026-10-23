@@ -440,7 +440,7 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | direct function definitions or namespace groups containing function definitions; hosted entries (`web_search`, `web_search_preview`, `file_search`, `computer_use`, `computer_use_preview`, `code_interpreter`, `image_generation`, `local_shell`) are dropped from the prompt; see below |
+| `tools` | direct function or custom tool definitions, or namespace groups containing them; a `custom` tool's free-form `input` travels as one required string parameter (a `grammar` format renders as prompt text); hosted entries (`web_search`, `web_search_preview`, `file_search`, `computer_use`, `computer_use_preview`, `code_interpreter`, `image_generation`, `local_shell`) are dropped from the prompt; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
@@ -469,6 +469,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
+| `custom_tool_call` | completed assistant call with required `call_id` and `name` and an optional string `input` replayed through the function path as `{"input": ...}` |
+| `custom_tool_call_output` | completed custom-tool result, same shape and validation as `function_call_output` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
@@ -540,12 +542,14 @@ without changing declaration order, while `tool_choice:"none"` disables structur
 when the history contains earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, required or named tool choice, remote MCP tools, and custom free-form tools are
-rejected. Hosted tool entries (`web_search` and the other provider-executed types listed above)
-are dropped from the prompt rather than rejected: the model simply never sees them, which keeps
-Codex CLI's unconditional tool list usable. Deferred loading, output schemas, and caller
-restrictions that exclude direct invocation are also rejected because their semantics cannot be
-honored.
+`strict:true`, required or named tool choice, and remote MCP tools are rejected. Custom tools are
+accepted without a free-form decoder: the Engine sees a function with one required string `input`
+parameter, the grammar format (if any) is appended to the description as text the model reads, and
+the call returns as a `custom_tool_call` Item whose `input` holds the parameter verbatim. Hosted
+tool entries (`web_search` and the other provider-executed types listed above) are dropped from
+the prompt rather than rejected: the model simply never sees them, which keeps Codex CLI's
+unconditional tool list usable. Deferred loading, output schemas, and caller restrictions that
+exclude direct invocation are also rejected because their semantics cannot be honored.
 
 ### Response object and usage
 
@@ -554,7 +558,7 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 
 - a `reasoning` Item containing raw `reasoning_text` and an empty summary;
 - an assistant `message` containing an `output_text` part;
-- one or more `function_call` Items.
+- one or more `function_call` Items, or `custom_tool_call` Items for declared custom tools.
 
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
@@ -599,7 +603,9 @@ The normal lifecycle is:
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
 
-Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
+Function arguments use `response.function_call_arguments.delta` and `.done`; custom tool inputs use
+`response.custom_tool_call_input.delta` and `.done`, with the whole input sent in a single delta at
+its end. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
@@ -664,8 +670,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, Structured Outputs/JSON mode, `include` values beyond `reasoning.encrypted_content`,
-background execution, compaction, files/audio, and remote MCP/custom tools. These are
-compatibility boundaries, not silently accepted placeholders.
+background execution, compaction, files/audio, and remote MCP tools. These are compatibility
+boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 

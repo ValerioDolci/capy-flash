@@ -49,6 +49,22 @@ void add_wire_function_identity(Json& object, const OpenAIResponsesCreateRequest
     if (position->second.wire_namespace) { object["namespace"] = *position->second.wire_namespace; }
 }
 
+bool is_custom_tool(const OpenAIResponsesCreateRequest& request, std::string_view engine_name) {
+    const auto position = request.tool_identities.find(std::string(engine_name));
+    return position != request.tool_identities.end() && position->second.custom;
+}
+
+// A custom tool call arrives through the function path as {"input": ...}; when the model wrote
+// anything else, the raw arguments string passes through as the free-form input.
+std::string custom_tool_input(const std::string& arguments_json) {
+    const Json arguments = Json::parse(arguments_json, nullptr, false);
+    if (!arguments.is_discarded() && arguments.is_object() && arguments.contains("input") &&
+        arguments.at("input").is_string()) {
+        return arguments.at("input").get<std::string>();
+    }
+    return arguments_json;
+}
+
 Json response_common(const std::string& id, std::int64_t created_at,
                      const OpenAIResponsesCreateRequest& request,
                      const OpenAIResponsesRuntimeValues& runtime) {
@@ -136,11 +152,16 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
             ids.call_ids[index] = new_openai_response_item_id("call");
         }
         const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        const bool custom                     = is_custom_tool(request, call.name);
         Json item                             = {{"id", ids.function_calls[index]},
-                                                 {"type", "function_call"},
+                                                 {"type", custom ? "custom_tool_call" : "function_call"},
                                                  {"status", "completed"},
-                                                 {"call_id", ids.call_ids[index]},
-                                                 {"arguments", call.arguments_json}};
+                                                 {"call_id", ids.call_ids[index]}};
+        if (custom) {
+            item["input"] = custom_tool_input(call.arguments_json);
+        } else {
+            item["arguments"] = call.arguments_json;
+        }
         add_wire_function_identity(item, request, call.name);
         built.output_items.push_back(std::move(item));
     }
@@ -443,37 +464,54 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
     impl_->ids.call_ids.reserve(outcome.tool_calls.size());
     for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
-        const std::string item_id = new_openai_response_item_id("fc");
+        const bool custom = is_custom_tool(impl_->request, call.name);
+        // A custom tool's input goes out whole at its end, matching the official event sequence.
+        const std::string input   = custom ? custom_tool_input(call.arguments_json) : std::string();
+        const std::string item_id = new_openai_response_item_id(custom ? "ctc" : "fc");
         const std::string call_id = new_openai_response_item_id("call");
         impl_->ids.function_calls.push_back(item_id);
         impl_->ids.call_ids.push_back(call_id);
-        const int output_index = impl_->next_output_index++;
-        Json added_item        = {{"id", item_id},
-                                  {"type", "function_call"},
-                                  {"status", "in_progress"},
-                                  {"call_id", call_id},
-                                  {"arguments", ""}};
+        const int output_index                     = impl_->next_output_index++;
+        Json added_item                            = {{"id", item_id},
+                                                      {"type", custom ? "custom_tool_call" : "function_call"},
+                                                      {"status", "in_progress"},
+                                                      {"call_id", call_id}};
+        added_item[custom ? "input" : "arguments"] = "";
         add_wire_function_identity(added_item, impl_->request, call.name);
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.added",
                              Json{{"output_index", output_index}, {"item", added_item}})));
-        if (!call.arguments_json.empty()) {
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
+        if (custom) {
+            if (!input.empty()) {
+                finished.events_before_terminal.push_back(sse(impl_->event(
+                    "response.custom_tool_call_input.delta",
+                    Json{{"item_id", item_id}, {"output_index", output_index}, {"delta", input}})));
+            }
+            Json input_done = {
+                {"item_id", item_id}, {"output_index", output_index}, {"input", input}};
+            add_wire_function_identity(input_done, impl_->request, call.name);
+            finished.events_before_terminal.push_back(
+                sse(impl_->event("response.custom_tool_call_input.done", std::move(input_done))));
+        } else {
+            if (!call.arguments_json.empty()) {
+                finished.events_before_terminal.push_back(
+                    sse(impl_->event("response.function_call_arguments.delta",
+                                     Json{{"item_id", item_id},
+                                          {"output_index", output_index},
+                                          {"delta", call.arguments_json}})));
+            }
+            Json arguments_done = {{"item_id", item_id},
+                                   {"output_index", output_index},
+                                   {"arguments", call.arguments_json}};
+            add_wire_function_identity(arguments_done, impl_->request, call.name);
+            finished.events_before_terminal.push_back(sse(
+                impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
         }
-        Json arguments_done = {{"item_id", item_id},
-                               {"output_index", output_index},
-                               {"arguments", call.arguments_json}};
-        add_wire_function_identity(arguments_done, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
-        Json done_item = {{"id", item_id},
-                          {"type", "function_call"},
-                          {"status", "completed"},
-                          {"call_id", call_id},
-                          {"arguments", call.arguments_json}};
+        Json done_item                            = {{"id", item_id},
+                                                     {"type", custom ? "custom_tool_call" : "function_call"},
+                                                     {"status", "completed"},
+                                                     {"call_id", call_id}};
+        done_item[custom ? "input" : "arguments"] = custom ? input : call.arguments_json;
         add_wire_function_identity(done_item, impl_->request, call.name);
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.done",

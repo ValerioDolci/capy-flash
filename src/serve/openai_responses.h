@@ -24,6 +24,7 @@ struct GenerationOutcome;
 struct OpenAIResponsesFunctionIdentity {
     std::string name;
     std::optional<std::string> wire_namespace;
+    bool custom = false; // wire is a free-form custom tool; the Engine still sees a function
 
     bool operator==(const OpenAIResponsesFunctionIdentity&) const = default;
 };
