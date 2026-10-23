@@ -544,9 +544,10 @@ when the history contains earlier calls.
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, required or named tool choice, hosted tools other than web search, and remote MCP
 tools are rejected. Custom tools are accepted without a free-form decoder: the Engine sees a
-function with one required string `input` parameter, the grammar format (if any) is appended to the
-description as text the model reads, and the call returns as a `custom_tool_call` Item whose `input`
-holds the parameter verbatim. Hosted `web_search`/`web_search_preview` entries are dropped from the
+function with one required string `input` parameter, a `grammar` format (`lark` or `regex`) is
+appended to the description as text the model reads (it is not enforced), and the call returns as
+a `custom_tool_call` Item whose `input` holds the parameter verbatim; formats other than `text` and
+those grammars are rejected. Hosted `web_search`/`web_search_preview` entries are dropped from the
 prompt rather than rejected: the model simply never sees them, which keeps Codex CLI's
 unconditional tool list usable. Deferred loading, output schemas, and caller restrictions that
 exclude direct invocation are also rejected because their semantics cannot be honored.

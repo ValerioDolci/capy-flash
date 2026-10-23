@@ -828,19 +828,35 @@ parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
     }
     // The Engine has no free-form decoder: a grammar format is rendered as prompt text the model
     // reads, and the input travels as one required string parameter through the function path.
+    // Formats are {"type":"text"} or a lark/regex grammar; anything else is rejected rather than
+    // silently ignored.
     Json format = nullptr;
     if (item.contains("format") && !item.at("format").is_null()) {
-        if (!item.at("format").is_object()) {
-            bad_request("custom tool format must be an object", "tools");
-        }
         format = item.at("format");
-        if (format.contains("type") && format.at("type") == "grammar" &&
-            format.contains("definition") && format.at("definition").is_string()) {
-            const std::string syntax = format.contains("syntax") && format.at("syntax").is_string()
-                                           ? format.at("syntax").get<std::string>()
-                                           : "";
-            description += "\n\nThe input must follow this " + syntax + " grammar:\n" +
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("custom tool format must be a typed object", "tools");
+        }
+        const std::string format_type = format.at("type").get<std::string>();
+        if (format_type == "grammar") {
+            static const std::unordered_set<std::string> grammar_members = {"type", "syntax",
+                                                                            "definition"};
+            reject_nonnull_unknown_members(format, grammar_members, "tools");
+            const bool known_syntax =
+                format.contains("syntax") && format.at("syntax").is_string() &&
+                (format.at("syntax") == "lark" || format.at("syntax") == "regex");
+            if (!known_syntax || !format.contains("definition") ||
+                !format.at("definition").is_string()) {
+                bad_request(
+                    "custom tool grammar format needs syntax 'lark' or 'regex' and a string "
+                    "definition",
+                    "tools", "tool_format_not_supported");
+            }
+            description += "\n\nThe input must follow this " +
+                           format.at("syntax").get<std::string>() + " grammar:\n" +
                            format.at("definition").get<std::string>();
+        } else if (format_type != "text" || format.size() != 1) {
+            bad_request("custom tool format must be {\"type\":\"text\"} or a grammar", "tools",
+                        "tool_format_not_supported");
         }
     }
 

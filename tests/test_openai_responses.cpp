@@ -1059,6 +1059,25 @@ int test_custom_tool_round_trip() {
                           replay.prompt.input_items[2].at("type") == "custom_tool_call_output",
                       "canonical Items keep the custom wire types");
 
+    for (const Json& format :
+         {Json("lark"), Json{{"type", "regex"}}, Json{{"type", "text"}, {"extra", 1}},
+          Json{{"type", "grammar"}, {"syntax", "ebnf"}, {"definition", "x"}},
+          Json{{"type", "grammar"}, {"syntax", "lark"}, {"definition", 5}},
+          Json{{"type", "grammar"}, {"syntax", "lark"}}}) {
+        Json odd_format                  = source_body;
+        odd_format["tools"][0]["format"] = format;
+        failures += check(api_error([&] {
+                              (void)parse_openai_responses_create_request(odd_format, limits());
+                          }).status == 400,
+                          "custom tool format " + format.dump() + " is rejected");
+    }
+    Json text_format                  = source_body;
+    text_format["tools"][0]["format"] = Json{{"type", "text"}};
+    failures += check(parse_openai_responses_create_request(text_format, limits())
+                              .prompt.generation.tools[0]
+                              .description == "Apply a patch",
+                      "a text format adds nothing to the description");
+
     Json broken = {
         {"type", "custom_tool_call"}, {"call_id", "c1"}, {"name", "apply_patch"}, {"input", 3}};
     Json broken_body = {{"model", "m"}, {"input", Json::array({broken})}, {"store", false}};
