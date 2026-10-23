@@ -234,6 +234,8 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
                                        cache_boundary(part, "messages")));
         } else if (type == "image") {
             result.push_back(parse_image(part));
+        } else if (type == "tool_reference") {
+            continue;  // names a deferred tool for lower_tools; renders nothing into the prompt
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -788,9 +790,38 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     return result;
 }
 
+// Tool names pointed at by tool_reference blocks inside tool_result content: a deferred tool
+// becomes prompt-visible once the client's tool search has loaded it.  The scan stays silent on
+// malformed shapes; block validation reports them.
+std::unordered_set<std::string> referenced_tool_names(const Json& body) {
+    std::unordered_set<std::string> names;
+    if (!body.contains("messages") || !body.at("messages").is_array()) { return names; }
+    for (const Json& message : body.at("messages")) {
+        if (!message.is_object() || !message.contains("content") ||
+            !message.at("content").is_array()) {
+            continue;
+        }
+        for (const Json& block : message.at("content")) {
+            if (!block.is_object() || !block.contains("content") ||
+                !block.at("content").is_array()) {
+                continue;
+            }
+            for (const Json& part : block.at("content")) {
+                if (part.is_object() && part.contains("type") && part.at("type").is_string() &&
+                    part.at("type").get<std::string>() == "tool_reference" &&
+                    part.contains("tool_name") && part.at("tool_name").is_string()) {
+                    names.insert(part.at("tool_name").get<std::string>());
+                }
+            }
+        }
+    }
+    return names;
+}
+
 void lower_tools(const Json& body, GenerationRequest& request) {
     const ToolSelection selection       = parse_tool_choice(body);
     std::vector<ParsedTool> definitions = parse_tool_definitions(body);
+    const std::unordered_set<std::string> referenced = referenced_tool_names(body);
     const auto named                    = [&](const ParsedTool& tool) {
         return tool.definition.name == selection.name;
     };
@@ -837,10 +868,8 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                         "Schema, which NInfer cannot guarantee",
                         "tools", "strict_tools_not_supported");
         }
-        if (tool.defer_loading) {
-            bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
-                        "provide",
-                        "tools", "deferred_tools_not_supported");
+        if (tool.defer_loading && !referenced.count(tool.definition.name)) {
+            continue;  // deferred: out of the prompt until a tool_reference names it
         }
         if (tool.allowed_callers &&
             std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==

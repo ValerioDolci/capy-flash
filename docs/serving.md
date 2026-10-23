@@ -722,9 +722,11 @@ Completions: `high` and `max` render as `xhigh`, `low` and `medium` pass through
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
-`strict:true`, active single-call enforcement, deferred tools, tools that exclude direct model
+`strict:true`, active single-call enforcement, tools that exclude direct model
 calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
-required constraint or executor is absent. `tool_result` preserves text/image order and marks
+required constraint or executor is absent. `defer_loading:true` keeps a tool out of the prompt
+until a `tool_reference` block in some `tool_result` content names it via `tool_name`; the block
+itself renders nothing. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
