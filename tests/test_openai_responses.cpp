@@ -980,6 +980,76 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_codex_cli_compatibility() {
+    // The shape Codex CLI sends on every request: encrypted-reasoning include, a summary tier,
+    // and hosted tools it attaches whether the gateway can run them or not.
+    const Json body = {{"model", "qwen3.6-27b"},
+                       {"input", "hi"},
+                       {"store", false},
+                       {"stream", true},
+                       {"include", Json::array({"reasoning.encrypted_content"})},
+                       {"reasoning", Json{{"effort", "medium"}, {"summary", "auto"}}},
+                       {"prompt_cache_key", "pcache"},
+                       {"client_metadata", Json{{"session_id", "s1"}}},
+                       {"tool_choice", "auto"},
+                       {"tools", Json::array({Json{{"type", "web_search"}, {"name", "ws"}},
+                                              Json{{"type", "function"},
+                                                  {"name", "shell"},
+                                                  {"parameters", Json{{"type", "object"}}}})}};
+    int failures    = 0;
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    failures += check(request.prompt.generation.tools.size() == 1 &&
+                          request.prompt.generation.tools[0].name == "shell",
+                      "hosted web_search tool is dropped, function tools survive");
+    failures += check(request.tools.size() == 1 && request.tools[0].at("name") == "shell",
+                      "wire tool list reports only the function tool");
+    failures += check(request.prompt.generation.reasoning_effort == RequestedReasoningEffort::Medium,
+                      "reasoning effort honored next to an ignored summary");
+
+    Json hosted_only      = body;
+    hosted_only.erase("tool_choice");
+    hosted_only["tools"]  = Json::array({Json{{"type", "computer_use"}, {"display_width", 1024}}});
+    const OpenAIResponsesCreateRequest only_hosted =
+        parse_openai_responses_create_request(hosted_only, limits());
+    failures += check(only_hosted.prompt.generation.tools.empty() && only_hosted.tools.empty(),
+                      "an all-hosted tool list parses to no Engine tools");
+
+    Json logprobs      = body;
+    logprobs["include"] = Json::array({"message.output_text.logprobs"});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(logprobs, limits());
+                      }) == "include_not_supported",
+                      "include values beyond encrypted_content remain unsupported");
+    Json mixed      = body;
+    mixed["include"] = Json::array({"reasoning.encrypted_content", "web_search_call.action.sources"});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(mixed, limits());
+                      }) == "include_not_supported",
+                      "one unusable include value rejects the whole request");
+
+    Json odd_summary           = body;
+    odd_summary["reasoning"]   = Json{{"summary", "yolo"}};
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(odd_summary, limits());
+                      }) == "reasoning_option_not_supported",
+                      "unknown reasoning.summary tier is rejected");
+    Json typed_summary       = body;
+    typed_summary["reasoning"] = Json{{"summary", true}};
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(typed_summary, limits());
+                      }) == "reasoning_option_not_supported",
+                      "non-string reasoning.summary is rejected");
+
+    Json unknown_executor  = body;
+    unknown_executor["tools"] = Json::array({Json{{"type", "browser_invoker"}, {"name", "b"}}});
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(unknown_executor, limits());
+                      }) == "tool_type_not_supported",
+                      "executor-backed tool types outside the hosted list still 400");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -993,6 +1063,7 @@ int main() {
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
     failures += test_explicit_rejections();
+    failures += test_codex_cli_compatibility();
     failures += test_previous_response_call_graph();
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();

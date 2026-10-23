@@ -436,10 +436,11 @@ wire response contains typed `output` Items.
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` requests disabled thinking; other standard effort values fold onto the template tiers as for Chat Completions (`high`, `max`, `adaptive` render as `xhigh`; `minimal` as `low`) |
+| `reasoning.summary` | omitted or `auto`, `concise`, `detailed`; accepted and ignored — this model writes no summaries and clients tolerate their absence |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
+| `tools` | direct function definitions or namespace groups containing function definitions; hosted entries (`web_search`, `web_search_preview`, `file_search`, `computer_use`, `computer_use_preview`, `code_interpreter`, `image_generation`, `local_shell`) are dropped from the prompt; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
@@ -447,7 +448,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, an empty array, or only `"reasoning.encrypted_content"` entries; the Engine emits no encrypted reasoning and Codex CLI always requests it, so it is accepted and dropped |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -539,9 +540,12 @@ without changing declaration order, while `tool_choice:"none"` disables structur
 when the history contains earlier calls.
 
 NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+`strict:true`, required or named tool choice, remote MCP tools, and custom free-form tools are
+rejected. Hosted tool entries (`web_search` and the other provider-executed types listed above)
+are dropped from the prompt rather than rejected: the model simply never sees them, which keeps
+Codex CLI's unconditional tool list usable. Deferred loading, output schemas, and caller
+restrictions that exclude direct invocation are also rejected because their semantics cannot be
+honored.
 
 ### Response object and usage
 
@@ -659,9 +663,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
-files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
-accepted placeholders.
+moderation, Structured Outputs/JSON mode, `include` values beyond `reasoning.encrypted_content`,
+background execution, compaction, files/audio, and remote MCP/custom tools. These are
+compatibility boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 

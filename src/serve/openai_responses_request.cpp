@@ -770,6 +770,9 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
 
     static const std::unordered_set<std::string> namespace_members = {"type", "name", "description",
                                                                       "tools"};
+    static const std::unordered_set<std::string> hosted_types = {
+        "web_search",       "web_search_preview",  "file_search",   "computer_use",
+        "computer_use_preview", "code_interpreter", "image_generation", "local_shell"};
     std::unordered_set<std::string> declared_names;
     std::unordered_set<std::string> namespace_names;
     const auto append_function = [&](ParsedFunctionTool parsed) {
@@ -789,6 +792,13 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
         if (type == "function") {
             out.wire_tools.push_back(
                 append_function(parse_function_tool(item, std::nullopt, {}, out.tool_identities)));
+            continue;
+        }
+        if (hosted_types.contains(type)) {
+            // Hosted tools run on the serving provider's executor, which NInfer does not have.
+            // Codex CLI attaches them unconditionally: drop them from the prompt instead of
+            // rejecting, so the model simply never sees them. Unknown executor-backed types
+            // still 400 below.
             continue;
         }
         if (type != "namespace") {
@@ -920,10 +930,22 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    for (const char* key : {"context", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
+                        "reasoning", "reasoning_option_not_supported");
+        }
+    }
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        // Codex CLI always sends reasoning.summary. This model writes no summaries and clients
+        // tolerate their absence, which is what the Responses path already returns: accept the
+        // standard tiers and ignore them.
+        static const std::unordered_set<std::string> summary_tiers = {"auto", "concise",
+                                                                       "detailed"};
+        if (!reasoning.at("summary").is_string() ||
+            !summary_tiers.contains(reasoning.at("summary").get<std::string>())) {
+            bad_request("reasoning.summary changes reasoning input or output and is not supported",
                         "reasoning", "reasoning_option_not_supported");
         }
     }
@@ -1189,10 +1211,16 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        for (const Json& entry : body.at("include")) {
+            // Codex CLI always includes reasoning.encrypted_content. The Engine returns no
+            // encrypted reasoning and Codex runs fine without it (it only echoes what a
+            // response actually carried), so accept the request and drop it. Any other
+            // include value still has no available representation.
+            if (!entry.is_string() || entry.get<std::string>() != "reasoning.encrypted_content") {
+                bad_request("the requested additional response fields have no available response "
+                            "representation",
+                            "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
