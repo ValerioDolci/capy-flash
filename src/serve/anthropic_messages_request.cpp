@@ -235,7 +235,7 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
         } else if (type == "image") {
             result.push_back(parse_image(part));
         } else if (type == "tool_reference") {
-            continue;  // names a deferred tool for lower_tools; renders nothing into the prompt
+            continue; // names a deferred tool for lower_tools; renders nothing into the prompt
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -819,10 +819,10 @@ std::unordered_set<std::string> referenced_tool_names(const Json& body) {
 }
 
 void lower_tools(const Json& body, GenerationRequest& request) {
-    const ToolSelection selection       = parse_tool_choice(body);
-    std::vector<ParsedTool> definitions = parse_tool_definitions(body);
+    const ToolSelection selection                    = parse_tool_choice(body);
+    std::vector<ParsedTool> definitions              = parse_tool_definitions(body);
     const std::unordered_set<std::string> referenced = referenced_tool_names(body);
-    const auto named                    = [&](const ParsedTool& tool) {
+    const auto named                                 = [&](const ParsedTool& tool) {
         return tool.definition.name == selection.name;
     };
 
@@ -869,7 +869,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                         "tools", "strict_tools_not_supported");
         }
         if (tool.defer_loading && !referenced.count(tool.definition.name)) {
-            continue;  // deferred: out of the prompt until a tool_reference names it
+            continue; // deferred: out of the prompt until a tool_reference names it
         }
         if (tool.allowed_callers &&
             std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==

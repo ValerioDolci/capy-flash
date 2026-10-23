@@ -365,19 +365,18 @@ int test_tool_history() {
         {Json{{"role", "assistant"},
               {"content", Json::array({tool_use("toolu_mixed"), tool_use("toolu_only")})}},
          Json{{"role", "user"},
-              {"content", Json::array({Json{{"type", "tool_result"},
-                                            {"tool_use_id", "toolu_mixed"},
-                                            {"content", Json::array({Json{{"type", "text"},
-                                                                         {"text", "hit"}},
-                                                                  Json{{"type", "tool_reference"},
-                                                                      {"tool_name", "mcp__x"}}})}},
-                                       Json{{"type", "tool_result"},
-                                            {"tool_use_id", "toolu_only"},
-                                            {"content", Json::array({Json{{"type", "tool_reference"},
-                                                                         {"tool_name", "mcp__y"}}})}}})}}});
+              {"content",
+               Json::array({Json{{"type", "tool_result"},
+                                 {"tool_use_id", "toolu_mixed"},
+                                 {"content", Json::array({Json{{"type", "text"}, {"text", "hit"}},
+                                                          Json{{"type", "tool_reference"},
+                                                               {"tool_name", "mcp__x"}}})}},
+                            Json{{"type", "tool_result"},
+                                 {"tool_use_id", "toolu_only"},
+                                 {"content", Json::array({Json{{"type", "tool_reference"},
+                                                               {"tool_name", "mcp__y"}}})}}})}}});
     const GenerationRequest pointers = parse(body).generation;
-    failures += check(pointers.messages.size() == 3 &&
-                          pointers.messages[1].content.size() == 1 &&
+    failures += check(pointers.messages.size() == 3 && pointers.messages[1].content.size() == 1 &&
                           pointers.messages[1].content[0].text == "hit" &&
                           pointers.messages[2].content.size() == 1 &&
                           pointers.messages[2].content[0].text.empty(),
@@ -421,14 +420,14 @@ int test_tools() {
     const GenerationRequest deferred  = parse(body).generation;
     failures += check(prompt(deferred).options.tool_jsons.empty(),
                       "a deferred tool without any tool_reference reached the prompt");
-    body["messages"] = Json::array({Json{{"role", "user"},
-                                         {"content", Json::array({Json{
-                                              {"type", "tool_result"},
-                                              {"tool_use_id", "toolu_search"},
-                                              {"content", Json::array({
-                                                  Json{{"type", "text"}, {"text", "1 match"}},
-                                                  Json{{"type", "tool_reference"},
-                                                      {"tool_name", "weather"}}})}}})}}});
+    body["messages"]               = Json::array({Json{
+                      {"role", "user"},
+                      {"content",
+                       Json::array({Json{{"type", "tool_result"},
+                                         {"tool_use_id", "toolu_search"},
+                                         {"content", Json::array({Json{{"type", "text"}, {"text", "1 match"}},
+                                                                  Json{{"type", "tool_reference"},
+                                                                       {"tool_name", "weather"}}})}}})}}});
     const GenerationRequest loaded = parse(body).generation;
     failures += check(prompt(loaded).options.tool_jsons.size() == 1,
                       "a tool_reference did not bring its deferred tool into the prompt");
