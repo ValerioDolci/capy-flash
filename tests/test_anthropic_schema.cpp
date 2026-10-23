@@ -375,7 +375,13 @@ int test_tool_history() {
                                  {"tool_use_id", "toolu_only"},
                                  {"content", Json::array({Json{{"type", "tool_reference"},
                                                                {"tool_name", "mcp__y"}}})}}})}}});
+    const Json schema = Json{{"type", "object"}};
+    body["tools"] =
+        Json::array({Json{{"name", "mcp__x"}, {"input_schema", schema}, {"defer_loading", true}},
+                     Json{{"name", "mcp__y"}, {"input_schema", schema}, {"defer_loading", true}}});
     const GenerationRequest pointers = parse(body).generation;
+    failures += check(prompt(pointers).options.tool_jsons.size() == 2,
+                      "tool_reference blocks did not load both deferred tools");
     failures += check(pointers.messages.size() == 3 && pointers.messages[1].content.size() == 1 &&
                           pointers.messages[1].content[0].text == "hit" &&
                           pointers.messages[2].content.size() == 1 &&
@@ -433,6 +439,49 @@ int test_tools() {
                       "a tool_reference did not bring its deferred tool into the prompt");
     failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }).empty(),
                       "Count Tokens rejected a request carrying tool_reference history");
+
+    // A loaded deferred tool renders exactly like the same tool declared up front.
+    Json eager_body                         = body;
+    eager_body["tools"][0]["defer_loading"] = false;
+    failures += check(prompt(parse(eager_body).generation).options.tool_jsons ==
+                          prompt(loaded).options.tool_jsons,
+                      "a loaded deferred tool rendered differently from an eager one");
+
+    Json& reference        = body["messages"][0]["content"][0]["content"][1];
+    reference["tool_name"] = "mcp__unknown";
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
+                      "a tool_reference to an undeclared tool was accepted");
+    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
+                          "invalid_tool_reference",
+                      "Count Tokens accepted a tool_reference to an undeclared tool");
+    reference["tool_name"] = 7;
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
+                      "a tool_reference with a non-string tool_name was accepted");
+    reference.erase("tool_name");
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
+                      "a tool_reference without tool_name was accepted");
+    reference["tool_name"] = std::string(129, 'a');
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
+                      "a tool_reference with an over-long tool_name was accepted");
+
+    // Only tool_result content loads a deferred tool; a stray content array elsewhere does not.
+    body["messages"] = Json::array(
+        {Json{{"role", "user"},
+              {"content",
+               Json::array({Json{{"type", "text"},
+                                 {"text", "hi"},
+                                 {"content", Json::array({Json{{"type", "tool_reference"},
+                                                               {"tool_name", "weather"}}})}}})}}});
+    failures += check(prompt(parse(body).generation).options.tool_jsons.empty(),
+                      "a tool_reference outside tool_result content loaded a deferred tool");
+
+    // allowed_callers is validated whether or not the deferred tool is loaded.
+    body                                = base_request();
+    body["tools"]                       = Json::array({ordinary_tool()});
+    body["tools"][0]["defer_loading"]   = true;
+    body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_caller_not_supported",
+                      "a deferred tool skipped allowed_callers validation");
 
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
