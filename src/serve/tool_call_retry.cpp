@@ -14,10 +14,13 @@ bool contains(std::span<const TokenId> haystack, std::span<const TokenId> needle
 } // namespace
 
 std::string_view tool_call_retry_steering_text() noexcept {
+    // Ends on a colon: the appended tokens are teacher-forced as the model's own text, and a
+    // sentence-final period reads as the end of the turn (measured: one immediate stop token and
+    // an empty continuation). The colon primes the re-emission.
     return "\n\nThat call never reached the client: a parameter value contained one of these call "
            "tags, and this format pairs the tags by depth with no way to escape one. I will send "
-           "the call again with every parameter value free of literal tags, producing that text by "
-           "concatenation instead of writing it out.";
+           "the call again, building any tag-shaped text inside a parameter value by concatenation "
+           "so no literal tag appears. New attempt:";
 }
 
 ToolCallRetryPlan plan_tool_call_retry(const ToolCallRetryInput& input,
