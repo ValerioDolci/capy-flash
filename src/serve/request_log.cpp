@@ -654,8 +654,8 @@ static Json reasoning_retry_json(const ReasoningRetryStats& stats) {
 }
 
 static Json tool_call_retry_json(const ToolCallRetryStats& stats) {
-    if (stats.kept_tokens == 0U && stats.error.empty()) { return Json(nullptr); }
-    Json value{{"kept_tokens", stats.kept_tokens},
+    if (stats.reply_tokens == 0U && stats.error.empty()) { return Json(nullptr); }
+    Json value{{"reply_tokens", stats.reply_tokens},
                {"injected_tokens", stats.injected_tokens},
                {"continuation_prompt_tokens", stats.continuation_prompt},
                {"continuation_reused_tokens", stats.continuation_reused},

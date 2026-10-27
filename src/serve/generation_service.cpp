@@ -672,7 +672,7 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
     if (!options_.tool_call_retry || !tool_call_region_is_dead(outcome.tool_call_parse)) { return; }
     ReasoningRetryContext& retry = *prepared.reasoning_retry;
     const std::vector<ninfer::TokenId> steering =
-        engine_->tokenize_text(tool_call_retry_steering(first_dead_function_name(outcome.text)));
+        engine_->tokenize_text(tool_call_retry_steering(outcome.text));
     const ToolCallRetryPlan plan = plan_tool_call_retry(
         ToolCallRetryInput{.parse         = outcome.tool_call_parse,
                            .finish_reason = outcome.finish_reason,
@@ -682,7 +682,7 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
         reasoning_guard_tokens_, steering);
     if (!plan.retry || cancellation.requested()) { return; }
     ToolCallRetryStats& stats = outcome.tool_call_retry;
-    stats.kept_tokens         = plan.kept_tokens;
+    stats.reply_tokens        = plan.reply_tokens;
     stats.injected_tokens     = plan.injected_tokens;
 
     ninfer::RequestOptions options = std::move(retry.request_options);
@@ -713,8 +713,10 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
         return;
     }
 
-    // A continuation that died the same way tells the client nothing new: keep the first reply.
-    if (tool_call_region_is_dead(second.tool_call_parse)) {
+    // Only a structured call from the continuation is worth adopting: a half-call decoded as
+    // plain content (no marker in the model's stream) would hand the client the same dead round
+    // with new tokens billed. Anything else leaves the first reply standing.
+    if (second.tool_calls.empty()) {
         stats.error = "continuation produced no structured tool call either";
         return;
     }
@@ -730,7 +732,7 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
     outcome.tool_call_parse     = second.tool_call_parse;
     outcome.finish_reason       = second.finish_reason;
     outcome.matched_stop_string = std::move(second.matched_stop_string);
-    outcome.completion_tokens   = static_cast<int>(plan.kept_tokens + plan.injected_tokens +
+    outcome.completion_tokens   = static_cast<int>(plan.reply_tokens + plan.injected_tokens +
                                                    second.generated_token_ids.size());
     outcome.reasoning_tokens += static_cast<int>(second.reasoning_tokens);
 

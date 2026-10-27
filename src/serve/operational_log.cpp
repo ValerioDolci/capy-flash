@@ -319,7 +319,7 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
     // A fired retry owns the record: a recovered call leaves a clean final parse, so the fallback
     // line below would not render at all.
-    if (outcome.tool_call_retry.kept_tokens > 0U) {
+    if (outcome.tool_call_retry.reply_tokens > 0U) {
         const bool recovered = outcome.tool_call_retry.error.empty();
         return OperationalRecord{
             .severity = recovered ? OperationalSeverity::Info : OperationalSeverity::Warning,
