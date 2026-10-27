@@ -96,6 +96,29 @@ bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     });
 }
 
+// Strips a namespace wrapper off a function name: tools["server"]["tool"], ns.tool and server/tool
+// all yield tool, the last segment made of name characters. Names that are already plain, or whose
+// last segment is empty, return an empty view so callers keep the original name untouched.
+std::string_view unwrap_namespaced_function_name(std::string_view name,
+                                                 std::size_t max_name_length) {
+    if (name.find_first_of(".[/") == std::string_view::npos) { return {}; }
+    // Skips the closing punctuation of the catalog spelling (tools["server"]["tool"]) so the last
+    // name-character run is the tool itself.
+    auto is_name_byte = [](char byte) {
+        return is_ascii_digit(byte) || (byte >= 'a' && byte <= 'z') ||
+               (byte >= 'A' && byte <= 'Z') || byte == '_' || byte == '-';
+    };
+    std::size_t run_end = name.size();
+    while (run_end > 0 && !is_name_byte(name[run_end - 1])) { --run_end; }
+    std::size_t begin = run_end;
+    while (begin > 0 && is_name_byte(name[begin - 1])) { --begin; }
+    // begin/run_end bracket the last name run: nothing at the end, or no separator in front of it,
+    // means there is no namespace to strip.
+    if (run_end == 0 || begin == 0 || begin == run_end) { return {}; }
+    const std::string_view bare = name.substr(begin, run_end - begin);
+    return bare.size() <= max_name_length ? bare : std::string_view{};
+}
+
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
 
 constexpr bool admits_type(TypeSet types, SchemaType type) {
@@ -467,10 +490,19 @@ private:
         }
         if (contract_.enforce_declared_names &&
             find_tool_contract(contract_, call.name) == nullptr) {
-            // Undeclared (or oddly-punctuated) name: keep the call structurally. The client has
-            // no such tool to run, so it answers with a visible tool-not-found error the model
-            // can react to - strictly better than the markup silently becoming end_turn text.
-            call.salvaged = true;
+            // A harness catalog reference (tools["server"]["tool"]) can name a tool the client does
+            // expose under its short name. Only rename when the unwrapped name is declared; the
+            // gateway does not invent a runnable target for a name it has never been told about.
+            const std::string_view bare =
+                unwrap_namespaced_function_name(call.name, max_name_length_);
+            if (!bare.empty() && find_tool_contract(contract_, bare) != nullptr) {
+                call.name = bare;
+            } else {
+                // Undeclared (or oddly-punctuated) name: keep the call structurally. The client has
+                // no such tool to run, so it answers with a visible tool-not-found error the model
+                // can react to - strictly better than the markup silently becoming end_turn text.
+                call.salvaged = true;
+            }
         }
         pos = name_end + 1;
 

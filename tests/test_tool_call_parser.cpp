@@ -622,6 +622,36 @@ int test_catalog_spelling_salvage() {
     return failures;
 }
 
+int test_namespaced_reference_resolves_to_declared_name() {
+    // The shape a real client hits: the model writes the harness catalog reference while the
+    // tool is declared under its short name. Unwrapping only applies when the short name is
+    // declared.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+
+    int failures = 0;
+    for (const std::string& spelling :
+         {std::string("tools[\"srv\"][\"configure\"]"), std::string("srv.configure"),
+          std::string("srv/configure")}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(tool_call(spelling, {{"value", "x"}}), 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "configure" &&
+                              parsed.diagnostics.salvaged_call_count == 0,
+                          std::string("namespaced reference was not resolved: ") + spelling);
+    }
+
+    // Unwrapping must not invent a target: the short name is undeclared here, so the original
+    // catalog spelling stays on the call and is counted as salvaged.
+    const auto other_only = contract_for("other", Json{{"value", Json{{"type", "string"}}}});
+    const auto unresolved = fi::parse_qwen_tool_call_output(
+        tool_call("tools[\"srv\"][\"configure\"]", {{"value", "x"}}), 64, other_only);
+    failures += check(unresolved.is_tool_call_response && unresolved.tool_calls.size() == 1 &&
+                          unresolved.tool_calls.front().name == "tools[\"srv\"][\"configure\"]" &&
+                          unresolved.diagnostics.salvaged_call_count == 1,
+                      "undeclared namespaced reference was rewritten to a non-existent tool");
+    return failures;
+}
+
 int test_name_limits_and_non_strict_omissions() {
     const std::string name(128, 'a');
     const std::string text          = tool_call(name);
@@ -793,6 +823,7 @@ int main() {
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_catalog_spelling_salvage();
+    failures += test_namespaced_reference_resolves_to_declared_name();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();
