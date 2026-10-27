@@ -1267,9 +1267,10 @@ public:
     }
 
     void mark_lease_demote_tried(std::uint32_t slot) {
-        if (lease_demote_tried_.size() < catalog_count_) {
-            lease_demote_tried_.resize(catalog_count_);
-        }
+        // Private and shared slots both land here (the shared pass of the lease reclaim marks
+        // shared-prefix slots, which can exceed catalog_count_): grow to cover the slot.
+        const std::size_t needed = std::max<std::size_t>(catalog_count_, std::size_t{slot} + 1U);
+        if (lease_demote_tried_.size() < needed) { lease_demote_tried_.resize(needed); }
         lease_demote_tried_[slot] = true;
     }
 

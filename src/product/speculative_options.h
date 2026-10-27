@@ -12,6 +12,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "off" || value == "none") { return SpeculativeBackend::None; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 

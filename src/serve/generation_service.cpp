@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/prompt_overlap.h"
+#include "serve/turn_anchors.h"
 
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
@@ -238,7 +239,9 @@ public:
     explicit ContinuationOutputSink(const StreamSink& sink) : sink_(&sink) {}
 
     void start(ninfer::GenerationStart) override {}
+
     void progress(ninfer::PromptProgress) override {}
+
     void timing(ninfer::GenerationTimingObservation) override {}
 
     void publish(ninfer::OutputDelta delta) override {
@@ -253,27 +256,6 @@ public:
 private:
     const StreamSink* sink_ = nullptr;
 };
-
-// Turn anchors (--turn-anchors N). A same-session follow-up consumes the previous turn's
-// continuation and its own turn-closure capture replaces the previous closure, so once turn N+1 is
-// running no checkpoint is left at the end of turn N: a cancelled or edited turn re-prefilled the
-// whole conversation (issue #3). A private long-anchor opportunity at the message boundary before
-// the final message (and, with N > 1, before the messages preceding it) makes the follow-up's
-// prefill capture that branch point; the Engine keeps and replaces it like an explicit anchor,
-// within --max-long-anchors-per-continuation. Protocol markers stay first: Engine order follows
-// the marker order.
-void add_turn_anchor_markers(ninfer::PromptInput& input, std::uint32_t turn_anchors) {
-    if (turn_anchors == 0 || input.messages.size() < 2) { return; }
-    const std::size_t last_boundary = input.messages.size() - 1U;
-    for (std::size_t count = 0; count < turn_anchors && last_boundary > count; ++count) {
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-            .after_message_count = static_cast<std::uint32_t>(last_boundary - count),
-            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
-            .evidence            = ninfer::SharedCandidateEvidence::None,
-            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
-        });
-    }
-}
 
 } // namespace
 
@@ -322,7 +304,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
     turn_anchors_ =
         resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
-    if (options_.reasoning_close_retry) { reasoning_guard_tokens_ = engine_->reasoning_guard_tokens(); }
+    if (options_.reasoning_close_retry) {
+        reasoning_guard_tokens_ = engine_->reasoning_guard_tokens();
+    }
     // On by default since v0.7: a model whose stop configuration the guard cannot handle (no or
     // more than two terminal ids, no thinking opener) serves without it instead of not starting.
     try {
@@ -596,16 +580,16 @@ void GenerationService::apply_reasoning_retry(PreparedRequest& prepared,
                                               const ninfer::GenerationResult& first,
                                               GenerationOutcome& outcome, const StreamSink* sink,
                                               const ninfer::CancellationView& cancellation) {
-    ReasoningRetryContext& retry = *prepared.reasoning_retry;
+    ReasoningRetryContext& retry  = *prepared.reasoning_retry;
     const ReasoningRetryPlan plan = plan_reasoning_retry(
-        ReasoningRetryInput{
-            .starts_in_reasoning      = prepared.enable_thinking,
-            .finish_reason            = outcome.finish_reason,
-            .generated                = first.generated_token_ids,
-            .content                  = outcome.text,
-            .tool_calls               = outcome.tool_calls.size(),
-            .thinking_control_applied = outcome.thinking.applied,
-            .requested_output_tokens  = retry.request_options.execution.requested_output_tokens},
+        ReasoningRetryInput{.starts_in_reasoning      = prepared.enable_thinking,
+                            .finish_reason            = outcome.finish_reason,
+                            .generated                = first.generated_token_ids,
+                            .content                  = outcome.text,
+                            .tool_calls               = outcome.tool_calls.size(),
+                            .thinking_control_applied = outcome.thinking.applied,
+                            .requested_output_tokens =
+                                retry.request_options.execution.requested_output_tokens},
         reasoning_guard_tokens_);
     if (plan.trigger == ReasoningRetryTrigger::None) { return; }
     if (cancellation.requested()) { return; }
@@ -629,12 +613,12 @@ void GenerationService::apply_reasoning_retry(PreparedRequest& prepared,
         const PreparationControl control{.deadline = deadline, .cancellation = cancellation};
         ninfer::PreparedPrompt prompt =
             engine_->prepare_continuation(std::move(retry.input), plan.appended, control);
-        ninfer::GenerationHandle generation = engine_->submit(
-            std::move(prompt), std::move(options),
-            retry.consumer_mode == GenerationConsumerMode::Streaming
-                ? ninfer::OutputConsumerMode::Streaming
-                : ninfer::OutputConsumerMode::Aggregate,
-            retry.observation, deadline);
+        ninfer::GenerationHandle generation =
+            engine_->submit(std::move(prompt), std::move(options),
+                            retry.consumer_mode == GenerationConsumerMode::Streaming
+                                ? ninfer::OutputConsumerMode::Streaming
+                                : ninfer::OutputConsumerMode::Aggregate,
+                            retry.observation, deadline);
         second = generation.wait(continuation_sink.get(), cancellation);
     } catch (const std::exception& exception) {
         // The first reply stands as it was.
@@ -654,7 +638,7 @@ void GenerationService::apply_reasoning_retry(PreparedRequest& prepared,
     outcome.finish_reason       = second.finish_reason;
     outcome.matched_stop_string = std::move(second.matched_stop_string);
     outcome.completion_tokens   = static_cast<int>(plan.kept_tokens + plan.injected_tokens +
-                                                 second.generated_token_ids.size());
+                                                   second.generated_token_ids.size());
     outcome.reasoning_tokens += static_cast<int>(second.reasoning_tokens);
 
     GenerationMetrics& metrics = outcome.metrics;

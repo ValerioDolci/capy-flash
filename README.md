@@ -18,7 +18,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.7.5**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.7.6**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -274,6 +274,15 @@ artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then check
 texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.7.6**
+- `/v1/messages` with four `cache_control` breakpoints (the Anthropic maximum, which OpenCode sends) no longer
+  returns HTTP 400: the server's own turn anchor gives way when the request already uses every marker slot
+  ([PR #34](https://github.com/ValerioDolci/capy-flash/pull/34) by @omni326).
+- `--spec off` (or `none`) after a `--profile` runs the profile without speculative decoding, dropping its
+  `--draft-tokens` and `--lm-head-draft` ([issue #33](https://github.com/ValerioDolci/capy-flash/issues/33)).
+- Builds with GCC 16 ([issue #31](https://github.com/ValerioDolci/capy-flash/issues/31)); an out-of-range write in
+  the context cache's KV lease bookkeeping is fixed.
 
 **v0.7.5**
 - `--miss-split calibrate` (Flash-Next NVFP4, opt-in; asked for in

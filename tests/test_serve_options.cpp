@@ -122,6 +122,23 @@ int main() {
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
+    const ServeOptions spec_off =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb", "--spec", "off"});
+    failures += check(spec_off.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          spec_off.speculative.draft_tokens == 0 &&
+                          spec_off.speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "--profile 27b-16gb --spec off kept the profile's speculation");
+    const ServeOptions spec_none =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next", "--spec", "none"});
+    failures += check(spec_none.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          spec_none.speculative.draft_tokens == 0,
+                      "--spec none is not a synonym of --spec off");
+    bool draft_after_off_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "off", "--draft-tokens", "3"});
+    } catch (const std::invalid_argument&) { draft_after_off_rejected = true; }
+    failures += check(draft_after_off_rejected, "--draft-tokens after --spec off was accepted");
+
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto options = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
                                     "--draft-tokens", std::to_string(k), "--lm-head-draft"});

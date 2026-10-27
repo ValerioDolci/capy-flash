@@ -220,7 +220,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2|off --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--host-pinned-max-gib G] [--no-prefix-reuse] "
@@ -631,6 +631,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+            if (options.speculative.backend == SpeculativeBackend::None) {
+                // --spec off also drops a profile's draft window and proposal head (like --no-vision)
+                options.speculative.draft_tokens  = 0;
+                options.speculative.proposal_head = ProposalHead::Full;
+            }
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));

@@ -256,7 +256,7 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
+frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend, and `--spec off` (after a `--profile`) removes the profile's backend, draft window and proposal head.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
@@ -1065,7 +1065,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
-| `--turn-anchors N` | private long-anchor opportunities at the last N message boundaries before the final message, so a cancelled or edited turn resumes from the end of the previous turn instead of re-prefilling the conversation (`0` disables). Default by model: `0` on Qwen3.8-Flash-Next (each anchor costs one extra prefill pass per turn, ~0.8 s there), `1` on the others, where the extra pass is not measurable | `0` Flash-Next, `1` others |
+| `--turn-anchors N` | private long-anchor opportunities at the last N message boundaries before the final message, so a cancelled or edited turn resumes from the end of the previous turn instead of re-prefilling the conversation (`0` disables). Protocol cache markers win the shared marker budget: with a request already carrying four `cache_control` breakpoints the anchor is dropped rather than pushing the request over the limit. Default by model: `0` on Qwen3.8-Flash-Next (each anchor costs one extra prefill pass per turn, ~0.8 s there), `1` on the others, where the extra pass is not measurable | `0` Flash-Next, `1` others |
 | `--elastic` | Qwen3.8-Flash-Next with offloaded experts: the KV pool keeps its address space for `--max-context` but backs pages on demand, and the VRAM it does not use becomes extra expert slots, given back when the KV grows; no effect on models without offloaded experts | off (on in `--profile flash-next` and `flash-next-1gpu`) |
 | `--kv-grow N` | with `--elastic`: step, in tokens, in which the KV backing starts and grows; must be positive | `8192` |
 | `--kv-budget-gib G` | with `--elastic`: at most `G` GiB of KV per GPU (Text and MTP pools); the base expert slots are sized for it instead of `--max-context`'s KV, and a request that needs more KV fails. Keeps more experts resident when contexts stay short | unset (sized for `--max-context`) |
