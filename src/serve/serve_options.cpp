@@ -95,9 +95,9 @@ std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
 
 namespace {
 
-// Serving profiles: the configurations the release launchers start (two 16 GB boards; 27b-16gb: one). They are
-// inserted before the command line's own flags, so an explicit flag overrides its profile value;
-// the KV capacity is left to follow --max-context.
+// Serving profiles: the configurations the release launchers start (two 16 GB boards; 27b-16gb:
+// one). They are inserted before the command line's own flags, so an explicit flag overrides its
+// profile value; the KV capacity is left to follow --max-context.
 struct ServeProfile {
     std::string_view name;
     std::vector<std::string_view> flags;
@@ -105,10 +105,16 @@ struct ServeProfile {
 
 const std::vector<ServeProfile>& serve_profiles() {
     static const std::vector<ServeProfile> profiles{
-        {"flash-next",
-         {"--tp", "2", "--devices", "0,1", "--kv-dtype", "int8", "--elastic", "--max-context",
-          "262144", "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3",
-          "--host-kv-mib", "4096", "--host-state-slots", "8", "--embedding-host"}},
+        {"flash-next", {"--tp",       "2",
+                        "--devices",  "0,1",
+                        "--kv-dtype", "int8",
+                        "--elastic",  "--max-context",
+                        "262144",     "--max-concurrency",
+                        "1",          "--spec",
+                        "mtp",        "--draft-tokens",
+                        "3",          "--host-kv-mib",
+                        "4096",       "--host-state-slots",
+                        "8",          "--embedding-host"}},
         {"27b",
          {"--tp",
           "2",
@@ -138,22 +144,49 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--prefill-chunk",
           "2048"}},
         // v0.7: Qwen3.8-Flash-Next on ONE 16 GB GPU (T242: GSQ-RCO 64 GB edition, 57 GiB of RAM,
-        // LocalMaxxing 110 tok/s): the flash-next configuration at one device with small RAM caches.
-        // v0.7.1: 8 Host StateImages (+0.66 GiB pinned): at one device only 1 Device StateImage fits, and
-        // with 2 Host ones three interleaved agent sessions lost their turn checkpoints (prompt reuse
-        // 34 % -> 83 %, replay 858 -> 276 s, T247).
+        // LocalMaxxing 110 tok/s): the flash-next configuration at one device with small RAM
+        // caches. v0.7.1: 8 Host StateImages (+0.66 GiB pinned): at one device only 1 Device
+        // StateImage fits, and with 2 Host ones three interleaved agent sessions lost their turn
+        // checkpoints (prompt reuse 34 % -> 83 %, replay 858 -> 276 s, T247).
         {"flash-next-1gpu",
          {"--device", "0", "--kv-dtype", "int8", "--elastic", "--max-context", "262144",
           "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3", "--embedding-host",
           "--host-kv-mib", "1024", "--host-state-slots", "8"}},
         // v0.7: Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
-        // (docs/serving.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9 GiB).
+        // (docs/serving.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9
+        // GiB).
         {"27b-16gb",
-         {"--device", "0", "--kv-dtype", "int8", "--max-context", "65536", "--kv-capacity", "auto",
-          "--vram-headroom-mib", "384", "--device-state-slots", "2", "--max-concurrency", "1",
-          "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--embedding-host",
-          "--vision", "--vision-device", "0", "--max-vision-tokens", "4096", "--host-state-slots",
-          "8", "--host-kv-mib", "4096", "--prefill-chunk", "2048"}},
+         {"--device",
+          "0",
+          "--kv-dtype",
+          "int8",
+          "--max-context",
+          "65536",
+          "--kv-capacity",
+          "auto",
+          "--vram-headroom-mib",
+          "384",
+          "--device-state-slots",
+          "2",
+          "--max-concurrency",
+          "1",
+          "--spec",
+          "mtp",
+          "--draft-tokens",
+          "3",
+          "--lm-head-draft",
+          "--embedding-host",
+          "--vision",
+          "--vision-device",
+          "0",
+          "--max-vision-tokens",
+          "4096",
+          "--host-state-slots",
+          "8",
+          "--host-kv-mib",
+          "4096",
+          "--prefill-chunk",
+          "2048"}},
     };
     return profiles;
 }
@@ -200,7 +233,8 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] [--port N] [--api-key KEY|--api-key-file FILE] "
+           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] [--port "
+           "N] [--api-key KEY|--api-key-file FILE] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
@@ -225,6 +259,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--host-pinned-max-gib G] [--no-prefix-reuse] "
            "[--reasoning-close-retry|--no-reasoning-close-retry] "
+           "[--tool-call-retry|--no-tool-call-retry] "
            "[--reasoning-eos-guard|--no-reasoning-eos-guard] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
@@ -311,7 +346,8 @@ std::string serve_usage_text(const char* argv0) {
            "memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees "
            "the table's VRAM (1.18 GiB per GPU on Qwen3.8-27B) for the KV pool, identical "
            "results\n"
-           "       --host-pinned-max-gib G keeps at most G GiB of the host-mapped weights (Flash-Next "
+           "       --host-pinned-max-gib G keeps at most G GiB of the host-mapped weights "
+           "(Flash-Next "
            "expert banks) page-locked; the banks of the least used layers beyond it stay in "
            "pageable memory (CPU reads them in place, GPU copies go through a pinned staging "
            "ring, no prefill streaming on them). Without it the whole page-locked allocation is "
@@ -334,16 +370,30 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
-           "       --reasoning-close-retry: a reply that ends with the model's terminal token inside "
+           "       --reasoning-close-retry: a reply that ends with the model's terminal token "
+           "inside "
            "its thinking (or right after </think> with blank content and no tool call) is closed "
-           "with \"\\n</think>\\n\\n\" and continued once (on by default; --no-reasoning-close-retry turns it off)\n"
-           "       --reasoning-eos-guard: the first token of a reply that starts in thinking is never "
-           "a terminal token (a terminal draw is redrawn without them; on by default; --no-reasoning-eos-guard turns it off)\n"
+           "with \"\\n</think>\\n\\n\" and continued once (on by default; "
+           "--no-reasoning-close-retry turns it off)\n"
+           "       --tool-call-retry: a reply whose tool-call markup parsed to zero structured "
+           "calls "
+           "(a parameter value containing a literal call tag breaks the depth pairing and the "
+           "format "
+           "has no escaping) is continued once with a steering line so the model re-sends the "
+           "call; "
+           "text requests that start in thinking only (on by default; --no-tool-call-retry turns "
+           "it "
+           "off)\n"
+           "       --reasoning-eos-guard: the first token of a reply that starts in thinking is "
+           "never "
+           "a terminal token (a terminal draw is redrawn without them; on by default; "
+           "--no-reasoning-eos-guard turns it off)\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
            "       --api-key-file FILE reads the key from FILE (one trailing newline stripped); "
-           "without --api-key or --api-key-file the key comes from NINFER_API_KEY when it is set.\n";
+           "without --api-key or --api-key-file the key comes from NINFER_API_KEY when it is "
+           "set.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -362,13 +412,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool api_key_explicit            = false;
     std::optional<std::string> api_key_file;
-    bool kv_capacity_explicit        = false;
-    bool context_capacity_explicit   = false;
-    bool device_explicit             = false;
-    bool host_state_explicit         = false;
-    bool host_kv_explicit            = false;
-    bool detail_steps_explicit       = false;
-    bool prefill_miss_tuned          = false;
+    bool kv_capacity_explicit      = false;
+    bool context_capacity_explicit = false;
+    bool device_explicit           = false;
+    bool host_state_explicit       = false;
+    bool host_kv_explicit          = false;
+    bool detail_steps_explicit     = false;
+    bool prefill_miss_tuned        = false;
     std::optional<std::size_t> vram_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -489,7 +539,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--disk-cache-dir must not be empty");
             }
         } else if (arg == "--disk-cache-gib") {
-            const std::uint64_t gib = parse_u64(require_value("--disk-cache-gib"), "disk-cache-gib");
+            const std::uint64_t gib =
+                parse_u64(require_value("--disk-cache-gib"), "disk-cache-gib");
             if (gib == 0 || gib > (1ULL << 20)) {
                 throw std::invalid_argument("--disk-cache-gib must be in [1,1048576]");
             }
@@ -502,7 +553,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.disk_min_free_bytes = gib << 30;
         } else if (arg == "--disk-cache-idle-ms") {
-            const std::uint64_t ms = parse_u64(require_value("--disk-cache-idle-ms"), "disk-cache-idle-ms");
+            const std::uint64_t ms =
+                parse_u64(require_value("--disk-cache-idle-ms"), "disk-cache-idle-ms");
             if (ms > 86400000ULL) {
                 throw std::invalid_argument("--disk-cache-idle-ms must be at most 86400000");
             }
@@ -548,7 +600,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (!(gib > 0.0)) { throw std::invalid_argument("--kv-budget-gib must be positive"); }
             options.elastic_kv.kv_budget_bytes = static_cast<std::size_t>(gib * 1073741824.0);
         } else if (arg == "--miss-split") {
-            const std::string value = require_value("--miss-split");
+            const std::string value      = require_value("--miss-split");
             options.miss_split_calibrate = false;
             if (value == "auto") {
                 options.miss_split = MissSplitMode::Auto;
@@ -561,8 +613,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--miss-split must be auto, calibrate or off");
             }
         } else if (arg == "--expert-cpu-threads") {
-            const int n = parse_nonnegative_int(require_value("--expert-cpu-threads"), "expert-cpu-threads");
-            if (n < 1 || n > 64) { throw std::invalid_argument("--expert-cpu-threads must be 1..64"); }
+            const int n =
+                parse_nonnegative_int(require_value("--expert-cpu-threads"), "expert-cpu-threads");
+            if (n < 1 || n > 64) {
+                throw std::invalid_argument("--expert-cpu-threads must be 1..64");
+            }
             options.expert_cpu_threads = static_cast<std::uint32_t>(n);
         } else if (arg == "--stream-min-tokens") {
             options.stream_min_tokens = static_cast<std::uint32_t>(
@@ -685,6 +740,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.reasoning_close_retry = true;
         } else if (arg == "--no-reasoning-close-retry") {
             options.reasoning_close_retry = false;
+        } else if (arg == "--tool-call-retry") {
+            options.tool_call_retry = true;
+        } else if (arg == "--no-tool-call-retry") {
+            options.tool_call_retry = false;
         } else if (arg == "--reasoning-eos-guard") {
             options.reasoning_eos_guard = true;
         } else if (arg == "--no-reasoning-eos-guard") {

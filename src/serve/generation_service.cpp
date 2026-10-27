@@ -304,7 +304,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
     turn_anchors_ =
         resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
-    if (options_.reasoning_close_retry) {
+    if (options_.reasoning_close_retry || options_.tool_call_retry) {
         reasoning_guard_tokens_ = engine_->reasoning_guard_tokens();
     }
     // On by default since v0.7: a model whose stop configuration the guard cannot handle (no or
@@ -415,7 +415,7 @@ PreparedRequest GenerationService::prepare_impl(
             .cancellation = CancellationView(is_cancelled),
         };
         std::shared_ptr<ReasoningRetryContext> retry;
-        if (options_.reasoning_close_retry && !request_has_media &&
+        if ((options_.reasoning_close_retry || options_.tool_call_retry) && !request_has_media &&
             cache_participation == CacheParticipation::ReadWrite) {
             retry                = std::make_shared<ReasoningRetryContext>();
             retry->input         = input;
@@ -568,6 +568,11 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.tool_call_parse = result.tool_call_parse;
     if (prepared.reasoning_retry) {
         apply_reasoning_retry(prepared, result, outcome, sink, cancellation);
+        // A fired reasoning retry consumes the continuation context; the tool-call retry rides it
+        // only when that one stood aside.
+        if (outcome.reasoning_retry.trigger == ReasoningRetryTrigger::None) {
+            apply_tool_call_retry(prepared, result, outcome, sink, cancellation);
+        }
         prepared.reasoning_retry.reset();
     }
     if (options_.reasoning_eos_guard) {
@@ -658,6 +663,87 @@ void GenerationService::apply_reasoning_retry(PreparedRequest& prepared,
     for (std::size_t index = 0; index < positions.size(); ++index) {
         metrics.speculative_accepted_per_position[index] += positions[index];
     }
+}
+
+void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
+                                              const ninfer::GenerationResult& first,
+                                              GenerationOutcome& outcome, const StreamSink* sink,
+                                              const ninfer::CancellationView& cancellation) {
+    if (!options_.tool_call_retry || !tool_call_region_is_dead(outcome.tool_call_parse)) { return; }
+    ReasoningRetryContext& retry = *prepared.reasoning_retry;
+    const std::vector<ninfer::TokenId> steering =
+        engine_->tokenize_text(tool_call_retry_steering_text());
+    const ToolCallRetryPlan plan = plan_tool_call_retry(
+        ToolCallRetryInput{.parse         = outcome.tool_call_parse,
+                           .finish_reason = outcome.finish_reason,
+                           .generated     = first.generated_token_ids,
+                           .requested_output_tokens =
+                               retry.request_options.execution.requested_output_tokens},
+        reasoning_guard_tokens_, steering);
+    if (!plan.retry || cancellation.requested()) { return; }
+    ToolCallRetryStats& stats = outcome.tool_call_retry;
+    stats.kept_tokens         = plan.kept_tokens;
+    stats.injected_tokens     = plan.injected_tokens;
+
+    ninfer::RequestOptions options = std::move(retry.request_options);
+    if (plan.remaining_output_tokens) {
+        options.execution.requested_output_tokens = *plan.remaining_output_tokens;
+    }
+    // A fresh draw: the model already made one attempt at this call with this prompt.
+    options.execution.sampling.seed = prepared.sampling.seed + 1U;
+    options.execution.thinking.budget.reset();
+    std::unique_ptr<ContinuationOutputSink> continuation_sink;
+    if (sink != nullptr) { continuation_sink = std::make_unique<ContinuationOutputSink>(*sink); }
+    ninfer::GenerationResult second;
+    try {
+        const auto deadline = Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+        const PreparationControl control{.deadline = deadline, .cancellation = cancellation};
+        ninfer::PreparedPrompt prompt =
+            engine_->prepare_continuation(std::move(retry.input), plan.appended, control);
+        ninfer::GenerationHandle generation =
+            engine_->submit(std::move(prompt), std::move(options),
+                            retry.consumer_mode == GenerationConsumerMode::Streaming
+                                ? ninfer::OutputConsumerMode::Streaming
+                                : ninfer::OutputConsumerMode::Aggregate,
+                            retry.observation, deadline);
+        second = generation.wait(continuation_sink.get(), cancellation);
+    } catch (const std::exception& exception) {
+        // The first reply stands as it was.
+        stats.error = exception.what();
+        return;
+    }
+
+    // A continuation that died the same way tells the client nothing new: keep the first reply.
+    if (tool_call_region_is_dead(second.tool_call_parse)) {
+        stats.error = "continuation produced no structured tool call either";
+        return;
+    }
+
+    stats.continuation_prompt     = second.prompt.prompt_tokens;
+    stats.continuation_reused     = second.reused_prompt_tokens;
+    stats.continuation_completion = static_cast<std::uint32_t>(second.generated_token_ids.size());
+    stats.continuation_path       = second.prefix_reuse_path;
+
+    outcome.text = std::move(second.content);
+    outcome.reasoning += second.reasoning;
+    outcome.tool_calls          = std::move(second.tool_calls);
+    outcome.tool_call_parse     = second.tool_call_parse;
+    outcome.finish_reason       = second.finish_reason;
+    outcome.matched_stop_string = std::move(second.matched_stop_string);
+    outcome.completion_tokens   = static_cast<int>(plan.kept_tokens + plan.injected_tokens +
+                                                   second.generated_token_ids.size());
+    outcome.reasoning_tokens += static_cast<int>(second.reasoning_tokens);
+
+    GenerationMetrics& metrics = outcome.metrics;
+    metrics.prefill_seconds += second.timings.prefill_seconds;
+    metrics.decode_seconds += second.timings.decode_seconds;
+    metrics.prompt_wall_seconds += second.timings.prompt_wall_seconds;
+    metrics.generation_wall_seconds += second.timings.generation_wall_seconds;
+    metrics.total_seconds += second.timings.total_seconds;
+    metrics.speculative_rounds += second.speculative.rounds;
+    metrics.speculative_draft_tokens += second.speculative.drafted_tokens;
+    metrics.speculative_accepted_tokens += second.speculative.accepted_tokens;
+    metrics.speculative_fallback_steps += second.speculative.fallback_steps;
 }
 
 void GenerationService::warmup() {
