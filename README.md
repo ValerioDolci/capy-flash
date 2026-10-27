@@ -18,7 +18,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.7.6**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.7.7**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -274,6 +274,9 @@ artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then check
 texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.7.7**
+- Two engine-wide failures fixed. Both could follow a reasoning-close retry (`--reasoning-close-retry`, on by default) when a later request repeated the prompt or restored from its turn anchor. The fixes are a continuation that no longer registers the chat prompt's capture points ([PR #36](https://github.com/ValerioDolci/capy-flash/pull/36) by @omni326), and a state fork closed before a shared prefix is promoted at the reuse point. Recommended for everyone.
 
 **v0.7.6**
 - `/v1/messages` with four `cache_control` breakpoints (the Anthropic maximum, which OpenCode sends) no longer

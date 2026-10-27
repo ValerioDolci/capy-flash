@@ -1143,6 +1143,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.capture_groups[staged.next_capture].long_anchor) {
                 throw std::logic_error("zero-prefill capture is not a shared base promotion");
             }
+            // An exact-hit restore that had to Fork (its StateImage is still referenced elsewhere,
+            // e.g. a turn anchor after a reasoning-close continuation) has written nothing yet;
+            // the first prefill chunk would close it, but this promotion publishes the base before
+            // any chunk runs and a capture cannot be reserved over an unsettled Fork. Close it here
+            // the way a terminal Begin does (decode.cpp).
+            if (sequence.state.fork_pending) {
+                const StateImageSelectors selectors = state_selectors(sequence);
+                state_images->copy_slot(selectors.source, selectors.destination, device.stream);
+                device.synchronize();
+                settle_state_fork(sequence);
+            }
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;
             return runtime::PrefillStepResult{

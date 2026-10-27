@@ -360,7 +360,10 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
     if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
-        throw std::logic_error("capture transaction is not reservable");
+        throw std::logic_error(std::string("capture transaction is not reservable") +
+                               (has_context_transaction() ? " (context transaction open)" : "") +
+                               (has_unsettled_state_fork() ? " (unsettled state fork)" : "") +
+                               (!valid_capture_offer(offer) ? " (invalid capture offer)" : ""));
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));

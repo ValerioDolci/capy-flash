@@ -911,13 +911,14 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 
 PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const TokenId> appended,
                                               const PreparationControl& control) const {
-    PreparedPrompt prompt = prepare(std::move(input), control);
+    PreparedPrompt prompt    = prepare(std::move(input), control);
     PreparedPromptData& data = *prompt.data_;
     if (data.has_media()) {
         throw std::invalid_argument("reasoning continuation does not support media prompts");
     }
     if (!data.starts_in_reasoning) {
-        throw std::invalid_argument("reasoning continuation requires a prompt that starts in thinking");
+        throw std::invalid_argument(
+            "reasoning continuation requires a prompt that starts in thinking");
     }
     if (appended.size() > impl_->max_context ||
         data.token_ids.size() > impl_->max_context - appended.size()) {
@@ -932,6 +933,12 @@ PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const
     data.token_ids.insert(data.token_ids.end(), appended.begin(), appended.end());
     assign_text_positions(data);
     (void)checked_token_count(data.token_ids.size());
+    // A continuation must not register the chat prompt's capture points as reuse candidates: they
+    // sit mid-conversation here, and a conversation has no sampling hidden at a mid-prompt
+    // frontier. A later request matching one exactly takes the zero-suffix path and dies on the
+    // missing tail hidden (measured: engine-wide FATAL after a close-retry continuation). The
+    // conversation's own end state stays publishable.
+    data.context_cache.opportunities.clear();
     // The appended tokens are the reply so far plus the closing suffix: decoding resumes in
     // content, where the tool-call contract of the chat prompt still applies.
     data.starts_in_reasoning = false;
@@ -941,8 +948,8 @@ PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const
 ReasoningGuardTokens Frontend::reasoning_guard_tokens() const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     ReasoningGuardTokens tokens;
-    // The bare canonical close, not the thinking-budget message: the reply chose to stop, it was not
-    // cut short.
+    // The bare canonical close, not the thinking-budget message: the reply chose to stop, it was
+    // not cut short.
     tokens.close_suffix   = impl_->tokenizer->encode(fi::kCanonicalReasoningCloseSerialization);
     tokens.stop_token_ids = impl_->defaults.token_ids;
     tokens.think_close    = impl_->tokenizer->encode(kThinkClose);

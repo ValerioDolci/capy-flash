@@ -1150,30 +1150,59 @@ int test_reasoning_continuation(const Frontend& frontend) {
         return input;
     };
     const ninfer::ReasoningGuardTokens tokens = frontend.reasoning_guard_tokens();
-    int failures = check(!tokens.close_suffix.empty() && !tokens.stop_token_ids.empty() &&
-                             tokens.think_close.size() == 1,
-                         "reasoning guard tokens are incomplete");
-    const auto base         = frontend.prepare(text_input(std::nullopt));
-    const auto& base_data   = FrontendFactory::inspect(base);
+    int failures          = check(!tokens.close_suffix.empty() && !tokens.stop_token_ids.empty() &&
+                                      tokens.think_close.size() == 1,
+                                  "reasoning guard tokens are incomplete");
+    const auto base       = frontend.prepare(text_input(std::nullopt));
+    const auto& base_data = FrontendFactory::inspect(base);
     std::vector<ninfer::TokenId> appended{fixture_byte_token('o'), fixture_byte_token('k')};
     appended.insert(appended.end(), tokens.close_suffix.begin(), tokens.close_suffix.end());
-    const auto continued    = frontend.prepare_continuation(text_input(std::nullopt), appended);
-    const auto& data        = FrontendFactory::inspect(continued);
+    const auto continued = frontend.prepare_continuation(text_input(std::nullopt), appended);
+    const auto& data     = FrontendFactory::inspect(continued);
     std::vector<ninfer::TokenId> expected = base_data.token_ids;
     expected.insert(expected.end(), appended.begin(), appended.end());
-    failures += check(data.token_ids == expected && !data.starts_in_reasoning &&
-                          data.identity.rewrite_checkpoint &&
-                          data.identity.rewrite_checkpoint->frontier ==
-                              base_data.identity.rewrite_checkpoint->frontier &&
-                          data.position_axis(0).back() ==
-                              static_cast<std::int32_t>(expected.size() - 1U) &&
-                          data.tool_call_output == base_data.tool_call_output,
-                      "reasoning continuation did not append the reply and close to the chat "
-                      "prompt, or did not continue in content");
+    failures +=
+        check(data.token_ids == expected && !data.starts_in_reasoning &&
+                  data.identity.rewrite_checkpoint &&
+                  data.identity.rewrite_checkpoint->frontier ==
+                      base_data.identity.rewrite_checkpoint->frontier &&
+                  data.position_axis(0).back() == static_cast<std::int32_t>(expected.size() - 1U) &&
+                  data.tool_call_output == base_data.tool_call_output,
+              "reasoning continuation did not append the reply and close to the chat "
+              "prompt, or did not continue in content");
     failures += check(throws_invalid_argument([&] {
                           (void)frontend.prepare_continuation(text_input(false), appended);
                       }),
                       "reasoning continuation accepted a prompt that does not start in thinking");
+
+    // A continuation must not register the chat prompt's capture points: as a conversation it has
+    // no sampling hidden at those mid-prompt frontiers, and a later request matching one exactly
+    // plans a zero-suffix reuse that dies on the missing tail hidden (engine-wide failure).
+    {
+        ninfer::PromptInput marked        = text_input(std::nullopt);
+        constexpr std::string_view stable = "stable cache section.";
+        ninfer::ChatMessage system;
+        system.role = ninfer::ChatRole::System;
+        system.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::string(stable), .media = {}});
+        system.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                   .text  = "\ndynamic working directory",
+                                                   .media = {}});
+        marked.messages.insert(marked.messages.begin(), std::move(system));
+        marked.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+            .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
+        });
+        const auto marked_base = frontend.prepare(marked);
+        failures +=
+            check(!FrontendFactory::inspect(marked_base).context_cache.opportunities.empty(),
+                  "the marker fixture produced no capture opportunity");
+        const auto continued_marked = frontend.prepare_continuation(std::move(marked), appended);
+        failures +=
+            check(FrontendFactory::inspect(continued_marked).context_cache.opportunities.empty(),
+                  "a continuation still registers the chat prompt's capture points");
+    }
     return failures;
 }
 
