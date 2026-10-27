@@ -552,9 +552,16 @@ int test_strict_structure_and_active_tool_set() {
                        "missing structural tags were accepted");
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
-    failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
-                       "non-whitespace suffix was accepted");
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(suffix, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "call before trailing prose was dropped instead of salvaged");
+        failures += check(parsed.trailing_content == "extra answer",
+                          "trailing prose was not returned as content");
+        failures += check(parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                          "salvaged trailing content still counted as fallback");
+    }
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
@@ -569,14 +576,50 @@ int test_strict_structure_and_active_tool_set() {
                        "duplicate parameter was silently overwritten");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
-    failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
-                       "undeclared tool name was accepted");
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(unknown_tool, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "other" &&
+                              parsed.diagnostics.salvaged_call_count == 1,
+                          "undeclared tool name was not kept as a salvaged call");
+    }
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
-    failures += check_rejected(invalid_name, kLegacyContract,
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(invalid_name, 64, kLegacyContract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "bad.name",
+                          "punctuated function name was dropped instead of kept");
+    }
+
+    const std::string spacey_name = "<tool_call>\n<function=bad name>\n</function>\n</tool_call>";
+    failures += check_rejected(spacey_name, contract,
                                ninfer::ToolCallParseFallbackReason::InvalidToolName,
-                               "invalid function-name character was accepted");
+                               "multi-token function name was accepted");
+    return failures;
+}
+
+int test_catalog_spelling_salvage() {
+    // The Code Mode catalog spelling models emit for sandbox-only tools: punctuation that the
+    // OpenAI name charset rejects, but which must still surface as a call (visible tool-not-found
+    // on the client) rather than silently ending the turn as end_turn text.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string text =
+        tool_call("tools[\"context-mode\"].ctx_batch_execute", {{"commands", "[{\"label\":\"x\"}]"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "catalog-spelled call was dropped as text");
+    if (parsed.tool_calls.size() != 1) { return failures; }
+    failures += check(parsed.tool_calls.front().name ==
+                          "tools[\"context-mode\"].ctx_batch_execute",
+                      "catalog-spelled name was altered");
+    failures += check(parsed.diagnostics.salvaged_call_count == 1,
+                      "catalog-spelled call was not counted as salvaged");
+    failures += check(parsed.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::None,
+                      "salvaged catalog call still reported a fallback reason");
     return failures;
 }
 
@@ -750,6 +793,7 @@ int main() {
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
+    failures += test_catalog_spelling_salvage();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();

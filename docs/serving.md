@@ -734,8 +734,10 @@ client-executed functions; this does not add a remote MCP executor.
 NInfer renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
+a later request. Only functions in the current effective tool set run client-side; a structurally
+complete call for an undeclared or oddly-punctuated function name is still returned as a structured
+call (counted in `salvaged_call_count`) so the client reports a visible unknown-tool error instead
+of the markup silently ending the turn as text. `allowed_tools` with mode `auto` filters that set
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
@@ -1362,10 +1364,12 @@ thinking control is not model-origin and raw output does not hide it. `thinking_
 24 the count was recorded only under a thinking budget and was 0 otherwise.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
-call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+call count, calls salvaged structurally despite an undeclared or oddly-punctuated function name,
+trailing prose kept beside salvaged calls, empty non-string arguments omitted during normalization,
+schema-mismatched arguments preserved for consumer validation, and a stable text-fallback reason.
+Fallback reasons are `none`, `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`,
+`undeclared_tool`, and `trailing_content`; salvaged calls and call-plus-trailing-prose output
+report `none`. These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

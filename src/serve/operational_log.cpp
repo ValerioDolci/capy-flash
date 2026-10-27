@@ -317,8 +317,20 @@ OperationalRecord render_prefill_miss(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    if (!outcome.tool_call_parse.marker_seen ||
+    if (!outcome.tool_call_parse.marker_seen) {
+        return std::nullopt;
+    }
+    if (outcome.tool_call_parse.salvaged_call_count > 0 &&
         reason == ninfer::ToolCallParseFallbackReason::None) {
+        // Kept as a structured call despite an undeclared/oddly-named function: not a text
+        // fallback, but operators still want the "the model asked for a tool I don't have" clue.
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) + " salvaged undeclared tool call | " +
+                       std::to_string(outcome.tool_call_parse.salvaged_call_count) + " call(s)",
+        };
+    }
+    if (reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
     }
     return OperationalRecord{

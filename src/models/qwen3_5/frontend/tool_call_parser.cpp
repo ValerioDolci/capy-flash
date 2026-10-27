@@ -32,6 +32,9 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+    // Name parsed structurally but not (or oddly) matching a declared tool: kept as a call so
+    // the client surfaces it, counted in diagnostics.salvaged_call_count.
+    bool salvaged = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -61,10 +64,6 @@ constexpr bool is_format_whitespace(char byte) {
 
 constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
 
-constexpr bool is_ascii_alphanumeric(char byte) {
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
-}
-
 std::string_view trim_format_whitespace(std::string_view text) {
     std::size_t begin = 0;
     while (begin < text.size() && is_format_whitespace(text[begin])) { ++begin; }
@@ -87,10 +86,13 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
+// A tool name must be one token: non-empty, within the length limit, no whitespace. Punctuation
+// beyond [A-Za-z0-9_-] (e.g. the Code Mode catalog spelling tools["server"].tool) is accepted and
+// counted as salvaged instead of dropping the whole marker region back into content.
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
-    return std::all_of(name.begin(), name.end(), [](char byte) {
-        return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
+    return std::none_of(name.begin(), name.end(), [](char byte) {
+        return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r';
     });
 }
 
@@ -413,6 +415,9 @@ public:
                          const Contract& contract)
         : text_(text), max_name_length_(max_name_length), contract_(contract) {}
 
+    // Where parsing stopped; meaningful when parse() returned TrailingContent.
+    mutable std::size_t stop_pos = 0;
+
     FallbackReason parse(std::vector<RawToolCall>& calls) const {
         std::size_t pos = 0;
         for (;;) {
@@ -421,6 +426,7 @@ public:
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
             if (!starts_with_at(text_, pos, kToolOpen)) {
+                stop_pos = pos;
                 return calls.empty() ? FallbackReason::MalformedStructure
                                      : FallbackReason::TrailingContent;
             }
@@ -461,7 +467,10 @@ private:
         }
         if (contract_.enforce_declared_names &&
             find_tool_contract(contract_, call.name) == nullptr) {
-            return FallbackReason::UndeclaredTool;
+            // Undeclared (or oddly-punctuated) name: keep the call structurally. The client has
+            // no such tool to run, so it answers with a visible tool-not-found error the model
+            // can react to - strictly better than the markup silently becoming end_turn text.
+            call.salvaged = true;
         }
         pos = name_end + 1;
 
@@ -610,13 +619,22 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
     const FallbackReason failure = parser.parse(raw_calls);
     if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
-        return fallback(text, out.diagnostics);
+        // Complete calls followed by prose: keep the calls, hand the prose back as content.
+        const bool salvage_trailing =
+            failure == FallbackReason::TrailingContent && !raw_calls.empty();
+        if (!salvage_trailing) {
+            out.diagnostics.fallback_reason = failure;
+            return fallback(text, out.diagnostics);
+        }
+        out.trailing_content = rtrim_format_whitespace(tool_region.substr(parser.stop_pos));
+        out.diagnostics.trailing_content_bytes =
+            static_cast<std::uint32_t>(out.trailing_content.size());
     }
 
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+        if (raw.salvaged) { ++out.diagnostics.salvaged_call_count; }
     }
 
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
@@ -684,7 +702,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(parsed.trailing_content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }

@@ -558,8 +558,11 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// normalization but do not validate the call; only a structure failure (or a function name that
+// is empty, oversized, or split by whitespace) can return a complete marker region to ordinary
+// content. An undeclared or oddly-punctuated name is kept as a structured call
+// (salvaged_call_count) so the client sees a visible unknown-tool error it can feed back to the
+// model, instead of the markup silently landing in content and ending the turn.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -591,8 +594,10 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 struct ToolCallParseDiagnostics {
     bool marker_seen                            = false;
     std::uint32_t structured_call_count         = 0;
+    std::uint32_t salvaged_call_count           = 0;
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
+    std::uint32_t trailing_content_bytes        = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
