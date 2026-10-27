@@ -13,14 +13,28 @@ bool contains(std::span<const TokenId> haystack, std::span<const TokenId> needle
 
 } // namespace
 
-std::string_view tool_call_retry_steering_text() noexcept {
-    // Ends on a colon: the appended tokens are teacher-forced as the model's own text, and a
-    // sentence-final period reads as the end of the turn (measured: one immediate stop token and
-    // an empty continuation). The colon primes the re-emission.
-    return "\n\nThat call never reached the client: a parameter value contained one of these call "
-           "tags, and this format pairs the tags by depth with no way to escape one. I will send "
-           "the call again, building any tag-shaped text inside a parameter value by concatenation "
-           "so no literal tag appears. New attempt:";
+std::string tool_call_retry_steering(std::string_view function_name) {
+    std::string text =
+        "\n\nThe call above never reached the client: a parameter value contained a literal tag, "
+        "tags pair by depth, and this format has no way to escape one. I will re-send the call; "
+        "if a value must hold tag-shaped text I will split it across calls so no literal tag "
+        "appears in any value.";
+    if (!function_name.empty()) {
+        text += "\n\n<tool_call>\n<function=";
+        text.append(function_name);
+        text += ">\n";
+    }
+    return text;
+}
+
+std::string first_dead_function_name(std::string_view reply) noexcept {
+    static constexpr std::string_view kOpen = "<function=";
+    const std::size_t open                  = reply.find(kOpen);
+    if (open == std::string_view::npos) { return {}; }
+    const std::size_t begin = open + kOpen.size();
+    const std::size_t end   = reply.find('>', begin);
+    if (end == std::string_view::npos || end == begin) { return {}; }
+    return std::string(reply.substr(begin, end - begin));
 }
 
 ToolCallRetryPlan plan_tool_call_retry(const ToolCallRetryInput& input,

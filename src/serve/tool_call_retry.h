@@ -7,8 +7,9 @@
 // region is returned as ordinary content with end_turn: the agent loop dies silently and the client
 // has nothing to react to (measured: 44 such dead rounds in the production request log, 43 of them
 // text-only with thinking open, i.e. continuable). When that happens the service appends the reply
-// so far, the canonical thinking close, and one line of steering text to the prompt, and lets the
-// model re-send the call once, from that point, with a different seed. Nothing changes for a reply
+// so far, the canonical thinking close when the reply left thinking open, and steering that ends
+// with the open tags of a fresh call to the same tool, and lets the
+// model continue the call once, from that point, with a different seed. Nothing changes for a reply
 // that does not end this way: the first generation runs exactly as without the option.
 
 #include "ninfer/types.h"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -59,9 +61,14 @@ struct ToolCallRetryPlan {
                                                      const ReasoningGuardTokens& tokens,
                                                      std::span<const TokenId> steering);
 
-// Steering line appended after the dead reply, in the model's own voice: keeping the model in role
-// works better than an instruction addressed to it. Names the tags in words; a literal tag here
-// would be the very construct that breaks the wire format.
-[[nodiscard]] std::string_view tool_call_retry_steering_text() noexcept;
+// Steering appended after the dead reply, in the model's own voice. Prose alone measured an
+// immediate stop token (the assistant turn already looked finished); when the dead reply spelled
+// out a call, the steering ends by teacher-forcing the opening tags of a fresh call to the first
+// named tool, so the continuation goes through the parameters. Tag names in prose are words; the
+// wire tag appears only in the primed prefix.
+[[nodiscard]] std::string tool_call_retry_steering(std::string_view function_name);
+
+// The first function name spelled out in a dead reply, empty when none is complete.
+[[nodiscard]] std::string first_dead_function_name(std::string_view reply) noexcept;
 
 } // namespace ninfer::serve

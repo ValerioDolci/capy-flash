@@ -672,7 +672,7 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
     if (!options_.tool_call_retry || !tool_call_region_is_dead(outcome.tool_call_parse)) { return; }
     ReasoningRetryContext& retry = *prepared.reasoning_retry;
     const std::vector<ninfer::TokenId> steering =
-        engine_->tokenize_text(tool_call_retry_steering_text());
+        engine_->tokenize_text(tool_call_retry_steering(first_dead_function_name(outcome.text)));
     const ToolCallRetryPlan plan = plan_tool_call_retry(
         ToolCallRetryInput{.parse         = outcome.tool_call_parse,
                            .finish_reason = outcome.finish_reason,

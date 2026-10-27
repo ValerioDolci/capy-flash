@@ -46,6 +46,10 @@ ToolCallRetryInput stopped(const std::vector<TokenId>& generated,
 
 const std::vector<TokenId> kSteering = {501, 502, 503};
 
+bool steering_bare_prefix_free(const std::string& text) {
+    return text.find("<tool_call>") == std::string::npos;
+}
+
 } // namespace
 
 int main() {
@@ -119,6 +123,22 @@ int main() {
         const auto plan               = plan_tool_call_retry(input, tokens, kSteering);
         failures += check(plan.retry && plan.remaining_output_tokens == 1U,
                           "budget accounting wrong for the tightest retry");
+    }
+
+    // The steering text names the failed tool in a primed open prefix when the dead reply spelled
+    // one out, and stays prose-only when it did not.
+    {
+        const std::string reply = "working...\n<function=write_note>\nvalue\n<function=other>\n";
+        const auto name         = ninfer::serve::first_dead_function_name(reply);
+        failures += check(name == "write_note", "first dead function name wrong");
+        const auto steering = ninfer::serve::tool_call_retry_steering(name);
+        failures += check(steering.ends_with("<tool_call>\n<function=write_note>\n"),
+                          "steering does not end with the primed open call prefix");
+        const auto bare = ninfer::serve::tool_call_retry_steering(
+            ninfer::serve::first_dead_function_name("no call here"));
+        failures += check(ninfer::serve::first_dead_function_name("no call here").empty() &&
+                              steering_bare_prefix_free(bare),
+                          "nameless steering still primes a call");
     }
 
     if (failures == 0) { std::cout << "tool_call_retry tests passed\n"; }
