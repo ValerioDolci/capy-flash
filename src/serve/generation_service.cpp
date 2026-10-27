@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/prompt_overlap.h"
+#include "serve/turn_anchors.h"
 
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
@@ -253,27 +254,6 @@ public:
 private:
     const StreamSink* sink_ = nullptr;
 };
-
-// Turn anchors (--turn-anchors N). A same-session follow-up consumes the previous turn's
-// continuation and its own turn-closure capture replaces the previous closure, so once turn N+1 is
-// running no checkpoint is left at the end of turn N: a cancelled or edited turn re-prefilled the
-// whole conversation (issue #3). A private long-anchor opportunity at the message boundary before
-// the final message (and, with N > 1, before the messages preceding it) makes the follow-up's
-// prefill capture that branch point; the Engine keeps and replaces it like an explicit anchor,
-// within --max-long-anchors-per-continuation. Protocol markers stay first: Engine order follows
-// the marker order.
-void add_turn_anchor_markers(ninfer::PromptInput& input, std::uint32_t turn_anchors) {
-    if (turn_anchors == 0 || input.messages.size() < 2) { return; }
-    const std::size_t last_boundary = input.messages.size() - 1U;
-    for (std::size_t count = 0; count < turn_anchors && last_boundary > count; ++count) {
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-            .after_message_count = static_cast<std::uint32_t>(last_boundary - count),
-            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
-            .evidence            = ninfer::SharedCandidateEvidence::None,
-            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
-        });
-    }
-}
 
 } // namespace
 

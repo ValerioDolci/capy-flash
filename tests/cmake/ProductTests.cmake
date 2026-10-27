@@ -48,6 +48,10 @@ ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_turn_anchors_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_turn_anchors.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_serve_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES ninfer_serve)
