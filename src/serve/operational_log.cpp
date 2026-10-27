@@ -317,9 +317,7 @@ OperationalRecord render_prefill_miss(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    if (!outcome.tool_call_parse.marker_seen) {
-        return std::nullopt;
-    }
+    if (!outcome.tool_call_parse.marker_seen) { return std::nullopt; }
     if (outcome.tool_call_parse.salvaged_call_count > 0 &&
         reason == ninfer::ToolCallParseFallbackReason::None) {
         // Kept as a structured call despite an undeclared/oddly-named function: not a text
@@ -330,9 +328,7 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
                        std::to_string(outcome.tool_call_parse.salvaged_call_count) + " call(s)",
         };
     }
-    if (reason == ninfer::ToolCallParseFallbackReason::None) {
-        return std::nullopt;
-    }
+    if (reason == ninfer::ToolCallParseFallbackReason::None) { return std::nullopt; }
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +

@@ -724,11 +724,11 @@ int main() {
         Json::parse(format_request_done_json("serve-test", 3004, context, salvaged_outcome));
     const std::optional<OperationalRecord> salvage_record =
         render_tool_call_fallback(context, salvaged_outcome);
-    failures += check(
-        salvaged_done.at("result").at("tool_call_parse").at("salvaged_call_count") == 1 &&
-            salvage_record && salvage_record->severity == OperationalSeverity::Info &&
-            salvage_record->message == "req#7 salvaged undeclared tool call | 1 call(s)",
-        "salvaged tool-call diagnostics are absent or misrouted");
+    failures +=
+        check(salvaged_done.at("result").at("tool_call_parse").at("salvaged_call_count") == 1 &&
+                  salvage_record && salvage_record->severity == OperationalSeverity::Info &&
+                  salvage_record->message == "req#7 salvaged undeclared tool call | 1 call(s)",
+              "salvaged tool-call diagnostics are absent or misrouted");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

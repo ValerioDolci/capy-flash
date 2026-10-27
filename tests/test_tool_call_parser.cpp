@@ -558,9 +558,9 @@ int test_strict_structure_and_active_tool_set() {
                           "call before trailing prose was dropped instead of salvaged");
         failures += check(parsed.trailing_content == "extra answer",
                           "trailing prose was not returned as content");
-        failures += check(parsed.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::None,
-                          "salvaged trailing content still counted as fallback");
+        failures +=
+            check(parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                  "salvaged trailing content still counted as fallback");
     }
 
     const std::string missing_parameter_close =
@@ -593,9 +593,9 @@ int test_strict_structure_and_active_tool_set() {
     }
 
     const std::string spacey_name = "<tool_call>\n<function=bad name>\n</function>\n</tool_call>";
-    failures += check_rejected(spacey_name, contract,
-                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
-                               "multi-token function name was accepted");
+    failures +=
+        check_rejected(spacey_name, contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                       "multi-token function name was accepted");
     return failures;
 }
 
@@ -603,23 +603,22 @@ int test_catalog_spelling_salvage() {
     // The Code Mode catalog spelling models emit for sandbox-only tools: punctuation that the
     // OpenAI name charset rejects, but which must still surface as a call (visible tool-not-found
     // on the client) rather than silently ending the turn as end_turn text.
-    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
-    const std::string text =
-        tool_call("tools[\"context-mode\"].ctx_batch_execute", {{"commands", "[{\"label\":\"x\"}]"}});
-    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+    const auto contract    = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string text = tool_call("tools[\"context-mode\"].ctx_batch_execute",
+                                       {{"commands", "[{\"label\":\"x\"}]"}});
+    const auto parsed      = fi::parse_qwen_tool_call_output(text, 64, contract);
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
                       "catalog-spelled call was dropped as text");
     if (parsed.tool_calls.size() != 1) { return failures; }
-    failures += check(parsed.tool_calls.front().name ==
-                          "tools[\"context-mode\"].ctx_batch_execute",
+    failures += check(parsed.tool_calls.front().name == "tools[\"context-mode\"].ctx_batch_execute",
                       "catalog-spelled name was altered");
     failures += check(parsed.diagnostics.salvaged_call_count == 1,
                       "catalog-spelled call was not counted as salvaged");
-    failures += check(parsed.diagnostics.fallback_reason ==
-                          ninfer::ToolCallParseFallbackReason::None,
-                      "salvaged catalog call still reported a fallback reason");
+    failures +=
+        check(parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+              "salvaged catalog call still reported a fallback reason");
     return failures;
 }
 
