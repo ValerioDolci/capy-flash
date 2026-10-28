@@ -692,8 +692,11 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
     // A fresh draw: the model already made one attempt at this call with this prompt.
     options.execution.sampling.seed = prepared.sampling.seed + 1U;
     options.execution.thinking.budget.reset();
-    std::unique_ptr<ContinuationOutputSink> continuation_sink;
-    if (sink != nullptr) { continuation_sink = std::make_unique<ContinuationOutputSink>(*sink); }
+    // Unlike the reasoning-close retry, this one must not publish into a live stream: the dead
+    // reply's bytes are already on the wire, and continuation deltas (content or reasoning) would
+    // run the streamed prefix past what the terminal message can replay (response-layer
+    // require_prefix). The continuation always runs aggregate; the terminal difference reaches a
+    // streaming client through the response layer's suffix replay instead.
     ninfer::GenerationResult second;
     try {
         const auto deadline = Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
@@ -702,11 +705,8 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
             engine_->prepare_continuation(std::move(retry.input), plan.appended, control);
         ninfer::GenerationHandle generation =
             engine_->submit(std::move(prompt), std::move(options),
-                            retry.consumer_mode == GenerationConsumerMode::Streaming
-                                ? ninfer::OutputConsumerMode::Streaming
-                                : ninfer::OutputConsumerMode::Aggregate,
-                            retry.observation, deadline);
-        second = generation.wait(continuation_sink.get(), cancellation);
+                            ninfer::OutputConsumerMode::Aggregate, retry.observation, deadline);
+        second = generation.wait(nullptr, cancellation);
     } catch (const std::exception& exception) {
         // The first reply stands as it was.
         stats.error = exception.what();
@@ -726,8 +726,18 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
     stats.continuation_completion = static_cast<std::uint32_t>(second.generated_token_ids.size());
     stats.continuation_path       = second.prefix_reuse_path;
 
-    outcome.text = std::move(second.content);
-    outcome.reasoning += second.reasoning;
+    if (sink != nullptr) {
+        // The streaming client already received the dead reply as text: keep it as the terminal
+        // text prefix so the streamed content stays a prefix of the terminal message, and append
+        // the continuation's content after it (the response layer replays that difference). The
+        // continuation's reasoning is dropped: it was never streamed, and terminal reasoning may
+        // not appear after streamed text.
+        outcome.text += second.content;
+    } else {
+        // Aggregate clients never saw the dead reply: it stands aside completely.
+        outcome.text = std::move(second.content);
+        outcome.reasoning += second.reasoning;
+    }
     outcome.tool_calls          = std::move(second.tool_calls);
     outcome.tool_call_parse     = second.tool_call_parse;
     outcome.finish_reason       = second.finish_reason;
