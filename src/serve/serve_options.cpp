@@ -687,7 +687,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
             if (options.speculative.backend == SpeculativeBackend::None) {
-                // --spec off also drops a profile's draft window and proposal head (like --no-vision)
+                // --spec off also drops a profile's draft window and proposal head (like
+                // --no-vision)
                 options.speculative.draft_tokens  = 0;
                 options.speculative.proposal_head = ProposalHead::Full;
             }
