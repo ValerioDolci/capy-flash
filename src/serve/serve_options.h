@@ -68,10 +68,11 @@ struct ServeOptions {
     // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
     // once (serve/reasoning_retry.h).
     bool reasoning_close_retry = true;
-    // --tool-call-retry (on by default; --no-tool-call-retry): a reply whose tool-call markup
-    // parsed to zero structured calls (parameter value containing a literal call tag, ...) is
-    // continued once with a steering line so the model re-sends the call (serve/tool_call_retry.h).
-    bool tool_call_retry = true;
+    // --tool-call-retry (off by default; --tool-call-retry turns it on): a reply whose tool-call
+    // markup parsed to zero structured calls (parameter value containing a literal call tag, ...)
+    // is continued once with a steering line so the model re-sends the call
+    // (serve/tool_call_retry.h).
+    bool tool_call_retry = false;
     // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the
     // first token of a reply that starts in thinking is never a terminal token; a terminal draw is
     // redrawn without the terminal ids (models/qwen3_5/execution/reasoning_eos_guard.h).

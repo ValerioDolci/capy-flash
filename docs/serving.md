@@ -179,9 +179,9 @@ On Qwen3.8-Flash-Next:
 - Empty-reply guards (v0.7, every model, on by default): a terminal token drawn right after `<think>` is redrawn
   (`--reasoning-eos-guard`), and a reply that ends inside its reasoning is closed and continued once
   (`--reasoning-close-retry`); `--no-reasoning-eos-guard` and `--no-reasoning-close-retry` turn them off.
-- Dead tool-call guard (on by default): a reply whose tool markup parsed to zero structured calls is
-  continued once with a steering line so the model re-sends the call (`--tool-call-retry`,
-  `--no-tool-call-retry`); see `serve/tool_call_retry.h`.
+- Dead tool-call guard (off by default): a reply whose tool markup parsed to zero structured calls is
+  continued once with a steering line so the model re-sends the call (`--tool-call-retry`);
+  see `serve/tool_call_retry.h`.
 - Output is not bit-reproducible run to run: which experts sit in VRAM (GPU path) or not (CPU path) depends on
   timing, and long streamed prefills differ in the last bits. For exact A/B comparisons freeze the residency
   ([diagnostics](capy-flash/diagnostics.md)).
@@ -1084,7 +1084,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--reasoning-eos-guard`, `--no-reasoning-eos-guard` | the first token of a reply that starts in thinking is never a terminal token: a terminal draw is redrawn without the terminal ids; token-identical when it does not fire. A model whose stop configuration the guard cannot handle serves without it (log line `reasoning EOS guard off for this model`) | on |
 | `--reasoning-close-retry`, `--no-reasoning-close-retry` | a reply that ends with a terminal token inside its thinking (or right after `</think>` with blank content and no tool call) gets `"\n</think>\n\n"` appended and is continued once; text requests with prefix reuse only. Turn both guards off to compare outputs with another engine or to measure raw model behaviour | on |
-| `--tool-call-retry`, `--no-tool-call-retry` | a reply whose tool-call markup parsed to zero structured calls (a parameter value containing a literal call tag breaks the depth pairing and the format has no escaping) is retried once: the dead reply is dropped from the continuation context, the thinking close plus a steering line naming the tool is appended, and the model answers again with a different seed. The retry is adopted only if it produces a structured call; otherwise the first reply stands unchanged. Text requests that start in thinking only; counted in `request_done` as `tool_call_retry` | on |
+| `--tool-call-retry`, `--no-tool-call-retry` | a reply whose tool-call markup parsed to zero structured calls (a parameter value containing a literal call tag breaks the depth pairing and the format has no escaping) is retried once: the dead reply is dropped from the continuation context, the thinking close plus a steering line naming the tool is appended, and the model answers again with a different seed. The retry is adopted only if it produces a structured call; otherwise the first reply stands unchanged. Text requests that start in thinking only; counted in `request_done` as `tool_call_retry` | off |
 | `--chat-template FILE` | Jinja chat template used instead of the one embedded in the artifact; the capy-flash launchers pass `qwen3_8.jinja` ([Chat template](#chat-template)) | artifact's template |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
