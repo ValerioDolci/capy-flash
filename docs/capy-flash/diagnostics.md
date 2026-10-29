@@ -114,6 +114,7 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+| `NINFER_ATTN_PV_F16ACC` | `1` / unset (off) | INT8-KV prefill attention (the tiled kernel, more than 256 columns): P x V of each 64-key tile accumulates in FP16 (GeForce Blackwell runs the FP32-accumulating FP16 MMA at half rate) and is added to the FP32 accumulator. Runs on the ping-pong kernel (`tiled_pp_mma.cuh`), which gives the same bits as the tiled kernel with FP16 PV. A tile overflows once its sum of p x v exceeds 65504 (`ninfer_softmax_attention_test`: equal scores and V of about 1,080 and more). | opt-in | numerics | ninfer |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
