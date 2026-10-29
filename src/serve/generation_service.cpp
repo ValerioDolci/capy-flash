@@ -713,6 +713,15 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
         return;
     }
 
+    // Recorded for both outcomes: an unadopted continuation's shape (silent, prose, or dead
+    // again) is the failure evidence, and without it every miss logs as zero completion tokens.
+    stats.continuation_prompt     = second.prompt.prompt_tokens;
+    stats.continuation_reused     = second.reused_prompt_tokens;
+    stats.continuation_completion = static_cast<std::uint32_t>(second.generated_token_ids.size());
+    stats.continuation_path       = second.prefix_reuse_path;
+    stats.continuation_finish     = second.finish_reason;
+    stats.continuation_parse      = second.tool_call_parse;
+
     // Only a structured call from the continuation is worth adopting: a half-call decoded as
     // plain content (no marker in the model's stream) would hand the client the same dead round
     // with new tokens billed. Anything else leaves the first reply standing.
@@ -720,11 +729,6 @@ void GenerationService::apply_tool_call_retry(PreparedRequest& prepared,
         stats.error = "continuation produced no structured tool call either";
         return;
     }
-
-    stats.continuation_prompt     = second.prompt.prompt_tokens;
-    stats.continuation_reused     = second.reused_prompt_tokens;
-    stats.continuation_completion = static_cast<std::uint32_t>(second.generated_token_ids.size());
-    stats.continuation_path       = second.prefix_reuse_path;
 
     if (sink != nullptr) {
         // The streaming client already received the dead reply as text: keep it as the terminal

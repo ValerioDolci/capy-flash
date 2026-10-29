@@ -660,7 +660,9 @@ static Json tool_call_retry_json(const ToolCallRetryStats& stats) {
                {"continuation_prompt_tokens", stats.continuation_prompt},
                {"continuation_reused_tokens", stats.continuation_reused},
                {"continuation_completion_tokens", stats.continuation_completion},
-               {"continuation_reuse_path", prefix_reuse_path_name(stats.continuation_path)}};
+               {"continuation_reuse_path", prefix_reuse_path_name(stats.continuation_path)},
+               {"continuation_finish_reason", finish_reason_name(stats.continuation_finish)},
+               {"continuation_parse", tool_call_parse_json(stats.continuation_parse)}};
     if (!stats.error.empty()) { value["error"] = stats.error; }
     return value;
 }
