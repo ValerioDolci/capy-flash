@@ -32,8 +32,8 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
-    // Name parsed structurally but not (or oddly) matching a declared tool: kept as a call so
-    // the client surfaces it, counted in diagnostics.salvaged_call_count.
+    // Name kept as a call despite being undeclared, or repaired from a punctuated spelling to a
+    // declared tool: counted in diagnostics.salvaged_call_count.
     bool salvaged = false;
 };
 
@@ -86,13 +86,18 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
-// A tool name must be one token: non-empty, within the length limit, no whitespace. Punctuation
-// beyond [A-Za-z0-9_-] (e.g. the Code Mode catalog spelling tools["server"].tool) is accepted and
-// counted as salvaged instead of dropping the whole marker region back into content.
+constexpr bool is_ascii_alphanumeric(char byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
+}
+
+// A tool name may carry only the characters the request parsers accept in tool-call history
+// (`require_tool_name` / `require_function_name`, [A-Za-z0-9_-]): salvaging anything else back to
+// the client would 400 the next request when the history comes back. Names with other punctuation
+// become calls only when unwrapping resolves one to a declared tool (parse_function below).
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
-    return std::none_of(name.begin(), name.end(), [](char byte) {
-        return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r';
+    return std::all_of(name.begin(), name.end(), [](char byte) {
+        return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
     });
 }
 
@@ -468,6 +473,14 @@ private:
         return true;
     }
 
+    // Declared in the request but removed for this turn by tool_choice.allowed_tools.
+    bool is_filtered_out(std::string_view name) const {
+        for (const std::string& filtered : contract_.filtered_out_names) {
+            if (filtered == name) { return true; }
+        }
+        return false;
+    }
+
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
         if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
@@ -486,23 +499,26 @@ private:
         }
         call.name = text_.substr(name_begin, name_end - name_begin);
         if (!valid_function_name(call.name, max_name_length_)) {
-            return FallbackReason::InvalidToolName;
-        }
-        if (contract_.enforce_declared_names &&
-            find_tool_contract(contract_, call.name) == nullptr) {
             // A harness catalog reference (tools["server"]["tool"]) can name a tool the client does
-            // expose under its short name. Only rename when the unwrapped name is declared; the
-            // gateway does not invent a runnable target for a name it has never been told about.
+            // expose under its short name. Only rename when the unwrapped name is a declared,
+            // allowed tool; a punctuated name the client cannot echo back must not become a call.
             const std::string_view bare =
                 unwrap_namespaced_function_name(call.name, max_name_length_);
-            if (!bare.empty() && find_tool_contract(contract_, bare) != nullptr) {
-                call.name = bare;
-            } else {
-                // Undeclared (or oddly-punctuated) name: keep the call structurally. The client has
-                // no such tool to run, so it answers with a visible tool-not-found error the model
-                // can react to - strictly better than the markup silently becoming end_turn text.
-                call.salvaged = true;
+            if (bare.empty() || !valid_function_name(bare, max_name_length_) ||
+                is_filtered_out(bare) || find_tool_contract(contract_, bare) == nullptr) {
+                return FallbackReason::InvalidToolName;
             }
+            call.name     = bare;
+            call.salvaged = true;
+        } else if (is_filtered_out(call.name)) {
+            // Declared but excluded for this turn (tool_choice.allowed_tools): falling back to text
+            // keeps the filter a restriction, as docs/serving.md promises.
+            return FallbackReason::UndeclaredTool;
+        } else if (find_tool_contract(contract_, call.name) == nullptr) {
+            // Undeclared but request-legal name: keep the call structurally. The client has no such
+            // tool to run, so it answers with a visible tool-not-found error the model can react to
+            // - strictly better than the markup silently becoming end_turn text.
+            call.salvaged = true;
         }
         pos = name_end + 1;
 
@@ -624,10 +640,12 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> filtered_out_names, bool enabled) {
     if (!enabled) { return {}; }
     auto contract                    = std::make_shared<ToolCallOutputContract>();
     contract->enforce_declared_names = true;
+    contract->filtered_out_names.assign(filtered_out_names.begin(), filtered_out_names.end());
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);

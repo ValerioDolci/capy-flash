@@ -37,7 +37,7 @@ std::string tool_definition(const std::string& tool_name, Json properties,
 std::shared_ptr<const fi::ToolCallOutputContract>
 contract_from_definitions(const std::vector<std::string>& definitions) {
     return fi::build_tool_call_output_contract(
-        std::span<const std::string>(definitions.data(), definitions.size()), true);
+        std::span<const std::string>(definitions.data(), definitions.size()), {}, true);
 }
 
 std::shared_ptr<const fi::ToolCallOutputContract> output_contract_for(const std::string& tool_name,
@@ -584,13 +584,12 @@ int test_strict_structure_and_active_tool_set() {
                           "undeclared tool name was not kept as a salvaged call");
     }
 
+    // Punctuated names are rejected even under the legacy contract: the request parsers accept
+    // only [A-Za-z0-9_-] in tool-call history, so handing one back 400s the next request.
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
-    {
-        const auto parsed = fi::parse_qwen_tool_call_output(invalid_name, 64, kLegacyContract);
-        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                              parsed.tool_calls.front().name == "bad.name",
-                          "punctuated function name was dropped instead of kept");
-    }
+    failures += check_rejected(invalid_name, kLegacyContract,
+                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "punctuated function name was accepted under the legacy contract");
 
     const std::string spacey_name = "<tool_call>\n<function=bad name>\n</function>\n</tool_call>";
     failures +=
@@ -599,33 +598,29 @@ int test_strict_structure_and_active_tool_set() {
     return failures;
 }
 
-int test_catalog_spelling_salvage() {
-    // The Code Mode catalog spelling models emit for sandbox-only tools: punctuation that the
-    // OpenAI name charset rejects, but which must still surface as a call (visible tool-not-found
-    // on the client) rather than silently ending the turn as end_turn text.
-    const auto contract    = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
-    const std::string text = tool_call("tools[\"context-mode\"].ctx_batch_execute",
-                                       {{"commands", "[{\"label\":\"x\"}]"}});
-    const auto parsed      = fi::parse_qwen_tool_call_output(text, 64, contract);
+int test_unresolved_punctuated_names_stay_text() {
+    // The Code Mode catalog spelling models emit for sandbox-only tools carries punctuation the
+    // request parsers reject in tool-call history ([A-Za-z0-9_-]{1,128}). Kept as a structured
+    // call it kills the conversation one turn later with a 400, so an unresolved spelling must
+    // stay ordinary text like any other malformed call.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
 
     int failures = 0;
-    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
-                      "catalog-spelled call was dropped as text");
-    if (parsed.tool_calls.size() != 1) { return failures; }
-    failures += check(parsed.tool_calls.front().name == "tools[\"context-mode\"].ctx_batch_execute",
-                      "catalog-spelled name was altered");
-    failures += check(parsed.diagnostics.salvaged_call_count == 1,
-                      "catalog-spelled call was not counted as salvaged");
-    failures +=
-        check(parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
-              "salvaged catalog call still reported a fallback reason");
+    failures += check_rejected(tool_call("tools[\"context-mode\"].ctx_batch_execute",
+                                         {{"commands", "[{\"label\":\"x\"}]"}}),
+                               contract, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "unresolved catalog spelling was kept as a call");
+    const auto other_only = contract_for("other", Json{{"value", Json{{"type", "string"}}}});
+    failures += check_rejected(tool_call("tools[\"srv\"][\"configure\"]", {{"value", "x"}}),
+                               other_only, ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "namespaced reference to an undeclared tool was kept as a call");
     return failures;
 }
 
 int test_namespaced_reference_resolves_to_declared_name() {
     // The shape a real client hits: the model writes the harness catalog reference while the
     // tool is declared under its short name. Unwrapping only applies when the short name is
-    // declared.
+    // itself declared, valid, and not filtered out for this turn.
     const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
 
     int failures = 0;
@@ -636,19 +631,26 @@ int test_namespaced_reference_resolves_to_declared_name() {
             fi::parse_qwen_tool_call_output(tool_call(spelling, {{"value", "x"}}), 64, contract);
         failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
                               parsed.tool_calls.front().name == "configure" &&
-                              parsed.diagnostics.salvaged_call_count == 0,
+                              parsed.diagnostics.salvaged_call_count == 1,
                           std::string("namespaced reference was not resolved: ") + spelling);
     }
+    return failures;
+}
 
-    // Unwrapping must not invent a target: the short name is undeclared here, so the original
-    // catalog spelling stays on the call and is counted as salvaged.
-    const auto other_only = contract_for("other", Json{{"value", Json{{"type", "string"}}}});
-    const auto unresolved = fi::parse_qwen_tool_call_output(
-        tool_call("tools[\"srv\"][\"configure\"]", {{"value", "x"}}), 64, other_only);
-    failures += check(unresolved.is_tool_call_response && unresolved.tool_calls.size() == 1 &&
-                          unresolved.tool_calls.front().name == "tools[\"srv\"][\"configure\"]" &&
-                          unresolved.diagnostics.salvaged_call_count == 1,
-                      "undeclared namespaced reference was rewritten to a non-existent tool");
+int test_allowed_tools_filter_stays_a_restriction() {
+    // tool_choice.allowed_tools removes the non-selected tools from the effective tool set. The
+    // output contract still learns their names: a call naming one keeps falling back to text,
+    // otherwise salvage would turn the filter into a suggestion the client happily executes.
+    auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    contract.filtered_out_names.push_back("hidden");
+
+    int failures = 0;
+    failures += check_rejected(tool_call("hidden", {{"value", "x"}}), contract,
+                               ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                               "call to a tool filtered out for this turn became structured");
+    failures += check_rejected(tool_call("srv.hidden", {{"value", "x"}}), contract,
+                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               "namespaced reference to a filtered-out tool was accepted");
     return failures;
 }
 
@@ -822,8 +824,9 @@ int main() {
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
-    failures += test_catalog_spelling_salvage();
+    failures += test_unresolved_punctuated_names_stay_text();
     failures += test_namespaced_reference_resolves_to_declared_name();
+    failures += test_allowed_tools_filter_stays_a_restriction();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();

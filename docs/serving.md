@@ -735,9 +735,13 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set run client-side; a structurally
-complete call for an undeclared or oddly-punctuated function name is still returned as a structured
-call (counted in `salvaged_call_count`) so the client reports a visible unknown-tool error instead
-of the markup silently ending the turn as text. `allowed_tools` with mode `auto` filters that set
+complete call for an undeclared function name within the `[A-Za-z0-9_-]` charset is still returned
+as a structured call (counted in `salvaged_call_count`) so the client reports a visible
+unknown-tool error instead of the markup silently ending the turn as text. A punctuated spelling
+(`tools["server"].tool`) is repaired only when unwrapping resolves it to a declared tool (also
+counted); an unresolved one, and any call to a name `allowed_tools` filtered out for this turn,
+stays text because the client could not carry it back in the next request's history.
+`allowed_tools` with mode `auto` filters that set
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 

@@ -559,11 +559,12 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure failure (or a function name that
-// is empty, oversized, or split by whitespace) can return a complete marker region to ordinary
-// content. An undeclared or oddly-punctuated name is kept as a structured call
-// (salvaged_call_count) so the client sees a visible unknown-tool error it can feed back to the
-// model, instead of the markup silently landing in content and ending the turn.
+// normalization but do not validate the call; a structure failure, a function name outside the
+// charset the request parsers accept ([A-Za-z0-9_-], unless unwrapping resolves it to a declared
+// tool), or a declared name filtered out for this turn returns a complete marker region to
+// ordinary content. An undeclared name that the request charset accepts is kept as a structured
+// call (salvaged_call_count) so the client sees a visible unknown-tool error it can feed back to
+// the model; a punctuated name the client could not echo back next turn is not.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -678,6 +679,9 @@ struct PromptOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Names declared in the request but removed for this turn by tool_choice.allowed_tools. The
+    // output contract needs them so calls naming them keep falling back to text.
+    std::vector<std::string> filtered_out_tool_names;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
