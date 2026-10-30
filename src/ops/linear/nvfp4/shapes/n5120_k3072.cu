@@ -51,7 +51,7 @@ Nvfp4A4Route select_a4(std::int32_t tokens) {
 }
 
 bool uses_a4(std::int32_t, std::int32_t max_tokens) {
-    return max_tokens >= kNvfp4OutputFamilyFirstA4Tokens;
+    return max_tokens >= nvfp4_first_a4_tokens(true);
 }
 } // namespace
 

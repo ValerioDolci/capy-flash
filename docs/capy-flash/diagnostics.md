@@ -114,6 +114,7 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+| `NINFER_NVFP4_OUT_FIRST_A4`, `NINFER_NVFP4_DOWN_FIRST_A4` | tokens (17, 8) | First token count at which the attention-output / MLP-down projections and their two-device halves take the A4 route (activations quantized to NVFP4), in `linear()` and `linear_add` alike, so both ranks of a row-parallel pair stay on one route. `NINFER_NVFP4_DOWN_FIRST_A4=7` puts a 7-column DFlash2 verify window on A4. | opt-in | numerics | ninfer |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 

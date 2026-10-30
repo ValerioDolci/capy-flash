@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -49,6 +50,24 @@ using Nvfp4N28672K5120 = Nvfp4Geometry<28672, 5120>;
 // linear() in one row-parallel pair always take the same route.
 inline constexpr std::int32_t kNvfp4OutputFamilyFirstA4Tokens = 17;
 inline constexpr std::int32_t kNvfp4DownFamilyFirstA4Tokens   = 8;
+
+// NINFER_NVFP4_OUT_FIRST_A4 / NINFER_NVFP4_DOWN_FIRST_A4 (opt-in) override the crossovers above
+// (default: the constants). Measured on the two-device halves at the 7-token DFlash2 verify width
+// (cold cache, RTX 5070 Ti / 5080): down [5120,8704] A16 36.9 / 30.7 us, A4 34.8 / 28.7 us; output
+// [5120,3072] A16 = A4. Service, down from 7: 24 greedy prompts (2k/8k), acceptance 0.572 -> 0.574,
+// ms per round 13.27 -> 13.08, decode 326.2 -> 332.6 tok/s (+2.0 %). A4 quantizes the activations,
+// as every width >= 8 and prefill do.
+inline std::int32_t nvfp4_first_a4_tokens(bool output_family) {
+    static const std::int32_t out = [] {
+        const char* e = std::getenv("NINFER_NVFP4_OUT_FIRST_A4");
+        return e != nullptr ? std::atoi(e) : kNvfp4OutputFamilyFirstA4Tokens;
+    }();
+    static const std::int32_t down = [] {
+        const char* e = std::getenv("NINFER_NVFP4_DOWN_FIRST_A4");
+        return e != nullptr ? std::atoi(e) : kNvfp4DownFamilyFirstA4Tokens;
+    }();
+    return output_family ? out : down;
+}
 
 using Nvfp4Activation3072Geometry  = Nvfp4ActivationGeometry<3072>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
