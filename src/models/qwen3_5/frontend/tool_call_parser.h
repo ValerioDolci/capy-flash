@@ -49,26 +49,34 @@ struct ToolCallOutputContract {
     };
 
     std::vector<Tool> tools;
+    // Declared in the request but removed for this turn by tool_choice.allowed_tools: calls naming
+    // them keep falling back to text so the filter stays a restriction.
+    std::vector<std::string> filtered_out_names;
     bool enforce_declared_names = false;
 };
 
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
+    // Prose after complete calls, returned as content when calls are salvaged through.
+    std::string trailing_content;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics diagnostics;
 };
 
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> filtered_out_names, bool enabled);
 
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time, valid calls are retained structurally; undeclared names (and
+// punctuated spellings that resolve to a declared tool) are salvaged (counted in diagnostics);
+// anything else - malformed output, unresolvable punctuated names, filtered-out names - is
+// restored verbatim as content.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {

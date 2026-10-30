@@ -656,6 +656,13 @@ PublishedOutput OutputSession::commit_preview() {
                 if (delta.channel == OutputChannel::Content) { content = &delta; }
             }
             if (content != nullptr) {
+                // Trailing prose after salvaged calls joins streamed content that may end
+                // mid-sentence; a separator keeps the two runs apart. Verbatim restores
+                // (structured_call_count == 0) must not gain one.
+                const bool salvaged_run = terminal.diagnostics.structured_call_count != 0;
+                if (salvaged_run && !content->text.empty() && content->text.back() != '\n') {
+                    content->text += '\n';
+                }
                 content->text += terminal.content;
             } else {
                 output.push_back(OutputDelta{.channel = OutputChannel::Content,

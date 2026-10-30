@@ -32,6 +32,9 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+    // Name kept as a call despite being undeclared, or repaired from a punctuated spelling to a
+    // declared tool: counted in diagnostics.salvaged_call_count.
+    bool salvaged = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -61,10 +64,6 @@ constexpr bool is_format_whitespace(char byte) {
 
 constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
 
-constexpr bool is_ascii_alphanumeric(char byte) {
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
-}
-
 std::string_view trim_format_whitespace(std::string_view text) {
     std::size_t begin = 0;
     while (begin < text.size() && is_format_whitespace(text[begin])) { ++begin; }
@@ -87,11 +86,42 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
+constexpr bool is_ascii_alphanumeric(char byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
+}
+
+// A tool name may carry only the characters the request parsers accept in tool-call history
+// (`require_tool_name` / `require_function_name`, [A-Za-z0-9_-]): salvaging anything else back to
+// the client would 400 the next request when the history comes back. Names with other punctuation
+// become calls only when unwrapping resolves one to a declared tool (parse_function below).
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
     return std::all_of(name.begin(), name.end(), [](char byte) {
         return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
     });
+}
+
+// Strips a namespace wrapper off a function name: tools["server"]["tool"], ns.tool and server/tool
+// all yield tool, the last segment made of name characters. Names that are already plain, or whose
+// last segment is empty, return an empty view so callers keep the original name untouched.
+std::string_view unwrap_namespaced_function_name(std::string_view name,
+                                                 std::size_t max_name_length) {
+    if (name.find_first_of(".[/") == std::string_view::npos) { return {}; }
+    // Skips the closing punctuation of the catalog spelling (tools["server"]["tool"]) so the last
+    // name-character run is the tool itself.
+    auto is_name_byte = [](char byte) {
+        return is_ascii_digit(byte) || (byte >= 'a' && byte <= 'z') ||
+               (byte >= 'A' && byte <= 'Z') || byte == '_' || byte == '-';
+    };
+    std::size_t run_end = name.size();
+    while (run_end > 0 && !is_name_byte(name[run_end - 1])) { --run_end; }
+    std::size_t begin = run_end;
+    while (begin > 0 && is_name_byte(name[begin - 1])) { --begin; }
+    // begin/run_end bracket the last name run: nothing at the end, or no separator in front of it,
+    // means there is no namespace to strip.
+    if (run_end == 0 || begin == 0 || begin == run_end) { return {}; }
+    const std::string_view bare = name.substr(begin, run_end - begin);
+    return bare.size() <= max_name_length ? bare : std::string_view{};
 }
 
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
@@ -413,6 +443,9 @@ public:
                          const Contract& contract)
         : text_(text), max_name_length_(max_name_length), contract_(contract) {}
 
+    // Where parsing stopped; meaningful when parse() returned TrailingContent.
+    mutable std::size_t stop_pos = 0;
+
     FallbackReason parse(std::vector<RawToolCall>& calls) const {
         std::size_t pos = 0;
         for (;;) {
@@ -421,6 +454,7 @@ public:
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
             if (!starts_with_at(text_, pos, kToolOpen)) {
+                stop_pos = pos;
                 return calls.empty() ? FallbackReason::MalformedStructure
                                      : FallbackReason::TrailingContent;
             }
@@ -437,6 +471,14 @@ private:
         if (!starts_with_at(text_, pos, token)) { return false; }
         pos += token.size();
         return true;
+    }
+
+    // Declared in the request but removed for this turn by tool_choice.allowed_tools.
+    bool is_filtered_out(std::string_view name) const {
+        for (const std::string& filtered : contract_.filtered_out_names) {
+            if (filtered == name) { return true; }
+        }
+        return false;
     }
 
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
@@ -457,11 +499,26 @@ private:
         }
         call.name = text_.substr(name_begin, name_end - name_begin);
         if (!valid_function_name(call.name, max_name_length_)) {
-            return FallbackReason::InvalidToolName;
-        }
-        if (contract_.enforce_declared_names &&
-            find_tool_contract(contract_, call.name) == nullptr) {
+            // A harness catalog reference (tools["server"]["tool"]) can name a tool the client does
+            // expose under its short name. Only rename when the unwrapped name is a declared,
+            // allowed tool; a punctuated name the client cannot echo back must not become a call.
+            const std::string_view bare =
+                unwrap_namespaced_function_name(call.name, max_name_length_);
+            if (bare.empty() || !valid_function_name(bare, max_name_length_) ||
+                is_filtered_out(bare) || find_tool_contract(contract_, bare) == nullptr) {
+                return FallbackReason::InvalidToolName;
+            }
+            call.name     = bare;
+            call.salvaged = true;
+        } else if (is_filtered_out(call.name)) {
+            // Declared but excluded for this turn (tool_choice.allowed_tools): falling back to text
+            // keeps the filter a restriction, as docs/serving.md promises.
             return FallbackReason::UndeclaredTool;
+        } else if (find_tool_contract(contract_, call.name) == nullptr) {
+            // Undeclared but request-legal name: keep the call structurally. The client has no such
+            // tool to run, so it answers with a visible tool-not-found error the model can react to
+            // - strictly better than the markup silently becoming end_turn text.
+            call.salvaged = true;
         }
         pos = name_end + 1;
 
@@ -583,10 +640,12 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
 } // namespace
 
 std::shared_ptr<const ToolCallOutputContract>
-build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
+build_tool_call_output_contract(std::span<const std::string> tool_jsons,
+                                std::span<const std::string> filtered_out_names, bool enabled) {
     if (!enabled) { return {}; }
     auto contract                    = std::make_shared<ToolCallOutputContract>();
     contract->enforce_declared_names = true;
+    contract->filtered_out_names.assign(filtered_out_names.begin(), filtered_out_names.end());
     contract->tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
@@ -610,13 +669,22 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     const QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
     const FallbackReason failure = parser.parse(raw_calls);
     if (failure != FallbackReason::None) {
-        out.diagnostics.fallback_reason = failure;
-        return fallback(text, out.diagnostics);
+        // Complete calls followed by prose: keep the calls, hand the prose back as content.
+        const bool salvage_trailing =
+            failure == FallbackReason::TrailingContent && !raw_calls.empty();
+        if (!salvage_trailing) {
+            out.diagnostics.fallback_reason = failure;
+            return fallback(text, out.diagnostics);
+        }
+        out.trailing_content = rtrim_format_whitespace(tool_region.substr(parser.stop_pos));
+        out.diagnostics.trailing_content_bytes =
+            static_cast<std::uint32_t>(out.trailing_content.size());
     }
 
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+        if (raw.salvaged) { ++out.diagnostics.salvaged_call_count; }
     }
 
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
@@ -684,7 +752,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(parsed.trailing_content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }
