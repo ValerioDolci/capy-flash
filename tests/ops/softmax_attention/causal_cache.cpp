@@ -1706,7 +1706,8 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
 
 int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
                 MappingPattern mapping, std::span<const int> oracle_queries = {},
-                std::span<const std::uint32_t> graph_limits = {}) {
+                std::span<const std::uint32_t> graph_limits = {},
+                std::vector<std::uint16_t>* output          = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1806,6 +1807,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    if (output) *output = output_bits;
     int failures = graph_failures +
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
@@ -1836,7 +1838,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
 }
 
 int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping, std::span<const int> oracle_queries = {}) {
+                MappingPattern mapping, std::span<const int> oracle_queries = {},
+                std::vector<std::uint16_t>* output = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1888,6 +1891,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention_cached", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    if (output) *output = output_bits;
     int failures = verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
@@ -2651,6 +2655,53 @@ int run_tensor_parallel_geometry_cases(KvCacheStorage storage) {
     return failures;
 }
 
+// Under the original kernel's partition (two resident CTAs per SM) the pipelined decode/verify
+// kernel (NINFER_ATTN_DEC_PIPE) must reproduce the original kernel bit for bit; each side also
+// passes the oracle.
+int run_int8_dec_pipe_parity_cases() {
+    constexpr auto storage = KvCacheStorage::Int8Group64;
+    int failures           = 0;
+    const auto parity = [&](const std::string& label, std::array<int, 2> a, std::array<int, 2> b,
+                            const auto& run) {
+        std::vector<std::uint16_t> out_a;
+        std::vector<std::uint16_t> out_b;
+        ops::int8_kv_dec_pipe_routes_for_test(a[0], a[1]);
+        failures += run(&out_a);
+        ops::int8_kv_dec_pipe_routes_for_test(b[0], b[1]);
+        failures += run(&out_b);
+        ops::int8_kv_dec_pipe_routes_for_test(-1, -1);
+        if (out_a.empty() || out_a != out_b) {
+            std::cerr << label << ": outputs differ\n";
+            ++failures;
+        } else {
+            std::cout << label << ": same bits\n";
+        }
+    };
+    for (const Geometry& geometry : {kGeometries[0], kTensorParallelGeometry}) {
+        const std::string name = geometry.name;
+        for (const int width : {6, 7, 8}) {
+            const std::string w = " W=" + std::to_string(width) + " " + name;
+            const auto seed     = static_cast<std::uint32_t>(1910 + width);
+            parity("INT8 decode pipe (original partition) vs grouped append" + w, {1, 2}, {0, -1},
+                   [&](std::vector<std::uint16_t>* out) {
+                       return run_a1_case(
+                           geometry, storage,
+                           {width, 2048, static_cast<unsigned>(2048 + width), seed, false, true},
+                           MappingPattern::Fragmented, {}, {}, out);
+                   });
+            parity("INT8 decode pipe (original partition) vs grouped cached" + w, {1, 2}, {0, -1},
+                   [&](std::vector<std::uint16_t>* out) {
+                       return run_a3_case(
+                           geometry, storage,
+                           {width, 8192, static_cast<unsigned>(8192 + width), seed + 10u},
+                           MappingPattern::Fragmented, {}, out);
+                   });
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " INT8 decode pipe parity\n";
+    return failures;
+}
+
 int run_storage_cases(KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2682,6 +2733,7 @@ int run_storage_cases(KvCacheStorage storage) {
     failures += run_numerical_profile_cases(storage);
     failures += run_small_prefill_cases(storage);
     failures += run_tensor_parallel_geometry_cases(storage);
+    if (storage == KvCacheStorage::Int8Group64) failures += run_int8_dec_pipe_parity_cases();
     return failures;
 }
 

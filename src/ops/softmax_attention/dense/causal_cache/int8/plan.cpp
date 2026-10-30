@@ -2,6 +2,7 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -47,6 +48,22 @@ GroupedShape grouped_shape(int heads, int tokens) {
 }
 } // namespace
 
+namespace {
+// int8_kv_dec_pipe_routes_for_test; -1 = default.
+int test_dec_pipe               = -1;
+int test_dec_pipe_resident_ctas = -1;
+} // namespace
+
+bool int8_kv_dec_pipe_enabled(int heads, int width) {
+    static const bool env = [] {
+        const char* e = std::getenv("NINFER_ATTN_DEC_PIPE");
+        return e != nullptr && e[0] == '1';
+    }();
+    const bool enabled = test_dec_pipe >= 0 ? test_dec_pipe != 0 : env;
+    return enabled && (heads == 12 || heads == 24) && width <= Int8KvCausalPlan::kTokenTile &&
+           (width * 6 + 15) / 16 == 3;
+}
+
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope, int sms) {
     if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
@@ -61,8 +78,11 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
     const int tiles =
         family == Int8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
-    const auto shape =
-        grouped_shape(heads, family == Int8KvFamily::Grouped ? width : grouped_limit);
+    auto shape = grouped_shape(heads, family == Int8KvFamily::Grouped ? width : grouped_limit);
+    if (family == Int8KvFamily::Grouped && int8_kv_dec_pipe_enabled(heads, width)) {
+        // One 15-warp CTA per SM (a test may assume the original kernel's partition instead).
+        shape.resident_ctas = test_dec_pipe_resident_ctas > 0 ? test_dec_pipe_resident_ctas : 1;
+    }
     // Split rule: a row takes as many splits as it has key tiles, up to one wave of the launching
     // device (the schedule's resident CTAs per SM times its SMs, shared with the other rows, KV
     // heads and query tiles). Past one wave the partition is balanced: the fewest splits that
@@ -95,3 +115,12 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+void int8_kv_dec_pipe_routes_for_test(int dec_pipe, int resident_ctas) noexcept {
+    detail::test_dec_pipe               = dec_pipe;
+    detail::test_dec_pipe_resident_ctas = resident_ctas;
+}
+
+} // namespace ninfer::ops

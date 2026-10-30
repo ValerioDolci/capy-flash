@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "ops/launcher/kernel_attr_once.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/grouped_pipe_mma.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
 #include "ops/softmax_attention/common/causal_merge.cuh"
 #include <stdexcept>
@@ -25,6 +27,25 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         throw std::invalid_argument("INT8 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
+    if constexpr (!ParallelQueries && G::GroupSize == 6 &&
+                  (S::kTokenTile * G::GroupSize + 15) / 16 == int8_kv_dec_pipe::kRowTiles) {
+        if (int8_kv_dec_pipe_enabled(G::QHeads, S::kTokenTile)) {
+            constexpr auto pipe_kernel =
+                int8_kv_grouped_pipe_mma_kernel<G, S, MultiBatch, Masked, Input>;
+            constexpr int pipe_bytes = int8_kv_dec_pipe::kSharedBytes;
+            static FuncAttrPerDevice pipe_attribute;
+            pipe_attribute.ensure(pipe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  pipe_bytes);
+            const dim3 pipe_grid(G::KVHeads, p.batch, partition.capacity);
+            pipe_kernel<<<pipe_grid, int8_kv_dec_pipe::kThreads, pipe_bytes, stream>>>(
+                p.q, input, p.positions, cache.keys, cache.values, cache.key_scales,
+                cache.value_scales, cache.tables, cache.valid_columns, cache.table_rows,
+                cache.table_stride, p.width, p.visible_capacity, partition, p.scale, partial.acc,
+                partial.maximum, partial.sum);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     constexpr auto kernel =
         int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries>;
     constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;

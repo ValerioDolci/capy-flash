@@ -164,4 +164,10 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens);
 
+// Test only: overrides the INT8-KV pipelined decode/verify route for exactness tests; -1 keeps the
+// default. dec_pipe stands for NINFER_ATTN_DEC_PIPE; resident_ctas is the resident CTAs per SM the
+// plan assumes for the pipelined kernel (default 1; 2 is the original kernel's partition). Not
+// thread-safe; applies to plans made afterwards.
+void int8_kv_dec_pipe_routes_for_test(int dec_pipe, int resident_ctas) noexcept;
+
 } // namespace ninfer::ops
