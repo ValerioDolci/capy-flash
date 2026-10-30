@@ -57,19 +57,26 @@ struct ServeOptions {
     bool enable_vision = false;
     std::optional<int> vision_device;               // CUDA device of the Vision tower
     std::optional<std::uint32_t> max_vision_tokens; // merged-token ceiling of one media item
-    bool use_cuda_graph     = true;
-    bool tp_mailbox         = true;
-    bool embedding_host     = false; // token embedding table in mapped pinned host memory
+    bool use_cuda_graph = true;
+    bool tp_mailbox     = true;
+    bool embedding_host = false; // token embedding table in mapped pinned host memory
     // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
     std::uint64_t host_pinned_max_bytes = 0;
-    bool allow_prefix_reuse = true;
-    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry): a reply that ends with the model's
-    // terminal token inside its thinking (or right after "</think>" with blank content and no tool
-    // call) is closed with "\n</think>\n\n" and continued once (serve/reasoning_retry.h).
+    bool allow_prefix_reuse             = true;
+    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry):
+    // a reply that ends with the model's terminal token inside its thinking (or right after
+    // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
+    // once (serve/reasoning_retry.h).
     bool reasoning_close_retry = true;
-    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the first token of a reply that starts in
-    // thinking is never a terminal token; a terminal draw is redrawn without the terminal ids
-    // (models/qwen3_5/execution/reasoning_eos_guard.h). Token-identical when it does not fire.
+    // --tool-call-retry (off by default; --tool-call-retry turns it on): a reply whose tool-call
+    // markup parsed to zero structured calls (parameter value containing a literal call tag, ...)
+    // is continued once with a steering line so the model re-sends the call
+    // (serve/tool_call_retry.h).
+    bool tool_call_retry = false;
+    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the
+    // first token of a reply that starts in thinking is never a terminal token; a terminal draw is
+    // redrawn without the terminal ids (models/qwen3_5/execution/reasoning_eos_guard.h).
+    // Token-identical when it does not fire.
     bool reasoning_eos_guard = true;
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
@@ -82,9 +89,9 @@ struct ServeOptions {
     // measurable, so they keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
     // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
-    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|calibrate|off) and
-    // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
-    // RoutedExpertOptions::stream_min_tokens; 0 = never).
+    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split
+    // auto|calibrate|off) and the prompt-chunk width from which the missing experts stream over
+    // PCIe (--stream-min-tokens, RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
     std::optional<MissSplitMode> miss_split;
     bool miss_split_calibrate = false; // --miss-split calibrate (MissSplitOptions::calibrate)

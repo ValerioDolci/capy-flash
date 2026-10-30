@@ -15,6 +15,7 @@ add_library(ninfer_serve STATIC
   translate.cpp
   generation_service.cpp
   reasoning_retry.cpp
+  tool_call_retry.cpp
   turn_anchors.cpp
   prompt_overlap.cpp
   prefill_miss_dump.cpp

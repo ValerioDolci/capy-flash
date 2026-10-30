@@ -89,6 +89,8 @@ const char* finish_reason_name(ninfer::FinishReason reason) {
 Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
+                {"salvaged_call_count", diagnostics.salvaged_call_count},
+                {"trailing_content_bytes", diagnostics.trailing_content_bytes},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"fallback_reason",
@@ -651,6 +653,20 @@ static Json reasoning_retry_json(const ReasoningRetryStats& stats) {
     return value;
 }
 
+static Json tool_call_retry_json(const ToolCallRetryStats& stats) {
+    if (stats.reply_tokens == 0U && stats.error.empty()) { return Json(nullptr); }
+    Json value{{"reply_tokens", stats.reply_tokens},
+               {"injected_tokens", stats.injected_tokens},
+               {"continuation_prompt_tokens", stats.continuation_prompt},
+               {"continuation_reused_tokens", stats.continuation_reused},
+               {"continuation_completion_tokens", stats.continuation_completion},
+               {"continuation_reuse_path", prefix_reuse_path_name(stats.continuation_path)},
+               {"continuation_finish_reason", finish_reason_name(stats.continuation_finish)},
+               {"continuation_parse", tool_call_parse_json(stats.continuation_parse)}};
+    if (!stats.error.empty()) { value["error"] = stats.error; }
+    return value;
+}
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -675,6 +691,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)},
              {"prompt_ngram_overlap", optional_json(outcome.metrics.prompt_ngram_overlap)},
              {"reasoning_close_retry", reasoning_retry_json(outcome.reasoning_retry)},
+             {"tool_call_retry", tool_call_retry_json(outcome.tool_call_retry)},
              {"reasoning_eos_guard_total", optional_json(outcome.reasoning_eos_guard_total)}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},

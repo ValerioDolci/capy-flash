@@ -312,7 +312,8 @@ struct RoutedExpertOptions {
     // CPU threads of the missing experts with ggml block banks (they replace cpu_threads there):
     // their decode-once kernels are compute-bound at 6 threads and reach the RAM bandwidth at 12
     // (one per physical core of the 9900X; T219: replay decode 196.7 -> 204.9 tok/s at 6 -> 12).
-    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the 9900X).
+    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the
+    // 9900X).
     std::uint32_t gguf_cpu_threads = 0;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
@@ -558,8 +559,11 @@ struct GeneratedToolCall {
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
-// normalization but do not validate the call; only a structure/identity failure can return a
-// complete marker region to ordinary content.
+// normalization but do not validate the call; only a structure failure (or a function name that
+// is empty, oversized, or split by whitespace) can return a complete marker region to ordinary
+// content. An undeclared or oddly-punctuated name is kept as a structured call
+// (salvaged_call_count) so the client sees a visible unknown-tool error it can feed back to the
+// model, instead of the markup silently landing in content and ending the turn.
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
@@ -591,8 +595,10 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
 struct ToolCallParseDiagnostics {
     bool marker_seen                            = false;
     std::uint32_t structured_call_count         = 0;
+    std::uint32_t salvaged_call_count           = 0;
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
+    std::uint32_t trailing_content_bytes        = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
@@ -1327,9 +1333,9 @@ struct LoadSummary {
     std::uint64_t host_mapped_bytes = 0;
     // v0.7 pinned fallback (EngineOptions::host_pinned_max_bytes): the host-mapped weights kept in
     // pageable memory instead (with alignment) and how many parents; 0 when all are page-locked.
-    std::uint64_t host_pageable_bytes  = 0;
-    std::size_t host_pageable_objects  = 0;
-    std::size_t host_mapped_objects    = 0;
+    std::uint64_t host_pageable_bytes     = 0;
+    std::size_t host_pageable_objects     = 0;
+    std::size_t host_mapped_objects       = 0;
     std::uint64_t host_pinned_limit_bytes = 0;
     bool host_pinned_alloc_failed         = false;
     std::vector<LoadDeviceSummary> devices; // One entry per tensor-parallel rank.

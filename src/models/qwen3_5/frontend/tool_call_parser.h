@@ -55,6 +55,8 @@ struct ToolCallOutputContract {
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
+    // Prose after complete calls, returned as content when calls are salvaged through.
+    std::string trailing_content;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics diagnostics;
 };
@@ -67,8 +69,8 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             const ToolCallOutputContract& contract);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time, valid calls are retained structurally; undeclared or oddly-named
+// calls are salvaged (counted in diagnostics); truly malformed output is restored verbatim.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {

@@ -317,10 +317,30 @@ OperationalRecord render_prefill_miss(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    if (!outcome.tool_call_parse.marker_seen ||
-        reason == ninfer::ToolCallParseFallbackReason::None) {
-        return std::nullopt;
+    // A fired retry owns the record: a recovered call leaves a clean final parse, so the fallback
+    // line below would not render at all.
+    if (outcome.tool_call_retry.reply_tokens > 0U) {
+        const bool recovered = outcome.tool_call_retry.error.empty();
+        return OperationalRecord{
+            .severity = recovered ? OperationalSeverity::Info : OperationalSeverity::Warning,
+            .message =
+                "req#" + std::to_string(context.id) + " tool-call retry | " +
+                (recovered ? "re-sent, " + std::to_string(outcome.tool_calls.size()) + " call(s)"
+                           : outcome.tool_call_retry.error),
+        };
     }
+    if (!outcome.tool_call_parse.marker_seen) { return std::nullopt; }
+    if (outcome.tool_call_parse.salvaged_call_count > 0 &&
+        reason == ninfer::ToolCallParseFallbackReason::None) {
+        // Kept as a structured call despite an undeclared/oddly-named function: not a text
+        // fallback, but operators still want the "the model asked for a tool I don't have" clue.
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) + " salvaged undeclared tool call | " +
+                       std::to_string(outcome.tool_call_parse.salvaged_call_count) + " call(s)",
+        };
+    }
+    if (reason == ninfer::ToolCallParseFallbackReason::None) { return std::nullopt; }
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
