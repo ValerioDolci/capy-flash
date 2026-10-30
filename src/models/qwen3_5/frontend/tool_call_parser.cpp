@@ -32,6 +32,10 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+    // Structural damage was repaired without guessing bytes: an unambiguous close was missing at
+    // end-of-response, or a stray close tag was dropped where a parameter should open. Counted
+    // separately so a salvaged call is distinguishable from a clean one in every consumer.
+    bool structural = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -445,7 +449,14 @@ private:
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
-        return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
+        if (consume(pos, kToolClose)) { return FallbackReason::None; }
+        // The response ended right after the function: no closer can be matched, but nothing is
+        // guessed either - the remaining bytes are all already consumed by the call.
+        if (pos == text_.size()) {
+            call.structural = true;
+            return FallbackReason::None;
+        }
+        return FallbackReason::MalformedStructure;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
@@ -468,6 +479,17 @@ private:
         for (;;) {
             skip_format_whitespace(text_, pos);
             if (consume(pos, kFunctionClose)) { return FallbackReason::None; }
+            if (pos == text_.size()) {
+                call.structural = true;
+                return FallbackReason::None;
+            }
+            // A stray `</parameter>` where a parameter should open: no parameter is open, so
+            // dropping the tag repairs the call without guessing any bytes.
+            if (starts_with_at(text_, pos, kParamClose)) {
+                call.structural = true;
+                pos += kParamClose.size();
+                continue;
+            }
             const FallbackReason failure = parse_parameter(pos, call);
             if (failure != FallbackReason::None) { return failure; }
         }
@@ -489,7 +511,19 @@ private:
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
         if (!find_parameter_close(value_begin, value_end)) {
-            return FallbackReason::MalformedStructure;
+            // Truncated at the end of the response: nothing after the value can end it (no
+            // parameter, function, or next-call marker follows), so the value is exactly the
+            // bytes that remain. Any other unterminated case would make the value end a guess.
+            if (text_.find(kParamClose, value_begin) != std::string_view::npos ||
+                text_.find(kFunctionClose, value_begin) != std::string_view::npos ||
+                text_.find(kToolOpen, value_begin) != std::string_view::npos) {
+                return FallbackReason::MalformedStructure;
+            }
+            call.parameters.push_back(
+                RawParameter{.name = name, .value = text_.substr(value_begin)});
+            call.structural = true;
+            pos             = text_.size();
+            return FallbackReason::None;
         }
         call.parameters.push_back(RawParameter{
             .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
@@ -617,6 +651,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+        if (raw.structural) { ++out.diagnostics.structural_salvage_count; }
     }
 
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());

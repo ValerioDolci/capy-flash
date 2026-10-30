@@ -546,10 +546,14 @@ int test_strict_structure_and_active_tool_set() {
     const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
     int failures        = 0;
 
-    const std::string malformed = "<tool_call>\n<function=configure>\n";
-    failures +=
-        check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                       "missing structural tags were accepted");
+    const std::string end_truncated = "<tool_call>\n<function=configure>\n";
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(end_truncated, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.diagnostics.structural_salvage_count == 1 &&
+                              Json::parse(parsed.tool_calls.front().arguments_json).empty(),
+                          "call ended at response end without closers was not salvaged");
+    }
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
     failures +=
@@ -634,12 +638,57 @@ int test_conflicting_duplicate_tool_contracts_use_legacy_normalization() {
     return failures;
 }
 
-int test_all_or_nothing_structural_commit() {
+int test_partial_region_salvages_truncated_call() {
     const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
     const std::string text = tool_call("configure", {{"flag", "true"}}) +
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                          "partially valid tool-call region was partially committed");
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                          parsed.diagnostics.structural_salvage_count == 1,
+                      "region with one complete and one end-truncated call was fully rejected");
+    if (parsed.tool_calls.size() == 2) {
+        const Json first  = Json::parse(parsed.tool_calls[0].arguments_json);
+        const Json second = Json::parse(parsed.tool_calls[1].arguments_json);
+        failures += check(first.at("flag") == true && second.at("flag") == false,
+                          "partial commit changed call argument bytes");
+    }
+    return failures;
+}
+
+int test_unambiguous_structural_salvage() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+
+    // Production shape: a stray closer before any parameter was opened, then a normal close.
+    const std::string stray =
+        "<tool_call>\n<function=configure>\n</parameter>\n</function>\n</tool_call>";
+    const auto stray_parsed = fi::parse_qwen_tool_call_output(stray, 64, contract);
+    failures += check(stray_parsed.is_tool_call_response && stray_parsed.tool_calls.size() == 1 &&
+                          stray_parsed.diagnostics.structural_salvage_count == 1,
+                      "stray parameter close before any parameter lost the call");
+
+    // Both function and tool closers missing at the end of the response, parameter fully closed.
+    const std::string no_closers =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nx\n</parameter>\n";
+    const auto no_closers_parsed = fi::parse_qwen_tool_call_output(no_closers, 64, contract);
+    failures += check(no_closers_parsed.tool_calls.size() == 1 &&
+                          no_closers_parsed.diagnostics.structural_salvage_count == 1,
+                      "missing closers at response end lost the call");
+    if (no_closers_parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(no_closers_parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "x", "salvaged call changed closed parameter bytes");
+    }
+
+    // Ambiguous damage stays rejected: a closer exists but belongs to another depth, so the
+    // value end would be a guess.
+    const std::string ambiguous =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nx\n</function>\n</tool_call>";
+    failures +=
+        check_rejected(ambiguous, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                       "ambiguous value end was guessed into a call");
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -675,7 +724,7 @@ int test_incremental_valid_and_boolean() {
 }
 
 int test_incremental_fallback_preserves_bytes() {
-    const std::string original = "prefix  \n<tool_call>\n<function=broken>";
+    const std::string original = "prefix  \n<tool_call>\nbroken function open>";
     fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
@@ -752,7 +801,8 @@ int main() {
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
-    failures += test_all_or_nothing_structural_commit();
+    failures += test_partial_region_salvages_truncated_call();
+    failures += test_unambiguous_structural_salvage();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
