@@ -192,17 +192,33 @@ void ElasticArena::set_mapped(std::span<const std::size_t> mapped, cudaStream_t 
     for (std::size_t r = 0; r < ranges_.size(); ++r) {
         ranges_[r].mapped = std::min(ranges_[r].mapped, mapped[r]);
     }
+    // Finish mapping before submitting any zeroing: rollback never races queued writes.
+    try {
+        for (std::size_t k = 0; k < scratch_.size(); ++k) {
+            if (scratch_[k] != 0 && handle_[k] == 0) {
+                back(k);
+                scratch_[k] = 2; // newly backed; zero only after all mappings succeed
+            }
+        }
+    } catch (...) {
+        // A shared granule can lose its old owner without being in the initial release set.
+        if (!releasing) { CUDA_CHECK(cudaDeviceSynchronize()); }
+        // The capybara keeps its old pond, not half a new one.
+        std::copy(fixed_.begin(), fixed_.end(), scratch_.begin());
+        for (const auto& r : ranges_) { mark_prefix(scratch_, r.offset, r.mapped, granule_); }
+        for (std::size_t k = 0; k < scratch_.size(); ++k) {
+            if (scratch_[k] == 0) { release(k); }
+        }
+        throw;
+    }
     bool zeroed = false;
     for (std::size_t k = 0; k < scratch_.size();) {
-        if (scratch_[k] == 0 || handle_[k] != 0) {
+        if (scratch_[k] != 2) {
             ++k;
             continue;
         }
-        std::size_t e = k;
-        while (e < scratch_.size() && scratch_[e] != 0 && handle_[e] == 0) {
-            back(e);
-            ++e;
-        }
+        std::size_t e = k + 1;
+        while (e < scratch_.size() && scratch_[e] == 2) { ++e; }
         CUDA_CHECK(cudaMemsetAsync(base_ + k * granule_, 0, (e - k) * granule_, stream));
         zeroed = true;
         k      = e;

@@ -16,8 +16,8 @@
 //
 // The owner keeps every device access inside backed bytes: it shrinks a prefix only after the
 // device work that could touch the released bytes has completed, and grows it before handing the
-// bytes out. Not thread-safe; no device synchronization of its own except the zeroing of newly
-// backed granules (completed before set_mapped returns).
+// bytes out. Not thread-safe; releasing granules drains device work; zeroing newly backed
+// granules completes on the supplied stream before set_mapped returns.
 
 #include "core/arena.h"
 
@@ -66,8 +66,8 @@ public:
     [[nodiscard]] std::int64_t physical_delta(std::span<const std::size_t> mapped) const;
     // Applies those prefixes: releases the granules no longer needed first, then backs (and
     // zeroes, on `stream`, completed before returning) the newly needed ones. Throws on an
-    // allocation failure after undoing nothing it released (the arena is then consistent with the
-    // prefixes it reports).
+    // mapping/allocation failure: growth is rolled back, completed shrinks remain, and backing
+    // matches the reported prefixes min(previous, requested). Retained granules keep their data.
     void set_mapped(std::span<const std::size_t> mapped, cudaStream_t stream);
 
 private:
