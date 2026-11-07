@@ -156,6 +156,85 @@ void test_arena() {
     CUDA_CHECK(cudaStreamDestroy(s));
 }
 
+void test_growth_failure() {
+    std::size_t g = 0;
+    {
+        ElasticArena probe(0, 1, {});
+        g = probe.granule();
+    }
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    // Five new granules in two runs, separated by a shrinking range. Fail each driver
+    // operation at every position, including after a whole run has been mapped.
+    for (int stage = 0; stage < 3; ++stage) {
+        for (int position = 1; position <= 5; ++position) {
+            const int handles = fault::handles, mappings = fault::mappings;
+            {
+                const ElasticRangeSpec ranges[] = {{0, 3 * g, g}, {3 * g, g, g}, {4 * g, 3 * g, 0}};
+                ElasticArena arena(0, 8 * g, ranges);
+                auto* base = static_cast<std::byte*>(arena.span().data);
+                CUDA_CHECK(cudaMemset(base, 0x5a, g));
+                CUDA_CHECK(cudaMemset(base + 7 * g, 0xa5, g));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                const std::size_t want[] = {3 * g, 0, 3 * g};
+                // Repeat the same failure: retries must not accumulate hidden backing.
+                for (int retry = 0; retry < 2; ++retry) {
+                    fault::stage     = stage;
+                    fault::remaining = position;
+                    bool threw       = false;
+                    try {
+                        arena.set_mapped(want, stream);
+                    } catch (const std::runtime_error&) { threw = true; }
+                    fault::stage = -1;
+                    check(threw && fault::remaining == 0, "injected driver failure reached");
+                    check(arena.range(0).mapped == g && arena.range(1).mapped == 0 &&
+                              arena.range(2).mapped == 0,
+                          "failed growth retains completed shrink");
+                    check(arena.physical_bytes() == 2 * g && fault::handles == handles + 2 &&
+                              fault::mappings == mappings + 2,
+                          "rollback releases handles and mappings");
+                    check(arena.physical_delta(want) == static_cast<std::int64_t>(5 * g),
+                          "retry budget includes every failed growth granule");
+                    check(all(read(base, g), 0x5a) && all(read(base + 7 * g, g), 0xa5),
+                          "rollback preserves elastic and fixed data");
+                }
+                arena.set_mapped(want, stream);
+                check(arena.span().data == base && arena.physical_bytes() == 7 * g &&
+                          arena.physical_delta(want) == 0,
+                      "retry publishes complete backing");
+                check(all(read(base + g, 2 * g), 0) && all(read(base + 4 * g, 3 * g), 0),
+                      "all retry growth bytes are zero");
+                check(all(read(base, g), 0x5a) && all(read(base + 7 * g, g), 0xa5),
+                      "successful retry preserves existing bytes exactly");
+                arena.set_mapped(want, stream);
+                check(arena.physical_bytes() == 7 * g, "same prefixes are idempotent");
+            }
+            check(fault::handles == handles && fault::mappings == mappings,
+                  "destruction releases all backing after recovery");
+        }
+        // One granule changes owners without being remapped. On failure neither of the
+        // reported prefixes needs it: rollback must release it too.
+        const ElasticRangeSpec shared[] = {{0, g / 2, g / 2}, {g / 2, 3 * g - g / 2, 0}};
+        ElasticArena arena(0, 3 * g, shared);
+        const std::size_t want[] = {0, 3 * g - g / 2};
+        fault::stage             = stage;
+        fault::remaining         = 2;
+        bool threw               = false;
+        try {
+            arena.set_mapped(want, stream);
+        } catch (const std::runtime_error&) { threw = true; }
+        fault::stage = -1;
+        check(threw && arena.physical_bytes() == 0 && arena.range(0).mapped == 0 &&
+                  arena.range(1).mapped == 0,
+              "rollback releases an orphaned shared granule");
+        arena.set_mapped(want, stream);
+        check(all(read(static_cast<std::byte*>(arena.span().data), 3 * g), 0),
+              "shared granule retry is fully zeroed");
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    check(fault::handles == 0 && fault::mappings == 0, "failure scenarios leak no backing");
+}
+
 void test_pool_backing() {
     // A one-plane pool of 64 pages of 64 tokens x 256 BF16, page-major.
     LayoutBuilder builder;
@@ -272,6 +351,7 @@ int main() {
         CUDA_CHECK(cudaSetDevice(0));
         test_arena();
         test_pool_backing();
+        test_growth_failure();
         if (count >= 2) { test_cross_device_copy(); }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
