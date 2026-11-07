@@ -14,6 +14,7 @@
 #include "core/elastic_arena.h"
 #include "core/paged_kv_cache.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -22,6 +23,57 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Linker wrapping injects driver failures without production hooks or exhausting the GPU.
+namespace fault {
+int stage = -1, remaining = 0;
+int handles = 0, mappings = 0;
+
+bool hit(int at) { return stage == at && --remaining == 0; }
+} // namespace fault
+
+extern "C" {
+CUresult __real_cuMemCreate(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*,
+                            unsigned long long);
+CUresult __real_cuMemMap(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
+                         unsigned long long);
+CUresult __real_cuMemSetAccess(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+CUresult __real_cuMemRelease(CUmemGenericAllocationHandle);
+CUresult __real_cuMemUnmap(CUdeviceptr, size_t);
+
+CUresult __wrap_cuMemCreate(CUmemGenericAllocationHandle* h, size_t n, const CUmemAllocationProp* p,
+                            unsigned long long flags) {
+    if (fault::hit(0)) { return CUDA_ERROR_OUT_OF_MEMORY; }
+    const auto result = __real_cuMemCreate(h, n, p, flags);
+    if (result == CUDA_SUCCESS) { ++fault::handles; }
+    return result;
+}
+
+CUresult __wrap_cuMemMap(CUdeviceptr p, size_t n, size_t offset, CUmemGenericAllocationHandle h,
+                         unsigned long long flags) {
+    if (fault::hit(1)) { return CUDA_ERROR_OUT_OF_MEMORY; }
+    const auto result = __real_cuMemMap(p, n, offset, h, flags);
+    if (result == CUDA_SUCCESS) { ++fault::mappings; }
+    return result;
+}
+
+CUresult __wrap_cuMemSetAccess(CUdeviceptr p, size_t n, const CUmemAccessDesc* desc, size_t count) {
+    if (fault::hit(2)) { return CUDA_ERROR_OUT_OF_MEMORY; }
+    return __real_cuMemSetAccess(p, n, desc, count);
+}
+
+CUresult __wrap_cuMemRelease(CUmemGenericAllocationHandle h) {
+    const auto result = __real_cuMemRelease(h);
+    if (result == CUDA_SUCCESS) { --fault::handles; }
+    return result;
+}
+
+CUresult __wrap_cuMemUnmap(CUdeviceptr p, size_t n) {
+    const auto result = __real_cuMemUnmap(p, n);
+    if (result == CUDA_SUCCESS) { --fault::mappings; }
+    return result;
+}
+}
 
 namespace {
 
