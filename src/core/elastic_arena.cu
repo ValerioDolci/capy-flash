@@ -30,6 +30,13 @@ CUmemAllocationProp device_prop(int device) {
 
 CUdeviceptr ptr_of(std::byte* p) { return reinterpret_cast<CUdeviceptr>(p); }
 
+void mark_prefix(std::vector<std::uint8_t>& out, std::size_t offset, std::size_t bytes,
+                 std::size_t granule) {
+    if (bytes == 0) { return; }
+    const std::size_t end = (offset + bytes + granule - 1) / granule;
+    for (std::size_t k = offset / granule; k < end; ++k) { out[k] = 1; }
+}
+
 } // namespace
 
 ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges)
@@ -123,10 +130,7 @@ void ElasticArena::needed(std::span<const std::size_t> mapped,
         if (mapped[r] > ranges_[r].bytes) {
             throw std::invalid_argument("ElasticArena: prefix beyond its range");
         }
-        if (mapped[r] == 0) { continue; }
-        const std::size_t first = ranges_[r].offset / granule_;
-        const std::size_t last  = (ranges_[r].offset + mapped[r] + granule_ - 1) / granule_;
-        for (std::size_t k = first; k < last; ++k) { out[k] = 1; }
+        mark_prefix(out, ranges_[r].offset, mapped[r], granule_);
     }
 }
 
