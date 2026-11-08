@@ -1,7 +1,7 @@
 # Vendored ggml-iq
 
 capy-flash vendors fngine's standalone extract of ggml's reference code for the GSQ-RCO block
-formats, unchanged:
+formats:
 
 - source: <https://github.com/satellitedown/fngine>, commit `c20a885`, directory `third_party/ggml-iq`
 - upstream: ggml (llama.cpp) commit `3cf03257f219afbe7334045ff7c6a06ac68c627d`; what was extracted and
@@ -12,3 +12,5 @@ The host kernels use the grids and block structs (`ggml-iq-tables.h`, `ggml-iq.h
 dequantizers, reference quantizers and generic dot products in `ggml-iq.c` are the oracles of
 `tests/ops/test_host_gguf.cpp`. Built as part of `ninfer_host_moe` (src/ops/sparse_moe/sources.cmake)
 without FMA contraction.
+
+Local adjustment: `kvalues_iq4nl` uses `static const` for C compatibility.
