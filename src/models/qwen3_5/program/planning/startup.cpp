@@ -1469,7 +1469,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 return std::max(plan.text_prefill, plan.mtp_prefill) + hidden_bytes +
                        (std::size_t(64) << 20);
             };
-            for (std::uint32_t chunk = experts.prompt_chunk; chunk > base; chunk /= 2) {
+            // NINFER_QWEN4_PROMPT_CHUNK sets the widest chunk tried, below or above the default: a
+            // wider chunk spreads the per-chunk expert copies and dequantization over more tokens,
+            // and lends more cache layers while the prompt runs.
+            std::uint32_t widest = experts.prompt_chunk;
+            if (const char* v = std::getenv("NINFER_QWEN4_PROMPT_CHUNK"); v != nullptr && *v != 0) {
+                widest = static_cast<std::uint32_t>(std::max(std::atoi(v), 1));
+            }
+            for (std::uint32_t chunk = widest; chunk > base; chunk /= 2) {
                 const std::uint32_t width = std::min(chunk, impl->capacity);
                 if (width <= base || width % kPrefillChunkAlignment != 0) { continue; }
                 const std::size_t need = need_for(width);
