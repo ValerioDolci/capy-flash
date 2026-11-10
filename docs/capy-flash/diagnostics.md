@@ -114,6 +114,7 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+| `NINFER_TP_XIN_KERNEL` | `1` / unset (off) | `--tp 2` on a pair without peer access: the receive leg of the T62 prefill exchange (MoE output and mixer output projection) is read from the peer's pinned buffer by a 16-block kernel on a stream of the device's greatest priority instead of a host-to-device copy, so it does not queue behind streamed expert weights on the copy engine. Pieces that are not 16-byte aligned keep the copy; a pair with peer access keeps the copy. | performance | same bits | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
