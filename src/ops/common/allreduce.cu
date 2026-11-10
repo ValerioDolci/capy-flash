@@ -617,6 +617,78 @@ __global__ void exchange_narrow_combine_kernel(float* __restrict__ partial,
     }
 }
 
+// ---- INT8 payload (allreduce.h, Payload::INT8, NINFER_TP_AR_PAYLOAD=int8) ----
+// Per column `rows` int8 codes then rows / 32 binary16 scales. Both ranks dequantize the same bytes
+// to the same floats and add the same two values, so their sums are bitwise equal. q * s is exact
+// in FP32 (8-bit code times an 11-bit significand), so contraction could not change it; __fmul_rn /
+// __fadd_rn state the intent.
+constexpr int kInt8Block = 32;
+
+__host__ __device__ constexpr std::size_t int8_column_bytes(std::int64_t rows) {
+    return static_cast<std::size_t>(rows + rows / 16);
+}
+
+// One warp per 32-row block of `columns` columns starting at src (column-major, `rows` per column).
+__global__ void exchange_int8_narrow_kernel(const float* __restrict__ src,
+                                            std::byte* __restrict__ dst, std::int64_t rows,
+                                            std::int64_t columns) {
+    const std::int64_t per_column = rows / kInt8Block;
+    const std::int64_t blocks     = per_column * columns;
+    const int lane                = static_cast<int>(threadIdx.x & 31U);
+    const std::int64_t warps      = static_cast<std::int64_t>(gridDim.x) * (blockDim.x / 32);
+    for (std::int64_t w =
+             static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+         w < blocks; w += warps) {
+        const std::int64_t column = w / per_column, block = w % per_column;
+        const float v  = src[column * rows + block * kInt8Block + lane];
+        const bool bad = __any_sync(0xFFFFFFFFU, !isfinite(v));
+        float amax     = fabsf(v);
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, o));
+        }
+        __half scale = __float2half(0.0F);
+        int q        = 0;
+        if (bad) {
+            scale =
+                __ushort_as_half(static_cast<unsigned short>(0x7E00)); // NaN: the block becomes NaN
+        } else if (amax > 0.0F) {
+            const float s   = fminf(fmaxf(__fdiv_rn(amax, 127.0F), 6.103515625e-05F), 65504.0F);
+            scale           = __float2half_ru(s);
+            const float inv = __fdiv_rn(1.0F, __half2float(scale));
+            q = static_cast<int>(fminf(fmaxf(rintf(__fmul_rn(v, inv)), -127.0F), 127.0F));
+        }
+        std::byte* col = dst + column * static_cast<std::int64_t>(int8_column_bytes(rows));
+        reinterpret_cast<std::int8_t*>(col)[block * kInt8Block + lane] =
+            static_cast<std::int8_t>(q);
+        if (lane == 0) { reinterpret_cast<__half*>(col + rows)[block] = scale; }
+    }
+}
+
+__device__ __forceinline__ float int8_value(const std::byte* base, std::int64_t rows,
+                                            std::size_t i) {
+    const auto column    = static_cast<std::int64_t>(i) / rows;
+    const auto row       = static_cast<std::int64_t>(i) % rows;
+    const std::byte* col = base + column * static_cast<std::int64_t>(int8_column_bytes(rows));
+    const float s = __half2float(reinterpret_cast<const __half*>(col + rows)[row / kInt8Block]);
+    return __fmul_rn(static_cast<float>(reinterpret_cast<const std::int8_t*>(col)[row]), s);
+}
+
+// S = fl32(value(own) + value(peer)); partial <- S; out <- RNE_bf16(S). The own operand is read
+// back from the bytes the peer received.
+__global__ void exchange_int8_combine_kernel(float* __restrict__ partial,
+                                             const std::byte* __restrict__ own,
+                                             const std::byte* __restrict__ peer,
+                                             __nv_bfloat16* __restrict__ bf16_out,
+                                             std::int64_t rows, std::size_t count) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += stride) {
+        const float sum = __fadd_rn(int8_value(own, rows, i), int8_value(peer, rows, i));
+        partial[i]      = sum;
+        if (bf16_out != nullptr) { bf16_out[i] = __float2bfloat16_rn(sum); }
+    }
+}
+
 // stats[0] = max |v| bits (non-negative floats order as unsigned ints), [1] = |v| > 65504,
 // [2] = 0 < |v| < 2^-14 (FP16 subnormal), [3] = non-finite.
 __global__ void exchange_stats_kernel(const float* __restrict__ v, std::size_t count,
@@ -707,6 +779,7 @@ bool HostExchange::begin_sum_f32(const std::array<Tensor, 2>& partial,
     p.payload = payload;
     p.rows    = partial[0].ne[0];
     p.columns = static_cast<std::int64_t>(partial[0].numel()) / std::max<std::int64_t>(p.rows, 1);
+    if (p.payload == Payload::INT8 && p.rows % kInt8Block != 0) { p.payload = Payload::FP16; }
     const std::size_t esize = payload == Payload::FP32 ? 4 : 2;
     const std::size_t bytes = static_cast<std::size_t>(partial[0].numel()) * esize;
     reserve(bytes, 0, ec);
@@ -732,11 +805,27 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
     if (count == 0) { return; }
     const ExecutionContext& ec = *p.ec;
     const CurrentDeviceGuard guard;
-    const std::size_t esize  = p.payload == Payload::FP32 ? 4 : 2;
-    const std::size_t total  = static_cast<std::size_t>(p.rows * p.columns);
-    const std::size_t begin  = static_cast<std::size_t>(p.rows * first);
-    const std::size_t n      = static_cast<std::size_t>(p.rows * count);
-    const std::size_t offset = begin * esize, bytes = n * esize;
+    const std::size_t total = static_cast<std::size_t>(p.rows * p.columns);
+    const std::size_t begin = static_cast<std::size_t>(p.rows * first);
+    const std::size_t n     = static_cast<std::size_t>(p.rows * count);
+    // Bytes per column on the links: FP32 4 * rows, FP16 / BF16 2 * rows, INT8 rows * 17 / 16.
+    std::size_t column_bytes = 0;
+    switch (p.payload) {
+    case Payload::FP32:
+        column_bytes = 4 * static_cast<std::size_t>(p.rows);
+        break;
+    case Payload::FP16:
+    case Payload::BF16:
+        column_bytes = 2 * static_cast<std::size_t>(p.rows);
+        break;
+    case Payload::INT8:
+        column_bytes = int8_column_bytes(p.rows);
+        break;
+    default:
+        require(false, "HostExchange: unknown payload");
+    }
+    const std::size_t offset  = static_cast<std::size_t>(first) * column_bytes;
+    const std::size_t bytes   = static_cast<std::size_t>(count) * column_bytes;
     const cudaStream_t stream = ec.dev[rank]->stream;
     CurrentDeviceGuard::set(ec.dev[rank]->device);
     const std::byte* source = nullptr;
@@ -744,6 +833,16 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
     if (p.payload == Payload::FP32) {
         source      = static_cast<const std::byte*>(p.partial[r].data) + offset;
         destination = static_cast<std::byte*>(p.staging[peer].data) + offset;
+    } else if (p.payload == Payload::INT8) {
+        // Own bytes in the first part of staging[r]; the peer receives at byte 2 * total of
+        // staging[peer] (where the 16-bit payloads' second half starts; staging holds 4 * total
+        // bytes).
+        std::byte* own = static_cast<std::byte*>(p.staging[r].data) + offset;
+        exchange_int8_narrow_kernel<<<grid_for(n), 256, 0, stream>>>(
+            static_cast<const float*>(p.partial[r].data) + begin, own, p.rows, count);
+        CUDA_CHECK(cudaGetLastError());
+        source      = own;
+        destination = static_cast<std::byte*>(p.staging[peer].data) + 2 * total + offset;
     } else {
         auto* own = static_cast<std::uint16_t*>(p.staging[r].data) + begin;
         exchange_narrow_kernel<<<grid_for(n), 256, 0, stream>>>(
@@ -824,6 +923,12 @@ void HostExchange::finish_sum_f32() {
         if (p.payload == Payload::FP32) {
             allreduce_f32_combine(static_cast<float*>(p.partial[r].data),
                                   static_cast<const float*>(p.staging[r].data), out, count, stream);
+        } else if (p.payload == Payload::INT8) {
+            const auto* staged = static_cast<const std::byte*>(p.staging[r].data);
+            exchange_int8_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
+                static_cast<float*>(p.partial[r].data), staged, staged + 2 * count, out, p.rows,
+                count);
+            CUDA_CHECK(cudaGetLastError());
         } else {
             exchange_narrow_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
                 static_cast<float*>(p.partial[r].data),

@@ -283,7 +283,14 @@ public:
     // `staging[r]`: FP32 of the partial's shape, disjoint from it. Not thread-safe; one call at a
     // time; the pinned buffers are shared with pull() (calls on the two paths are stream-ordered
     // through each rank's stream).
-    enum class Payload : int { FP32 = 0, FP16 = 1, BF16 = 2 };
+    //
+    // INT8 (NINFER_TP_AR_PAYLOAD=int8, opt-in): per column `rows` int8 codes and rows / 32 FP16
+    // scales, rows * 17 / 16 bytes (2720 instead of 5120 for 2560 rows). Per 32-row block s =
+    // binary16 rounded up of min(max(amax / 127, 2^-14), 65504), q = rint(x / s) in [-127, 127],
+    // value q * s: values beyond 127 * 65504 saturate, an all-zero block is 0, a block holding NaN
+    // or Inf becomes NaN in all 32 rows. Lossy (on real Qwen3.8 Flash partials ~3.4-3.8x the BF16
+    // payload's error); rows not a multiple of 32 use FP16.
+    enum class Payload : int { FP32 = 0, FP16 = 1, BF16 = 2, INT8 = 3 };
     [[nodiscard]] bool begin_sum_f32(const std::array<Tensor, 2>& partial,
                                      const std::array<Tensor, 2>& staging,
                                      const std::array<Tensor, 2>* bf16_out, Payload payload,

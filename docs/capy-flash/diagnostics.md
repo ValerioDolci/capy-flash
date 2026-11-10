@@ -123,7 +123,7 @@ equivalent transports.
 | variable | values (default) | effect | class | results | scope |
 |---|---|---|---|---|---|
 | `NINFER_TP_AR` | on (default), `0` | `0` turns off the T62 prefill MoE exchange (narrow payload, column groups) and goes back to the T56 FP32 path. | legacy A/B | numerics (prefill only) | capy |
-| `NINFER_TP_AR_PAYLOAD` | `fp16` (default since T127), `bf16`, `fp32` | Payload of the TP2 prefill MoE exchange. BF16 was the T62 default. Decode MoE exchanges are always FP32. | legacy A/B | numerics | capy |
+| `NINFER_TP_AR_PAYLOAD` | `fp16` (default since T127), `bf16`, `fp32`, `int8` | Payload of the TP2 prefill MoE exchange. BF16 was the T62 default. Decode MoE exchanges are always FP32. `int8` (opt-in, lossy): 32-row blocks of int8 codes with binary16 scales, 2,720 instead of 5,120 bytes per 2,560-row column, also for the mixer output projection; columns whose rows are not a multiple of 32 use FP16. | legacy A/B | numerics | capy |
 | `NINFER_TP_AR_SHIFT` | `2` (0..14) | The FP16 payload carries v·2^-k, saturated to the FP16 range, and is rescaled exactly on receipt; this rules out overflow (T128b). | production default | numerics (tiny) | capy |
 | `NINFER_TP_AR_GROUP` | 2,048 columns (default), `0` = one group, multiples of 2,048 | Column groups that overlap the prefill exchange with the expert GEMM (T62). | performance | same bits | capy |
 | `NINFER_TP_AR_PIPE` | `1` / unset | `1` uses the pipelined exchange even with an FP32 payload and no groups. | performance | timing | capy |
