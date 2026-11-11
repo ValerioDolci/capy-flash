@@ -211,6 +211,10 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
                                           stream);
     linear(normalized, weights.down, projection, stream);
     detail::hyper_connection_gates_launch(projection, kHcStreams, lowrank, inject, stream);
+    if (detail::hc_up_collapse_supported(weights.up, geometry.hidden, tokens)) {
+        detail::hc_up_collapse_launch(lowrank, weights.up, normalized, mixed, stream);
+        return;
+    }
     linear(lowrank, weights.up, up, stream);
     detail::hyper_connection_collapse_launch(up, normalized, kHcStreams, mixed, stream);
 }
