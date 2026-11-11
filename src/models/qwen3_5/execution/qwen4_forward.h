@@ -658,6 +658,11 @@ private:
     const TextConfig& config_;
     std::array<Rank, 2> r_;
     std::array<const Qwen4MtpParameters*, 2> mtp_{};
+    // The GDN gating forked onto side streams (gdn_controls), joined before the
+    // recurrence reads g/beta (gdn_join_gating); null when not forked.
+    struct GatingOverlap;
+    GatingOverlap* gating_fork_ = nullptr;
+    void gdn_join_gating();
     int width_ = 1;
     Qwen4Collectives tp_;
     std::int32_t first_ = 1;
