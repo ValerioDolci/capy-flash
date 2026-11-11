@@ -24,7 +24,8 @@ at its default (on). Leave every other variable unset in a server.
 ## How to read the tables
 
 - **Class**: *production* (set or kept on in serving), *performance* (an adopted optimization with a switch back to
-  the old behaviour), *legacy A/B* (restores an older numerical path), *diagnostic* (dumps, logs, probes, self-tests),
+  the old behaviour), *opt-in* (off by default: a faster path that changes the arithmetic), *legacy A/B*
+  (restores an older numerical path), *diagnostic* (dumps, logs, probes, self-tests),
   *validation* (changes execution or tokens on purpose, for exactness checks), *benchmark* (kernel candidate
   selection).
 - **Results**: *numerics*: the arithmetic changes, so logits and possibly tokens change. *Same bits*: the code
@@ -114,6 +115,14 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+
+### Opt-in, off by default
+
+Faster paths that change the arithmetic (lossy, or a different summation order). Unset keeps the default path.
+
+| variable | values (default) | effect | class | results | scope |
+|---|---|---|---|---|---|
+| `NINFER_Q8_A8` | `32` (or `1`), `128`, unset / `0` (off) | Q8_G32 projections at prefill widths (64 tokens and more; the four dense shapes of one Flash-Next rank at tp 2) on int8 tensor cores: activations quantized per token and 32- or 128-value group into the optional linear workspace (A16 tiles when it has no room). | opt-in | numerics | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 

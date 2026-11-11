@@ -42,6 +42,14 @@ enum class LinearPolicy : std::uint8_t {
  * `[min_tokens,max_tokens]` interval. Invalid registered profiles, policies, or intervals throw;
  * a legal route that requires no transient storage returns zero.
  */
+// Transient bytes a linear may use when the workspace has room for them (an optional faster route:
+// Q8 prefill on int8 tensor cores, NINFER_Q8_A8). Never required - without them the route falls
+// back - so linear_workspace_capacity_bytes and the split validators do not count them; a planner
+// that wants the route reserves them on top. 0 when there is no such route.
+[[nodiscard]] std::size_t linear_optional_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                                          std::int32_t input_rows,
+                                                          std::int32_t max_tokens);
+
 [[nodiscard]] std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                                           std::int32_t input_rows,
                                                           LinearPolicy policy,

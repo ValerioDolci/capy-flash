@@ -56,6 +56,11 @@ endforeach()
 add_test(NAME ninfer_moe_route_simt_test COMMAND ninfer_moe_route_test)
 set_tests_properties(ninfer_moe_route_simt_test PROPERTIES ENVIRONMENT "NINFER_QWEN4_ROUTER_MMA=0")
 
+# Q8 prefill on int8 tensor cores (ops/linear/q8/q8_a8.h) against an exact float oracle.
+ninfer_add_op_test(ninfer_q8_a8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a8.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
