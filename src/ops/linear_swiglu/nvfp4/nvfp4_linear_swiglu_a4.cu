@@ -40,7 +40,7 @@ template <class Schedule>
 void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
             cudaStream_t stream) {
     auto scope = workspace.scope();
-    const Nvfp4A4Workspace scratch =
+    Nvfp4A4Workspace scratch =
         allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
     launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);

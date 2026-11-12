@@ -114,6 +114,7 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
 | `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
+| `NINFER_TP_PREFILL_SP` | `1` / unset (off) | `--tp 2` prompt chunks of a plain model (dense FFN, no hyper-connections, NVFP4 projections) over the HostExchange, i.e. a pair without peer access: sequence-parallel prefill (`qwen4_forward/plain_sp.h`). Each rank owns half of every half-chunk's columns; the row-parallel partials are reduce-scattered, the owner adds them to the residual in FP32, norms its columns and quantizes them to NVFP4, and the planes are all-gathered: 0.64x of the overlap's exchange bytes. Both partials are rounded to BF16 before the residual add. Each rank keeps a copy of the peer's GDN gating weights; the per-call buffers come from the work arena, and a call without room takes the overlap path. | opt-in | numerics | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
@@ -174,6 +175,7 @@ These variables change execution on purpose so that runs can be compared exactly
 
 | variable | values | effect | results | scope |
 |---|---|---|---|---|
+| `NINFER_TP_PREFILL_SP_NO_ROOM` | `1` (unset = off) | With `NINFER_TP_PREFILL_SP=1`: every SP prefill call fails its buffer allocation and takes the overlap path, as when the work arena has no room (the fallback's test). | same bits as SP off | capy |
 | `NINFER_CONSTRAINT_DEAD_END_AFTER` | N (unset = off) | Read only by the test program `ninfer_engine_constraint_real_test deadend` (the engine and `ninfer-serve` never read it): from the N-th output token on, every constrained request of the test reports a dead end (no legal token), exactly as the matcher would; the request fails with `ConstraintDeadEnd` and the other requests continue. | test only | capy |
 | `NINFER_QWEN4_EXPERT_FREEZE` | `1`, `all` (gated) | `1`: residency is decided by the prompt windows alone, each prompt window waits for its fills, and decode windows insert nothing, so an MTP run and its no-draft control run each expert on the same side. `all`: nothing is ever inserted or evicted (fast bench, T59). | numerics (deterministic residency) | capy |
 | `NINFER_QWEN4_FREEZE_FLUSH` | any value | With `EXPERT_FREEZE=1`, the post-prompt refill lands before the first decode window (T98). | residency | capy |

@@ -286,6 +286,11 @@ public:
         if (text_.tp2()) { text_.peer_tap_capture_layer_columns(layer, x[1], first); }
     }
 
+    [[nodiscard]] bool captures_layer(int layer) const override {
+        return std::find(sink_.layers.begin(), sink_.layers.end(),
+                         static_cast<std::uint32_t>(layer)) != sink_.layers.end();
+    }
+
 private:
     TextContext& text_;
     DFlashFeatureSink& sink_;

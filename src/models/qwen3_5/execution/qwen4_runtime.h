@@ -4,6 +4,11 @@
 // teacher-forcing taps, the routed-expert probe and a drafter's feature tap. Small on purpose: the
 // Program and the validation dumps bind these without the forward (qwen4_forward.h).
 
+#include "core/weight.h"
+#include <atomic>
+#include <cstdlib>
+#include <span>
+#include <string_view>
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -84,6 +89,57 @@ public:
     // bytes, at the same place, as capture_layer publishes for those columns.
     virtual void capture_layer_columns(int layer, const std::array<Tensor, 2>& x,
                                        std::int32_t first) = 0;
+
+    // Whether the tap keeps `layer`'s output at all (capture_layer of other layers does nothing):
+    // the SP prefill gathers a layer's whole residual only for the layers a tap keeps.
+    [[nodiscard]] virtual bool captures_layer(int layer) const {
+        (void)layer;
+        return true;
+    }
+};
+
+// The sequence-parallel tp 2 prefill (qwen4_forward/plain_sp.h), opt-in: NINFER_TP_PREFILL_SP=1
+// turns it on. Both row-parallel partials are rounded to BF16 before the FP32 residual add (today
+// rank 0 adds the residual in the GEMM epilogue, then BF16 of the peer's partial), so the residual
+// rounds differently and the switch is off by default.
+[[nodiscard]] inline bool qwen4_prefill_sp_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_TP_PREFILL_SP");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    return on;
+}
+
+// Validation: NINFER_TP_PREFILL_SP_NO_ROOM=1 fails every SP prefill call's buffer allocation, so
+// the call takes the overlap path as it does when the work arena has no room for the SP buffers.
+[[nodiscard]] inline bool qwen4_prefill_sp_no_room_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_TP_PREFILL_SP_NO_ROOM");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    return on;
+}
+
+// Prefill calls of this process that ran the SP schedule, and those that fell back to the overlap
+// path for lack of room (read by tests).
+struct Qwen4PrefillSpCounts {
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> fallbacks{0};
+};
+
+[[nodiscard]] inline Qwen4PrefillSpCounts& qwen4_prefill_sp_counts() {
+    static Qwen4PrefillSpCounts counts;
+    return counts;
+}
+
+// One rank's copy of the other rank's GDN gating weights (the SP prefill computes the
+// peer's heads' g/beta over the columns it owns), on this rank's device. Empty for a layer without
+// GDN.
+struct Qwen4PeerGdnControl {
+    bool present = false;
+    bool paired  = false; // first|second = the a and b halves; otherwise first is the one parent
+    Weight first, second;
+    Tensor a_log, dt_bias;
 };
 
 // Program-owned inputs a TextContext reads (bound per execution core). At tp 2 each rank
@@ -124,6 +180,9 @@ struct Qwen4Runtime {
     // T43: the MTP proposal head over a draft token shortlist (rank 0's at tp 2), null = the full
     // Text output head. Program-owned (qwen4_draft_head.h).
     const Qwen4DraftHead* draft_head = nullptr;
+    // [layer] this rank's copies of the peer's GDN gating weights for the SP prefill;
+    // empty = the SP prefill is off (one device, not a dense plain model, or switched off).
+    std::span<const Qwen4PeerGdnControl> sp_peer_control;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

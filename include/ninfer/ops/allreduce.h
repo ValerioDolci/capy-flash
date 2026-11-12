@@ -336,6 +336,40 @@ public:
         return lane >= 0 && lane < kSumLanes && lanes_[static_cast<std::size_t>(lane)].active;
     }
 
+    // ---- Byte moves on the same lanes (sequence-parallel prefill) ------------------------------
+    //
+    //   move_begin(lane, segments, ec)  segments[r] are up to kMoveSegments ranges rank r sends:
+    //                                   `source` on ec.dev[r], complete on rank r's stream, to
+    //                                   `destination` on the peer. Transport and ordering are
+    //                                   sum_begin's: device-to-host on rank r's send stream into
+    //                                   the lane's pinned buffer, chunk by chunk host-to-device on
+    //                                   the peer's receive stream; the ranks' streams only record
+    //                                   one event each.
+    //   move_finish(lane, ec)           rank r's stream waits for both receive streams of the lane
+    //                                   (its inbound bytes; the peer's read of rank r's host
+    //                                   buffer, which follows rank r's reads of its sources). No
+    //                                   combine.
+    //
+    // A lane holds one open call of either kind; sum_finish rejects a move and move_finish a sum.
+    // Work enqueued between begin and finish must not write a source or touch a destination.
+    // Segments of 0 bytes are skipped. Eager only.
+    struct MoveSegment {
+        const void* source = nullptr;
+        void* destination  = nullptr;
+        std::size_t bytes  = 0;
+    };
+
+    // Four ranges: an NVFP4 plane's codes and scales plus a GDN layer's two gating rows (SP
+    // prefill).
+    static constexpr int kMoveSegments = 4;
+    using MoveSegments                 = std::array<std::array<MoveSegment, kMoveSegments>, 2>;
+    void move_begin(int lane, const MoveSegments& segments, const ExecutionContext& ec);
+    void move_finish(int lane, const ExecutionContext& ec);
+    // After a failure: closes an open move on `lane` whatever happens (errors ignored), the ranks'
+    // streams waiting for its inbound copies as move_finish does, so the lane takes the next call
+    // and no copy lands in memory the next call reuses. A closed lane is left alone.
+    void abandon_move(int lane, const ExecutionContext& ec) noexcept;
+
 private:
     void reserve(std::size_t bytes, std::size_t chunks, const ExecutionContext& ec);
     static void grow(std::vector<cudaEvent_t>& events, std::size_t count, int device);
@@ -371,6 +405,7 @@ private:
     // issued in time order); everything else is per lane.
     struct Lane {
         bool active          = false;
+        bool move            = false; // the open call is a move_begin, not a sum_begin
         std::size_t capacity = 0;
         std::array<Tensor, 2> buffer, staging;
         std::array<std::byte*, 2> host{nullptr, nullptr};

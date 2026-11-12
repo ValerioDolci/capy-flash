@@ -875,6 +875,11 @@ public:
     std::optional<execution::Qwen4Runtime> qwen4_runtime_record;
     // T43: the draft shortlist proposal head (Qwen4Runtime::draft_head of rank 0), when planned.
     std::optional<execution::Qwen4DraftHead> qwen4_draft_head;
+    // [rank] that rank's copies of the other rank's GDN gating weights (SP prefill,
+    // qwen4_forward/plain_sp.h) and their storage; empty when the SP prefill is off.
+    std::array<std::vector<DeviceBuffer>, 2> qwen4_sp_peer_storage;
+    std::array<std::vector<execution::Qwen4PeerGdnControl>, 2> qwen4_sp_peer_control;
+    void construct_qwen4_sp_peer_control();
     // tp 2: rank 1's expert backend (the odd expert IDs) and runtime record (TpExecution::qwen4).
     std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_peer_experts;
     std::optional<execution::Qwen4Runtime> qwen4_peer_runtime_record;

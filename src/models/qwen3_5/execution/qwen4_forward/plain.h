@@ -34,6 +34,8 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scatter.h"
 
+#include <cstdio>
+#include <new>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -65,21 +67,56 @@ void Qwen4Forward<Arena>::run_plain(const RankTensors& ids, RankTensors& out,
     }
     std::array<PlainHalf, 2> halves;
     if (split > 0) { halves = plain_halves(x, staging, split); }
+    // The sequence-parallel prefill (plain_sp.h) when this chunk can take it; planning
+    // reserves its peak next to the plain path's whenever a chunk could.
+    if constexpr (!kExecute) {
+        if (sp_possible()) { sp_plan(); }
+    }
+    bool sp = sp_eligible(split);
+    SpCall sp_call;
+    if (sp) {
+        try {
+            if (qwen4_prefill_sp_no_room_env()) { throw std::bad_alloc(); }
+            sp_call = sp_begin(halves);
+            qwen4_prefill_sp_counts().runs.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::bad_alloc&) {
+            sp = false; // no room for its buffers: the overlap path
+            qwen4_prefill_sp_counts().fallbacks.fetch_add(1, std::memory_order_relaxed);
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "SP prefill: work arena too small, using the overlap path\n");
+            }
+        }
+    }
     for (std::size_t layer = 0; layer < config_.layer_types.size(); ++layer) {
         try {
-            if (split > 0) {
+            if (sp) {
+                sp_layer(layer, sp_call);
+            } else if (split > 0) {
                 plain_half_blocks(layer, halves);
             } else {
                 plain_block(layer, x, staging);
             }
         } catch (const std::exception& error) {
+            if (sp) { sp_abandon(sp_call); }
             abandon_lanes(halves);
             throw std::runtime_error("text/layers/" + std::to_string(layer) + " " + phase() +
-                                     (split > 0 ? " overlap" : "") + (width_ == 2 ? " tp2" : "") +
-                                     " columns=" + std::to_string(T) + ": " + error.what());
+                                     (sp          ? " sp"
+                                      : split > 0 ? " overlap"
+                                                  : "") +
+                                     (width_ == 2 ? " tp2" : "") + " columns=" + std::to_string(T) +
+                                     ": " + error.what());
         }
     }
-    if (split > 0) {
+    if (sp) {
+        try {
+            sp_end(sp_call);
+        } catch (...) {
+            sp_abandon(sp_call);
+            throw;
+        }
+    } else if (split > 0) {
         // The last layer's exchanges (and its taps) complete before the final norm reads x.
         try {
             finish_half(halves[0], 0);

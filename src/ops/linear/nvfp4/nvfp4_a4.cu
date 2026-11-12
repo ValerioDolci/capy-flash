@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_a4_quantize.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_tma_launch.h"
+#include "ninfer/ops/nvfp4_activation.h"
 
 #include <cuda_bf16.h>
 
@@ -56,8 +57,40 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
 
 } // namespace
 
-void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
+void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace& workspace,
                               Nvfp4ScaleLayout layout, cudaStream_t stream) {
+    if (ScopedNvfp4Activation* scope = ScopedNvfp4Activation::find(x.data, x.ne[1])) {
+        // Sequence-parallel prefill hand-off (ninfer/ops/nvfp4_activation.h).
+        Nvfp4ActivationPlane& plane = scope->plane();
+        const std::int32_t tokens   = x.ne[1];
+        const std::size_t code_bytes =
+            static_cast<std::size_t>(tokens) * (static_cast<std::size_t>(weight.k) / 2);
+        const std::size_t scale_bytes =
+            static_cast<std::size_t>(layout != Nvfp4ScaleLayout::RowMajor
+                                         ? nvfp4_a4_padded_tokens(tokens, layout)
+                                         : tokens) *
+            (static_cast<std::size_t>(weight.k) / 16);
+        if (plane.codes == nullptr || plane.scales == nullptr || plane.code_capacity < code_bytes ||
+            plane.scale_capacity < scale_bytes) {
+            throw std::invalid_argument("NVFP4 activation hand-off: the plane is too small");
+        }
+        workspace = {static_cast<std::uint8_t*>(plane.codes),
+                     static_cast<std::uint8_t*>(plane.scales), plane.scale_capacity};
+        scope->mark_used();
+        if (scope->mode() == ScopedNvfp4Activation::Mode::Consume) {
+            if (plane.layout != static_cast<int>(layout) || plane.k != weight.k ||
+                plane.code_bytes != code_bytes || plane.scale_bytes != scale_bytes) {
+                throw std::invalid_argument(
+                    "NVFP4 activation hand-off: the consuming projection reads another layout "
+                    "than the capture wrote");
+            }
+            return;
+        }
+        plane.layout      = static_cast<int>(layout);
+        plane.k           = weight.k;
+        plane.code_bytes  = code_bytes;
+        plane.scale_bytes = scale_bytes;
+    }
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
     }
@@ -101,3 +134,47 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+namespace {
+thread_local ScopedNvfp4Activation* activation_scopes = nullptr;
+} // namespace
+
+std::size_t nvfp4_activation_code_capacity(std::int32_t tokens, std::int32_t k) {
+    return detail::nvfp4_a4_checked_bytes(tokens, static_cast<std::size_t>(k) / 2);
+}
+
+std::size_t nvfp4_activation_scale_capacity(std::int32_t tokens, std::int32_t k) {
+    return detail::nvfp4_a4_checked_bytes(detail::nvfp4_a4_padded_tokens(tokens),
+                                          static_cast<std::size_t>(k) / 16);
+}
+
+ScopedNvfp4Activation::ScopedNvfp4Activation(Mode mode, const void* input, std::int32_t tokens,
+                                             Nvfp4ActivationPlane& plane)
+    : mode_(mode), input_(input), tokens_(tokens), plane_(&plane), previous_(activation_scopes) {
+    if (input == nullptr || tokens <= 0) {
+        throw std::invalid_argument("NVFP4 activation hand-off: invalid input or token count");
+    }
+    activation_scopes = this;
+}
+
+ScopedNvfp4Activation::~ScopedNvfp4Activation() {
+    // Scopes nest; unlink this one wherever it sits so an exception unwinding several stays sound.
+    for (ScopedNvfp4Activation** link = &activation_scopes; *link != nullptr;
+         link                         = &(*link)->previous_) {
+        if (*link == this) {
+            *link = previous_;
+            break;
+        }
+    }
+}
+
+ScopedNvfp4Activation* ScopedNvfp4Activation::find(const void* input,
+                                                   std::int32_t tokens) noexcept {
+    for (ScopedNvfp4Activation* scope = activation_scopes; scope != nullptr;
+         scope                        = scope->previous_) {
+        if (scope->input_ == input && scope->tokens_ == tokens) { return scope; }
+    }
+    return nullptr;
+}
+} // namespace ninfer::ops

@@ -84,8 +84,8 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_linear_swiglu_a4_launch(x, weight, out, *workspace, stream);
         return;
     case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
-        auto scope                     = workspace->scope();
-        const Nvfp4A4Workspace scratch = allocate_fused_workspace(*workspace, x.ne[1]);
+        auto scope               = workspace->scope();
+        Nvfp4A4Workspace scratch = allocate_fused_workspace(*workspace, x.ne[1]);
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
         launch_nvfp4_linear_swiglu_a4_tma(
             nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),

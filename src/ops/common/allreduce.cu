@@ -950,6 +950,7 @@ void HostExchange::sum_finish(int lane_index, const ExecutionContext& ec) {
     require(lane_index >= 0 && lane_index < kSumLanes, "HostExchange: sum lane out of range");
     Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
     require(lane.active, "HostExchange: sum_finish without sum_begin");
+    require(!lane.move, "HostExchange: sum_finish on a lane opened by move_begin");
     const CurrentDeviceGuard guard;
     for (int rank = 0; rank < 2; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -966,6 +967,110 @@ void HostExchange::sum_finish(int lane_index, const ExecutionContext& ec) {
     lane.buffer  = {};
     lane.staging = {};
     lane.active  = false;
+}
+
+void HostExchange::move_begin(int lane_index, const MoveSegments& segments,
+                              const ExecutionContext& ec) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    require(lane_index >= 0 && lane_index < kSumLanes, "HostExchange: move lane out of range");
+    Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
+    require(!lane.active, "HostExchange: move_begin on an open lane");
+    const auto chunks_of = [](std::size_t bytes) {
+        return (bytes + kLaneChunkBytes - 1) / kLaneChunkBytes;
+    };
+    std::size_t bytes = 0, chunks = 0;
+    for (const auto& rank_segments : segments) {
+        std::size_t rank_bytes = 0, rank_chunks = 0;
+        for (const MoveSegment& segment : rank_segments) {
+            require(segment.bytes == 0 ||
+                        (segment.source != nullptr && segment.destination != nullptr),
+                    "HostExchange: a move segment needs a source and a destination");
+            rank_bytes += segment.bytes;
+            rank_chunks += chunks_of(segment.bytes);
+        }
+        bytes  = std::max(bytes, rank_bytes);
+        chunks = std::max(chunks, rank_chunks);
+    }
+    const CurrentDeviceGuard guard;
+    reserve_lane(lane, bytes, chunks, ec);
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaEventRecord(lane.begun[r], ec.dev[rank]->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(lane_send_[r], lane.begun[r], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(lane_receive_[r], lane.begun[r], 0));
+    }
+    // Leg 1, both ranks: the segments one after another into the lane's host buffer.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        std::size_t host_offset = 0, c = 0;
+        for (const MoveSegment& segment : segments[r]) {
+            const auto* source = static_cast<const std::byte*>(segment.source);
+            for (std::size_t offset = 0; offset < segment.bytes; offset += kLaneChunkBytes) {
+                const std::size_t n = std::min(kLaneChunkBytes, segment.bytes - offset);
+                CUDA_CHECK(cudaMemcpyAsync(lane.host[r] + host_offset + offset, source + offset, n,
+                                           cudaMemcpyDeviceToHost, lane_send_[r]));
+                CUDA_CHECK(cudaEventRecord(lane.chunk_done[r][c++], lane_send_[r]));
+            }
+            host_offset += segment.bytes;
+        }
+    }
+    // Leg 2, both ranks: the peer's chunks into their destinations, each behind its event.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r    = static_cast<std::size_t>(rank);
+        const auto peer = static_cast<std::size_t>(1 - rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        std::size_t host_offset = 0, c = 0;
+        for (const MoveSegment& segment : segments[peer]) {
+            auto* destination = static_cast<std::byte*>(segment.destination);
+            for (std::size_t offset = 0; offset < segment.bytes; offset += kLaneChunkBytes) {
+                const std::size_t n = std::min(kLaneChunkBytes, segment.bytes - offset);
+                CUDA_CHECK(cudaStreamWaitEvent(lane_receive_[r], lane.chunk_done[peer][c++], 0));
+                CUDA_CHECK(cudaMemcpyAsync(destination + offset,
+                                           lane.host[peer] + host_offset + offset, n,
+                                           cudaMemcpyHostToDevice, lane_receive_[r]));
+            }
+            host_offset += segment.bytes;
+        }
+        CUDA_CHECK(cudaEventRecord(lane.received[r], lane_receive_[r]));
+    }
+    lane.buffer  = {};
+    lane.staging = {};
+    lane.active  = true;
+    lane.move    = true;
+}
+
+void HostExchange::move_finish(int lane_index, const ExecutionContext& ec) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    require(lane_index >= 0 && lane_index < kSumLanes, "HostExchange: move lane out of range");
+    Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
+    require(lane.active && lane.move, "HostExchange: move_finish without move_begin");
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[rank]->stream, lane.received[r], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[rank]->stream, lane.received[1 - r], 0));
+    }
+    lane.active = false;
+    lane.move   = false;
+}
+
+void HostExchange::abandon_move(int lane_index, const ExecutionContext& ec) noexcept {
+    if (lane_index < 0 || lane_index >= kSumLanes) { return; }
+    Lane& lane = lanes_[static_cast<std::size_t>(lane_index)];
+    if (!lane.active || !lane.move) { return; }
+    lane.active        = false;
+    lane.move          = false;
+    int previous       = 0;
+    const bool restore = cudaGetDevice(&previous) == cudaSuccess;
+    for (std::size_t r = 0; r < 2; ++r) {
+        (void)cudaSetDevice(ec.dev[r]->device);
+        (void)cudaStreamWaitEvent(ec.dev[r]->stream, lane.received[r], 0);
+        (void)cudaStreamWaitEvent(ec.dev[r]->stream, lane.received[1 - r], 0);
+    }
+    if (restore) { (void)cudaSetDevice(previous); }
 }
 
 // ---- v07/p2p-overlap: split-phase lanes over the direct cross-device copy ----------------------

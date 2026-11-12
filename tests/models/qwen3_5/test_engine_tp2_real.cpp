@@ -33,6 +33,7 @@
 //
 // Returns 77 without the artifact or below two CUDA devices.
 
+#include "models/qwen3_5/execution/qwen4_runtime.h"
 #include "ninfer/engine.h"
 
 #include <cuda_runtime.h>
@@ -603,6 +604,34 @@ int exercise_kv_lease(const char* artifact, std::uint32_t window = 4096, bool ho
 
 } // namespace
 
+// NINFER_TP_PREFILL_SP=1: the long prompts above run in half-chunks over the HostExchange, so the
+// sequence-parallel prefill must have run them; with NINFER_TP_PREFILL_SP_NO_ROOM=1 every such call
+// must have fallen back to the overlap path. Either way the answers above must be right. A pair
+// with peer access has no HostExchange, so the SP prefill stays off there and this check is
+// skipped.
+int check_sp_prefill() {
+    namespace exec = ninfer::models::qwen3_5::execution;
+    if (!exec::qwen4_prefill_sp_env()) { return 0; }
+    int forward = 0, reverse = 0;
+    if (cudaDeviceCanAccessPeer(&forward, 0, 1) == cudaSuccess &&
+        cudaDeviceCanAccessPeer(&reverse, 1, 0) == cudaSuccess && forward != 0 && reverse != 0) {
+        std::cerr << "  SP prefill: the pair has peer access, so it stays off; not checked\n";
+        return 0;
+    }
+    const auto& counts            = exec::qwen4_prefill_sp_counts();
+    const std::uint64_t runs      = counts.runs.load();
+    const std::uint64_t fallbacks = counts.fallbacks.load();
+    std::cerr << "  SP prefill: " << runs << " calls ran it, " << fallbacks << " fell back\n";
+    if (exec::qwen4_prefill_sp_no_room_env()) {
+        if (runs == 0 && fallbacks > 0) { return 0; }
+        std::cerr << "SP prefill: the forced no-room fallback did not take every call\n";
+        return 1;
+    }
+    if (runs > 0 && fallbacks == 0) { return 0; }
+    std::cerr << "SP prefill: the long prompts did not run the sequence-parallel schedule\n";
+    return 1;
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
@@ -643,6 +672,7 @@ int main() {
         std::cerr << "tp 2 Engine failed: " << error.what() << '\n';
         return 1;
     }
+    if (check_sp_prefill() != 0) { return 1; }
     {
         // Guardrail: a Host tier larger than the RAM the machine can spare is refused at startup
         // with a message that says what fits, instead of pinning it and courting an OOM kill.

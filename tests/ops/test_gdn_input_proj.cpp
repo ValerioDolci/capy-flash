@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/nvfp4_activation.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -294,6 +295,88 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     return failures;
 }
 
+// Sequence-parallel prefill hand-off (ninfer/ops/nvfp4_activation.h): a capture quantizes into the
+// scope's plane and computes the bits of a plain call; a consume over an input holding other data
+// computes the captured input's bits without reading it; a plane whose recorded sizes do not
+// match the consuming call is rejected.
+int run_nvfp4_handoff_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQkvRows     = 10240;
+    constexpr std::int32_t kZRows       = 6144;
+    constexpr std::int32_t kRows        = kQkvRows + kZRows;
+    const auto policy                   = ops::LinearPolicy::AllowA4;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 701U + tokens);
+    const std::vector<float> other      = make_bf16_activation(kHidden, tokens, 9001U + tokens);
+    DeviceBuffer device_activation      = to_device(bf16_bits(activation));
+    DeviceBuffer device_other           = to_device(bf16_bits(other));
+    const Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    const Tensor x_other(device_other.p, DType::BF16, {kHidden, tokens});
+    WorkspaceArena workspace(
+        std::max<std::size_t>(ops::gdn_input_proj_workspace_capacity_bytes(
+                                  QType::NVFP4, kRows, kHidden, policy, tokens, tokens),
+                              256));
+    const auto run = [&](const Tensor& input) {
+        GuardedBf16Tensor qkv(kQkvRows, tokens);
+        GuardedBf16Tensor z(kZRows, tokens);
+        Tensor qkv_output = qkv.tensor();
+        Tensor z_output   = z.tensor();
+        ops::gdn_input_proj(input, parent.view(), qkv_output, z_output, policy, workspace, nullptr);
+        cuda_synchronize();
+        std::vector<double> values         = qkv.values();
+        const std::vector<double> z_values = z.values();
+        values.insert(values.end(), z_values.begin(), z_values.end());
+        return values;
+    };
+    const std::string label             = "gdn NVFP4 A4 hand-off T=" + std::to_string(tokens);
+    int failures                        = 0;
+    const std::vector<double> reference = run(x);
+    const std::size_t code_capacity     = ops::nvfp4_activation_code_capacity(tokens, kHidden);
+    const std::size_t scale_capacity    = ops::nvfp4_activation_scale_capacity(tokens, kHidden);
+    DeviceBuffer codes(code_capacity);
+    DeviceBuffer scales(scale_capacity);
+    ops::Nvfp4ActivationPlane plane{codes.p, code_capacity, scales.p, scale_capacity};
+    {
+        ops::ScopedNvfp4Activation scope(ops::ScopedNvfp4Activation::Mode::Capture, x.data, tokens,
+                                         plane);
+        if (run(x) != reference) {
+            std::cerr << label << ": a capture changed the output\n";
+            ++failures;
+        }
+        if (!scope.used() || plane.layout < 0 || plane.code_bytes == 0) {
+            std::cerr << label << ": the capture was not taken\n";
+            ++failures;
+        }
+    }
+    {
+        ops::ScopedNvfp4Activation scope(ops::ScopedNvfp4Activation::Mode::Consume, x_other.data,
+                                         tokens, plane);
+        if (run(x_other) != reference) {
+            std::cerr << label << ": a consume did not compute the captured input\n";
+            ++failures;
+        }
+        if (!scope.used()) {
+            std::cerr << label << ": the consume was not taken\n";
+            ++failures;
+        }
+    }
+    {
+        ops::Nvfp4ActivationPlane wrong = plane;
+        wrong.scale_bytes += 16;
+        ops::ScopedNvfp4Activation scope(ops::ScopedNvfp4Activation::Mode::Consume, x_other.data,
+                                         tokens, wrong);
+        bool rejected = false;
+        try {
+            (void)run(x_other);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) {
+            std::cerr << label << ": a mismatched plane was accepted\n";
+            ++failures;
+        }
+    }
+    std::cout << label << ": " << (failures ? "FAIL" : "ok") << '\n';
+    return failures;
+}
+
 int run_nvfp4() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kRows   = 16384;
@@ -314,6 +397,9 @@ int run_nvfp4() {
     failures += run_nvfp4_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1025, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_handoff_case(parent, 17);
+    failures += run_nvfp4_handoff_case(parent, 600);
+    failures += run_nvfp4_handoff_case(parent, 1280);
     return failures;
 }
 

@@ -724,11 +724,95 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         qwen4_draft_head   = draft;
         runtime.draft_head = &*qwen4_draft_head;
     }
+    construct_qwen4_sp_peer_control();
+    if (!qwen4_sp_peer_control[0].empty()) {
+        runtime.sp_peer_control      = qwen4_sp_peer_control[0];
+        peer_runtime.sp_peer_control = qwen4_sp_peer_control[1];
+    }
     qwen4_runtime_record = runtime;
     if (peer) {
         qwen4_peer_runtime_record = peer_runtime;
         tp_execution->qwen4       = &*qwen4_peer_runtime_record;
     }
+}
+
+// Each rank's copy of the other rank's GDN gating weights (about 0.5 MB per GDN layer),
+// which the SP prefill uses to compute the peer's heads' g/beta over the columns it owns
+// (qwen4_forward/plain_sp.h). Two devices, a plain model without routed experts and every GDN
+// control weight a contiguous BF16 matrix; otherwise (or without NINFER_TP_PREFILL_SP=1) nothing is
+// copied and the SP prefill stays off. cudaMemcpyPeer stages through the host when the devices
+// have no peer access.
+void ProgramImpl::construct_qwen4_sp_peer_control() {
+    const auto& config = parameters.model.config().text;
+    if (!peer || !peer_parameters || !peer_parameters->qwen4 || !parameters.qwen4 ||
+        config.hyper_connection.has_value() || config.qwen4_routed_experts() ||
+        !execution::qwen4_prefill_sp_env()) {
+        return;
+    }
+    const auto contiguous_bf16 = [](const Weight& w) {
+        return w.qtype == QType::BF16 && w.layout == QuantLayout::Contiguous &&
+               w.qdata != nullptr && w.n > 0 && w.k > 0;
+    };
+    const std::array<const execution::Parameters*, 2> source{peer_parameters, &parameters};
+    const std::array<int, 2> device_of{device.device, peer->device.device};
+    std::array<std::vector<DeviceBuffer>, 2> storage;
+    std::array<std::vector<execution::Qwen4PeerGdnControl>, 2> controls;
+    const std::size_t layers = parameters.qwen4->layers.size();
+    for (int rank = 0; rank < 2; ++rank) {
+        const int to   = device_of[static_cast<std::size_t>(rank)];
+        const int from = device_of[static_cast<std::size_t>(1 - rank)];
+        const ScopedCurrentDevice on_rank(to);
+        auto& out = controls[static_cast<std::size_t>(rank)];
+        auto& own = storage[static_cast<std::size_t>(rank)];
+        out.resize(layers);
+        const auto copy_bytes = [&](const void* data, std::size_t bytes) -> void* {
+            own.emplace_back(bytes);
+            CUDA_CHECK(cudaMemcpyPeer(own.back().p, to, data, from, bytes));
+            return own.back().p;
+        };
+        const auto copy_weight = [&](const Weight& w) {
+            const std::size_t bytes =
+                static_cast<std::size_t>(w.n) * static_cast<std::size_t>(w.k) * 2;
+            Weight copy        = w;
+            copy.qdata         = copy_bytes(w.qdata, bytes);
+            copy.payload       = copy.qdata;
+            copy.payload_bytes = bytes;
+            return copy;
+        };
+        const auto copy_tensor = [&](const Tensor& t) {
+            if (!t.is_contiguous()) { throw std::invalid_argument("not contiguous"); }
+            Tensor copy = t;
+            copy.data   = copy_bytes(t.data, t.bytes());
+            return copy;
+        };
+        for (std::size_t layer = 0; layer < layers; ++layer) {
+            const auto* gdn = std::get_if<execution::GdnParameters>(
+                &source[static_cast<std::size_t>(rank)]->qwen4->layers[layer].mixer);
+            if (gdn == nullptr) { continue; }
+            execution::Qwen4PeerGdnControl& c = out[layer];
+            if (const auto* one = std::get_if<execution::LinearParameters>(&gdn->control)) {
+                if (!contiguous_bf16(one->weight)) { return; }
+                c.first = copy_weight(one->weight);
+            } else {
+                const auto& pair = std::get<ops::PairedProjectionWeights>(gdn->control);
+                if (!contiguous_bf16(pair.first) || !contiguous_bf16(pair.second)) { return; }
+                c.paired = true;
+                c.first  = copy_weight(pair.first);
+                c.second = copy_weight(pair.second);
+            }
+            try {
+                c.a_log   = copy_tensor(gdn->a_log);
+                c.dt_bias = copy_tensor(gdn->dt_bias);
+            } catch (const std::invalid_argument&) { return; }
+            c.present = true;
+        }
+    }
+    qwen4_sp_peer_storage = std::move(storage);
+    qwen4_sp_peer_control = std::move(controls);
+    std::size_t bytes     = 0;
+    for (const DeviceBuffer& b : qwen4_sp_peer_storage[0]) { bytes += b.bytes; }
+    std::fprintf(stderr, "SP prefill: peer GDN gating copies %.1f MiB per rank\n",
+                 static_cast<double>(bytes) / (1 << 20));
 }
 
 // The routed-expert backends of a Qwen4Exp MoE on every rank: the in-place expert tables, the MTP

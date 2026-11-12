@@ -10,6 +10,7 @@
 #include "models/qwen3_5/execution/qwen4_forward/moe.h"
 #include "models/qwen3_5/execution/qwen4_forward/mtp.h"
 #include "models/qwen3_5/execution/qwen4_forward/plain.h"
+#include "models/qwen3_5/execution/qwen4_forward/plain_sp.h"
 #include "models/qwen3_5/execution/qwen4_forward/projection.h"
 #include "models/qwen3_5/execution/qwen4_forward/qsa.h"
 #include "models/qwen3_5/execution/qwen4_forward/residual.h"

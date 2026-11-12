@@ -716,6 +716,133 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
 
 // T68: HostExchange::copy, one way in each direction, sizes across many 4 KiB chunks, against the
 // uploaded bytes; eager_exchange selects the attached exchange.
+// Sequence-parallel prefill: HostExchange::move_begin / move_finish, the lanes' byte moves without
+// a combine. Rank 0 sends four segments of its source (the head in three pieces and a tail, the
+// pieces crossing the lane's 2 MiB chunk) into the same ranges of rank 1's destination, rank 1 one
+// middle segment into rank 0's; two lanes carry two such calls at once, a 64 MB memset skews rank 1
+// before every begin, and the sources are rewritten on the ranks' streams right after each finish.
+// Exact oracle: every destination byte inside a segment holds the last round's source byte, every
+// byte outside stays zero (no overrun, no stale chunk, no source read after the next round rewrote
+// it).
+int run_move_lane_case(const char* label, std::size_t bytes, int rounds, const ExecutionContext& ec,
+                       ops::HostExchange& exchange) {
+    const std::size_t a = bytes / 3 + 5, b = 2 * bytes / 3 + 11;
+    std::array<std::array<std::unique_ptr<GuardedDeviceBuffer>, 2>, 2> source, destination;
+    for (int lane = 0; lane < 2; ++lane) {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            source[lane][rank]      = std::make_unique<GuardedDeviceBuffer>(bytes);
+            destination[lane][rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+            cuda_check(cudaMemset(destination[lane][rank]->data(), 0, bytes), "clear destination");
+        }
+    }
+    const auto pattern = [&](int round, int lane, int rank, std::size_t i) {
+        return static_cast<std::uint8_t>((i * 131u + static_cast<std::size_t>(round) * 17u +
+                                          static_cast<std::size_t>(lane) * 7u +
+                                          static_cast<std::size_t>(rank) * 3u + 1u) &
+                                         0xFFu);
+    };
+    std::vector<std::uint8_t> host(bytes);
+    const auto upload = [&](int round, int lane, int rank) {
+        for (std::size_t i = 0; i < bytes; ++i) { host[i] = pattern(round, lane, rank, i); }
+        set_device(ec, rank);
+        cuda_check(cudaMemcpyAsync(source[lane][rank]->data(), host.data(), bytes,
+                                   cudaMemcpyHostToDevice, ec.dev[rank]->stream),
+                   "upload source");
+        cuda_check(cudaStreamSynchronize(ec.dev[rank]->stream), "upload sync");
+    };
+    set_device(ec, 1);
+    DeviceBuffer skew(64u << 20);
+    synchronize_both(ec);
+    for (int round = 0; round < rounds; ++round) {
+        for (int lane = 0; lane < 2; ++lane) {
+            if (round > 0) { exchange.move_finish(lane, ec); }
+            for (int rank = 0; rank < 2; ++rank) { upload(round, lane, rank); }
+            set_device(ec, 1);
+            cuda_check(cudaMemsetAsync(skew.p, round * 2 + lane, skew.bytes, ec.dev[1]->stream),
+                       "skew memset");
+            const auto* s0 = static_cast<const std::byte*>(source[lane][0]->data());
+            const auto* s1 = static_cast<const std::byte*>(source[lane][1]->data());
+            auto* d0       = static_cast<std::byte*>(destination[lane][0]->data());
+            auto* d1       = static_cast<std::byte*>(destination[lane][1]->data());
+            ops::HostExchange::MoveSegments segments{};
+            const std::size_t a1 = a / 3, a2 = 2 * a / 3;
+            segments[0][0] = {s0, d1, a1};
+            segments[0][1] = {s0 + a1, d1 + a1, a2 - a1};
+            segments[0][2] = {s0 + a2, d1 + a2, a - a2};
+            segments[0][3] = {s0 + b, d1 + b, bytes - b};
+            segments[1][0] = {s1 + a, d0 + a, b - a};
+            exchange.move_begin(lane, segments, ec);
+        }
+    }
+    exchange.move_finish(0, ec);
+    exchange.move_finish(1, ec);
+    synchronize_both(ec);
+    int failures = 0;
+    for (int lane = 0; lane < 2; ++lane) {
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            const auto result = from_device<std::uint8_t>(destination[lane][rank]->data(), bytes);
+            std::size_t wrong = 0;
+            for (std::size_t i = 0; i < bytes; ++i) {
+                const bool inside       = rank == 1 ? (i < a || i >= b) : (i >= a && i < b);
+                const std::uint8_t want = inside ? pattern(rounds - 1, lane, 1 - rank, i) : 0;
+                if (result[i] != want) { ++wrong; }
+            }
+            if (wrong != 0) {
+                std::cerr << label << " lane " << lane << " rank " << rank << ": " << wrong
+                          << " of " << bytes << " bytes wrong\n";
+                ++failures;
+            }
+        }
+    }
+    std::cout << label << ": " << (failures ? "FAIL" : "ok") << '\n';
+    return failures;
+}
+
+// abandon_move: a lane begun and abandoned (as after a failed prompt chunk) is free again for the
+// next move, and abandoning a closed lane does nothing.
+int run_abandon_move_case(const ExecutionContext& ec, ops::HostExchange& exchange) {
+    constexpr std::size_t bytes = 1u << 20;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> source, destination;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        source[rank]      = std::make_unique<GuardedDeviceBuffer>(bytes);
+        destination[rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+        cuda_check(cudaMemset(source[rank]->data(), rank + 1, bytes), "fill source");
+        cuda_check(cudaMemset(destination[rank]->data(), 0, bytes), "clear destination");
+    }
+    ops::HostExchange::MoveSegments segments{};
+    segments[0][0] = {source[0]->data(), destination[1]->data(), bytes};
+    segments[1][0] = {source[1]->data(), destination[0]->data(), bytes};
+    int failures   = 0;
+    try {
+        exchange.abandon_move(3, ec); // closed: nothing
+        exchange.move_begin(3, segments, ec);
+        exchange.abandon_move(3, ec);
+        exchange.move_begin(3, segments, ec); // the lane is free again
+        exchange.move_finish(3, ec);
+        synchronize_both(ec);
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            const auto result = from_device<std::uint8_t>(destination[rank]->data(), bytes);
+            const auto want   = static_cast<std::uint8_t>(2 - rank);
+            for (std::size_t i = 0; i < bytes; ++i) {
+                if (result[i] != want) {
+                    std::cerr << "abandon move: rank " << rank << " byte " << i << " wrong\n";
+                    ++failures;
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "abandon move: " << error.what() << '\n';
+        ++failures;
+    }
+    std::cout << "abandon move: " << (failures ? "FAIL" : "ok") << '\n';
+    return failures;
+}
+
 int run_host_copy_case(const ExecutionContext& ec, ops::HostExchange& exchange,
                        const ops::PeerEvents& events) {
     int failures = 0;
@@ -868,6 +995,10 @@ int main(int argc, char** argv) {
                                                 209u, ec, events, host_events);
         failures += run_split_lane_case("split lanes bf16 [2560,96] 32+64 x3 + sum", kHidden, 96,
                                         32, 3, 213u, ec, host_events);
+        failures +=
+            run_move_lane_case("move lanes 5 MiB x3", (std::size_t{5} << 20) + 77, 3, ec, exchange);
+        failures += run_move_lane_case("move lanes 4 KiB x2", 4096, 2, ec, exchange);
+        failures += run_abandon_move_case(ec, exchange);
         if (ops::allreduce_sum_split_available(ec, events)) {
             std::cerr << "split all-reduce available without a host exchange\n";
             ++failures;

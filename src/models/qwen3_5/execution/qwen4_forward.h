@@ -47,6 +47,7 @@
 // (core, residual, plain, projection, attention, qsa, gdn, ffn, moe, mtp) and instantiated once
 // for execution and once for planning in qwen4_forward.cpp; callers include this header only.
 
+#include "ninfer/ops/nvfp4_activation.h"
 #include "core/device.h"
 #include "core/device_scope.h"
 #include "core/gdn_replay_records.h"
@@ -494,6 +495,57 @@ private:
     // One plain block over the two halves of a prompt chunk: mixer A, mixer B, FFN A, FFN B, each
     // beginning its closing all-reduce on its half's lane.
     void plain_half_blocks(std::size_t layer, std::array<PlainHalf, 2>& halves);
+
+    // ---- Sequence-parallel tp 2 prefill (qwen4_forward/plain_sp.h)
+    // ---------------------------------
+    enum class SpKind { Attention, Gdn, Ffn };
+
+    // One half's SP state: the half's binding (PlainHalf), the columns each rank owns, the open
+    // exchanges and the per-call buffers its stages share (allocated once per call, run_plain).
+    struct SpHalf {
+        PlainHalf* half    = nullptr;
+        std::int32_t count = 0, own = 0; // half width, owned columns per rank ((count + 1) / 2)
+        std::array<std::int32_t, 2> own_first{};
+        bool reduce_open = false; // lane h holds the reduce-scatter of `partial`
+        bool gather_open = false; // lane h holds the all-gather of the planes
+        bool x_open      = false; // lane 2 + h holds the all-gather of the residual
+        int tapped_layer = -1;
+        RankTensors h, partial;
+        std::array<ops::Nvfp4ActivationPlane, 2> own_plane, peer_plane;
+        std::array<std::byte*, 2> block{}; // the union of the block intermediates below
+        RankTensors q, gate, k, v, qkv, z, g, beta, g_peer, beta_peer, activation;
+    };
+
+    struct SpCall {
+        std::array<SpHalf, 2> halves;
+    };
+
+    // Whether a model and environment can take the SP prefill at all (planning reserves for it):
+    // tp 2, plain dense blocks with the fused routes and NVFP4 input projections, switch on.
+    [[nodiscard]] bool sp_possible() const;
+    // Whether this prompt chunk (overlap split `split` > 0) takes it: sp_possible, the host
+    // exchange without direct peer lanes, every rank's peer gating copies.
+    [[nodiscard]] bool sp_eligible(std::int32_t split) const;
+    // The bytes of one half's per-call buffers on one rank for a half `count` columns wide.
+    [[nodiscard]] std::size_t sp_half_bytes(std::int32_t count) const;
+    // Planning: the SP path's peak next to the plain path's (sibling scope).
+    void sp_plan();
+    // Allocates and carves the per-call buffers of both halves (execution).
+    SpCall sp_begin(std::array<PlainHalf, 2>& halves);
+    void sp_stage1(SpHalf& half, int h, SpKind kind, std::size_t layer);
+    void sp_stage2(SpHalf& half, int h, SpKind kind, std::size_t layer);
+    void sp_close_reduce(SpHalf& half, int h);
+    void sp_begin_x_gather(SpHalf& half, int h, int tapped_layer);
+    void sp_close_x_gather(SpHalf& half, int h);
+    void sp_layer(std::size_t layer, SpCall& call);
+    // The chunk's end: every residual column on both ranks (taps of the last layer included).
+    void sp_end(SpCall& call);
+    void sp_abandon(SpCall& call) noexcept;
+    [[nodiscard]] bool sp_tapped(std::size_t layer) const;
+    // Binds a half's columns as half_block does (positions, envelope, GDN slots) around `body`,
+    // without its lane.
+    template <class Body>
+    void bind_half(const PlainHalf& half, Body&& body);
 
     // ---- Dense gated attention (qwen4_forward/attention.h) --------------------------------------
     // Dense gated full attention of a plain block (no QSA) over each rank's query/KV heads.

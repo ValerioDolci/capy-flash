@@ -206,6 +206,15 @@ set_tests_properties(
   ninfer_qwen3_5_engine_tp2_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# The same Engine checks with the sequence-parallel prefill on, and with its no-room fallback forced
+# (the test then also checks which path the long prompts took).
+add_test(NAME ninfer_qwen3_5_engine_tp2_sp_real_test COMMAND ninfer_qwen3_5_engine_tp2_real_test)
+set_tests_properties(ninfer_qwen3_5_engine_tp2_sp_real_test PROPERTIES
+  ENVIRONMENT "NINFER_TP_PREFILL_SP=1" SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_5_engine_tp2_sp_no_room_real_test COMMAND ninfer_qwen3_5_engine_tp2_real_test)
+set_tests_properties(ninfer_qwen3_5_engine_tp2_sp_no_room_real_test PROPERTIES
+  ENVIRONMENT "NINFER_TP_PREFILL_SP=1;NINFER_TP_PREFILL_SP_NO_ROOM=1" SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_engine_mtp_tp2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_mtp_tp2_real.cpp"
   LIBRARIES ninfer_engine ninfer_core)
