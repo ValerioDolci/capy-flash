@@ -72,9 +72,7 @@ std::vector<int> read_cpu_list(const std::string& path) {
     if (!f || !std::getline(f, text)) return {};
     try {
         return parse_cpu_list(text);
-    } catch (const std::invalid_argument&) {
-        return {};
-    }
+    } catch (const std::invalid_argument&) { return {}; }
 }
 
 struct HostCore {
@@ -85,8 +83,8 @@ struct HostCore {
 
 // The allowed physical cores (process affinity), grouped by nothing, in cpu order.
 // The affinity of the process as it was at the first call: HostCpuPool pins its calling thread to
-// cpus[0], so reading the calling thread's mask later would see a single cpu (and a second pool, or a
-// test that builds several, would find "fewer physical cores than requested threads").
+// cpus[0], so reading the calling thread's mask later would see a single cpu (and a second pool, or
+// a test that builds several, would find "fewer physical cores than requested threads").
 const std::pair<bool, cpu_set_t>& process_mask() {
     static const std::pair<bool, cpu_set_t> mask = [] {
         cpu_set_t m;
@@ -102,7 +100,7 @@ std::vector<HostCore> allowed_cores(int* logical = nullptr) {
     std::vector<HostCore> cores;
     int n_logical = 0;
     for (int cpu = 0;; ++cpu) {
-        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+        const std::string base          = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
         const std::vector<int> siblings = read_cpu_list(base + "/topology/thread_siblings_list");
         if (siblings.empty()) break;
         if (!allowed(cpu)) continue;
@@ -192,7 +190,8 @@ HostCpuTopology host_cpu_topology() {
     return t;
 }
 
-std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf, std::string* reason) {
+std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
+                                     std::string* reason) {
     const std::int32_t cores = std::max<std::int32_t>(1, topology.physical_cores);
     std::int32_t n           = 0;
     std::string why;
@@ -202,9 +201,9 @@ std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
         n   = cores;
         why = "one per physical core (ggml block banks)";
     } else {
-        // NVFP4: the dots are bound by the memory bandwidth (9900X: 68 GB/s at 6 threads, per-expert
-        // cost flat from 6 to 12, v072/cpu-threads): half the physical cores, at least 6, and at
-        // least two per L3 domain, since one core cannot fill a CCD's link to memory.
+        // NVFP4: the dots are bound by the memory bandwidth (9900X: 68 GB/s at 6 threads,
+        // per-expert cost flat from 6 to 12, v072/cpu-threads): half the physical cores, at least
+        // 6, and at least two per L3 domain, since one core cannot fill a CCD's link to memory.
         n   = std::max({std::int32_t{6}, cores / 2, 2 * topology.l3_domains});
         why = "max(6, cores/2, 2 per L3 domain) (NVFP4 banks, memory-bound)";
     }
@@ -213,8 +212,8 @@ std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
     // allowed logical CPU per core (a cpuset such as taskset -c 0-15, or SMT off) it has no free
     // sibling and shares a worker's core: 16 workers on a 16-CPU cpuset dropped decode from ~144
     // to 80-90 tok/s on an EPYC 7F52 (issue #11), so one core is left to it.
-    const bool spare_core = cores > 1 && topology.logical_cpus <= topology.physical_cores &&
-                            n >= cores;
+    const bool spare_core =
+        cores > 1 && topology.logical_cpus <= topology.physical_cores && n >= cores;
     if (spare_core) n = cores - 1;
     if (reason != nullptr) {
         if (spare_core) why += ", one core left to the main thread (no free SMT sibling)";
@@ -352,8 +351,10 @@ HostMoeExecutor::HostMoeExecutor(HostCpuPool& pool, std::int32_t hidden, std::in
     pair_token_.resize(static_cast<std::size_t>(max_pairs));
     pair_alpha_.resize(static_cast<std::size_t>(max_pairs));
     used_tokens_.reserve(static_cast<std::size_t>(max_tokens));
-    x_act_ = W4A8ActivationBuffer(hidden, max_tokens);
-    h_act_ = W4A8ActivationBuffer(intermediate, max_pairs);
+    if (!options.gguf_only) {
+        x_act_ = W4A8ActivationBuffer(hidden, max_tokens);
+        h_act_ = W4A8ActivationBuffer(intermediate, max_pairs);
+    }
     if (options.prefetch_rows < 0)
         throw std::invalid_argument("host MoE executor: prefetch_rows < 0");
     const auto n = static_cast<std::size_t>(pool.size());
@@ -379,10 +380,9 @@ HostMoeCallStats HostMoeExecutor::run(const HostExpertLayer& layer, const HostMo
     }
     const bool gguf_layer = layer.format == HostExpertFormat::Gguf;
     if (layer.hidden != hidden_ || layer.intermediate != intermediate_ ||
-        (!gguf_layer &&
-         (layer.gate_up.k != hidden_ || layer.down.k != intermediate_ ||
-          layer.gate_up.rows != std::int64_t{layer.experts} * 2 * intermediate_ ||
-          layer.down.rows != std::int64_t{layer.experts} * hidden_))) {
+        (!gguf_layer && (layer.gate_up.k != hidden_ || layer.down.k != intermediate_ ||
+                         layer.gate_up.rows != std::int64_t{layer.experts} * 2 * intermediate_ ||
+                         layer.down.rows != std::int64_t{layer.experts} * hidden_))) {
         throw std::invalid_argument("host MoE executor: layer geometry mismatch");
     }
     if (expert_slot_.size() < static_cast<std::size_t>(layer.experts)) {

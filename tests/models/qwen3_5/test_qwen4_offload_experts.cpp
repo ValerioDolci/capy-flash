@@ -30,6 +30,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen3_5/execution/qwen4_experts.h"
+#include "models/qwen3_5/qwen4_layer_profile.h"
 #include "ninfer/ops/moe_slots.h"
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
@@ -754,9 +755,48 @@ void test_slot_profile() {
           "profile: ring + workspace lendable at 66 slots");
 }
 
+// The exclusive tier (NINFER_QWEN4_EXCLUSIVE_LAYERS / _SCALE) holds tail / 2 experts per GPU in the
+// base slots of its layers: those base slots are a floor of the profile, taken from the other
+// layers when the pool is short (10. 11. 2026: at --kv-ram-active, scale 1.4 started with 230 base
+// slots in layer 0 against a floor of 208, and a busier desktop on the 5080 refused the start).
+void test_slot_profile_exclusive_floor() {
+    ::unsetenv("NINFER_QWEN4_SLOT_PROFILE");
+    ::unsetenv("NINFER_QWEN4_EXCLUSIVE_LAYERS");
+    ::unsetenv("NINFER_QWEN4_EXCLUSIVE_SCALE");
+    const auto plain103 = Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2);
+    const auto plain80  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2);
+    const auto plain30  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 30, 3, 2);
+    ::setenv("NINFER_QWEN4_EXCLUSIVE_LAYERS", "17", 1);
+    ::setenv("NINFER_QWEN4_EXCLUSIVE_SCALE", "1.4", 1);
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2) == plain103,
+          "exclusive floor: a profile already above the floors is unchanged");
+    const auto b     = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2);
+    std::int64_t sum = 0;
+    bool floors      = true;
+    bool bounded     = true;
+    for (std::int32_t l = 0; l < 49; ++l) {
+        const std::int32_t x = b[static_cast<std::size_t>(l)];
+        sum += x;
+        bounded = bounded && x >= 1 && x + 3 <= 256;
+        floors  = floors && x >= models::qwen3_5::qwen4_exclusive_tail(l) / 2;
+    }
+    check(plain80[0] < models::qwen3_5::qwen4_exclusive_tail(0) / 2 &&
+              b[0] == models::qwen3_5::qwen4_exclusive_tail(0) / 2,
+          "exclusive floor: layer 0 below its floor is raised to it");
+    check(sum == 49 * 80 && bounded && floors,
+          "exclusive floor: every exclusive layer at its floor or above, the pool kept, within the "
+          "partition");
+    check(b[30] < plain80[30], "exclusive floor: the other layers give the slots");
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 30, 3, 2) == plain30,
+          "exclusive floor: floors larger than the pool are left to the startup check");
+    ::unsetenv("NINFER_QWEN4_EXCLUSIVE_LAYERS");
+    ::unsetenv("NINFER_QWEN4_EXCLUSIVE_SCALE");
+}
+
 int main() {
     test_ring_layers();
     test_slot_profile();
+    test_slot_profile_exclusive_floor();
     int count             = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess || count == 0) {

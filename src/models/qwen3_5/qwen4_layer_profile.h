@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 #include <vector>
 
@@ -25,6 +26,40 @@ inline constexpr std::array<std::int16_t, 49> kQwen4LayerSlotWeights = {
 // layers, Qwen4OffloadExperts::ring_layers / layers_below), kept page-locked first.
 inline constexpr std::int32_t kQwen4PinnedTopLayers = 12;
 
+// Exclusive tier: the first NINFER_QWEN4_EXCLUSIVE_LAYERS expert layers keep the experts the GPUs
+// hold at start-up in VRAM only, without a page-locked host copy. Off (0) by default. GGUF banks.
+[[nodiscard]] inline std::int32_t qwen4_exclusive_layers() noexcept {
+    const char* v = std::getenv("NINFER_QWEN4_EXCLUSIVE_LAYERS");
+    return v != nullptr ? std::max(std::atoi(v), 0) : 0;
+}
+
+// The base slots run above the fitted weights here (mean 79-84 against 66);
+// NINFER_QWEN4_EXCLUSIVE_SCALE lets the tail follow them. Too high and the backend refuses at
+// start.
+[[nodiscard]] inline double qwen4_exclusive_scale() noexcept {
+    const char* v = std::getenv("NINFER_QWEN4_EXCLUSIVE_SCALE");
+    return v != nullptr ? std::atof(v) : 1.0;
+}
+
+// Experts of a layer without a host slot, split evenly between two GPUs: the highest ids, as many
+// as one GPU's base slots at the fitted profile, on both. The base slots at load are not known yet
+// (startup.cpp sizes them); the backend refuses at start if they are fewer.
+[[nodiscard]] inline std::int32_t qwen4_exclusive_tail(std::int32_t layer) noexcept {
+    return layer >= 0 && layer < qwen4_exclusive_layers() &&
+                   layer < static_cast<std::int32_t>(kQwen4LayerSlotWeights.size())
+               ? 2 * (static_cast<std::int32_t>(
+                          kQwen4LayerSlotWeights[static_cast<std::size_t>(layer)] *
+                          qwen4_exclusive_scale()) &
+                      ~1)
+               : 0;
+}
+
+// Host slots beyond the non-exclusive experts: the swaps one layer can have in flight.
+[[nodiscard]] inline std::int32_t qwen4_exclusive_spare() noexcept {
+    const char* v = std::getenv("NINFER_QWEN4_EXCLUSIVE_SPARE");
+    return v != nullptr ? std::max(std::atoi(v), 1) : 2;
+}
+
 // v0.7 pinned fallback: the order in which the expert banks of the expert layers [0, layers)
 // (Text layers [0, text_layers), then the MTP layer(s)) stay page-locked when not all fit, most
 // important first: (1) the last kQwen4PinnedTopLayers Text layers, top down (a lent layer has no
@@ -32,7 +67,7 @@ inline constexpr std::int32_t kQwen4PinnedTopLayers = 12;
 // (2) the MTP layer(s) (called several times per decode round); (3) the other Text layers by
 // kQwen4LayerSlotWeights descending (the layers with the most cache insertions), ties low first.
 [[nodiscard]] inline std::vector<std::int32_t> qwen4_host_pin_order(std::int32_t layers,
-                                                                   std::int32_t text_layers) {
+                                                                    std::int32_t text_layers) {
     std::vector<std::int32_t> order;
     if (layers <= 0 || text_layers < 0 || text_layers > layers) { return order; }
     const std::int32_t top = std::min(kQwen4PinnedTopLayers, text_layers);

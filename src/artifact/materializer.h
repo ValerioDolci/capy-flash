@@ -50,7 +50,16 @@ struct HostMappedPlacement {
     // page-locked allocation cannot hold every parent, lower k kept pinned first. Set by the
     // model's load plan; the binder leaves 0.
     std::uint32_t pageable_rank = 0;
+    // Exclusive tier: the last `tail_bytes` of the parent are read into a temporary buffer
+    // (host_tail_of, freed by release_host_tails) and never take page-locked memory; `spare_bytes`
+    // of page-locked room follow the rest of the parent.
+    std::uint64_t tail_bytes  = 0;
+    std::uint64_t spare_bytes = 0;
 };
+
+// The temporary tail of the host-mapped parent at `parent` (its host or device address), or null.
+[[nodiscard]] const std::byte* host_tail_of(const std::byte* parent);
+void release_host_tails();
 
 struct MaterializationPlan {
     const Reader* source                = nullptr;

@@ -63,7 +63,13 @@ struct PolicyConfig {
     // the least recently used, and experts used or inserted in the current window are not
     // candidates (if all are, the least recently used goes, as with 0). Prompt windows keep LRU.
     double evict_tau_windows = 0.0;
-    Rule rule                = Rule::kEngine;
+    // Hysteresis of a decode insertion into a full lane (radiance's heat engine): the candidate's
+    // decayed frequency must reach hysteresis_ratio * the victim's score + hysteresis_gain, so the
+    // two ends of the ranking do not trade places on noise. A declined swap costs a miss; a swap
+    // costs link traffic in both directions with the exclusive tier. 0 ratio = off.
+    double hysteresis_ratio = 0.0;
+    double hysteresis_gain  = 0.0;
+    Rule rule               = Rule::kEngine;
     // T69: a prompt window (decide_prompt) of T tokens adds its counts to the decayed frequency
     // weighted by the window's mean recency, hl * (1 - 2^(-T/hl)) / (T ln 2) (hl =
     // half_life_tokens; ~1 for a decode window, ~hl/(T ln 2) for a wide prompt chunk), as if its

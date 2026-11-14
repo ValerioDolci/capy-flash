@@ -149,6 +149,9 @@ private:
     std::vector<std::uint64_t> row_scratch_;
     std::vector<std::byte>
         scales_; // resident scale plane (Mapped); empty: read through the mapping
+    // Every row of the plane holds these two bytes (the checkpoint's single multiplier): no plane.
+    std::array<std::byte, 2> uniform_scale_{};
+    bool scale_is_uniform_ = false;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

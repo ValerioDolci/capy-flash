@@ -1,8 +1,9 @@
-// GGUF layers of the host MoE executor (HostExpertLayer::format == Gguf): the decode-once kernels of
-// host_gguf.h (gguf_kernels_: AVX-512 or AVX2, the same bits) in three phases over the pool, sharing
-// run()'s CSR of host experts.
+// GGUF layers of the host MoE executor (HostExpertLayer::format == Gguf): the decode-once kernels
+// of host_gguf.h (gguf_kernels_: AVX-512 or AVX2, the same bits) in three phases over the pool,
+// sharing run()'s CSR of host experts.
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
+#include <string>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -33,13 +34,12 @@ void HostMoeExecutor::gguf_call() {
     const auto& g                = layer.gguf;
     if (!g.gate_up_rows || !g.down_rows ||
         g.gate_up_row_bytes != gguf::weight_row_bytes(g.gate_up, hidden_) ||
-        g.down_row_bytes != gguf::weight_row_bytes(g.down, intermediate_) || intermediate_ % kGgufRows ||
-        hidden_ % kGgufRows) {
+        g.down_row_bytes != gguf::weight_row_bytes(g.down, intermediate_) ||
+        intermediate_ % kGgufRows || hidden_ % kGgufRows) {
         throw std::invalid_argument("host MoE executor: GGUF layer geometry mismatch");
     }
-    const std::size_t x_bytes =
-        std::max(gguf::packed_act_bytes(gguf::ActFormat::Q8_K, hidden_),
-                 gguf::packed_act_bytes(gguf::ActFormat::Q8_0, hidden_));
+    const std::size_t x_bytes = std::max(gguf::packed_act_bytes(gguf::ActFormat::Q8_K, hidden_),
+                                         gguf::packed_act_bytes(gguf::ActFormat::Q8_0, hidden_));
     const std::size_t h_bytes = gguf::packed_act_bytes(gguf::ActFormat::Q8_0, intermediate_);
     if (!gguf_x_) {
         const auto alloc = [](std::size_t n) {
@@ -47,13 +47,15 @@ void HostMoeExecutor::gguf_call() {
             if (!p) throw std::bad_alloc();
             return AlignedBytes(p);
         };
-        gguf_x_bytes_ = align64(x_bytes);
-        gguf_h_bytes_ = align64(h_bytes);
-        gguf_x_       = alloc(gguf_x_bytes_ * static_cast<std::size_t>(max_tokens_));
-        gguf_h_ = alloc(gguf_h_bytes_ * static_cast<std::size_t>(max_tokens_) * static_cast<std::size_t>(max_top_k_));
+        gguf_x_bytes_   = align64(x_bytes);
+        gguf_h_bytes_   = align64(h_bytes);
+        gguf_x_         = alloc(gguf_x_bytes_ * static_cast<std::size_t>(max_tokens_));
+        gguf_h_         = alloc(gguf_h_bytes_ * static_cast<std::size_t>(max_tokens_) *
+                                static_cast<std::size_t>(max_top_k_));
         std::size_t dec = 0;
-        for (const auto f : {gguf::WeightFormat::IQ2_S, gguf::WeightFormat::IQ3_XXS, gguf::WeightFormat::IQ3_S,
-                             gguf::WeightFormat::IQ4_XS, gguf::WeightFormat::IQ4_NL}) {
+        for (const auto f :
+             {gguf::WeightFormat::IQ2_S, gguf::WeightFormat::IQ3_XXS, gguf::WeightFormat::IQ3_S,
+              gguf::WeightFormat::IQ4_XS, gguf::WeightFormat::IQ4_NL}) {
             dec = std::max(dec, gguf::decoded_row_bytes(f, hidden_));
         }
         for (const auto f : {gguf::WeightFormat::IQ4_NL, gguf::WeightFormat::Q2_0}) {
@@ -69,6 +71,16 @@ void HostMoeExecutor::gguf_call() {
             m.acts.resize(T);
         }
     }
+    // Exclusive tier: a missing expert must have a host copy; a read without one is garbage.
+    if (g.host_slots != nullptr) {
+        for (std::int32_t u = 0; u < unique_count_; ++u) {
+            const std::int32_t e = unique_[static_cast<std::size_t>(u)];
+            if (g.host_slots[e] < 0) {
+                throw std::logic_error("host MoE executor: expert " + std::to_string(e) +
+                                       " has neither a device slot nor a host slot");
+            }
+        }
+    }
     for (auto& n : gguf_next_) n.store(0, std::memory_order_relaxed);
     pool_.run(&HostMoeExecutor::gguf_body, this);
 }
@@ -78,9 +90,9 @@ void HostMoeExecutor::gguf_body(void* self, std::int32_t member) {
 }
 
 void HostMoeExecutor::gguf_member(std::int32_t member) {
-    const HostExpertLayer& layer = *layer_;
-    const auto& g                = layer.gguf;
-    const HostMoeJob& job        = *job_;
+    const HostExpertLayer& layer   = *layer_;
+    const auto& g                  = layer.gguf;
+    const HostMoeJob& job          = *job_;
     const gguf::HostGgufKernels& K = gguf_kernels_;
     const std::int32_t H = hidden_, I = intermediate_, T = job.tokens;
     const gguf::ActFormat xact = gguf::format_info(g.gate_up).act;
@@ -91,7 +103,7 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     for (std::int32_t i; (i = gguf_next_[0].fetch_add(1, std::memory_order_relaxed)) < used;) {
         const std::int32_t t = used_tokens_[static_cast<std::size_t>(i)];
         K.quantize_pack_bf16_q8f32(xact, job.x + static_cast<std::size_t>(t) * H, H,
-                                       gguf_x_.get() + gguf_x_bytes_ * static_cast<std::size_t>(t));
+                                   gguf_x_.get() + gguf_x_bytes_ * static_cast<std::size_t>(t));
     }
     stamp(member, 1);
     pool_.barrier(1);
@@ -107,18 +119,24 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
         const std::int32_t n  = pair_begin_[static_cast<std::size_t>(u) + 1] - p0;
         for (std::int32_t i = 0; i < n; ++i) {
             me.acts[static_cast<std::size_t>(i)] =
-                gguf_x_.get() + gguf_x_bytes_ * static_cast<std::size_t>(pair_token_[static_cast<std::size_t>(p0 + i)]);
+                gguf_x_.get() + gguf_x_bytes_ * static_cast<std::size_t>(
+                                                    pair_token_[static_cast<std::size_t>(p0 + i)]);
         }
-        const std::uint8_t* gate = g.gate_up_rows + (static_cast<std::size_t>(e) * 2 * I + static_cast<std::size_t>(s) * kGgufRows) * g.gate_up_row_bytes;
-        const std::uint8_t* up   = gate + static_cast<std::size_t>(I) * g.gate_up_row_bytes;
+        const std::int32_t row_e = g.host_slots != nullptr ? g.host_slots[e] : e;
+        const std::uint8_t* gate = g.gate_up_rows + (static_cast<std::size_t>(row_e) * 2 * I +
+                                                     static_cast<std::size_t>(s) * kGgufRows) *
+                                                        g.gate_up_row_bytes;
+        const std::uint8_t* up = gate + static_cast<std::size_t>(I) * g.gate_up_row_bytes;
         for (std::int32_t c = 0; c < kGgufRows / kGgufChunk; ++c) {
             const std::size_t off = static_cast<std::size_t>(c) * kGgufChunk * g.gate_up_row_bytes;
             K.decode_rows(g.gate_up, gate + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
             K.gemm_decoded(g.gate_up, me.dec.get(), kGgufChunk, H, me.acts.data(), n,
-                               me.gate.data() + static_cast<std::size_t>(c) * kGgufChunk * n, static_cast<std::size_t>(n));
+                           me.gate.data() + static_cast<std::size_t>(c) * kGgufChunk * n,
+                           static_cast<std::size_t>(n));
             K.decode_rows(g.gate_up, up + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
             K.gemm_decoded(g.gate_up, me.dec.get(), kGgufChunk, H, me.acts.data(), n,
-                               me.up.data() + static_cast<std::size_t>(c) * kGgufChunk * n, static_cast<std::size_t>(n));
+                           me.up.data() + static_cast<std::size_t>(c) * kGgufChunk * n,
+                           static_cast<std::size_t>(n));
         }
         for (std::int32_t i = 0; i < n; ++i) {
             alignas(64) float gv[kGgufRows], uv[kGgufRows], hv[kGgufRows];
@@ -127,8 +145,8 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
                 uv[r] = me.up[static_cast<std::size_t>(r) * n + i];
             }
             K.silu_mul(gv, uv, hv, kGgufRows);
-            K.quantize_pack_q8_0_half_q8f32(hv, s / 2, s % 2,
-                                                gguf_h_.get() + gguf_h_bytes_ * static_cast<std::size_t>(p0 + i));
+            K.quantize_pack_q8_0_half_q8f32(
+                hv, s / 2, s % 2, gguf_h_.get() + gguf_h_bytes_ * static_cast<std::size_t>(p0 + i));
         }
     }
     stamp(member, 3);
@@ -140,26 +158,33 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     for (std::int32_t it; (it = gguf_next_[2].fetch_add(1, std::memory_order_relaxed)) < outs;) {
         const std::int32_t r0 = it * kGgufRows;
         for (std::int32_t t = 0; t < T; ++t) {
-            std::memset(job.out + static_cast<std::size_t>(t) * H + r0, 0, sizeof(float) * kGgufRows);
+            std::memset(job.out + static_cast<std::size_t>(t) * H + r0, 0,
+                        sizeof(float) * kGgufRows);
         }
         for (std::int32_t u = 0; u < U; ++u) {
             const std::int32_t e  = unique_[static_cast<std::size_t>(u)];
             const std::int32_t p0 = pair_begin_[static_cast<std::size_t>(u)];
             const std::int32_t n  = pair_begin_[static_cast<std::size_t>(u) + 1] - p0;
             for (std::int32_t i = 0; i < n; ++i) {
-                me.acts[static_cast<std::size_t>(i)] = gguf_h_.get() + gguf_h_bytes_ * static_cast<std::size_t>(p0 + i);
+                me.acts[static_cast<std::size_t>(i)] =
+                    gguf_h_.get() + gguf_h_bytes_ * static_cast<std::size_t>(p0 + i);
             }
-            const std::uint8_t* rows = g.down_rows + (static_cast<std::size_t>(e) * H + static_cast<std::size_t>(r0)) * g.down_row_bytes;
+            const std::int32_t row_e = g.host_slots != nullptr ? g.host_slots[e] : e;
+            const std::uint8_t* rows =
+                g.down_rows + (static_cast<std::size_t>(row_e) * H + static_cast<std::size_t>(r0)) *
+                                  g.down_row_bytes;
             for (std::int32_t c = 0; c < kGgufRows / kGgufChunk; ++c) {
-                K.decode_rows(g.down, rows + static_cast<std::size_t>(c) * kGgufChunk * g.down_row_bytes,
-                                  g.down_row_bytes, kGgufChunk, I, me.dec.get());
-                K.gemm_decoded(g.down, me.dec.get(), kGgufChunk, I, me.acts.data(), n, me.part.data(),
-                                   static_cast<std::size_t>(n));
+                K.decode_rows(g.down,
+                              rows + static_cast<std::size_t>(c) * kGgufChunk * g.down_row_bytes,
+                              g.down_row_bytes, kGgufChunk, I, me.dec.get());
+                K.gemm_decoded(g.down, me.dec.get(), kGgufChunk, I, me.acts.data(), n,
+                               me.part.data(), static_cast<std::size_t>(n));
                 for (std::int32_t r = 0; r < kGgufChunk; ++r) {
                     for (std::int32_t i = 0; i < n; ++i) {
                         const std::int32_t t = pair_token_[static_cast<std::size_t>(p0 + i)];
                         job.out[static_cast<std::size_t>(t) * H + r0 + c * kGgufChunk + r] +=
-                            pair_alpha_[static_cast<std::size_t>(p0 + i)] * me.part[static_cast<std::size_t>(r) * n + i];
+                            pair_alpha_[static_cast<std::size_t>(p0 + i)] *
+                            me.part[static_cast<std::size_t>(r) * n + i];
                     }
                 }
             }

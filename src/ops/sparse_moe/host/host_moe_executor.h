@@ -47,24 +47,27 @@ enum class HostExpertFormat : std::uint8_t { Nvfp4, Gguf };
 // A layer bank of ggml blocks (artifact layout gguf_blocks_v1): gate_up [E*2I] rows of H values
 // (expert-major: gate rows, then up rows), down [E*H] rows of I values, whole blocks per row.
 struct HostGgufBank {
-    gguf::WeightFormat gate_up         = gguf::WeightFormat::IQ3_XXS;
-    gguf::WeightFormat down            = gguf::WeightFormat::IQ4_NL;
-    const std::uint8_t* gate_up_rows   = nullptr;
-    const std::uint8_t* down_rows      = nullptr;
-    std::size_t gate_up_row_bytes      = 0;
-    std::size_t down_row_bytes         = 0;
+    gguf::WeightFormat gate_up       = gguf::WeightFormat::IQ3_XXS;
+    gguf::WeightFormat down          = gguf::WeightFormat::IQ4_NL;
+    const std::uint8_t* gate_up_rows = nullptr;
+    const std::uint8_t* down_rows    = nullptr;
+    std::size_t gate_up_row_bytes    = 0;
+    std::size_t down_row_bytes       = 0;
+    // Exclusive tier: expert id -> its host slot in the rows; null = the id itself. An entry a
+    // call reads does not change during it (ExpertHostPool).
+    const std::int32_t* host_slots = nullptr;
 };
 
 // Routed experts of one MoE layer in host memory. Expert e owns gate rows [e*2I, e*2I+I), up rows
 // [e*2I+I, (e+1)*2I) of gate_up [E*2I, H] and rows [e*H, (e+1)*H) of down [E*H, I]: NVFP4 planes
 // (format Nvfp4) or ggml block rows (format Gguf, `gguf`).
 //
-// Gguf layers (capy-flash v0.7): decode-once kernels of host_gguf.h (AVX-512 or AVX2, the same bits;
-// gguf::host_gguf_isa(Options::isa)); x and h quantized per
-// 32 values with an FP32 scale (quantize_pack_*_q8f32, the GPU GGUF Ops' codec), h = silu(g) * u in
-// FP32; three dynamic phases (tokens, gate/up in (expert, 32-row) items, down in 32-row output
-// items summing every host expert in ascending id order), so the output does not depend on the
-// thread count or the item order. The NVFP4 Options (schedule, a4, prefetch) do not apply.
+// Gguf layers (capy-flash v0.7): decode-once kernels of host_gguf.h (AVX-512 or AVX2, the same
+// bits; gguf::host_gguf_isa(Options::isa)); x and h quantized per 32 values with an FP32 scale
+// (quantize_pack_*_q8f32, the GPU GGUF Ops' codec), h = silu(g) * u in FP32; three dynamic phases
+// (tokens, gate/up in (expert, 32-row) items, down in 32-row output items summing every host expert
+// in ascending id order), so the output does not depend on the thread count or the item order. The
+// NVFP4 Options (schedule, a4, prefetch) do not apply.
 struct HostExpertLayer {
     Nvfp4Plane gate_up;
     Nvfp4Plane down;
@@ -127,6 +130,7 @@ struct HostCpuTopology {
     std::int32_t l3_domains     = 0; // distinct L3 caches (CCDs) among them
     std::int32_t numa_nodes     = 0; // distinct NUMA nodes among them
 };
+
 [[nodiscard]] HostCpuTopology host_cpu_topology();
 
 // Default number of CPU threads for the missing routed experts when the caller did not set one
@@ -188,6 +192,8 @@ private:
 class HostMoeExecutor {
 public:
     struct Options {
+        // Every layer is a ggml block bank: the NVFP4 activation buffers are not allocated.
+        bool gguf_only = false;
         // Experts with at least this many tokens use the multi-token dot, the others the
         // per-token (FreeToken) dot. 1 = multi-token everywhere: measured 12 % faster per call on
         // the decode pattern at 6 threads (T03 kernel: one decode per group, one accumulator),
@@ -258,16 +264,20 @@ private:
     void gguf_call();
     static void gguf_body(void* self, std::int32_t member);
     void gguf_member(std::int32_t member);
+
     struct AlignedFree {
         void operator()(std::uint8_t* p) const noexcept;
     };
+
     using AlignedBytes = std::unique_ptr<std::uint8_t[], AlignedFree>;
+
     struct GgufMember {
         AlignedBytes dec;
         std::vector<float> gate, up, part;
         std::vector<const void*> acts;
     };
-    AlignedBytes gguf_x_, gguf_h_;      // packed activations: [max_tokens], [max pairs]
+
+    AlignedBytes gguf_x_, gguf_h_; // packed activations: [max_tokens], [max pairs]
     std::size_t gguf_x_bytes_ = 0, gguf_h_bytes_ = 0;
     std::vector<GgufMember> gguf_members_;
     alignas(64) std::atomic<std::int32_t> gguf_next_[3]{};

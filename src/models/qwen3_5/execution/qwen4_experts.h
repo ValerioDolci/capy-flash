@@ -802,6 +802,7 @@ private:
     Qwen4OffloadOptions options_;
     DeviceMemory memory_;
     std::vector<Qwen4ExpertBank> device_banks_; // divisors on the device, pool as slots
+    std::unique_ptr<expert_cache::ExpertHostPool> host_pool_; // exclusive tier, before cache_
     std::unique_ptr<expert_cache::ExpertCache> cache_;
     std::unique_ptr<Qwen4ExpertPrefetch> prefetch_;
     std::int32_t staging_slots_      = 0;

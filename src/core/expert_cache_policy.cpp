@@ -359,6 +359,22 @@ void ExpertCachePolicy::decide(std::int32_t layer, std::span<const Routed> route
         if (config_.rule == Rule::kEngine && !admissible(e, true)) { continue; }
         // T69: a lane whose base slots are blocked with no active column holds nothing.
         if (capacity(layer, partition_of(e)) == 0) { continue; }
+        if (config_.hysteresis_ratio > 0.0 && config_.rule == Rule::kEngine) {
+            const std::int32_t p = partition_of(e);
+            if (full(layer, p)) {
+                const std::int32_t local = victim_local(layer, p, /*scored=*/true);
+                const std::size_t i      = lane_base(layer, p) + static_cast<std::size_t>(local);
+                const double age =
+                    static_cast<double>(window_[static_cast<std::size_t>(layer)] - last_use_[i]);
+                const double recency = config_.evict_tau_windows > 0.0
+                                           ? std::exp2(-age / config_.evict_tau_windows)
+                                           : 1.0;
+                const double victim  = f[expert_of_[i]] * recency;
+                if (f[e] < config_.hysteresis_ratio * victim + config_.hysteresis_gain) {
+                    continue;
+                }
+            }
+        }
         out.inserts.push_back(insert(layer, e, /*scored=*/true));
         ++inserted;
     }

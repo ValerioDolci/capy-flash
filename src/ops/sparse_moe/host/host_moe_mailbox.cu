@@ -904,11 +904,11 @@ namespace {
 // singular.
 bool solve_costs(std::span<const HostMoeCostSample> s, const std::vector<char>& keep,
                  bool with_column, double column, std::array<double, 3>& out) {
-    const int n = with_column ? 3 : 2;
+    const int n    = with_column ? 3 : 2;
     double a[3][4] = {};
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (keep[i] == 0) continue;
-        const double c = static_cast<double>(s[i].pairs - s[i].experts);
+        const double c    = static_cast<double>(s[i].pairs - s[i].experts);
         const double x[3] = {1.0, static_cast<double>(s[i].experts), c};
         const double y    = static_cast<double>(s[i].us) - (with_column ? 0.0 : column * c);
         for (int r = 0; r < n; ++r) {
@@ -960,7 +960,7 @@ HostMoeCostFit fit_host_costs(std::span<const HostMoeCostSample> samples, float 
         const double mad = std::max(sorted[sorted.size() / 2], 0.5);
         for (std::size_t i = 0; i < samples.size(); ++i) keep[i] = r[i] <= 4.0 * mad ? 1 : 0;
     }
-    double ss = 0.0;
+    double ss         = 0.0;
     std::int32_t kept = 0;
     for (std::size_t i = 0; i < samples.size(); ++i) {
         if (keep[i] == 0) continue;
@@ -1048,7 +1048,8 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
             const std::lock_guard lock(cost_mutex_);
             if (static_cast<std::int64_t>(cost_samples_.size()) <
                 cost_capacity_.load(std::memory_order_relaxed)) {
-                cost_samples_.push_back({st.experts, st.pairs, 1e-3F * static_cast<float>(st.end_ns)});
+                cost_samples_.push_back(
+                    {st.experts, st.pairs, 1e-3F * static_cast<float>(st.end_ns)});
             }
         }
     }
@@ -1150,8 +1151,13 @@ void HostMoeMailbox::service() {
     std::int32_t layer = 0;
     try {
         HostCpuPool pool(config_.cpus);
+        HostMoeExecutor::Options executor_options = config_.executor;
+        executor_options.gguf_only =
+            std::all_of(layers_.begin(), layers_.end(), [](const HostExpertLayer& l) {
+                return l.format == HostExpertFormat::Gguf;
+            });
         HostMoeExecutor executor(pool, config_.hidden, config_.intermediate, config_.max_tokens,
-                                 config_.top_k, config_.executor);
+                                 config_.top_k, executor_options);
         started_.store(1, std::memory_order_release);
         using clock         = std::chrono::steady_clock;
         auto last           = clock::now();

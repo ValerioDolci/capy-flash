@@ -143,6 +143,16 @@ void PleGather::load_scales() {
                 at += take;
             });
     }
+    // The published artifacts repeat one multiplier on every row: 0.6 GiB that can be two bytes.
+    bool uniform = bytes >= 2;
+    for (std::uint64_t i = 2; i < bytes && uniform; i += 2) {
+        uniform = scales_[i] == scales_[0] && scales_[i + 1] == scales_[1];
+    }
+    if (uniform) {
+        uniform_scale_    = {scales_[0], scales_[1]};
+        scale_is_uniform_ = true;
+        std::vector<std::byte>().swap(scales_);
+    }
 }
 
 PleGather::~PleGather() = default;
@@ -272,7 +282,7 @@ void PleGather::prefetch_mapped(std::span<const std::uint64_t> rows) const {
     };
     for (const std::uint64_t row : rows) {
         add_range(row * table_.row_bytes, table_.row_record_bytes());
-        if (table_.format == PleRowFormat::Fp8RowBf16 && scales_.empty()) {
+        if (table_.format == PleRowFormat::Fp8RowBf16 && scales_.empty() && !scale_is_uniform_) {
             add_range(table_.scale_plane + row * 2U, 2);
         }
     }
@@ -374,7 +384,8 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
                     continue;
                 }
                 const std::byte* scale =
-                    reader_ ? streamed(2 * r + 1)
+                    reader_             ? streamed(2 * r + 1)
+                    : scale_is_uniform_ ? uniform_scale_.data()
                     : !scales_.empty()
                         ? scales_.data() + rows[r] * 2U
                         : locate(table_.scale_plane + rows[r] * 2U, 2, scale_bounce.data());

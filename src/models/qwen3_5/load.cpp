@@ -110,6 +110,13 @@ void rank_host_mapped(artifact::MaterializationPlan& plan,
         const auto found = layer_of.find(placement.object.index);
         if (found != layer_of.end()) {
             placement.pageable_rank = rank[static_cast<std::size_t>(found->second)];
+            const std::int32_t tail = qwen4_exclusive_tail(found->second);
+            if (tail > 0 &&
+                plan.source->directory().tensor(placement.object).format.rfind("gguf", 0) == 0) {
+                const std::uint64_t stride = placement.bytes / 512;
+                placement.tail_bytes       = stride * static_cast<std::uint64_t>(tail);
+                placement.spare_bytes      = stride * qwen4_exclusive_spare();
+            }
         }
     }
 }

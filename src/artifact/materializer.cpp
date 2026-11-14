@@ -33,10 +33,15 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::artifact {
 namespace {
+
+// Exclusive tier: the start-up tails of the host-mapped parents, one model per process.
+std::unordered_map<const std::byte*, const std::byte*> host_tails;
+std::unique_ptr<PageableHostBuffer> host_tail_buffer;
 
 // T156: the host-mapped weights are one page-locked allocation (64.6 GiB for Qwen3.8-Flash-Next).
 // Without enough free RAM the populate + registration stalls in reclaim and systemd-oomd kills the
@@ -577,15 +582,31 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (plan.host_mapped_bytes > std::numeric_limits<std::size_t>::max()) {
             throw ArtifactError("host-mapped backing exceeds size_t");
         }
-        require_host_memory(plan.host_mapped_bytes);
-        const std::span<const HostMappedPlacement> placements(plan.host_mapped_objects);
+        // Exclusive tier: the page-locked layout without the tails, plus the spare room.
+        std::vector<HostMappedPlacement> compact = plan.host_mapped_objects;
+        std::uint64_t host_mapped_total          = plan.host_mapped_bytes;
+        std::uint64_t tail_total                 = 0;
+        for (const auto& placement : compact) { tail_total += placement.tail_bytes; }
+        if (tail_total != 0) {
+            std::uint64_t compact_end = 0;
+            for (auto& placement : compact) {
+                placement.bytes += placement.spare_bytes - placement.tail_bytes;
+                placement.offset = align_up(compact_end, placement.alignment, "exclusive offset");
+                compact_end = checked_add(placement.offset, placement.bytes, "exclusive bytes");
+            }
+            host_mapped_total = compact_end;
+            host_tail_buffer =
+                std::make_unique<PageableHostBuffer>(static_cast<std::size_t>(tail_total));
+        }
+        require_host_memory(host_mapped_total);
+        const std::span<const HostMappedPlacement> placements(compact);
         std::uint64_t pinned_limit   = host_pinned_limit(plan);
         const std::uint64_t reserved = plan.host_pinned_reserved_bytes;
         if (pinned_limit == 0 && ram_guard_enabled()) {
             // #40: without an explicit limit, keep the page-locked part outside free CMA memory.
             const HostMemInfo memory = read_host_meminfo();
             pinned_limit = cma_pinned_limit(memory.total, memory.available, memory.cma_free,
-                                            plan.host_mapped_bytes, reserved, kPinnedReserveBytes);
+                                            host_mapped_total, reserved, kPinnedReserveBytes);
             if (pinned_limit != 0) {
                 std::fprintf(stderr,
                              "host-mapped weights: %s of the available RAM is CMA (CmaFree), which "
@@ -616,25 +637,24 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         // Even capybaras have a memory budget.
         // Even without pageable candidates, an explicit cap must hold. The residency planner
         // below reports mandatory pinned bytes above the budget and refuses before allocation.
-        if (limit == 0 || limit >= plan.host_mapped_bytes) {
+        if (limit == 0 || limit >= host_mapped_total) {
             try {
-                out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
-                    static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
-                    PinnedHostPages::Huge);
-                residency =
-                    plan_host_residency(placements, plan.host_mapped_bytes, plan.host_mapped_bytes);
+                out.host_mapped_ =
+                    std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(host_mapped_total),
+                                                       HostMapping::Yes, PinnedHostPages::Huge);
+                residency = plan_host_residency(placements, host_mapped_total, host_mapped_total);
                 placed_whole = true;
             } catch (const std::exception& error) {
                 if (!may_split) {
                     throw ArtifactError("host-mapped weight buffer of " +
-                                        std::to_string(plan.host_mapped_bytes) +
+                                        std::to_string(host_mapped_total) +
                                         " bytes: " + error.what());
                 }
                 out.stats_.host_pinned_alloc_failed = true;
                 std::fprintf(stderr,
                              "host-mapped weights: the page-locked allocation of %s failed (%s); "
                              "keeping part of the expert banks in pageable memory\n",
-                             gib_text(plan.host_mapped_bytes).c_str(), error.what());
+                             gib_text(host_mapped_total).c_str(), error.what());
             }
         }
         if (!placed_whole) {
@@ -642,12 +662,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             // StateImages, mailboxes, the staging ring, the Host KV planes of --kv-ram-active)
             // unless the limit is explicit; every failed try steps down.
             const std::uint64_t reserve =
-                std::min(plan.host_mapped_bytes, kPinnedReserveBytes + reserved);
-            std::uint64_t budget = limit != 0 && limit < plan.host_mapped_bytes
-                                       ? limit
-                                       : plan.host_mapped_bytes - reserve;
+                std::min(host_mapped_total, kPinnedReserveBytes + reserved);
+            std::uint64_t budget =
+                limit != 0 && limit < host_mapped_total ? limit : host_mapped_total - reserve;
             for (;;) {
-                residency = plan_host_residency(placements, plan.host_mapped_bytes, budget);
+                residency = plan_host_residency(placements, host_mapped_total, budget);
                 if (residency.required_pinned_bytes > budget) {
                     throw ArtifactError(
                         "host-mapped weights: the parents that must stay page-locked need " +
@@ -709,11 +728,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         const auto bytes_of = [&](std::size_t i) {
             const auto& placement = plan.host_mapped_objects[i];
             std::byte* base       = residency.pageable[i] != 0 ? pageable : host;
-            return std::span(base + residency.offset[i], static_cast<std::size_t>(placement.bytes));
+            return std::span(base + residency.offset[i],
+                             static_cast<std::size_t>(placement.bytes - placement.tail_bytes));
         };
         std::uint64_t end = 0;
         std::vector<HostRead> reads;
-        reads.reserve(plan.host_mapped_objects.size());
+        reads.reserve(plan.host_mapped_objects.size() * 2);
+        std::vector<const std::byte*> tail_of(plan.host_mapped_objects.size(), nullptr);
+        std::size_t tail_used = 0;
         std::vector<bool> placed(out.objects_.size(), false);
         for (std::size_t i = 0; i < plan.host_mapped_objects.size(); ++i) {
             const auto& placement = plan.host_mapped_objects[i];
@@ -734,7 +756,20 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             placed[placement.object.index] = true;
             end                            = placement.offset + placement.bytes;
             const auto bytes               = bytes_of(i);
-            const auto payload             = static_cast<std::size_t>(descriptor.bytes);
+            auto payload                   = static_cast<std::size_t>(descriptor.bytes);
+            if (placement.tail_bytes != 0) {
+                // Exclusive tier: payload and parent are the same size in these formats.
+                if (descriptor.bytes != placement.bytes) {
+                    throw ArtifactError("exclusive tier: a parent with padding");
+                }
+                payload = bytes.size();
+                std::span<std::byte> tail(static_cast<std::byte*>(host_tail_buffer->data()) +
+                                              tail_used,
+                                          static_cast<std::size_t>(placement.tail_bytes));
+                reads.push_back({descriptor.offset + payload, tail});
+                tail_of[i] = tail.data();
+                tail_used += placement.tail_bytes;
+            }
             reads.push_back({descriptor.offset, bytes.first(payload)});
             // Padding after the stored payload reads as zero, as in a device arena.
             std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(payload), bytes.end(),
@@ -758,7 +793,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 const std::byte* base =
                     in_pageable ? bytes.data() : mapped[device] + residency.offset[i];
                 backing.parent = WeightParent{geometry, base, divisor};
-                backing.shard  = {ShardAxis::HostMapped, {}, geometry.shape};
+                if (tail_of[i] != nullptr) { host_tails[base] = tail_of[i]; }
+                backing.shard = {ShardAxis::HostMapped, {}, geometry.shape};
                 if (!in_pageable) {
                     out.stats_.per_device_host_mapped_bytes[device] += placement.bytes;
                 }
@@ -997,6 +1033,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         reader, std::move(plan),
         std::span<DeviceContext* const>(devices.data(), static_cast<std::size_t>(execution.tp)),
         startup_observer);
+}
+
+const std::byte* host_tail_of(const std::byte* parent) {
+    const auto found = host_tails.find(parent);
+    return found == host_tails.end() ? nullptr : found->second;
+}
+
+void release_host_tails() {
+    host_tails.clear();
+    host_tail_buffer.reset();
 }
 
 } // namespace ninfer::artifact
