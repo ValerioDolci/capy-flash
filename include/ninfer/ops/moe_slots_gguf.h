@@ -32,7 +32,8 @@ enum class MoeGgufFormat : std::int32_t {
 [[nodiscard]] bool moe_gguf_gate_up_supported(MoeGgufFormat format) noexcept;
 [[nodiscard]] bool moe_gguf_down_supported(MoeGgufFormat format) noexcept;
 // Bytes of one expert: 1280 gate|up rows of 2560 and 2560 down rows of 640.
-[[nodiscard]] std::int64_t moe_gguf_expert_bytes(MoeGgufFormat gate_up, MoeGgufFormat down) noexcept;
+[[nodiscard]] std::int64_t moe_gguf_expert_bytes(MoeGgufFormat gate_up,
+                                                 MoeGgufFormat down) noexcept;
 
 // One layer's experts. An expert is resident in slot s = slot_table[e] (-1, or s outside
 // [0, slots): not here). Its rows are found in one of two ways:
@@ -44,18 +45,18 @@ enum class MoeGgufFormat : std::int32_t {
 //            place, slot_table = identity: the Mapped route and GPU reads of missing experts).
 struct MoeGgufLayer {
     Tensor slot_table; // I32 [E]
-    std::int32_t slots                = 0;
-    const std::int64_t* slot_offset   = nullptr;
-    const std::byte* base             = nullptr; // blob form
-    const std::byte* gate_up_base     = nullptr; // planar form
-    const std::byte* down_base        = nullptr; // planar form
-    MoeGgufFormat gate_up_format      = MoeGgufFormat::IQ3_XXS;
-    MoeGgufFormat down_format         = MoeGgufFormat::IQ4_NL;
-    // moe_grouped_gguf only, blob form (capy-flash v0.7 prefill streaming): an expert without a
+    std::int32_t slots              = 0;
+    const std::int64_t* slot_offset = nullptr;
+    const std::byte* base           = nullptr; // blob form
+    const std::byte* gate_up_base   = nullptr; // planar form
+    const std::byte* down_base      = nullptr; // planar form
+    MoeGgufFormat gate_up_format    = MoeGgufFormat::IQ3_XXS;
+    MoeGgufFormat down_format       = MoeGgufFormat::IQ4_NL;
+    // moe_grouped_gguf only, blob form (prefill streaming): an expert without a
     // slot whose host_table[e] >= 0 (device I32 [E]) is read in place from the planar bases at row
     // block host_table[e] (the layer's host-mapped bank, zero-copy over PCIe); -1 = not here.
     // Null = blob experts only.
-    const std::int32_t* host_table    = nullptr;
+    const std::int32_t* host_table = nullptr;
 };
 
 /**

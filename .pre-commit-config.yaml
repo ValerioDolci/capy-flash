@@ -8,8 +8,9 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=1024]
-        exclude: ^tools/freq_corpus/fixtures/ranking/ # token rankings, one i64 per vocabulary entry (1.9 MB)
+        exclude: ^tools/freq_corpus/fixtures/ranking/ # token rankings, one i64 per vocabulary entry
       - id: check-merge-conflict
+      - id: detect-private-key
       - id: check-yaml
       - id: check-json
   - repo: https://github.com/astral-sh/ruff-pre-commit

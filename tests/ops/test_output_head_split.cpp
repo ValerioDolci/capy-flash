@@ -1,11 +1,8 @@
 // Two-device parity of the vocabulary-split output head.
 //
 // The FP8 output head `[248320,5120]` splits its output rows, the vocabulary, into two
-// `[124160,5120]` halves. Each rank computes its half of the logits with linear_column_parallel,
-// and allgather_rows then rebuilds the whole `[248320,T]` logits on both devices. This suite
-// compares each half and each rebuilt image against linear() over the whole head on device 0.
-// linear() stores the vocabulary fastest, so the gather runs once per token, over `[1,124160]`
-// blocks.
+// `[124160,5120]` halves. Each rank computes its half of the logits with linear_column_parallel.
+// This suite compares each half against linear() over the whole head on device 0.
 //
 // The whole head and its halves are generated independently from one logical matrix, and each case
 // first checks that each half is the parent's block and that the two halves differ. Every policy
@@ -46,10 +43,6 @@ constexpr std::int32_t kHalf   = kVocab / 2;
 constexpr QType kQType         = QType::FP8_E4M3FN_ROW_BF16;
 constexpr ReductionCriterion kHeadCriterion{2.0 * kBf16UnitRoundoff, 0.0, 2.0 * kBf16UnitRoundoff};
 
-void* element_offset(void* base, std::size_t elements) {
-    return static_cast<std::uint8_t*>(base) + elements * sizeof(std::uint16_t);
-}
-
 qw::PackedWeight make_head(std::int32_t rows, std::uint32_t seed, std::int32_t row_origin) {
     qw::PatternedWeightOptions options;
     options.row_origin              = row_origin;
@@ -87,7 +80,7 @@ int compare(const std::string& label, const std::vector<double>& got,
     return verify_reduction(label, got, expected, kHeadCriterion);
 }
 
-int run_head(const ExecutionContext& ec, const ops::PeerEvents& events) {
+int run_head(const ExecutionContext& ec) {
     constexpr std::uint32_t kSeed = 301U;
     int failures                  = 0;
     const qw::PackedWeight parent = make_head(kVocab, kSeed, 0);
@@ -142,14 +135,11 @@ int run_head(const ExecutionContext& ec, const ops::PeerEvents& events) {
             const std::vector<double> expected = from_device_bf16(reference.data(), whole_elements);
 
             std::array<std::optional<GuardedDeviceBuffer>, 2> half_out;
-            std::array<std::optional<GuardedDeviceBuffer>, 2> logits;
             std::array<std::optional<DeviceArena>, 2> arena;
             for (std::size_t rank = 0; rank < 2; ++rank) {
                 set_device(ec, static_cast<int>(rank));
                 half_out[rank].emplace(half_elements * sizeof(std::uint16_t));
                 half_out[rank]->fill(0xff);
-                logits[rank].emplace(whole_elements * sizeof(std::uint16_t));
-                logits[rank]->fill(0xcd);
                 arena[rank].emplace(workspace_bytes(kHalf, policy, tokens));
             }
             const std::array<Tensor, 2> x{Tensor(x_device[0].p, DType::BF16, {kHidden, tokens}),
@@ -162,32 +152,14 @@ int run_head(const ExecutionContext& ec, const ops::PeerEvents& events) {
 
             retire_staging(ec);
             ops::linear_column_parallel(x, w, out, policy, workspace, ec);
-            for (std::int32_t token = 0; token < tokens; ++token) {
-                const auto half_offset  = static_cast<std::size_t>(token) * kHalf;
-                const auto whole_offset = static_cast<std::size_t>(token) * kVocab;
-                const std::array<Tensor, 2> part{
-                    Tensor(element_offset(half_out[0]->data(), half_offset), DType::BF16,
-                           {1, kHalf}),
-                    Tensor(element_offset(half_out[1]->data(), half_offset), DType::BF16,
-                           {1, kHalf})};
-                const std::array<Tensor, 2> destination{
-                    Tensor(element_offset(logits[0]->data(), whole_offset), DType::BF16,
-                           {1, kVocab}),
-                    Tensor(element_offset(logits[1]->data(), whole_offset), DType::BF16,
-                           {1, kVocab})};
-                ops::allgather_rows(destination, part, ec, events);
-            }
             synchronize_both(ec);
 
             std::array<std::vector<double>, 2> half_observed;
-            std::array<std::vector<double>, 2> rebuilt;
             for (std::size_t rank = 0; rank < 2; ++rank) {
                 const std::string rank_label = label + " rank " + std::to_string(rank);
                 set_device(ec, static_cast<int>(rank));
                 failures += half_out[rank]->verify_guards(rank_label);
-                failures += logits[rank]->verify_guards(rank_label + " gathered");
                 half_observed[rank] = from_device_bf16(half_out[rank]->data(), half_elements);
-                rebuilt[rank]       = from_device_bf16(logits[rank]->data(), whole_elements);
 
                 std::vector<double> block(half_elements);
                 for (std::int32_t token = 0; token < tokens; ++token) {
@@ -198,15 +170,9 @@ int run_head(const ExecutionContext& ec, const ops::PeerEvents& events) {
                               block.begin() + static_cast<std::ptrdiff_t>(token) * kHalf);
                 }
                 failures += compare(rank_label, half_observed[rank], block);
-                failures += compare(rank_label + " gathered", rebuilt[rank], expected);
             }
             if (half_observed[0] == half_observed[1]) {
                 std::cerr << label << ": both ranks produced the same logit half\n";
-                ++failures;
-            }
-            // The gather relocates bytes, so both devices hold the identical image.
-            if (rebuilt[0] != rebuilt[1]) {
-                std::cerr << label << ": the gathered logits differ between devices\n";
                 ++failures;
             }
         }
@@ -264,8 +230,7 @@ int main() {
         const ExecutionContext ec({0, 1});
         std::cout << "peer access: " << (ops::enable_peer_access(ec) ? "direct" : "host-staged")
                   << '\n';
-        const ops::PeerEvents events(ec);
-        failures += run_head(ec, events);
+        failures += run_head(ec);
     } catch (const std::exception& error) {
         std::cerr << "output head split: " << error.what() << '\n';
         return 1;

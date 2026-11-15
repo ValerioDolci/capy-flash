@@ -3,20 +3,19 @@
 //
 // Scalar model: integer block sums per 4-element lane, then per 64-weight group and lane one FP32
 // product (e4m3 weight scale x activation block scale) and one fused multiply-add into that lane's
-// accumulator (std::fmaf), the four PerToken accumulators added pairwise, the 16 lanes reduced in
-// _mm512_reduce_add_ps's order, out = s * 0.5 / divisor; the int8 and A4 codecs element by
-// element with vpmovdb's truncation.
+// accumulator (std::fmaf), the 16 lanes reduced in _mm512_reduce_add_ps's order, out = s * 0.5 /
+// divisor; the int8 and A4 codecs element by element with vpmovdb's truncation.
 //
 // Criteria (pre-registered): zero differing bits in every comparison below.
 //   1. codecs: quantize_bf16 / quantize_blocks / quantize_*_a4 (q, qu, corr, sb16, asb) on random
 //      activations with outliers, all-zero blocks, tiny and huge values, A4 grid ties;
-//   2. dots: rows_dot PerToken and MultiToken, T = 1..8, prefetch 0 and 3 rows, synthetic planes
+//   2. dots: rows_dot, T = 1..8, synthetic planes
 //      at k = 2560, 640, 1088 (16-block steps + 4-block tail), 192 (tail only), 64;
 //   3. real rows (NINFER_HOST_NVFP4_BANKS = directory with layer_00.nvfp4.{gate_up,down}.bin, the
 //      Flash-Next layer-0 banks as stored in the artifact): every row of 24 random experts, gate/up
 //      and down, T = 1, 3, 4, 8, W4A8 and A4 activations; the scalar model on 4 of them;
-//   4. the layer executor (HostMoeExecutor, 6 threads, Static and Dynamic, a4 on and off, decode
-//      windows T = 1..8 and a 24-token prefill chunk) with isa = Avx2 vs Avx512Vnni on the real
+//   4. the layer executor (HostMoeExecutor, 6 threads, a4 on and off, decode windows T = 1..8
+//      (Static) and a 24-token prefill chunk (Dynamic)) with isa = Avx2 vs Avx512Vnni on the real
 //      layer (or on a synthetic one without NINFER_HOST_NVFP4_BANKS).
 // ISAs the CPU lacks are skipped (on a CPU without AVX-512 the test compares AVX2 to the model).
 #include "host_moe_fixture.h"
@@ -146,34 +145,19 @@ float scale_of(const Nvfp4Plane& p, std::int64_t r, int blk) {
 }
 
 // lanes[j] += di * f over the 64-weight group of blocks b..b+3
-void model_group(const Nvfp4Plane& p, std::int64_t r, int b, const W4A8Activation& a, float* acc,
-                 bool per_token) {
+void model_group(const Nvfp4Plane& p, std::int64_t r, int b, const W4A8Activation& a, float* acc) {
     for (int j = 0; j < 16; ++j) {
         const int blk = b + j / 4;
-        const float f =
-            per_token ? scale_of(p, r, blk) * a.asb[blk] : scale_of(p, r, blk) * a.sb16[b * 4 + j];
-        acc[j] = std::fmaf(static_cast<float>(lane_sum(p, r, blk, j % 4, a)), f, acc[j]);
+        const float f = scale_of(p, r, blk) * a.sb16[b * 4 + j];
+        acc[j]        = std::fmaf(static_cast<float>(lane_sum(p, r, blk, j % 4, a)), f, acc[j]);
     }
 }
 
-float model_dot(const Nvfp4Plane& p, std::int64_t r, const W4A8Activation& a, DotKernel kernel) {
-    const int nb = p.k / 16;
-    float s;
-    if (kernel == DotKernel::PerToken) {
-        float acc[4][16] = {};
-        int b            = 0;
-        for (; b + 16 <= nb; b += 16)
-            for (int c = 0; c < 4; ++c) model_group(p, r, b + 4 * c, a, acc[c], true);
-        for (; b + 4 <= nb; b += 4) model_group(p, r, b, a, acc[0], true);
-        float l[16];
-        for (int j = 0; j < 16; ++j) l[j] = (acc[0][j] + acc[1][j]) + (acc[2][j] + acc[3][j]);
-        s = reduce16(l);
-    } else {
-        float acc[16] = {};
-        for (int b = 0; b < nb; b += 4) model_group(p, r, b, a, acc, false);
-        s = reduce16(acc);
-    }
-    return s * 0.5F / p.divisor(r);
+float model_dot(const Nvfp4Plane& p, std::int64_t r, const W4A8Activation& a) {
+    const int nb  = p.k / 16;
+    float acc[16] = {};
+    for (int b = 0; b < nb; b += 4) model_group(p, r, b, a, acc);
+    return reduce16(acc) * 0.5F / p.divisor(r);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -244,14 +228,13 @@ struct DotTally {
 };
 
 // Rows [r0, r0 + n) of `p` for T tokens: every ISA, and the model on rows where `model`.
-void check_rows(const Nvfp4Plane& p, std::int64_t r0, int n, const Acts& acts, int T,
-                DotKernel kernel, int prefetch, bool model, DotTally& tally) {
+void check_rows(const Nvfp4Plane& p, std::int64_t r0, int n, const Acts& acts, int T, bool model,
+                DotTally& tally) {
     std::vector<std::vector<float>> out(g_isas.size(),
                                         std::vector<float>(static_cast<std::size_t>(T) * n));
     for (std::size_t i = 0; i < g_isas.size(); ++i) {
         host_nvfp4_kernels(g_isas[i]).rows_dot(p, r0, n, acts.view[i].data(), T, out[i].data(),
-                                               static_cast<std::size_t>(n), kernel,
-                                               kernel == DotKernel::MultiToken ? prefetch : 0);
+                                               static_cast<std::size_t>(n));
     }
     tally.rows += n;
     for (std::size_t i = 1; i < g_isas.size(); ++i)
@@ -263,7 +246,7 @@ void check_rows(const Nvfp4Plane& p, std::int64_t r0, int n, const Acts& acts, i
     tally.model_rows += n;
     for (int i = 0; i < n; ++i)
         for (int t = 0; t < T; ++t) {
-            const float m = model_dot(p, r0 + i, acts.view[0][t], kernel);
+            const float m = model_dot(p, r0 + i, acts.view[0][t]);
             tally.model_diff +=
                 std::memcmp(&m, &out[0][static_cast<std::size_t>(t) * n + i], 4) != 0;
         }
@@ -329,12 +312,8 @@ void test_synthetic_dots(std::mt19937_64& rng) {
             const Acts acts =
                 make_acts(k, kHostMaxTokens, a4, rng, "synthetic k=" + std::to_string(k));
             for (int T = 1; T <= kHostMaxTokens; ++T) {
-                for (const DotKernel kernel : {DotKernel::PerToken, DotKernel::MultiToken}) {
-                    for (const int pf : {0, 3}) {
-                        check_rows(plane, 0, 64, acts, T, kernel, pf, true, tally);
-                        check_rows(plane, 128 + 37, 19, acts, T, kernel, pf, T <= 2, tally);
-                    }
-                }
+                check_rows(plane, 0, 64, acts, T, true, tally);
+                check_rows(plane, 128 + 37, 19, acts, T, T <= 2, tally);
             }
         }
     }
@@ -405,15 +384,8 @@ void test_real_rows(const RealLayer& real, std::mt19937_64& rng) {
                 const Acts x = make_acts(kH, T, a4, rng, "real gate/up");
                 const Acts h = make_acts(kI, T, a4, rng, "real down");
                 check_rows(real.layer.gate_up, std::int64_t{e} * 2 * kI, 2 * kI, x, T,
-                           DotKernel::MultiToken, 0, model && T == 1, tally);
-                check_rows(real.layer.down, std::int64_t{e} * kH, kH, h, T, DotKernel::MultiToken,
-                           0, model && T == 1, tally);
-                if (T == 3 || T == 8) {
-                    check_rows(real.layer.gate_up, std::int64_t{e} * 2 * kI, 2 * kI, x, T,
-                               DotKernel::PerToken, 0, false, tally);
-                    check_rows(real.layer.down, std::int64_t{e} * kH, kH, h, T, DotKernel::PerToken,
-                               0, false, tally);
-                }
+                           model && T == 1, tally);
+                check_rows(real.layer.down, std::int64_t{e} * kH, kH, h, T, model && T == 1, tally);
             }
         }
     }
@@ -439,44 +411,41 @@ void test_executor(const HostExpertLayer& layer, std::mt19937_64& rng, const cha
     l.gate_up_input_divisor = 8.0F;
     l.down_input_divisor    = 40.0F;
     for (const bool a4 : {true, false}) {
-        for (const Schedule sched : {Schedule::Static, Schedule::Dynamic}) {
-            std::vector<std::unique_ptr<HostMoeExecutor>> ex;
-            for (const HostIsa isa : g_isas) {
-                HostMoeExecutor::Options o;
-                o.a4       = a4;
-                o.schedule = sched;
-                o.isa      = isa;
-                ex.push_back(std::make_unique<HostMoeExecutor>(pool, layer.hidden,
-                                                               layer.intermediate, 24, 10, o));
+        std::vector<std::unique_ptr<HostMoeExecutor>> ex;
+        for (const HostIsa isa : g_isas) {
+            HostMoeExecutor::Options o;
+            o.a4  = a4;
+            o.isa = isa;
+            ex.push_back(std::make_unique<HostMoeExecutor>(pool, layer.hidden, layer.intermediate,
+                                                           24, 10, o));
+        }
+        for (const int T : {1, 2, 3, 4, 5, 6, 7, 8, 24}) {
+            std::vector<std::uint16_t> x;
+            for (int t = 0; t < T; ++t) {
+                const auto r = random_bf16(layer.hidden, rng, 0);
+                x.insert(x.end(), r.begin(), r.end());
             }
-            for (const int T : {1, 2, 3, 4, 5, 6, 7, 8, 24}) {
-                std::vector<std::uint16_t> x;
-                for (int t = 0; t < T; ++t) {
-                    const auto r = random_bf16(layer.hidden, rng, 0);
-                    x.insert(x.end(), r.begin(), r.end());
-                }
-                std::vector<std::int32_t> ids(static_cast<std::size_t>(T) * 10);
-                std::vector<float> alpha(ids.size());
-                const int pool_experts = std::min(layer.experts, 20); // tokens share experts
-                for (std::size_t i = 0; i < ids.size(); ++i) {
-                    ids[i]   = (i % 10 < 3) ? -1 : (pick(rng) % pool_experts);
-                    alpha[i] = weight(rng);
-                }
-                for (int t = 0; t < T; ++t) { // distinct experts within a token
-                    std::sort(ids.begin() + t * 10, ids.begin() + t * 10 + 10);
-                    for (int s = 1; s < 10; ++s)
-                        if (ids[t * 10 + s] >= 0 && ids[t * 10 + s] == ids[t * 10 + s - 1])
-                            ids[t * 10 + s] = -1;
-                }
-                std::vector<std::vector<float>> out(
-                    g_isas.size(), std::vector<float>(static_cast<std::size_t>(T) * layer.hidden));
-                for (std::size_t i = 0; i < g_isas.size(); ++i) {
-                    HostMoeJob job{T, 10, x.data(), ids.data(), alpha.data(), out[i].data()};
-                    (void)ex[i]->run(l, job);
-                }
-                ++calls;
-                for (std::size_t i = 1; i < g_isas.size(); ++i) diff += !same_bits(out[0], out[i]);
+            std::vector<std::int32_t> ids(static_cast<std::size_t>(T) * 10);
+            std::vector<float> alpha(ids.size());
+            const int pool_experts = std::min(layer.experts, 20); // tokens share experts
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                ids[i]   = (i % 10 < 3) ? -1 : (pick(rng) % pool_experts);
+                alpha[i] = weight(rng);
             }
+            for (int t = 0; t < T; ++t) { // distinct experts within a token
+                std::sort(ids.begin() + t * 10, ids.begin() + t * 10 + 10);
+                for (int s = 1; s < 10; ++s)
+                    if (ids[t * 10 + s] >= 0 && ids[t * 10 + s] == ids[t * 10 + s - 1])
+                        ids[t * 10 + s] = -1;
+            }
+            std::vector<std::vector<float>> out(
+                g_isas.size(), std::vector<float>(static_cast<std::size_t>(T) * layer.hidden));
+            for (std::size_t i = 0; i < g_isas.size(); ++i) {
+                HostMoeJob job{T, 10, x.data(), ids.data(), alpha.data(), out[i].data()};
+                (void)ex[i]->run(l, job);
+            }
+            ++calls;
+            for (std::size_t i = 1; i < g_isas.size(); ++i) diff += !same_bits(out[0], out[i]);
         }
     }
     std::printf("executor (%s): %ld calls x %zu ISAs, %ld calls with differing outputs\n", what,

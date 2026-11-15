@@ -345,7 +345,7 @@ public:
 } // namespace
 
 namespace {
-// capy-flash strict mode (--constraint-json-strict, default on; the intent of XGrammar's
+// Strict mode (--constraint-json-strict, default on; the intent of XGrammar's
 // strict_mode, which vLLM and SGLang use by default), made explicit on the prepared schema so
 // that it does not depend on how the vendor treats annotations:
 // - an object that declares properties and says nothing about additionalProperties admits only
@@ -390,7 +390,7 @@ std::string prepare_json_schema(std::string_view source, const OutputConstraintL
                  "numeric schema value cannot be preserved by the JSON number representation");
         schema.root = std::move(parsed.value);
     } catch (const Json::exception& error) { fail(Kind::InvalidJsonSchema, {}, error.what()); }
-    // Before the recursive validation below and the recursive vendor converter (capy-flash).
+    // Before the recursive validation below and the recursive vendor converter.
     check_json_schema_limits(schema.root, limits);
     schema.source_validation = true;
     schema.draft7            = schema.root.is_object() && schema.root.contains("$schema") &&

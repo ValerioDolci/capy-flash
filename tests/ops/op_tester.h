@@ -253,7 +253,7 @@ public:
         storage_.fill(guard_byte_);
         // cudaMemset runs on the legacy stream, which does not order the non-blocking streams
         // the Ops run on: wait for it, or under load the guard fill can land after a kernel
-        // wrote the payload (T162: hyper_connection read 0xa5a5a5a5 as its output).
+        // wrote the payload (an Op then reads the 0xa5a5a5a5 fill as its output).
         cuda_check(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize guarded fill");
     }
 

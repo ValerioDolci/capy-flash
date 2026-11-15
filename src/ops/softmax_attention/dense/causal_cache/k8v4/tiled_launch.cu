@@ -20,8 +20,6 @@ void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView ca
     };
     if (p.query_heads == 24)
         invoke.template operator()<CausalD256H24Kv4>();
-    else if (p.query_heads == 16)
-        invoke.template operator()<CausalD256H16Kv2>();
     else
         throw std::invalid_argument("K8V4 attention: unsupported head geometry");
 }

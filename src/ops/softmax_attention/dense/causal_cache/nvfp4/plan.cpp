@@ -10,7 +10,7 @@ constexpr int kGroupedPrefillMaxWidth = 192;
 
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
                                             CausalAttentionExecutionEnvelope envelope) {
-    if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
+    if ((heads != 24 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
         (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
@@ -25,15 +25,15 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
     const int query_tile        = family == Nvfp4KvFamily::ParallelGrouped && width <= 16
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
-    // 12/2 is one device's half of 24/4 at tp 2: two KV heads with 24/4's group of six.
-    const int row_tiles = (query_tile * (heads == 16 ? 8 : 6) + 15) / 16;
+    // 24/4 and its tp 2 half 12/2 both have query groups of six.
+    const int row_tiles = (query_tile * 6 + 15) / 16;
     constexpr int sms   = kCausalAttentionSmCount;
     const int wave_ctas = (sms / independent_tiles) * independent_tiles;
     const int budget    = row_tiles <= 2 || wave_ctas < sms * 9 / 10 ? 2 * sms : sms;
     CausalKvPartition partition{
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (row_tiles <= 2 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.key_shift = row_tiles <= 2 ? 7 : 8;
     partition.capacity  = partition.active(envelope.max_visible_keys);
     return {family, heads, width, batch, query_tile, envelope, partition};
 }

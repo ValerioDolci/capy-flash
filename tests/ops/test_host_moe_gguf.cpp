@@ -11,7 +11,8 @@
 //    can move an h code across a rounding boundary; one such flip changes an output by at most
 //    d_h * |w_down|, far inside this bound);
 //  - determinism: identical bits for 1, 3 and 6 threads, and a token's output in a T = 8 call
-//    equals the same token's output in a call of its own (T independence);
+//    equals the same token's output in a call of its own (T independence); identical bits with
+//    Options::gguf_only;
 //  - tokens without a host expert (all ids < 0) get 0.
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
@@ -47,6 +48,7 @@ std::uint16_t bf16(float f) {
     std::memcpy(&u, &f, 4);
     return static_cast<std::uint16_t>((u + 0x7FFFU + ((u >> 16) & 1U)) >> 16);
 }
+
 float from_bf16(std::uint16_t b) {
     const std::uint32_t u = std::uint32_t(b) << 16;
     float f;
@@ -56,21 +58,35 @@ float from_bf16(std::uint16_t b) {
 
 void dequantize(g::WeightFormat fmt, const void* row, float* y, int k) {
     switch (fmt) {
-    case g::WeightFormat::IQ2_S: dequantize_row_iq2_s(static_cast<const block_iq2_s*>(row), y, k); return;
-    case g::WeightFormat::IQ3_XXS: dequantize_row_iq3_xxs(static_cast<const block_iq3_xxs*>(row), y, k); return;
-    case g::WeightFormat::IQ3_S: dequantize_row_iq3_s(static_cast<const block_iq3_s*>(row), y, k); return;
-    case g::WeightFormat::IQ4_XS: dequantize_row_iq4_xs(static_cast<const block_iq4_xs*>(row), y, k); return;
-    case g::WeightFormat::IQ4_NL: dequantize_row_iq4_nl(static_cast<const block_iq4_nl*>(row), y, k); return;
-    case g::WeightFormat::Q2_0: dequantize_row_q2_0(static_cast<const block_q2_0*>(row), y, k); return;
+    case g::WeightFormat::IQ2_S:
+        dequantize_row_iq2_s(static_cast<const block_iq2_s*>(row), y, k);
+        return;
+    case g::WeightFormat::IQ3_XXS:
+        dequantize_row_iq3_xxs(static_cast<const block_iq3_xxs*>(row), y, k);
+        return;
+    case g::WeightFormat::IQ3_S:
+        dequantize_row_iq3_s(static_cast<const block_iq3_s*>(row), y, k);
+        return;
+    case g::WeightFormat::IQ4_XS:
+        dequantize_row_iq4_xs(static_cast<const block_iq4_xs*>(row), y, k);
+        return;
+    case g::WeightFormat::IQ4_NL:
+        dequantize_row_iq4_nl(static_cast<const block_iq4_nl*>(row), y, k);
+        return;
+    case g::WeightFormat::Q2_0:
+        dequantize_row_q2_0(static_cast<const block_q2_0*>(row), y, k);
+        return;
     }
 }
 
-// The executor's codec on doubles holding float values: per 32, d = fl(amax / 127), q = round(v / d).
+// The executor's codec on doubles holding float values: per 32, d = fl(amax / 127), q = round(v /
+// d).
 void q8f32(const std::vector<double>& v, std::vector<double>& out) {
     out.assign(v.size(), 0.0);
     for (std::size_t b = 0; b < v.size(); b += 32) {
         float amax = 0;
-        for (std::size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(static_cast<float>(v[b + i])));
+        for (std::size_t i = 0; i < 32; ++i)
+            amax = std::max(amax, std::fabs(static_cast<float>(v[b + i])));
         if (amax == 0) continue;
         const float d = amax / 127.0F;
         for (std::size_t i = 0; i < 32; ++i) {
@@ -94,7 +110,8 @@ Layer synthetic(g::WeightFormat gu, g::WeightFormat dn, int experts, std::mt1993
     L.gu.resize(rbg * 2 * I * experts);
     L.dn.resize(rbd * H * experts);
     std::uniform_real_distribution<float> dd(5e-4F, 2e-2F);
-    const auto fill = [&](std::vector<std::uint8_t>& v, g::WeightFormat f, std::size_t rb, int k, std::size_t rows) {
+    const auto fill = [&](std::vector<std::uint8_t>& v, g::WeightFormat f, std::size_t rb, int k,
+                          std::size_t rows) {
         for (auto& b : v) b = static_cast<std::uint8_t>(rng());
         const auto fi = g::format_info(f);
         for (std::size_t r = 0; r < rows; ++r)
@@ -134,8 +151,9 @@ void finish(Layer& L, g::WeightFormat gu, g::WeightFormat dn) {
     L.layer.intermediate           = I;
 }
 
-std::vector<double> oracle(const Layer& L, const std::vector<std::uint16_t>& x, const std::vector<std::int32_t>& ids,
-                           const std::vector<float>& alpha, int T) {
+std::vector<double> oracle(const Layer& L, const std::vector<std::uint16_t>& x,
+                           const std::vector<std::int32_t>& ids, const std::vector<float>& alpha,
+                           int T) {
     const auto& G = L.layer.gguf;
     std::vector<double> out(std::size_t(T) * H, 0.0), xq, hq;
     std::vector<float> w(H);
@@ -150,15 +168,20 @@ std::vector<double> oracle(const Layer& L, const std::vector<std::uint16_t>& x, 
             std::vector<double> hv(I);
             for (int r = 0; r < I; ++r) {
                 double gs = 0, us = 0;
-                dequantize(G.gate_up, G.gate_up_rows + (std::size_t(e) * 2 * I + r) * G.gate_up_row_bytes, w.data(), H);
+                dequantize(G.gate_up,
+                           G.gate_up_rows + (std::size_t(e) * 2 * I + r) * G.gate_up_row_bytes,
+                           w.data(), H);
                 for (int i = 0; i < H; ++i) gs += double(w[i]) * xq[i];
-                dequantize(G.gate_up, G.gate_up_rows + (std::size_t(e) * 2 * I + I + r) * G.gate_up_row_bytes, w.data(), H);
+                dequantize(G.gate_up,
+                           G.gate_up_rows + (std::size_t(e) * 2 * I + I + r) * G.gate_up_row_bytes,
+                           w.data(), H);
                 for (int i = 0; i < H; ++i) us += double(w[i]) * xq[i];
                 hv[r] = static_cast<float>(gs / (1.0 + std::exp(-gs)) * us);
             }
             q8f32(hv, hq);
             for (int r = 0; r < H; ++r) {
-                dequantize(G.down, G.down_rows + (std::size_t(e) * H + r) * G.down_row_bytes, w.data(), I);
+                dequantize(G.down, G.down_rows + (std::size_t(e) * H + r) * G.down_row_bytes,
+                           w.data(), I);
                 double s = 0;
                 for (int i = 0; i < I; ++i) s += double(w[i]) * hq[i];
                 out[std::size_t(t) * H + r] += alpha[std::size_t(t) * K + k] * s;
@@ -182,9 +205,10 @@ void run_layer(const Layer& L, std::mt19937_64& rng, int Tmax) {
         for (int k = 0; k < n; ++k) {
             int e;
             do e = pick(rng);
-            while (std::find(used.begin(), used.end(), e) != used.end() && int(used.size()) < L.experts);
+            while (std::find(used.begin(), used.end(), e) != used.end() &&
+                   int(used.size()) < L.experts);
             used.push_back(e);
-            ids[std::size_t(t) * K + k] = e;
+            ids[std::size_t(t) * K + k]   = e;
             alpha[std::size_t(t) * K + k] = 0.05F + 0.1F * k;
         }
     }
@@ -200,17 +224,31 @@ void run_layer(const Layer& L, std::mt19937_64& rng, int Tmax) {
             // T independence: each token alone.
             for (int t = 0; t < std::min(Tmax, 8); ++t) {
                 std::vector<float> one(H, 7.F);
-                ex.run(L.layer, h::HostMoeJob{1, K, x.data() + std::size_t(t) * H, ids.data() + std::size_t(t) * K,
+                ex.run(L.layer, h::HostMoeJob{1, K, x.data() + std::size_t(t) * H,
+                                              ids.data() + std::size_t(t) * K,
                                               alpha.data() + std::size_t(t) * K, one.data()});
-                check(std::memcmp(one.data(), out.data() + std::size_t(t) * H, sizeof(float) * H) == 0,
+                check(std::memcmp(one.data(), out.data() + std::size_t(t) * H, sizeof(float) * H) ==
+                          0,
                       L.name + ": token result depends on the call width");
             }
         }
     }
-    check(outs[0] == outs[1] && outs[1] == outs[2], L.name + ": result depends on the thread count");
-    const int To = std::min(Tmax, 8);
+    check(outs[0] == outs[1] && outs[1] == outs[2],
+          L.name + ": result depends on the thread count");
+    {
+        // A GGUF-only executor (no NVFP4 activation buffers) computes the same bits.
+        h::HostCpuPool pool(h::spread_cpus(3));
+        h::HostMoeExecutor::Options options;
+        options.gguf_only = true;
+        h::HostMoeExecutor ex(pool, H, I, std::max(Tmax, 8), K, options);
+        std::vector<float> out(std::size_t(Tmax) * H, 123.F);
+        ex.run(L.layer, h::HostMoeJob{Tmax, K, x.data(), ids.data(), alpha.data(), out.data()});
+        check(std::memcmp(out.data(), outs[1].data(), sizeof(float) * out.size()) == 0,
+              L.name + ": a GGUF-only executor changes the result");
+    }
+    const int To   = std::min(Tmax, 8);
     const auto ref = oracle(L, x, ids, alpha, To);
-    double worst = 0;
+    double worst   = 0;
     for (int t = 0; t < To; ++t) {
         double rms = 0, err = 0;
         for (int r = 0; r < H; ++r) {
@@ -226,8 +264,8 @@ void run_layer(const Layer& L, std::mt19937_64& rng, int Tmax) {
         worst = std::max(worst, err / rms);
     }
     check(worst <= 4e-3, L.name + ": error vs FP64 oracle " + std::to_string(worst) + " rms");
-    std::printf("%-34s T=%d  max|err|/rms %.2e  threads 1/3/6 identical %s\n", L.name.c_str(), Tmax, worst,
-                outs[0] == outs[1] && outs[1] == outs[2] ? "yes" : "NO");
+    std::printf("%-34s T=%d  max|err|/rms %.2e  threads 1/3/6 identical %s\n", L.name.c_str(), Tmax,
+                worst, outs[0] == outs[1] && outs[1] == outs[2] ? "yes" : "NO");
 }
 
 } // namespace
@@ -237,12 +275,16 @@ int main(int argc, char** argv) {
         std::printf("SKIP: CPU runs neither ISA of the host expert kernels (AVX2 + FMA + F16C)\n");
         return 77;
     }
-    std::printf("GGUF host kernels: %s (NINFER_HOST_ISA selects)\n", h::host_isa_name(g::host_gguf_isa()));
+    std::printf("GGUF host kernels: %s (NINFER_HOST_ISA selects)\n",
+                h::host_isa_name(g::host_gguf_isa()));
     std::mt19937_64 rng(77);
     const std::pair<g::WeightFormat, g::WeightFormat> pairs[] = {
-        {g::WeightFormat::IQ2_S, g::WeightFormat::Q2_0},    {g::WeightFormat::IQ2_S, g::WeightFormat::IQ4_NL},
-        {g::WeightFormat::IQ3_XXS, g::WeightFormat::IQ4_NL}, {g::WeightFormat::IQ3_S, g::WeightFormat::Q2_0},
-        {g::WeightFormat::IQ4_XS, g::WeightFormat::IQ4_NL},  {g::WeightFormat::IQ4_NL, g::WeightFormat::IQ4_NL}};
+        {g::WeightFormat::IQ2_S, g::WeightFormat::Q2_0},
+        {g::WeightFormat::IQ2_S, g::WeightFormat::IQ4_NL},
+        {g::WeightFormat::IQ3_XXS, g::WeightFormat::IQ4_NL},
+        {g::WeightFormat::IQ3_S, g::WeightFormat::Q2_0},
+        {g::WeightFormat::IQ4_XS, g::WeightFormat::IQ4_NL},
+        {g::WeightFormat::IQ4_NL, g::WeightFormat::IQ4_NL}};
     for (const auto& [gu, dn] : pairs) {
         Layer L = synthetic(gu, dn, 8, rng);
         finish(L, gu, dn);
@@ -260,12 +302,16 @@ int main(int argc, char** argv) {
             const auto m = nlohmann::json::parse(in);
             for (const auto& [layer, e] : m.at("layers").items()) {
                 g::WeightFormat gu, dn;
-                if (!format_of(e.at("gate_up").at("format"), &gu) || !format_of(e.at("down").at("format"), &dn)) continue;
+                if (!format_of(e.at("gate_up").at("format"), &gu) ||
+                    !format_of(e.at("down").at("format"), &dn))
+                    continue;
                 Layer L;
                 L.name    = "layer " + layer + " " + g::format_name(gu) + "+" + g::format_name(dn);
                 L.experts = 512;
                 for (auto [role, buf] : {std::pair{"gate_up", &L.gu}, std::pair{"down", &L.dn}}) {
-                    std::ifstream f(std::string(dir) + "/" + e.at(role).at("file").get<std::string>(), std::ios::binary);
+                    std::ifstream f(std::string(dir) + "/" +
+                                        e.at(role).at("file").get<std::string>(),
+                                    std::ios::binary);
                     buf->assign(std::istreambuf_iterator<char>(f), {});
                 }
                 finish(L, gu, dn);

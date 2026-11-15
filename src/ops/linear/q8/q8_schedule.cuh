@@ -38,22 +38,6 @@ struct Q8A16SimtSchedule {
     static_assert(kSharedBytes <= 48 * 1024, "Q8 SIMT shared memory exceeds 48 KiB");
 };
 
-template <int BlockRows, int WarpsPerRow, int MinBlocksPerSm, int StaticK = 0, int Unroll = 8>
-struct Q8A16GemvSchedule {
-    static_assert(BlockRows > 0 && WarpsPerRow > 0);
-    static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
-    static_assert(MinBlocksPerSm > 0 && Unroll > 0);
-    static_assert(StaticK == 0 || (StaticK > 0 && StaticK % 256 == 0));
-    static constexpr int kBlockRows      = BlockRows;
-    static constexpr int kBlockTokens    = 1;
-    static constexpr int kWarpsPerRow    = WarpsPerRow;
-    static constexpr int kThreads        = BlockRows * WarpsPerRow * 32;
-    static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
-    static constexpr int kStaticK        = StaticK;
-    static constexpr int kUnroll         = Unroll;
-    static_assert(kThreads <= 1024);
-};
-
 // One output row per warp (or WarpsPerRow warps split at scale pairs), the warp's whole K slice
 // (Phases 256-wide phases) loaded into registers before the contraction; T <= TokenCapacity.
 template <int BlockRows, int TokenCapacity, int WarpsPerRow, int Phases, int MinBlocksPerSm>

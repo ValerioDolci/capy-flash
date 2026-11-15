@@ -1,6 +1,6 @@
 #pragma once
 
-// The dual-device capture bridge of core/decode_graph.h (two-device tensor parallelism). Our file:
+// The dual-device capture bridge of core/decode_graph.h (two-device tensor parallelism).
 // decode_graph.h includes it with one line; the definitions are in tp2/decode_graph_tp2.inc.
 
 #include <cuda_runtime.h>

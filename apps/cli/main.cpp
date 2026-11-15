@@ -2,6 +2,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/engine_options.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
 
@@ -72,26 +73,6 @@ std::string format_finish(ninfer::FinishReason reason) {
         return "cancelled";
     }
     return "unknown";
-}
-
-std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-row256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
-
-std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
@@ -180,13 +161,14 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                    memory.runtime_reservation_bytes;
     print_metric("device", std::to_string(memory.device));
     print_metric("max context", std::to_string(memory.max_context));
-    print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
+    print_metric("KV capacity policy",
+                 ninfer::product::kv_capacity_mode_name(memory.kv_capacity_mode));
     print_metric("KV capacity", std::to_string(memory.kv_capacity));
     print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
                                        std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("kv cache dtype", ninfer::product::kv_cache_name(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));

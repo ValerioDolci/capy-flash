@@ -1,6 +1,6 @@
 # NInfer tools
 
-`tools/` contains artifact conversion and inspection, benchmark orchestration, and serving smoke
+`tools/` contains artifact conversion and inspection, benchmark inputs, and serving smoke
 checks. To download and run an existing artifact, start with the [project README](../README.md).
 To build your own weights, use the [weight conversion guide](../docs/weight-conversion.md).
 
@@ -16,10 +16,9 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Replace the chat template embedded in an artifact (weights unchanged; writes a new artifact directory) | [`replace_chat_template.py`](replace_chat_template.py), with positional `ENTRY.ninfer TEMPLATE.jinja OUT_DIR`; maintained templates in [`chat_templates/`](chat_templates/) |
-| Check that every `ninfer-serve` flag, `NINFER_*` variable, conversion recipe and `Tnn` tag of the sources is in the user docs (ctest `ninfer_docs_guard_test`) | [`check_docs.py`](check_docs.py) |
+| Check that every `ninfer-serve` flag, `NINFER_*` variable and conversion recipe of the sources is in the user docs (ctest `ninfer_docs_guard_test`) | [`check_docs.py`](check_docs.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
-| Run benchmark matrices | [`bench/`](bench/README.md) |
-| Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
+| Bake the `ninfer_bench` token corpus | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Check structured output (JSON object, JSON Schema, regex, choice, GBNF) end to end on a running server, validating replies with an independent JSON Schema validator | [`smoke/serve_structured_output.py`](smoke/serve_structured_output.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
@@ -62,12 +61,11 @@ the mailbox timing out or slow (WSL2 does that, [issue #1](https://github.com/Va
 `tools/tp2/mailbox_probe.cu` runs the same check without the engine or a model — nvcc and the CUDA
 runtime only; it includes the production exchange kernels from `src/ops/kernel/peer_exchange.cuh`,
 so build it from a checkout — and prints driver, devices, peer access, the startup exchange, the
-per-exchange cost of both transports (both mailbox kernels) and a verdict:
+per-exchange cost of both transports and a verdict:
 
 ```bash
 nvcc -O2 -std=c++20 -arch=sm_120a -o build/mailbox_probe tools/tp2/mailbox_probe.cu
 ./build/mailbox_probe            # devices 0 1; add `--simulate-hang` to see the timeout report
-./build/mailbox_probe --payload 40960 --legacy   # the original exchange kernel
 ./build/mailbox_probe --sweep    # maintainer: every kernel variant at 4, 10 and 40 KiB
 ./build/mailbox_probe --timed --payload 40960    # maintainer: per-phase clock64 anatomy
 ```
@@ -77,14 +75,13 @@ on builds without the startup probe), 1 a CUDA error or wrong sums (every exchan
 for bit against a CPU reference). On 2× RTX 5070 Ti without P2P, PCIe 5.0 x8 each (driver 595.91,
 CUDA 13.1), per exchange in a graph of 128, two alternating slots:
 
-| payload | pipelined kernel (default) | original kernel (`--legacy`) | copies |
-|--:|--:|--:|--:|
-| 4 KiB | 3.5 µs | 7.8 µs | 15.9 µs |
-| 10 KiB (decode token) | 3.7 µs | 8.8 µs | 17.2 µs |
-| 40 KiB (MTP-3 verify) | 6.2 µs | 19.6 µs | 20.0 µs |
+| payload | mailbox | copies |
+|--:|--:|--:|
+| 4 KiB | 3.5 µs | 15.9 µs |
+| 10 KiB (decode token) | 3.7 µs | 17.2 µs |
+| 40 KiB (MTP-3 verify) | 6.2 µs | 20.0 µs |
 
-The startup exchange takes about 0.03 ms and a missing peer is reported after about 0.8 s with
-either kernel.
+The startup exchange takes about 0.03 ms and a missing peer is reported after about 0.8 s.
 
 ## Artifact workflow
 
@@ -118,23 +115,6 @@ python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
 Recipes, mixed sources, custom methods, resources and sharding are described in the
 [conversion guide](../docs/weight-conversion.md). Numeric formats, layouts and framing are defined
 by the references linked from the [documentation map](../docs/README.md).
-
-## Benchmark orchestration
-
-`tools/bench/run_ninfer_bench_matrix.py` builds and runs the public-Engine benchmark matrix and
-writes ignored local reports below `profiles/bench/`:
-
-```bash
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core
-```
-
-See [`tools/bench/README.md`](bench/README.md) and [`bench/README.md`](../bench/README.md) for the
-orchestrator and executable contracts.
-
-For request-arrival latency, use the managed Qwen3.8-27B NVFP4/FP8 TTFT campaign. Its measurement
-runner remains an external-only HTTP client; the separate controller owns Serve lifecycle and
-artifacts. See [`tools/bench/ttft/README.md`](bench/ttft/README.md).
 
 ## Serving smoke
 

@@ -1,9 +1,7 @@
 #pragma once
-// Template bodies of the INT8 causal attention dispatch. Our split; upstream keeps them in
-// launch.cu, where every geometry, token width, batch/mask variant and kernel family was one
-// translation unit that nvcc compiles on one thread (3-5 min after any kernel change). Each
-// (geometry, entry) pair is instantiated in its own unit
-// (launch_<geometry>_{append,cached,prefill}.cu) and launch.cu only dispatches.
+// Template bodies of the INT8 causal attention dispatch. Each (geometry, entry) pair is
+// instantiated in its own unit (launch_<geometry>_{append,cached,prefill}.cu), so nvcc compiles
+// them in parallel; launch.cu only dispatches.
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/template_launch.cuh"
@@ -98,6 +96,5 @@ void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t 
 
 NINFER_INT8_KV_LAUNCH_UNITS(CausalD256H24Kv4, extern)
 NINFER_INT8_KV_LAUNCH_UNITS(CausalD256H12Kv2, extern)
-NINFER_INT8_KV_LAUNCH_UNITS(CausalD256H16Kv2, extern)
 
 } // namespace ninfer::ops::detail::int8_kv_launch

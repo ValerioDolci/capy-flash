@@ -16,7 +16,7 @@ namespace ninfer::ops {
 // activation recipe), grouped by expert instead of by token.
 
 // Columns of one piece. A wider call quantizes and groups all its columns and runs gate/up once
-// over the whole call (T56: each expert's gate/up weights read once per call), then the down
+// over the whole call (each expert's gate/up weights read once per call), then the down
 // projection and the merge per piece of this width (their FP32 per-assignment outputs are what
 // the workspace holds per piece). Bit-identical to calling the pieces separately.
 inline constexpr std::int32_t kMoeGroupedChunkColumns = 2048;

@@ -23,8 +23,6 @@ void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan.partition, partial.view(), stream);
     else if (plan.query_heads == 12)
         grouped_instance<CausalD256H12Kv2>(p, view, input, plan.partition, partial.view(), stream);
-    else if (plan.query_heads == 16)
-        grouped_instance<CausalD256H16Kv2>(p, view, input, plan.partition, partial.view(), stream);
     else
         throw std::invalid_argument("INT8 attention: unsupported head geometry");
 }
@@ -39,8 +37,6 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
         parallel_grouped<CausalD256H24Kv4>(p, cache, plan.partition, partial.view(), stream);
     else if (plan.query_heads == 12)
         parallel_grouped<CausalD256H12Kv2>(p, cache, plan.partition, partial.view(), stream);
-    else if (plan.query_heads == 16)
-        parallel_grouped<CausalD256H16Kv2>(p, cache, plan.partition, partial.view(), stream);
     else
         throw std::invalid_argument("INT8 attention: unsupported head geometry");
 }
@@ -50,8 +46,6 @@ void tiled_dispatch(const CausalAttentionOperands& p, Int8KvReadView cache, cuda
         tiled<CausalD256H24Kv4>(p, cache, stream);
     else if (p.query_heads == 12)
         tiled<CausalD256H12Kv2>(p, cache, stream);
-    else if (p.query_heads == 16)
-        tiled<CausalD256H16Kv2>(p, cache, stream);
     else
         throw std::invalid_argument("INT8 attention: unsupported head geometry");
 }

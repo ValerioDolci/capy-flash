@@ -31,11 +31,6 @@ enum class ParsePurpose {
     bad_request(std::move(message), "messages", "invalid_tool_history");
 }
 
-const Json& require_object(const Json& body) {
-    if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
-}
-
 std::string require_string(const Json& object, const char* key, const char* param,
                            const char* description) {
     if (!object.contains(key) || !object.at(key).is_string()) {
@@ -110,7 +105,8 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     }
     if (type == "url") {
         result.value = require_string(source, "url", "messages", "URL image source");
-        if (!result.value.starts_with("http://") && !result.value.starts_with("https://")) {
+        if (ninfer::product::media_acquire::uri_source_kind(result.value) !=
+            ninfer::product::media_acquire::SourceKind::Url) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
         result.kind = ninfer::product::media_acquire::SourceKind::Url;
@@ -954,16 +950,17 @@ bool thinking_display_omitted(const Json& body) {
     return thinking.contains("display") && thinking.at("display") == "omitted";
 }
 
-void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
+void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose,
+                  const RequestLimits& limits) {
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        // {"type":"json_schema","schema":{...}} (Neroued/ninfer eb6696ae). Token counting
-        // ignores the format: it does not change the prompt.
+        // {"type":"json_schema","schema":{...}}. Token counting ignores the format: it does not
+        // change the prompt.
         parse_json_output_format(config.at("format"), request, "output_config.format",
-                                 JsonFormatProtocol::Anthropic);
+                                 JsonFormatProtocol::Anthropic, limits);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1078,12 +1075,12 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+                         int effective_max_tokens, const RequestLimits& limits) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
-    parse_effort(body, request, purpose);
+    parse_effort(body, request, purpose, limits);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "
@@ -1107,7 +1104,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                                                           const RequestLimits& limits) {
-    require_object(body);
+    require_object_body(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
@@ -1128,22 +1125,23 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+                        result.generation.max_tokens, limits);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
     // structured_outputs extension and the combination rules (stop_sequences, active tools,
     // assistant prefill) once the whole request is known.
-    parse_structured_outputs(body, result.generation);
+    parse_structured_outputs(body, result.generation, limits);
     return result;
 }
 
-AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body) {
-    require_object(body);
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& body,
+                                                                 const RequestLimits& limits) {
+    require_object_body(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max());
+                        std::numeric_limits<int>::max(), limits);
     return result;
 }
 

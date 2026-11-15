@@ -558,7 +558,7 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     }
 
     {
-        // The pages handed out below must be backed first (elastic backing, T64).
+        // The pages handed out below must be backed first (elastic backing).
         std::int64_t last = -1;
         if (selected != free_page_runs_.size()) {
             last = static_cast<std::int64_t>(selected_begin) + count - 1;

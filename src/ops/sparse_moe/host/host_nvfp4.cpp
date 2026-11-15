@@ -1,10 +1,9 @@
-// NVFP4 W4A8 host dots. dot_per_token and grp4 are FreeToken's dot_nvfp4_i8_avx512vnni /
-// nvfp4_i8_grp4 (python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp @555efd8, Apache-2.0,
-// Copyright FlashML-org / FreeToken authors), changed to read the scale quad of a row from the
-// swizzled plane and to divide by the plane's FP32 divisor. dot_multi_token is the T03
-// kernel (variants V1 and V4 of a standalone CPU probe; docs/capy-flash/development-log.md),
-// changed the same way. The AVX2 forms of the same kernels are in host_nvfp4_avx2.cpp; this file
-// also selects the ISA (host_isa) and dispatches the public functions.
+// NVFP4 W4A8 host dots. dot_multi_token decodes the weights with FreeToken's nvfp4_i8_grp4
+// (python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp @555efd8, Apache-2.0, Copyright
+// FlashML-org / FreeToken authors), changed to read the scale quad of a row from the swizzled
+// plane and to divide by the plane's FP32 divisor. The AVX2 forms of the same kernels are in
+// host_nvfp4_avx2.cpp; this file also selects the ISA (host_isa) and dispatches the public
+// functions.
 #include "ops/sparse_moe/host/host_nvfp4.h"
 
 #include "ops/sparse_moe/host/host_nvfp4_isa.h"
@@ -14,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -54,79 +52,13 @@ alignas(16) const std::uint8_t kE2M1x2u[16] = {12, 13, 14, 15, 16, 18, 20, 24,
 namespace detail::avx512 {
 namespace {
 
-// ---------------------------------------------------------------- FreeToken (Apache-2.0)
-// acc + di * (e4m3 * asb) per lane, one explicit FMA: GCC contracted FreeToken's mul + add into
-// this FMA anyway (-ffp-contract=fast); spelled out so the AVX2 form can match it bit for bit.
-NINFER_HOST_AVX512 inline __m512 grp4(__m512 acc, const std::uint8_t* packed,
-                                      const std::uint8_t* scale_quad, const std::int8_t* asi8,
-                                      const float* asb, int b, __m512i lut, __m512i idx,
-                                      __m512i mask0F, __m512i idxsc) {
-    const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
-    const __m256i raw       = _mm256_loadu_si256(
-        reinterpret_cast<const __m256i*>(packed + static_cast<std::size_t>(b) * 8));
-    const __m512i src   = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
-    const __m512i lo    = _mm512_and_si512(src, mask0F);
-    const __m512i hi    = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
-    const __m512i w     = _mm512_shuffle_epi8(lut, _mm512_mask_blend_epi8(hi_half, lo, hi));
-    const __m512i a     = _mm512_loadu_si512(asi8 + static_cast<std::size_t>(b) * 16);
-    const __m512i aw    = _mm512_abs_epi8(w);
-    const __mmask64 neg = _mm512_movepi8_mask(w);
-    const __m512i sa    = _mm512_mask_sub_epi8(a, neg, _mm512_setzero_si512(), a);
-    const __m512i di    = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sa);
-    int sc_raw;
-    std::memcpy(&sc_raw, scale_quad, 4);
-    const __m128i sc4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(sc_raw));
-    const __m128 s4 =
-        _mm_mul_ps(_mm_i32gather_ps(kE4m3.value.data(), sc4, 4), _mm_loadu_ps(asb + b));
-    const __m512 scv = _mm512_permutexvar_ps(idxsc, _mm512_castps128_ps512(s4));
-    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(di), scv, acc);
-}
-
-// One row, one token; k % 64 == 0 (the layout guarantees it, so FreeToken's scalar tail is gone).
-NINFER_HOST_AVX512 float dot_per_token(const std::uint8_t* packed, const std::uint8_t* sc, int k,
-                                       const std::int8_t* asi8, const float* asb) {
-    const __m512i lut =
-        _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
-    const __m512i idx    = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
-    const __m512i mask0F = _mm512_set1_epi8(0x0F);
-    const __m512i idxsc  = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
-    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
-    __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
-    const int nb = k / kNvfp4Group;
-    const int pf = nb < 256 ? 2 * nb : 512; // FreeToken default: two rows (or 512 blocks) ahead
-    int b        = 0;
-    for (; b + 16 <= nb; b += 16) {
-        _mm_prefetch(reinterpret_cast<const char*>(packed + static_cast<std::size_t>(b + pf) * 8),
-                     _MM_HINT_T0);
-        _mm_prefetch(
-            reinterpret_cast<const char*>(packed + static_cast<std::size_t>(b + pf) * 8 + 64),
-            _MM_HINT_T0);
-        const std::uint8_t* s = sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride;
-        acc0                  = grp4(acc0, packed, s, asi8, asb, b, lut, idx, mask0F, idxsc);
-        acc1 = grp4(acc1, packed, s + kScaleQuadStride, asi8, asb, b + 4, lut, idx, mask0F, idxsc);
-        acc2 =
-            grp4(acc2, packed, s + 2 * kScaleQuadStride, asi8, asb, b + 8, lut, idx, mask0F, idxsc);
-        acc3 = grp4(acc3, packed, s + 3 * kScaleQuadStride, asi8, asb, b + 12, lut, idx, mask0F,
-                    idxsc);
-    }
-    for (; b + 4 <= nb; b += 4) {
-        acc0 = grp4(acc0, packed, sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride, asi8,
-                    asb, b, lut, idx, mask0F, idxsc);
-    }
-    return _mm512_reduce_add_ps(
-        _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
-}
-
-// ---------------------------------------------------------------- end of FreeToken code
-
-// T03 multi-token dot. V1: (w + 12) u8 x q s8 from corr; V4: (q + 128) u8 x w s8 from zero, then
+// Multi-token dot. V1: (w + 12) u8 x q s8 from corr; V4: (q + 128) u8 x w s8 from zero, then
 // - 128 * sum(w). Same integer sums, same float products, same accumulation: bit-identical.
 // V1 keeps 3k bytes of activation per token (spills the 48 KB L1D above ~5 tokens at k 2560),
-// V4 2k: V1 up to 5 tokens, V4 above (F1-dotmt smoke 06/10; revisit with the full run).
+// V4 2k: V1 up to 5 tokens, V4 above.
 template <int T, int V>
 NINFER_HOST_AVX512 inline void dot_multi_token(const std::uint8_t* packed, const std::uint8_t* sc,
-                                               int k, const W4A8Activation* act, float* s,
-                                               const std::uint8_t* prefetch = nullptr) {
+                                               int k, const W4A8Activation* act, float* s) {
     static_assert(T >= 1 && T <= kHostMaxTokens && (V == 1 || V == 4));
     const __m512i lut =
         V == 1 ? _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2u)))
@@ -141,10 +73,6 @@ NINFER_HOST_AVX512 inline void dot_multi_token(const std::uint8_t* packed, const
     for (int t = 0; t < T; ++t) acc[t] = _mm512_setzero_ps();
     const int nb = k / kNvfp4Group;
     for (int b = 0; b < nb; b += 4) {
-        if (prefetch != nullptr && (b & 7) == 0) {
-            _mm_prefetch(reinterpret_cast<const char*>(prefetch + static_cast<std::size_t>(b) * 8),
-                         _MM_HINT_T0);
-        }
         const __m256i raw = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(packed + static_cast<std::size_t>(b) * 8));
         const __m512i src = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
@@ -183,16 +111,12 @@ NINFER_HOST_AVX512 inline void dot_multi_token(const std::uint8_t* packed, const
 
 template <int T>
 NINFER_HOST_AVX512 void rows_multi_token(const Nvfp4Plane& p, std::int64_t r0, int n,
-                                         const W4A8Activation* act, float* out, std::size_t ldo,
-                                         int prefetch_rows) {
+                                         const W4A8Activation* act, float* out, std::size_t ldo) {
     constexpr int V = T <= 5 ? 1 : 4;
-    const std::size_t pf =
-        static_cast<std::size_t>(prefetch_rows) * static_cast<std::size_t>(p.k / 2);
     for (int i = 0; i < n; ++i) {
         const std::int64_t r = r0 + i;
         float s[T];
-        dot_multi_token<T, V>(p.row_codes(r), p.row_scales(r), p.k, act, s,
-                              prefetch_rows > 0 ? p.row_codes(r) + pf : nullptr);
+        dot_multi_token<T, V>(p.row_codes(r), p.row_scales(r), p.k, act, s);
         const float d = p.divisor(r);
 #pragma GCC unroll 8
         for (int t = 0; t < T; ++t) out[static_cast<std::size_t>(t) * ldo + i] = s[t] * 0.5F / d;
@@ -200,7 +124,7 @@ NINFER_HOST_AVX512 void rows_multi_token(const Nvfp4Plane& p, std::int64_t r0, i
 }
 
 using RowsFn = void (*)(const Nvfp4Plane&, std::int64_t, int, const W4A8Activation*, float*,
-                        std::size_t, int);
+                        std::size_t);
 constexpr RowsFn kRowsMultiToken[kHostMaxTokens + 1] = {nullptr,
                                                         rows_multi_token<1>,
                                                         rows_multi_token<2>,
@@ -210,20 +134,6 @@ constexpr RowsFn kRowsMultiToken[kHostMaxTokens + 1] = {nullptr,
                                                         rows_multi_token<6>,
                                                         rows_multi_token<7>,
                                                         rows_multi_token<8>};
-
-NINFER_HOST_AVX512 void rows_per_token(const Nvfp4Plane& p, std::int64_t r0, int n,
-                                       const W4A8Activation* act, int tokens, float* out,
-                                       std::size_t ldo) {
-    for (int i = 0; i < n; ++i) {
-        const std::int64_t r = r0 + i;
-        const float d        = p.divisor(r);
-        for (int t = 0; t < tokens; ++t) {
-            out[static_cast<std::size_t>(t) * ldo + i] =
-                dot_per_token(p.row_codes(r), p.row_scales(r), p.k, act[t].q, act[t].asb) * 0.5F /
-                d;
-        }
-    }
-}
 
 // q = rint(x / s) in [even 8, odd 8] order, s = absmax / 127; corr, sb16, qu of the block.
 NINFER_HOST_AVX512 inline void quantize_block(__m512 v, int b, W4A8Activation a) {
@@ -435,49 +345,10 @@ float detail::a4_e4m3_rn(float v) noexcept {
     return std::min(std::nearbyint(v / step) * step, 448.0F);
 }
 
-namespace {
-using detail::a4_e4m3_rn;
-
-// 2 * e2m1_rn(v): ties to the even code, satfinite
-int a4_e2m1x2_rn(float v) {
-    static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a              = std::fabs(v);
-    float r                    = 6.0F;
-    for (int i = 0; i < 7; ++i) {
-        if (a > grid[i + 1]) continue;
-        const float mid = 0.5F * (grid[i] + grid[i + 1]);
-        r = a < mid ? grid[i] : a > mid ? grid[i + 1] : (i % 2 == 0 ? grid[i] : grid[i + 1]);
-        break;
-    }
-    const int q = static_cast<int>(2.0F * r);
-    return v < 0.0F ? -q : q;
-}
-
-void a4_block(const float* v, int b, float gs, W4A8Activation a) {
-    float amax = 0.F;
-    for (int i = 0; i < 16; ++i) amax = std::max(amax, std::fabs(v[i]));
-    const float sf        = a4_e4m3_rn(gs * (amax * (1.0F / 6.0F)));
-    const float out_scale = (amax != 0.F && sf != 0.F) ? 1.0F / (sf * (1.0F / gs)) : 0.F;
-    std::int8_t* q        = a.q + static_cast<std::size_t>(b) * 16;
-    for (int j = 0; j < 16; ++j) {
-        const int stored = (j % 2 == 0) ? j / 2 : 8 + j / 2; // [even 8, odd 8]
-        q[stored]        = static_cast<std::int8_t>(a4_e2m1x2_rn(v[j] * out_scale));
-    }
-    for (int j = 0; j < 16; ++j)
-        a.qu[static_cast<std::size_t>(b) * 16 + j] = static_cast<std::uint8_t>(q[j] + 128);
-    for (int d = 0; d < 4; ++d) {
-        a.corr[static_cast<std::size_t>(b) * 4 + d] =
-            -12 * (q[4 * d] + q[4 * d + 1] + q[4 * d + 2] + q[4 * d + 3]);
-    }
-    const float s = sf / (2.0F * gs);
-    for (int d = 0; d < 4; ++d) a.sb16[static_cast<std::size_t>(b) * 4 + d] = s;
-    a.asb[b] = s;
-}
-} // namespace
-
 namespace detail::avx512 {
 namespace {
-// T148: the same block in AVX-512 (bit-identical to a4_block; see a4_selftest).
+// One block of the A4 codec (host_nvfp4.h quantize_blocks_a4): per 16 values sf = e4m3_rn(gs *
+// amax / 6), q = 2 * e2m1_rn(x * gs / sf) with ties to the even code, satfinite.
 NINFER_HOST_AVX512 void a4_block_vec(__m512 v, int b, float gs, W4A8Activation a) {
     const __m512 av       = _mm512_abs_ps(v);
     const float amax      = _mm512_reduce_max_ps(av);
@@ -519,54 +390,14 @@ NINFER_HOST_AVX512 void a4_block_vec(__m512 v, int b, float gs, W4A8Activation a
     a.asb[b] = sc;
 }
 
-// NINFER_HOST_A4_SELFTEST=1: vector vs scalar block, bit for bit, on random and edge values (once).
-NINFER_HOST_AVX512 void a4_selftest() {
-    static bool done = false;
-    if (done) return;
-    done          = true;
-    const char* e = std::getenv("NINFER_HOST_A4_SELFTEST");
-    if (e == nullptr || e[0] != '1') return;
-    std::int8_t qa[16], qb[16];
-    std::uint8_t ua[16], ub[16];
-    std::int32_t ca[4], cb[4];
-    float sa[4], sb[4], aa[1], ab[1];
-    W4A8Activation A{qa, aa, ca, sa, ua}, B{qb, ab, cb, sb, ub};
-    std::uint64_t st = 0x9E3779B97F4A7C15ULL;
-    long bad = 0, n = 0;
-    const float edge[] = {0.F,  0.25F, 0.5F, 0.75F, 1.F, 1.25F, 1.75F, 2.F,
-                          2.5F, 3.F,   3.5F, 4.F,   5.F, 6.F,   7.F,   1e-30F};
-    for (int it = 0; it < 200000; ++it) {
-        float v[16];
-        for (int j = 0; j < 16; ++j) {
-            st ^= st << 13;
-            st ^= st >> 7;
-            st ^= st << 17;
-            const float u = static_cast<float>((st >> 11) & 0xFFFFFF) / 16777216.0F;
-            v[j]          = (it % 4 == 0)
-                                ? edge[(st >> 40) % 16] * ((st >> 50) & 1 ? -1.F : 1.F) * 0.5F
-                                : (u - 0.5F) * std::ldexp(1.0F, static_cast<int>((st >> 44) % 24) - 12);
-        }
-        const float gs = std::ldexp(1.0F, static_cast<int>((st >> 33) % 16) - 4) * 1.37F;
-        a4_block(v, 0, gs, A);
-        a4_block_vec(_mm512_loadu_ps(v), 0, gs, B);
-        ++n;
-        if (std::memcmp(qa, qb, 16) || std::memcmp(ua, ub, 16) || std::memcmp(ca, cb, 16) ||
-            std::memcmp(sa, sb, 16) || std::memcmp(aa, ab, 4))
-            ++bad;
-    }
-    std::fprintf(stderr, "T148 A4 selftest: %ld blocks, %ld mismatches\n", n, bad);
-}
-
 NINFER_HOST_AVX512 void quantize_blocks_a4_impl(const float* x, int block0, int blocks, float gs,
                                                 W4A8Activation a) {
-    a4_selftest();
     for (int i = 0; i < blocks; ++i)
         a4_block_vec(_mm512_loadu_ps(x + static_cast<std::size_t>(i) * 16), block0 + i, gs, a);
 }
 
 NINFER_HOST_AVX512 void quantize_bf16_a4_impl(const std::uint16_t* x, int k, float gs,
                                               W4A8Activation a) {
-    a4_selftest();
     for (int b = 0; b < k / kNvfp4Group; ++b) {
         const __m256i h = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(x + static_cast<std::size_t>(b) * 16));
@@ -586,13 +417,8 @@ void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Acti
 }
 
 void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
-              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
-              std::int32_t prefetch_rows) {
-    if (kernel == DotKernel::MultiToken) {
-        kRowsMultiToken[tokens](plane, r0, n, acts, out, ldo, prefetch_rows);
-    } else {
-        rows_per_token(plane, r0, n, acts, tokens, out, ldo);
-    }
+              std::int32_t tokens, float* out, std::size_t ldo) {
+    kRowsMultiToken[tokens](plane, r0, n, acts, out, ldo);
 }
 } // namespace detail::avx512
 
@@ -615,9 +441,8 @@ void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Acti
 }
 
 void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
-              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
-              std::int32_t prefetch_rows) {
-    active_kernels().rows_dot(plane, r0, n, acts, tokens, out, ldo, kernel, prefetch_rows);
+              std::int32_t tokens, float* out, std::size_t ldo) {
+    active_kernels().rows_dot(plane, r0, n, acts, tokens, out, ldo);
 }
 
 } // namespace ninfer::ops::host

@@ -221,9 +221,6 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
-                              profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
-                              profile.output_rows == 6144;
     const bool q8_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 34816 &&
                             profile.input_rows == 5120 && profile.output_rows == 17408;
     // NVFP4 and FP8 also register the two-device output-row half [17408,5120].
@@ -234,8 +231,7 @@ void validate_profile(const Profile& profile) {
                           profile.input_rows == 5120;
     const bool nvfp4 = profile.qtype == QType::NVFP4 && (fused_gate_up || ffn14336);
     const bool fp8   = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && fused_gate_up;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
-        profile.gate_up_rows != 2 * profile.output_rows) {
+    if ((!q4 && !q8_dflash2 && !nvfp4 && !fp8) || profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&

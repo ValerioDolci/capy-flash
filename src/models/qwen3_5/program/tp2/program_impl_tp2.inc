@@ -2,8 +2,7 @@
 // end (after its closing namespace): the two-device (tp 2) parts of ProgramImpl's construction,
 // rank 1's runtime, the KV/StateImage mirrors, the mailbox probe and step-down, and the
 // vocabulary-split scoring head. The constructor calls construct_tensor_parallel() and
-// bind_tensor_parallel_execution() at the points where this code used to stand inline. Not a
-// header. Our file; see docs/maintainer/upstream-merge.md.
+// bind_tensor_parallel_execution() at its tp 2 steps. Not a header.
 
 #include "models/qwen3_5/execution/tp2/workspace_split.h"
 #include "models/qwen3_5/execution/tp2/prefill_slices.h"
@@ -24,11 +23,8 @@ namespace {
 // DFlash2 drafter's layer sums over its K+1 block columns. The ordinary slot carries one request's
 // exchange, hidden x (K+1); with `batch` the wide slots (PeerMailbox, WIDE SLOTS) carry a full
 // batch of `max_concurrency` requests, so the batched rounds stay on the mailbox instead of the
-// staged copies inside the same graph. Measured on two RTX 5070 Ti without P2P
-// (tools/tp2/mailbox_probe.cu, graph chain of 128): pipelined kernel 17.2 / 23.7 / 31.5 us against
-// copies 31.4 / 40.2 / 45.4 us per exchange at 160 / 240 / 320 KiB. The original kernel is slower
-// than the copies at those widths (84 / 131 / 196 us), so it gets no wide slots. Returns the wide
-// slot's bytes, 0 for none.
+// staged copies inside the same graph: without P2P the mailbox beats the staged copies at these
+// widths (tools/tp2/mailbox_probe.cu). Returns the wide slot's bytes, 0 for none.
 std::size_t tp2_mailbox_wide_slot_bytes(std::size_t request_bytes, std::uint32_t max_concurrency,
                                         bool batch) {
     return batch && max_concurrency > 1 ? request_bytes * max_concurrency : 0;
@@ -69,9 +65,9 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}) {
     const PersistentLayout& own = layout(plan);
     const DeviceSpan backing    = persistent.alloc_bytes(own.bytes, 256);
-    decoder                     = std::make_unique<qwen3_5::DecoderState>(
-        peer_device.device, backing, own.decoder,
-        elastic_arena ? elastic_arena->span() : DeviceSpan{});
+    decoder      = std::make_unique<qwen3_5::DecoderState>(peer_device.device, backing, own.decoder,
+                                                      elastic_arena ? elastic_arena->span()
+                                                                         : DeviceSpan{});
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backing, own.state_images);
     if (own.replay_records) {
         replay_records.emplace(backing, *own.replay_records);
@@ -188,12 +184,12 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             peer = std::make_unique<PeerRuntime>(*execution_context->dev[1], plan);
             peer_events.emplace(*execution_context);
             gdn_gating_overlap.emplace(*execution_context);
-            // T56: eager exchanges (prefill chunks) through pinned host buffers, asynchronously,
+            // Eager exchanges (prefill chunks) through pinned host buffers, asynchronously,
             // instead of the driver-staged peer copy that blocks the host per call. That copy is
             // only staged without P2P: with peer access it is a direct device-to-device copy and
-            // faster than two host hops (issue #3, P2P board: prefill 5.3k tok/s direct vs 2.0k
-            // through the host). So with P2P the direct copy stays, except with elastic KV, whose
-            // lent workspace is VMM memory the peer pull cannot read (T64/T68; startup.cpp keeps
+            // faster than two host hops (more than twice the prefill throughput on a P2P board).
+            // So with P2P the direct copy stays, except with elastic KV, whose
+            // lent workspace is VMM memory the peer pull cannot read (startup.cpp keeps
             // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=0 / =1 force either way.
             // enable_peer_access() only reports here: the Engine enabled it already, idempotently.
             // With peer access and no HostExchange, the 27B prefill overlap's split-phase sums take
@@ -242,13 +238,6 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                 graph_bridge.emplace(execution_context->dev[0]->device,
                                      execution_context->dev[1]->device);
                 if (plan.tp_mailbox) {
-                    // NINFER_TP_MAILBOX_LEGACY=1 keeps the original exchange kernel, for A/B
-                    // runs on one binary; both kernels produce the same bits.
-                    const char* legacy_env = std::getenv("NINFER_TP_MAILBOX_LEGACY");
-                    const ops::PeerExchangeKernel kernel =
-                        legacy_env != nullptr && std::string_view(legacy_env) == "1"
-                            ? ops::PeerExchangeKernel::Legacy
-                            : ops::PeerExchangeKernel::Pipelined;
                     // One slot carries one request's widest exchange, the [hidden, K+1]
                     // verification activation; the wide slots a full batch's.
                     // NINFER_TP_MAILBOX_SLOT=request leaves the wide slots out (the batched
@@ -264,21 +253,18 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                     const char* slot_env              = std::getenv("NINFER_TP_MAILBOX_SLOT");
                     const std::size_t wide_slot_bytes = tp2_mailbox_wide_slot_bytes(
                         slot_bytes, max_concurrency,
-                        kernel == ops::PeerExchangeKernel::Pipelined &&
-                            (slot_env == nullptr || std::string_view(slot_env) != "request"));
-                    peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel,
-                                         wide_slot_bytes);
+                        slot_env == nullptr || std::string_view(slot_env) != "request");
+                    peer_mailbox.emplace(*execution_context, slot_bytes, 2, wide_slot_bytes);
                     // Qwen4Exp: the exchanges release the next hyper-connection mixer early
-                    // (its Down launch streams its weights under the exchange, T45).
+                    // (its Down launch streams its weights under the exchange).
                     peer_mailbox->set_release_dependents(parameters.model.config().text.qwen4());
-                    // q27/dexch: decode exchanges prefetch the leading rows of the next GEMM's
+                    // Decode exchanges prefetch the leading rows of the next GEMM's
                     // weights into L2 while they wait on PCIe (PeerMailbox::set_l2_prefetch;
                     // the dense text forward names them). NINFER_TP_EXCHANGE_PREFETCH_KIB sets
                     // the bytes per exchange, 0 turns it off; timings only, never a result bit.
                     peer_mailbox->set_l2_prefetch_budget(tp2_exchange_prefetch_bytes());
                     peer_events->attach_mailbox(&*peer_mailbox);
-                    tp_transport_status.exchange_kernel = ops::peer_exchange_kernel_name(kernel);
-                    tp_transport_status.slot_bytes      = peer_mailbox->max_bytes();
+                    tp_transport_status.slot_bytes = peer_mailbox->max_bytes();
                     probe_peer_mailbox();
                 } else {
                     tp_transport_status.transport = "copies";
@@ -518,9 +504,8 @@ void ProgramImpl::probe_peer_mailbox() {
         tp_transport_status.fallback = "the startup probe exchange took " +
                                        std::to_string(static_cast<long>(elapsed_ms)) + " ms";
     }
-    tp_transport_status.transport       = "copies";
-    tp_transport_status.exchange_kernel = {};
-    tp_transport_status.slot_bytes      = 0;
+    tp_transport_status.transport  = "copies";
+    tp_transport_status.slot_bytes = 0;
     peer_events->attach_mailbox(nullptr);
     peer_mailbox.reset();
 }
@@ -544,14 +529,13 @@ void ProgramImpl::synchronize_devices() const {
 bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
     if (!peer_mailbox || !tp_execution) { return false; }
     // The executables bake in the hung mailbox's slab and words: they go first.
-    ordinary_graphs                      = {};
-    mtp_graphs                           = {};
-    dflash_graphs                        = {};
-    const std::size_t slot_bytes         = peer_mailbox->slot_bytes();
-    const std::size_t wide_slot_bytes    = peer_mailbox->wide_slot_bytes();
-    const ops::PeerExchangeKernel kernel = peer_mailbox->kernel();
-    const bool release_dependents        = peer_mailbox->release_dependents();
-    const std::size_t prefetch_budget    = peer_mailbox->l2_prefetch_budget();
+    ordinary_graphs                   = {};
+    mtp_graphs                        = {};
+    dflash_graphs                     = {};
+    const std::size_t slot_bytes      = peer_mailbox->slot_bytes();
+    const std::size_t wide_slot_bytes = peer_mailbox->wide_slot_bytes();
+    const bool release_dependents     = peer_mailbox->release_dependents();
+    const std::size_t prefetch_budget = peer_mailbox->l2_prefetch_budget();
     peer_events->attach_mailbox(nullptr);
     peer_mailbox.reset();
     const std::string previous = tp_transport_status.transport;
@@ -562,7 +546,7 @@ bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
          speculative_backend == SpeculativeBackend::DFlash2) &&
         !tp_execution->staged_draft_collectives) {
         tp_execution->staged_draft_collectives = true;
-        peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel, wide_slot_bytes);
+        peer_mailbox.emplace(*execution_context, slot_bytes, 2, wide_slot_bytes);
         peer_mailbox->set_release_dependents(release_dependents);
         peer_mailbox->set_l2_prefetch_budget(prefetch_budget);
         peer_events->attach_mailbox(&*peer_mailbox);
@@ -573,7 +557,6 @@ bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
     }
     tp_execution->staged_draft_collectives = false;
     tp_transport_status.transport          = "copies";
-    tp_transport_status.exchange_kernel    = {};
     tp_transport_status.slot_bytes         = 0;
     return true;
 }

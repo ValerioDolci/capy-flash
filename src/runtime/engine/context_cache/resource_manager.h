@@ -398,11 +398,11 @@ public:
             }
         }
 
-        // Issue #6: the disk tier resumes only a root prefill, so a shorter in-memory match (a
-        // system prompt another conversation left) used to win over the longer conversation saved
-        // on disk, which then went through prefill again. Loading costs a small fraction of a
-        // prefill of the same tokens (140k: ~1 s vs ~48 s on two 5070 Ti), so plan from the root
-        // alone when the disk holds more than the best in-memory match plus 1/16 of its own length.
+        // The disk tier resumes only a root prefill, so a shorter in-memory match (a system prompt
+        // another conversation left) would otherwise win over the longer conversation saved on
+        // disk, which would then go through prefill again. Loading costs a small fraction of a
+        // prefill of the same tokens, so plan from the root alone when the disk holds more than the
+        // best in-memory match plus 1/16 of its own length.
         if constexpr (requires { program.disk_resume_tokens(prompt); }) {
             if (candidates.size() > 1) {
                 const std::uint32_t disk = program.disk_resume_tokens(prompt);
@@ -1140,7 +1140,7 @@ public:
         return released;
     }
 
-    // Idle KV to the Host (v0.6; the Program has elastic KV and a Host KV tier): the Device keeps
+    // Idle KV to the Host (the Program has elastic KV and a Host KV tier): the Device keeps
     // only the KV of active requests. Every idle catalogued owner (no active edge, no open
     // context transaction) moves its Device KV pages to the Host, private continuations most
     // valuable first (the capture reclaim's order, reversed), then shared prefixes newest first;
@@ -1970,8 +1970,7 @@ private:
     // enabled, a Device-infeasible private capture first takes Device state from idle private
     // continuations without a live session, until the capture fits or none remains:
     //  - it never takes a checkpoint that costs more to rebuild than the capture protects, so a
-    //    short side conversation's capture is skipped instead of paid for with a long session
-    //    (issue #3: a 1.8k side conversation released a 44k agent session and its anchors);
+    //    short side conversation's capture is skipped instead of paid for with a long session;
     //  - it drops long anchors, lowest first, before it releases whole continuations: an anchor
     //    only serves a rewrite of the history, a lost endpoint re-prefills the next turn;
     //  - owners go lowest retention weight first, then lowest GreedyDual priority (rebuild tokens

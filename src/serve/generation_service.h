@@ -102,9 +102,6 @@ enum class GenerationConsumerMode : std::uint8_t {
 ApiError request_error_to_api_error(const ninfer::RequestError& exception,
                                     std::string_view constraint_param = {});
 
-// Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
-// request keeps its ingress/response lifetime reservation until the HTTP response is released and
-// is consumed exactly once by run().
 // What a reasoning-close retry needs to submit the continuation of this request.
 struct ReasoningRetryContext {
     ninfer::PromptInput input;
@@ -113,6 +110,9 @@ struct ReasoningRetryContext {
     ninfer::GenerationObservationOptions observation;
 };
 
+// Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
+// request keeps its ingress/response lifetime reservation until the HTTP response is released and
+// is consumed exactly once by run().
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;

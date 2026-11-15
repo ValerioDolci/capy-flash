@@ -74,7 +74,7 @@ void render_and_write(SseTransport& transport, Render&& render) {
     } catch (const std::exception& exception) { throw ResponseRenderFailure(exception.what()); }
 }
 
-RequestJson parse_json_body(const httplib::Request& request);
+RequestJson parse_json_body(const httplib::Request& request, const RequestLimits& limits);
 
 // NInfer extension. An optional `X-Ninfer-Client` request header labels the caller (a benchmark,
 // smoke test or gate run) for the request JSONL, so measurement can tell it apart from ordinary

@@ -1,4 +1,4 @@
-// Qualification benchmark for the Qwen3.6-35B G1 argmax domains.
+// Qualification benchmark for the argmax domains of the full output head and the shortlist.
 //
 //   ./ninfer_argmax_bench
 //   ./ninfer_argmax_bench --shape full --cols 1

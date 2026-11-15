@@ -1,5 +1,5 @@
 // The two-device [3072,5120] shard's dispatch: the parent's DFlash2 route table
-// (q8/q8_attn_input_plan.cpp, kDFlash2Routes) over the shard's launchers. Our file.
+// (q8/q8_attn_input_plan.cpp, kDFlash2Routes) over the shard's launchers.
 #include "ops/attn_input_proj/tp2/q8_dflash2_attn_input_shard.h"
 #include "ninfer/ops/tp2/attn_input_proj.h"
 

@@ -6,10 +6,6 @@ void launch_q4_a16_mma_r64_t48(const Tensor& x, const Weight& w, Tensor& out, cu
     launch_q4_a16_mma_instance<q4_instances::MmaR64T48K64Wr16Wt16S2A2B2>(x, w, out, stream);
 }
 
-void launch_q4_a16_mma_r64_t72(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_q4_a16_mma_instance<q4_instances::MmaR64T72K64Wr32Wt24S2A2B2>(x, w, out, stream);
-}
-
 void launch_q4_a16_mma_r64_t80(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_q4_a16_mma_instance<q4_instances::MmaR64T80K64Wr16Wt40S2A2B1>(x, w, out, stream);
 }

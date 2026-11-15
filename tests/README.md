@@ -17,9 +17,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,
-  logging, benchmark reports and causal-scoring evaluation;
-- `test_serve_corpus.py` — agreement between the serving request-log schema and its measurement
-  consumer.
+  logging, benchmark reports and causal-scoring evaluation.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
@@ -103,9 +101,7 @@ test support library. Both those libraries and the Op test executables receive t
 Run the native Python suites with the project Python environment:
 
 ```bash
-python3 -m pytest \
-  tests/artifact tests/convert \
-  tests/test_serve_corpus.py
+python3 -m pytest tests/artifact tests/convert
 ```
 
 Agentic measurement and long-context probe tests (no GPU):

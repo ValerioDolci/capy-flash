@@ -44,7 +44,7 @@ int main() {
     int failures      = 0;
     const auto tokens = qwen_tokens();
 
-    // The banco-agentico case: the first token after "<think>\n" is <|im_end|>.
+    // The first token after "<think>\n" is <|im_end|>.
     {
         const std::vector<TokenId> generated{248046};
         const auto plan = plan_reasoning_retry(stopped(generated), tokens);
@@ -53,7 +53,7 @@ int main() {
                               plan.injected_tokens == 3 && plan.remaining_output_tokens == 31997U,
                           "a first-token stop is not closed and continued with the close suffix");
     }
-    // Stop after some reasoning (B4): the reasoning is kept, then the close.
+    // Stop after some reasoning: the reasoning is kept, then the close.
     {
         const std::vector<TokenId> generated{100, 101, 102, 248044};
         const auto plan = plan_reasoning_retry(stopped(generated), tokens);

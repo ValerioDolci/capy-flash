@@ -17,21 +17,6 @@ namespace {
 
 using Json = RequestJson;
 
-void require_object(const Json& value, std::string_view name = "request body") {
-    if (!value.is_object()) { bad_request(std::string(name) + " must be a JSON object"); }
-}
-
-std::string require_function_name(const Json& object, const char* param) {
-    if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("function name must be a string", param);
-    }
-    const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
-    }
-    return name;
-}
-
 std::optional<std::string> optional_namespace_name(const Json& object, const char* param) {
     if (!object.contains("namespace") || object.at("namespace").is_null()) { return std::nullopt; }
     if (!object.at("namespace").is_string()) {
@@ -118,14 +103,10 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
     }
 
     ninfer::product::media_acquire::Source source;
-    source.value = part.at("image_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
-    }
+    source.value    = part.at("image_url").get<std::string>();
+    const auto kind = ninfer::product::media_acquire::uri_source_kind(source.value);
+    if (!kind) { bad_request("input_image.image_url must use HTTP(S) or a data URI", "input"); }
+    source.kind = *kind;
     return source;
 }
 
@@ -135,14 +116,10 @@ ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
         bad_request("input_video must contain a non-empty video_url", "input");
     }
     ninfer::product::media_acquire::Source source;
-    source.value = part.at("video_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
-    }
+    source.value    = part.at("video_url").get<std::string>();
+    const auto kind = ninfer::product::media_acquire::uri_source_kind(source.value);
+    if (!kind) { bad_request("input_video.video_url must use HTTP(S) or a data URI", "input"); }
+    source.kind = *kind;
     return source;
 }
 
@@ -390,7 +367,8 @@ void reject_nonnull_unknown_members(const Json& object,
 
 ToolCall parse_function_call_item(
     const Json& item, Json& canonical,
-    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+    const RequestLimits& limits) {
     static const std::unordered_set<std::string> allowed = {
         "id", "type", "call_id", "name", "arguments", "status", "caller", "namespace"};
     reject_nonnull_unknown_members(item, allowed, "input");
@@ -411,7 +389,7 @@ ToolCall parse_function_call_item(
         bad_request("function_call arguments must be a JSON string", "input");
     }
     call.arguments_json = item.at("arguments").get<std::string>();
-    check_request_json_nesting(call.arguments_json, "input");
+    check_request_json_nesting(call.arguments_json, "input", limits);
     const Json arguments = Json::parse(call.arguments_json, nullptr, false);
     if (arguments.is_discarded() || !arguments.is_object()) {
         bad_request("function_call arguments must encode a JSON object", "input");
@@ -631,7 +609,8 @@ private:
 };
 
 void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
-                 std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+                 std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities,
+                 const RequestLimits& limits) {
     Json values;
     if (input.is_string()) {
         values = Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", input}}});
@@ -674,7 +653,7 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
         } else if (type == "reasoning") {
             assistant.append_reasoning(parse_reasoning_item(item, canonical), index);
         } else if (type == "function_call") {
-            assistant.append_call(parse_function_call_item(item, canonical, identities));
+            assistant.append_call(parse_function_call_item(item, canonical, identities, limits));
         } else if (type == "custom_tool_call") {
             assistant.append_call(parse_custom_tool_call_item(item, canonical, identities));
         } else if (type == "function_call_output") {
@@ -1020,16 +999,7 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
         selected.insert(name);
     }
 
-    std::vector<ToolDefinition> effective;
-    effective.reserve(selected.size());
-    for (ToolDefinition& tool : out.prompt.generation.tools) {
-        if (selected.contains(tool.name)) {
-            effective.push_back(std::move(tool));
-        } else {
-            out.prompt.generation.filtered_out_tool_names.push_back(tool.name);
-        }
-    }
-    out.prompt.generation.tools = std::move(effective);
+    keep_allowed_tools(out.prompt.generation, selected);
 }
 
 void parse_tool_choice(const Json& body, ParsedPromptFields& out) {
@@ -1104,16 +1074,16 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     out.generation.reasoning_effort = *effort;
 }
 
-void parse_text(const Json& body, GenerationRequest& request) {
+void parse_text(const Json& body, GenerationRequest& request, const RequestLimits& limits) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
     static const std::unordered_set<std::string> allowed = {"format", "verbosity"};
     reject_nonnull_unknown_members(text, allowed, "text");
     if (text.contains("format") && !text.at("format").is_null()) {
-        // text / json_object / json_schema (Neroued/ninfer eb6696ae).
+        // text / json_object / json_schema.
         parse_json_output_format(text.at("format"), request, "text.format",
-                                 JsonFormatProtocol::Responses);
+                                 JsonFormatProtocol::Responses, limits);
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
         if (!text.at("verbosity").is_string()) {
@@ -1176,7 +1146,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     }
     out.prompt.model = body.at("model").get<std::string>();
     if (body.contains("input") && !body.at("input").is_null()) {
-        parse_input(body.at("input"), out.prompt, out.tool_identities);
+        parse_input(body.at("input"), out.prompt, out.tool_identities, limits);
     }
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {
@@ -1201,7 +1171,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
                     "parallel_tool_calls", "parallel_tool_calls_not_supported");
     }
     parse_reasoning(body, out.prompt);
-    parse_text(body, out.prompt.generation);
+    parse_text(body, out.prompt.generation, limits);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
@@ -1312,7 +1282,7 @@ void validate_common_top_level(const Json& body, bool create) {
 
 OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& body,
                                                                    const RequestLimits& limits) {
-    require_object(body);
+    require_object_body(body);
     validate_common_top_level(body, true);
     reject_unsupported_platform_fields(body);
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
@@ -1420,13 +1390,13 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
         out.text_format = nlohmann::json::parse(body.at("text").at("format").dump());
     }
-    parse_structured_outputs(body, out.prompt.generation);
+    parse_structured_outputs(body, out.prompt.generation, limits);
     return out;
 }
 
 OpenAIResponsesPromptRequest
 parse_openai_responses_input_tokens_request(const Json& body, const RequestLimits& limits) {
-    require_object(body);
+    require_object_body(body);
     validate_common_top_level(body, false);
     reject_unsupported_platform_fields(body);
     if (body.contains("personality") && !body.at("personality").is_null()) {

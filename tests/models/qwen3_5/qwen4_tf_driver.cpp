@@ -1,4 +1,4 @@
-// Qwen4Exp validation driver (T20): runs the public Engine on a fixed token sequence.
+// Qwen4Exp validation driver: runs the public Engine on a fixed token sequence.
 //
 //   ninfer_qwen4_tf_driver score ART IDS [--context N] [--chunk N] [--kv bf16|int8|fp8|nvfp4|k8v4]
 //   [--tp 1|2]
@@ -17,23 +17,19 @@
 //       prefill and decode timing, MTP rounds/acceptance); with --reuse-prefix the context cache is
 //       on and later runs may reuse the prompt's prefix. With NINFER_QWEN4_TFDUMP=<dir> the Program
 //       writes the logits of every decode round. --mtp K decodes with MTP (K draft tokens, window
-//       K+1) and reports the acceptance per draft position; --mtp-min-p P (T41) verifies only the
-//       proposals whose chain probability (--mtp-window-rule chain, default) or own probability
-//       (step) is >= P; --prompts reads one prompt per line of
-//       IDS (one Engine for all); --temperature > 0 samples (rejection sampling under MTP).
+//       K+1) and reports the acceptance per draft position; --prompts reads one prompt per line
+//       of IDS (one Engine for all); --temperature > 0 samples (rejection sampling under MTP).
 //       --concurrency N (2-8, greedy only): max_concurrency N and N x max_context of KV; each run
 //       submits every prompt at once (the Engine batches up to N of them), prints them in order.
-// Elastic KV (T64, both modes): [--elastic] [--kv-grow TOKENS] [--kv-budget-gib G]
+// Elastic KV (both modes): [--elastic] [--kv-grow TOKENS] [--kv-budget-gib G]
 //   [--elastic-columns N (with --slots)]: the KV pool is backed on demand and the expert cache
 //   gives up / takes back whole columns of slots as the KV grows / shrinks
 //   (EngineOptions::elastic_kv).
 // Routed experts (both modes): [--experts offload|mapped] [--slots N] [--slot-headroom-mib N]
-//   [--cpu-threads N] [--insert-cap N] [--admit F] [--half-life F] [--evict-tau F] [--device-reads
-//   N] [--embedding-host] [--kv-ram-active]
-//   [--prefetch N] [--prefetch-min-score F] [--prefetch-first-layer L] [--prefetch-gbps G]
-//   [--warm-start | --no-warm-start] (T25; warm start is on by default).
-//   [--miss-split auto|off|<fraction>|count:<n>] [--split-path staged|zc] [--split-rank 0|1]
-//   [--split-min N] [--split-max N]
+//   [--cpu-threads N] [--insert-cap N] [--admit F] [--half-life F] [--evict-tau F]
+//   [--embedding-host] [--kv-ram-active]
+//   [--warm-start | --no-warm-start] (warm start is on by default).
+//   [--miss-split auto|off] [--split-min N] [--split-max N]
 //   [--split-costs
 //   cpu_fixed,cpu_expert,cpu_column,cpu_read_slowdown,gpu_fixed,gpu_expert,gpu_column]. The
 //   resolved slot count and the device memory budget are printed to stderr (memory: ...).
@@ -129,7 +125,7 @@ int main(int argc, char** argv) {
         bool reuse_prefix     = false;
         std::uint32_t mtp     = 0;
         float temperature     = 0.0F;
-        std::int32_t top_k    = -1; // T107: < 0 = model default
+        std::int32_t top_k    = -1; // < 0 = model default
         float top_p           = -1.0F;
         std::uint64_t seed    = 0;
         std::string out_path;
@@ -159,24 +155,12 @@ int main(int argc, char** argv) {
                 if (options.tp == 2) { options.devices = {0, 1}; }
             } else if (arg == "--mtp") {
                 mtp = static_cast<std::uint32_t>(std::stoul(next()));
-            } else if (arg == "--mtp-min-p") {
-                // T41: adaptive MTP window (0 = fixed K).
-                options.speculative.min_draft_probability = std::stof(next());
             } else if (arg == "--draft-shortlist") {
-                // T43: proposal heads over a draft token shortlist (file of token IDs).
+                // Proposal heads over a draft token shortlist (file of token IDs).
                 options.speculative.draft_shortlist = next();
             } else if (arg == "--draft-rows") {
                 options.speculative.draft_shortlist_rows =
                     static_cast<std::uint32_t>(std::stoul(next()));
-            } else if (arg == "--mtp-window-rule") {
-                const std::string v = next();
-                if (v == "chain") {
-                    options.speculative.window_rule = ninfer::MtpWindowRule::Chain;
-                } else if (v == "step") {
-                    options.speculative.window_rule = ninfer::MtpWindowRule::Step;
-                } else {
-                    throw std::invalid_argument("--mtp-window-rule must be chain or step");
-                }
             } else if (arg == "--concurrency") {
                 lanes = static_cast<std::uint32_t>(std::stoul(next()));
                 if (lanes == 0 || lanes > 8) {
@@ -216,28 +200,13 @@ int main(int argc, char** argv) {
             } else if (arg == "--insert-cap") {
                 options.routed_experts.insert_cap = static_cast<std::uint32_t>(std::stoul(next()));
             } else if (arg == "--admit") {
-                // Admission threshold (default 2, T54); --admit 0 = plain LRU (the pre-T54 engine).
+                // Admission threshold (default 2); --admit 0 = plain LRU.
                 options.routed_experts.admit_threshold = std::stof(next());
             } else if (arg == "--half-life") {
                 options.routed_experts.half_life_tokens = std::stof(next());
             } else if (arg == "--evict-tau") {
-                // T61: frequency x recency victim, time constant in windows (default 4); 0 = LRU
-                // victim.
+                // Frequency x recency victim, time constant in windows (default 4); 0 = LRU victim.
                 options.routed_experts.evict_tau_windows = std::stof(next());
-            } else if (arg == "--device-reads") {
-                options.routed_experts.device_reads =
-                    static_cast<std::uint32_t>(std::stoul(next()));
-            } else if (arg == "--prefetch") {
-                // T25 router-ahead prefetch: staging copies per layer (0 = off).
-                options.routed_experts.prefetch_slots =
-                    static_cast<std::uint32_t>(std::stoul(next()));
-            } else if (arg == "--prefetch-min-score") {
-                options.routed_experts.prefetch_min_score = std::stof(next());
-            } else if (arg == "--prefetch-first-layer") {
-                options.routed_experts.prefetch_first_layer =
-                    static_cast<std::uint32_t>(std::stoul(next()));
-            } else if (arg == "--prefetch-gbps") {
-                options.routed_experts.prefetch_link_gbps = std::stof(next());
             } else if (arg == "--warm-start") {
                 options.routed_experts.warm_start = true;
             } else if (arg == "--no-warm-start") {
@@ -255,36 +224,19 @@ int main(int argc, char** argv) {
                 options.routed_experts.stream_cpu_token_us  = std::stof(v.substr(a + 1, b - a - 1));
                 options.routed_experts.stream_link_us       = std::stof(v.substr(b + 1));
             } else if (arg == "--prompt-chunk") {
-                // T42: largest streamed prompt chunk on lent workspace (0 = off).
+                // Largest streamed prompt chunk on lent workspace (0 = off).
                 options.routed_experts.prompt_chunk =
                     static_cast<std::uint32_t>(std::stoul(next()));
             } else if (arg == "--stream-ring") {
                 options.routed_experts.stream_ring_slots =
                     static_cast<std::uint32_t>(std::stoul(next()));
             } else if (arg == "--miss-split") {
-                // T18: auto | off | <fraction in [0,1]> | count:<n>
-                auto& split         = options.routed_experts.miss_split;
                 const std::string v = next();
-                if (v == "auto") {
-                    split.mode = ninfer::MissSplitMode::Auto;
-                } else if (v == "off") {
-                    split.mode = ninfer::MissSplitMode::Off;
-                } else if (v.rfind("count:", 0) == 0) {
-                    split.mode  = ninfer::MissSplitMode::Count;
-                    split.count = static_cast<std::uint32_t>(std::stoul(v.substr(6)));
-                } else {
-                    split.mode     = ninfer::MissSplitMode::Fraction;
-                    split.fraction = std::stof(v);
+                if (v != "auto" && v != "off") {
+                    throw std::invalid_argument("--miss-split auto|off");
                 }
-            } else if (arg == "--split-path") {
-                const std::string v = next();
-                if (v != "staged" && v != "zc") {
-                    throw std::invalid_argument("--split-path staged|zc");
-                }
-                options.routed_experts.miss_split.staged = v == "staged";
-            } else if (arg == "--split-rank") {
-                // T42, tp 2: which rank computes the GPU share (1 = rank 1, default; 0 = rank 0).
-                options.routed_experts.miss_split.peer_share = std::stoi(next()) != 0;
+                options.routed_experts.miss_split.mode =
+                    v == "auto" ? ninfer::MissSplitMode::Auto : ninfer::MissSplitMode::Off;
             } else if (arg == "--split-min") {
                 options.routed_experts.miss_split.min_misses =
                     static_cast<std::uint32_t>(std::stoul(next()));
@@ -312,7 +264,7 @@ int main(int argc, char** argv) {
             } else if (arg == "--kv-ram-active") {
                 options.kv_ram_active = true;
             } else if (arg == "--elastic") {
-                // T64: elastic KV <-> expert slots (KV backed on demand, the cache shrinks/grows).
+                // Elastic KV <-> expert slots (KV backed on demand, the cache shrinks/grows).
                 options.elastic_kv.enabled = true;
             } else if (arg == "--kv-grow") {
                 options.elastic_kv.grow_tokens = static_cast<std::uint32_t>(std::stoul(next()));
@@ -416,7 +368,7 @@ int main(int argc, char** argv) {
                 ninfer::KvCapacityPolicy::explicit_capacity(options.max_context * lanes);
             options.context_cache.enabled = reuse_prefix;
             if (reuse_prefix &&
-                options.tp == 2) { // T109: as ninfer-serve at tp 2 (no Host tier on rank 1)
+                options.tp == 2) { // as ninfer-serve at tp 2 (no Host tier on rank 1)
                 options.context_cache.host_state_slots       = 0;
                 options.context_cache.host_kv_capacity_bytes = 0;
             }
@@ -427,7 +379,7 @@ int main(int argc, char** argv) {
             ninfer::Engine engine(options);
             report_memory(engine);
             std::size_t index = 0;
-            // T121: NINFER_DRIVER_TEMPS = one temperature per prompt line (index across runs;
+            // NINFER_DRIVER_TEMPS = one temperature per prompt line (index across runs;
             // missing = --temperature); NINFER_DRIVER_STOPS = stop at the default stop tokens of
             // the model (as ninfer-serve), not raw max-new.
             std::vector<float> temps;
@@ -463,7 +415,7 @@ int main(int argc, char** argv) {
                     request.execution.sampling.temperature       = prompt_temperature;
                     request.execution.sampling.presence_penalty  = 0.0F;
                     request.execution.sampling.frequency_penalty = 0.0F;
-                    // T109: each repeat samples with its own seed (seed + run) so --repeat gives
+                    // Each repeat samples with its own seed (seed + run) so --repeat gives
                     // independent samples.
                     if (prompt_temperature > 0.0F) {
                         request.execution.sampling.seed = seed + run * 100003ULL + index;

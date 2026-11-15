@@ -1,6 +1,6 @@
-// Renames that turn upstream's FP8 gdn_input_proj sources into the [8192,5120] shard's when a
+// Renames that turn the parent's FP8 gdn_input_proj sources into the [8192,5120] shard's when a
 // translation unit of this directory includes them. Include it once, after
-// fp8_gdn_input_shard_prelude.h and right before the upstream source.
+// fp8_gdn_input_shard_prelude.h and right before the parent's source.
 
 #define Fp8GdnInputOutput                      Fp8GdnInputShardOutput
 #define fp8_gdn_input_decode_launch            fp8_gdn_input_shard_decode_launch

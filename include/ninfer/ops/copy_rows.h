@@ -8,7 +8,7 @@
 namespace ninfer::ops {
 
 /**
- * Strided row block copy (T139): for every column c in [0, columns),
+ * Strided row block copy: for every column c in [0, columns),
  *
  *   destination[c * row_bytes + b] = source[c * source_pitch + b],   b in [0, row_bytes),
  *

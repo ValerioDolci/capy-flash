@@ -1,6 +1,6 @@
 #pragma once
 
-// T43: the Qwen4Exp MTP proposal head over a draft token shortlist.
+// The Qwen4Exp MTP proposal head over a draft token shortlist.
 //
 // The verification head stays the full-vocabulary Text output head, so greedy acceptance (and the
 // output of a greedy MTP run) does not depend on the drafts; only which tokens are proposed does.

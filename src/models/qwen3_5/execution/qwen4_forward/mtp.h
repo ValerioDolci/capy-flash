@@ -133,17 +133,4 @@ void Qwen4Forward<Arena>::mtp_stem(std::array<const Qwen4MtpParameters*, 2> m,
     });
 }
 
-template <class Arena>
-void Qwen4Forward<Arena>::run_mtp(const Qwen4MtpParameters& m, const Tensor& ids,
-                                  const Tensor* embeddings, const Tensor& hidden_wide,
-                                  Tensor& wide_out, bool append_only) {
-    const RankTensors rank_ids{ids, Tensor{}};
-    RankTensors rank_embeddings;
-    if (embeddings != nullptr) { rank_embeddings = {*embeddings, Tensor{}}; }
-    const RankTensors rank_hidden{hidden_wide, Tensor{}};
-    RankTensors rank_out{wide_out, Tensor{}};
-    run_mtp({&m, nullptr}, rank_ids, embeddings != nullptr ? &rank_embeddings : nullptr,
-            rank_hidden, rank_out, append_only);
-}
-
 } // namespace ninfer::models::qwen3_5::execution

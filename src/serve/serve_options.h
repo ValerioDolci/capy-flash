@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "product/logging/logging.h"
+#include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,14 +13,7 @@
 
 namespace ninfer::serve {
 
-// Protocol default when the client omits max_tokens. Engine independently
-// clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens               = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes = 384ULL << 20;
-// Nesting of objects and arrays in a request body (and in JSON carried as a string, such as tool
-// call arguments), checked on the bytes before parsing: the prompt path reads client JSON with
-// recursive code (rendering, copies, serialization), so a deep document must not reach it.
-inline constexpr std::uint32_t kDefaultMaxRequestJsonDepth = 1000;
 // The template renderer converts client JSON recursively: about 12 000 levels exhaust an 8 MiB
 // thread stack (measured), so the maximum keeps a margin.
 inline constexpr std::uint32_t kMaximumMaxRequestJsonDepth = 5000;
@@ -65,8 +59,7 @@ struct ServeOptions {
     int tp     = 1;
     std::vector<int> devices; // One id per tensor-parallel rank; {device} at tp 1.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
-    // YaRN RoPE extension. factor <= 1 is DISABLED and must stay bit-identical to the
-    // unmodified engine: the fixed-frequency path is bypassed only when factor > 1.
+    // YaRN RoPE extension (EngineOptions::rope_yarn_factor); factor 1 is plain RoPE.
     float rope_yarn_factor                   = 1.0F;
     std::uint32_t rope_original_max_position = 262144;
     SpeculativeOptions speculative;
@@ -80,12 +73,12 @@ struct ServeOptions {
     // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
     std::uint64_t host_pinned_max_bytes = 0;
     bool allow_prefix_reuse             = true;
-    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry):
+    // --reasoning-close-retry (on by default, every model; --no-reasoning-close-retry):
     // a reply that ends with the model's terminal token inside its thinking (or right after
     // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
     // once (serve/reasoning_retry.h).
     bool reasoning_close_retry = true;
-    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the
+    // --reasoning-eos-guard (on by default, every model; --no-reasoning-eos-guard): the
     // first token of a reply that starts in thinking is never a terminal token; a terminal draw is
     // redrawn without the terminal ids (models/qwen3_5/execution/reasoning_eos_guard.h).
     // Token-identical when it does not fire.
@@ -94,13 +87,13 @@ struct ServeOptions {
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
     // turn branches from the conversation; see to_prompt_input.
     // Unset = the model's default (resolve_turn_anchors): 0 on Qwen4Exp, 1 elsewhere.
-    // capy-flash (T152): on Qwen3.8-Flash-Next every prefill pass reads the non-resident experts
-    // from host RAM (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67
-    // -> 1.82 s without it); a cancelled or edited turn then re-prefills the conversation. T161: on
-    // models whose weights are all on the GPU (Qwen3.8-27B) the extra pass costs nothing
-    // measurable, so they keep the anchor.
+    // On Qwen3.8-Flash-Next every prefill pass reads the non-resident experts from host RAM
+    // (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67 s instead of
+    // 1.82 s); a cancelled or edited turn then re-prefills the conversation. On models whose
+    // weights are all on the GPU (Qwen3.8-27B) the extra pass costs nothing measurable, so they
+    // keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
-    // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
+    // Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
     // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split
     // auto|calibrate|off) and the prompt-chunk width from which the missing experts stream over
     // PCIe (--stream-min-tokens, RoutedExpertOptions::stream_min_tokens; 0 = never).

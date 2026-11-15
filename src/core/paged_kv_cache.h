@@ -18,6 +18,15 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// Pages that hold `tokens` tokens, and the fewest tokens that need `pages` pages.
+[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+[[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
+    return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -257,7 +266,7 @@ public:
     void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
     /**
-     * Elastic backing (T64): only pages [0, backed_pages()) have physical memory. Before a page
+     * Elastic backing: only pages [0, backed_pages()) have physical memory. Before a page
      * at or beyond it is handed out (materialize, materialize_one), `grow(pages)` is called with
      * the number of leading pages that must then be backed; it backs them and records it with
      * set_backed_pages(), or throws, leaving the pool unchanged. Without a backing every page is
@@ -295,7 +304,7 @@ public:
     [[nodiscard]] std::size_t host_physical_bytes() const noexcept;
 
     /**
-     * Compaction of the Device KV backing (v0.6, idle KV to the Host): moves each lease whose page
+     * Compaction of the Device KV backing (idle KV to the Host): moves each lease whose page
      * lies above the lowest free page to that free page, in the given order (ascending page order
      * keeps neighbouring pages neighbours), copying the bytes on `stream` and on the mirror's
      * stream (rank 1 keeps the same physical indices) before the old pages are returned. Every
@@ -345,7 +354,7 @@ public:
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
     // The same transfers to/from caller memory laid out as `host` (one record per page, every
-    // rank's half), for the disk tier of the context cache (v0.7.2). The memory must stay valid
+    // rank's half), for the disk tier of the context cache. The memory must stay valid
     // and, for asynchronous copies, page-locked until the caller has synchronized both devices.
     void copy_to_host_buffer(std::span<const DeviceKVPageHandle> source, std::byte* destination,
                              const HostKVPageLayout& host, cudaStream_t stream = nullptr) const;

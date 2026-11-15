@@ -1,7 +1,6 @@
 // Translation-unit fragment of src/models/qwen3_5/program/speculative/target_verification.cpp,
 // included once at its end (after its closing namespace), so the two-device code below shares that
-// file's private helpers without copying them. Not a header. Our file; see
-// docs/maintainer/upstream-merge.md.
+// file's private helpers without copying them. Not a header.
 //
 // Two-device (tp 2) overload of target_verify_accept() (declared in program/context.h).
 
@@ -14,7 +13,7 @@
 namespace ninfer::models::qwen3_5::execution {
 
 namespace {
-// T123: process-wide probe state; staging allocated once at Program setup (never inside a capture).
+// Process-wide probe state; staging allocated once at Program setup (never inside a capture).
 struct TpRankProbe {
     std::FILE* log           = nullptr;
     void* host[2]            = {nullptr, nullptr};
@@ -104,47 +103,14 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
     card.set_peer_feature_sink(peer.feature_sink);
     const TextContext::RankTensors hidden{frame.target_hidden, peer.target_hidden};
-    if (frame.feature_sink != nullptr) {
-        card.target_verify_batch(
-            {frame.ids, peer.ids}, {frame.cache_positions, peer.cache_positions},
-            {frame.rope_positions, peer.rope_positions}, {frame.valid_columns, peer.valid_columns},
-            {frame.kv_table_rows, peer.kv_table_rows},
-            {frame.state_source_slots, peer.state_source_slots}, envelope, hidden,
-            frame.target_logits, frame.target_tokens, *frame.feature_sink);
-    } else {
-        card.target_verify_batch(
-            {frame.ids, peer.ids}, {frame.cache_positions, peer.cache_positions},
-            {frame.rope_positions, peer.rope_positions}, {frame.valid_columns, peer.valid_columns},
-            {frame.kv_table_rows, peer.kv_table_rows},
-            {frame.state_source_slots, peer.state_source_slots}, envelope, hidden,
-            frame.target_logits, frame.target_tokens);
-    }
+    card.target_verify_batch({frame.ids, peer.ids}, {frame.cache_positions, peer.cache_positions},
+                             {frame.rope_positions, peer.rope_positions},
+                             {frame.valid_columns, peer.valid_columns},
+                             {frame.kv_table_rows, peer.kv_table_rows},
+                             {frame.state_source_slots, peer.state_source_slots}, envelope, hidden,
+                             frame.target_logits, frame.target_tokens, frame.feature_sink);
     card.set_peer_feature_sink(nullptr);
-    if (frame.forced_targets.data != nullptr) {
-        // T59 replay: the reference continuation stands in for the computed argmax.
-        CUDA_CHECK(
-            ::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
-                                          frame.target_tokens.bytes(), execution.device.stream));
-    }
-    if (frame.proposal_q.data != nullptr) {
-        ops::speculative_accept_sparse_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
-            frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
-            frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
-    } else {
-        ops::speculative_accept_greedy_drafts(
-            frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
-            frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
-            frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            execution.work, execution.device.stream);
-    }
-    ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
-                                            frame.selected_hidden, execution.device.stream);
-    ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
-                 execution.device.stream);
+    accept_verified_drafts(execution, continuation_hidden_store, frame);
 
     // Rank 1 reads the accepted counts across devices once rank 0's acceptance is complete. The
     // copy is a pull on rank 1's stream over unified addressing, as the collectives' transfers.
@@ -160,7 +126,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     ops::scatter(peer.selected_hidden, peer.state_destination_slots, peer_continuation_hidden_store,
                  rank1.stream);
 
-    // T123: the two ranks' verification hidden must be bit-identical (replicated residual).
+    // The two ranks' verification hidden must be bit-identical (replicated residual).
     if (TpRankProbe& probe = tp_rank_probe(); probe.log != nullptr) {
         const std::size_t bytes = frame.target_hidden.bytes();
         if (bytes <= probe.capacity && bytes == peer.target_hidden.bytes() &&

@@ -1,4 +1,4 @@
-// Two-device parity of the Qwen4Exp routed-expert MoE at tp 2 (T30): routed experts partitioned by
+// Two-device parity of the Qwen4Exp routed-expert MoE at tp 2: routed experts partitioned by
 // expert ID (rank r computes the experts with id % 2 == r: its cache-resident ones with
 // moe_slots_nvfp4 Store, the ones missing from its cache from the CPU path, accumulated into the
 // same FP32 partial), the two FP32 rank partials summed by ONE allreduce_sum_f32 and rounded to
@@ -7,7 +7,7 @@
 // The CPU-path partial is emulated on the device by a second slot pool holding the rank's
 // "missing" experts and moe_slots_nvfp4 Accumulate into the rank's FP32 partial: the data flow and
 // the rounding point (everything a rank contributes accumulated in FP32, one BF16 rounding after
-// the cross-rank sum) are the production ones; the CPU arithmetic itself is T16's.
+// the cross-rank sum) are the production ones; test_host_moe checks the CPU arithmetic itself.
 //
 // Criteria (stated before the first run):
 //  * FP32 sum vs the single-device FP32 partial: |tp2 - full| <= 2^-15 * max_t|full[:,t]|. The two
@@ -25,7 +25,7 @@
 // captured into one two-device CUDA graph with the pipelined mailbox, replayed.
 //
 // Fixture (synthetic NVFP4 experts at the real geometry, calibration, FP64 recipe oracle) copied
-// from tests/ops/test_moe_slots.cpp (T15).
+// from tests/ops/test_moe_slots.cpp.
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/moe_slots.h"
 #include "ninfer/ops/peer_mailbox.h"
@@ -33,6 +33,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "ops/nvfp4_test_codec.h"
 #include "ops/op_tester.h"
 #include "ops/split_test_support.h"
 
@@ -76,44 +77,6 @@ constexpr ReductionCriterion kW4A4{0.18, 0.0, 0.30};
 // ~30x below the W4A4 error, so any scale, divisor or slot fault fails.
 constexpr ReductionCriterion kRecipe{5.0e-3, 0.0, 5.0e-2};
 constexpr float kDivisorJitter = 0.98742F; // see reference()
-
-const float kE2M1[16] = {0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
-                         -0.F, -0.5F, -1.F, -1.5F, -2.F, -3.F, -4.F, -6.F};
-
-float e4m3_decode(std::uint8_t c) {
-    const int sign = c >> 7, e = (c >> 3) & 15, m = c & 7;
-    float v = 0.F;
-    if (e == 0)
-        v = static_cast<float>(m) * std::ldexp(1.0F, -9);
-    else
-        v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
-    return sign ? -v : v;
-}
-
-// E4M3FN round-to-nearest-even, satfinite, of a non-negative value (the activation scale).
-float e4m3_rn(float v) {
-    if (!(v > 0.0F)) return 0.0F;
-    if (v >= 448.0F) return 448.0F;
-    int ex = 0;
-    std::frexp(v, &ex);                        // v = f * 2^ex, f in [0.5,1)
-    const int exponent = std::max(ex - 1, -6); // subnormal step below 2^-6
-    const float step   = std::ldexp(1.0F, exponent - 3);
-    return std::min(std::nearbyint(v / step) * step, 448.0F);
-}
-
-// E2M1 round-to-nearest-even (ties to the even code), satfinite.
-float e2m1_rn(float v) {
-    static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a              = std::fabs(v);
-    float r                    = 6.0F;
-    for (int i = 0; i < 7; ++i) {
-        if (a > grid[i + 1]) continue;
-        const float mid = 0.5F * (grid[i] + grid[i + 1]);
-        r = a < mid ? grid[i] : a > mid ? grid[i + 1] : (i % 2 == 0 ? grid[i] : grid[i + 1]);
-        break;
-    }
-    return std::copysign(r, v);
-}
 
 // The documented activation profile for 16 values: codes (as values) and the E4M3 scale.
 void quant16(const float* v, float gs, float* codes, float& sf) {

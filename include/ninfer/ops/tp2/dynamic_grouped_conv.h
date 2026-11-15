@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) form of linear_dynamic_grouped_conv_add. Our file:
-// ninfer/ops/dynamic_grouped_conv.h is upstream's and carries no hook.
+// Two-device (tp 2) form of linear_dynamic_grouped_conv_add.
 
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
@@ -15,7 +14,7 @@ namespace ninfer::ops {
  *                      + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b]
  *
  * with z = `projected`, contiguous BF16 [5120,W,B]; every other operand as in
- * linear_dynamic_grouped_conv_add (W in [2,16], B in [1,8]). It is upstream's finish kernel of the
+ * linear_dynamic_grouped_conv_add (W in [2,16], B in [1,8]). It is the finish kernel of the
  * materialized Q8 route (q8_dynamic_grouped_conv_add_materialized.cu), which reads the projection
  * from BF16 storage: a row-parallel drafter sums the ranks' partial projections with allreduce_sum
  * and runs this on both ranks, which then hold the identical residual. Elementwise, no workspace.

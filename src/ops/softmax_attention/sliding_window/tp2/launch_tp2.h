@@ -1,7 +1,7 @@
 #pragma once
 
 // Launch prototype of the two-device head block of sliding_window_attention
-// (ninfer/ops/tp2/sliding_window_attention.h). Our file.
+// (ninfer/ops/tp2/sliding_window_attention.h).
 
 #include "ops/softmax_attention/sliding_window/launch.h"
 

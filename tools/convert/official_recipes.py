@@ -202,7 +202,7 @@ _FLASH_NEXT_NVFP4_GROUPS = {
 }
 _FLASH_NEXT_NVFP4_DENSE = tuple(s for group in _FLASH_NEXT_NVFP4_GROUPS.values() for s in group)
 
-# T103: dense projections a Flash-Next recipe may keep in BF16 (as the checkpoint, GB300 and Strata):
+# Dense projections a Flash-Next recipe may keep in BF16 (as the checkpoint, GB300 and Strata):
 # the QSA indexer q|k, every hyper-connection mixer (block attn_hc/ffn_hc and the text/MTP hc_head,
 # Down|inject and Up) and the GDN q|k|v|z|out projections. The engine runs them through the generic
 # BF16 linear (ops/linear/bf16/bf16_generic.cu) and the hyper-connection general route.
@@ -232,7 +232,7 @@ def _flash_next(model, recipe, *, nvfp4_dense: bool, nvfp4_groups=None, nvfp4_he
     head are NVFP4 (nvfp4_mse, A16Only) and the GDN a/b projections stay Q8 in their own parent.
     ``nvfp4_groups`` (names of _FLASH_NEXT_NVFP4_GROUPS) and ``nvfp4_head`` select a subset instead
     (mixed recipes); the selection applies to the Text and MTP layers alike. ``bf16_groups``
-    (names of _FLASH_NEXT_BF16_GROUPS, T103) keep those projections in BF16 (cast_direct), Text
+    (names of _FLASH_NEXT_BF16_GROUPS) keep those projections in BF16 (cast_direct), Text
     and MTP alike; they take precedence over ``nvfp4_groups``.
     """
     if nvfp4_groups is None:
@@ -304,17 +304,17 @@ def qwen3_8_flash_next_nvfp4_dense(model, recipe, sources):
 
 
 def qwen3_8_flash_next_nvfp4_mix(model, recipe, sources):
-    """Flash-Next, NVFP4 experts, NVFP4 attention/GDN projections and head, Q8 shared expert (T26b)."""
+    """Flash-Next, NVFP4 experts, NVFP4 attention/GDN projections and head, Q8 shared expert."""
     _flash_next(model, recipe, nvfp4_dense=False, nvfp4_groups=("attention", "gdn"), nvfp4_head=True)
 
 
 def qwen3_8_flash_next_nvfp4_gdn(model, recipe, sources):
-    """Flash-Next, NVFP4 experts, NVFP4 GDN projections (q/k/v/z/out), everything else as the Q8 recipe (T26c)."""
+    """Flash-Next, NVFP4 experts, NVFP4 GDN projections (q/k/v/z/out), everything else as the Q8 recipe."""
     _flash_next(model, recipe, nvfp4_dense=False, nvfp4_groups=("gdn",), nvfp4_head=False)
 
 
 def _flash_next_g_bf16(*groups, gdn_q8=False):
-    """G (NVFP4 GDN, Q8 dense, Q6 head) with the T103 BF16 groups; BF16 GDN replaces NVFP4 GDN,
+    """G (NVFP4 GDN, Q8 dense, Q6 head) with the BF16 groups; BF16 GDN replaces NVFP4 GDN,
     and ``gdn_q8`` keeps the GDN projections Q8 (as the rest of the dense) instead of NVFP4."""
 
     def recipe_function(model, recipe, sources):
@@ -328,18 +328,11 @@ def _flash_next_g_bf16(*groups, gdn_q8=False):
         )
 
     gdn = " and Q8 GDN" if gdn_q8 else ""
-    recipe_function.__doc__ = f"Flash-Next G with {', '.join(groups)} projections in BF16{gdn} (T103)."
+    recipe_function.__doc__ = f"Flash-Next G with {', '.join(groups)} projections in BF16{gdn}."
     return recipe_function
 
 
-qwen3_8_flash_next_nvfp4_gdn_idxbf16 = _flash_next_g_bf16("indexer")
-qwen3_8_flash_next_nvfp4_gdn_hcbf16 = _flash_next_g_bf16("hc")
-qwen3_8_flash_next_nvfp4_gdnbf16 = _flash_next_g_bf16("gdn")
-qwen3_8_flash_next_nvfp4_gdn_idxhcbf16 = _flash_next_g_bf16("indexer", "hc")
-qwen3_8_flash_next_nvfp4_allbf16 = _flash_next_g_bf16("indexer", "hc", "gdn")
-# Valerio's T103 candidate: indexer and hyper-connections BF16, GDN Q8, everything else as G.
-qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8 = _flash_next_g_bf16("indexer", "hc", gdn_q8=True)
-# T104 (Valerio): indexer BF16 + GDN Q8, hyper-connections Q8 as G (cheapest candidate).
+# The published artifact: indexer BF16 + GDN Q8, hyper-connections Q8 as G.
 qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 = _flash_next_g_bf16("indexer", gdn_q8=True)
 
 
@@ -609,12 +602,6 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_dense": qwen3_8_flash_next_nvfp4_dense,
     "qwen3_8_flash_next_nvfp4_mix": qwen3_8_flash_next_nvfp4_mix,
     "qwen3_8_flash_next_nvfp4_gdn": qwen3_8_flash_next_nvfp4_gdn,
-    "qwen3_8_flash_next_nvfp4_gdn_idxbf16": qwen3_8_flash_next_nvfp4_gdn_idxbf16,
-    "qwen3_8_flash_next_nvfp4_gdn_hcbf16": qwen3_8_flash_next_nvfp4_gdn_hcbf16,
-    "qwen3_8_flash_next_nvfp4_gdnbf16": qwen3_8_flash_next_nvfp4_gdnbf16,
-    "qwen3_8_flash_next_nvfp4_gdn_idxhcbf16": qwen3_8_flash_next_nvfp4_gdn_idxhcbf16,
-    "qwen3_8_flash_next_nvfp4_allbf16": qwen3_8_flash_next_nvfp4_allbf16,
-    "qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8,
     "qwen3_8_flash_next_nvfp4_idxbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxbf16_gdnq8,
     "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
     "qwen4_bf16": qwen4_bf16,

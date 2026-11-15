@@ -52,18 +52,16 @@ int prepare_verify_case(int k, int batch) {
     DeviceBuffer d_anchors = to_device(anchors), d_lengths = to_device(lengths),
                  d_drafts  = to_device(drafts);
     DeviceBuffer d_extents = to_device(extents);
-    GuardedDeviceBuffer d_full(width * batch * sizeof(std::int32_t));
-    GuardedDeviceBuffer d_ids(d_full.bytes()), d_positions(d_full.bytes());
+    GuardedDeviceBuffer d_ids(width * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_positions(d_ids.bytes());
     Tensor a(d_anchors.p, DType::I32, {batch}), l(d_lengths.p, DType::I32, {batch});
     Tensor d(d_drafts.p, DType::I32, {k, batch}), e(d_extents.p, DType::I32, {batch});
-    Tensor full(d_full.data(), DType::I32, {width, batch}),
-        ids(d_ids.data(), DType::I32, {width, batch});
+    Tensor ids(d_ids.data(), DType::I32, {width, batch});
     Tensor positions(d_positions.data(), DType::I32, {width, batch});
     DeviceContext context;
     cuda_synchronize();
     const auto launch = [&] {
-        ops::speculative_prepare_verify_inputs(a, d, l, e, full, positions, context.stream);
-        ops::speculative_prepare_verify_ids(a, d, e, ids, context.stream);
+        ops::speculative_prepare_verify_inputs(a, d, l, e, ids, positions, context.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -90,8 +88,6 @@ int prepare_verify_case(int k, int batch) {
             }
         failures += verify_exact("verify ids", read<std::int32_t>(d_ids, expected_ids.size()),
                                  expected_ids);
-        failures += verify_exact("verify full ids", read<std::int32_t>(d_full, expected_ids.size()),
-                                 expected_ids);
         failures += verify_exact("verify positions",
                                  read<std::int32_t>(d_positions, expected_positions.size()),
                                  expected_positions);
@@ -104,7 +100,6 @@ int prepare_verify_case(int k, int batch) {
         verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
     failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, drafts.size()),
                              drafts);
-    failures += d_full.verify_guards("verify full ids");
     failures += d_ids.verify_guards("verify ids");
     failures += d_positions.verify_guards("verify positions");
     return failures;
@@ -128,7 +123,7 @@ struct SparseAcceptSuite {
     const int kSparseColumns;
     const int kSparseBatch;
     std::size_t observed_workspace = 0;
-    // Optional token masks, [K+1] positions of mask_words per row (upstream 08902f73).
+    // Optional token masks, [K+1] positions of mask_words per row.
     std::vector<std::uint32_t> masks;
     static constexpr int mask_words = (kSparseTokenDomain + 31) / 32;
 
@@ -718,8 +713,8 @@ struct SparseAcceptSuite {
                                           anchors, configs, history, {false});
     }
 
-    // Port of upstream 08902f73 grammar_mask_case: only a=V-2 and b=V-1 are legal at every
-    // column, both far below the illegal 12.0 plateau (x=42 is the raw target of every column).
+    // Grammar mask case: only a=V-2 and b=V-1 are legal at every column, both far below the
+    // illegal 12.0 plateau (x=42 is the raw target of every column).
     // p(a)=p(b)=.5, q(a)=q(x)=.5: a accepts; the illegal x is rejected (p=0) and corrects to b.
     int grammar_mask_case() {
         std::vector<int> targets(kSparseColumns * kSparseBatch, 42),
@@ -1596,7 +1591,7 @@ std::string accept_label(const char* what, const AcceptRoute& route, float tempe
            " K=" + std::to_string(route.k) + " T=" + std::to_string(temperature);
 }
 
-// Upstream 08902f73 grammar_onehot_case: one legal token per column, the legal drafts of
+// Grammar one-hot case, ported from ninfer: one legal token per column, the legal drafts of
 // columns 0 and 1 accepted, the draft of column 2 illegal, so column 2's only legal token is the
 // correction, whatever its logit (-2 against a 12.0 illegal plateau).
 int masked_onehot_case(const AcceptRoute& route, float temperature) {

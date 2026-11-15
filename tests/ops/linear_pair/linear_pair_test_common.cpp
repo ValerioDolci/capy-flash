@@ -23,11 +23,8 @@
 namespace ninfer::test::linear_pair {
 namespace {
 
-constexpr std::int32_t kOutputRows       = 1024;
-constexpr std::size_t kOutputScanWords   = 1U << 20;
-constexpr std::int32_t kDFlashParentRows = 6144;
-constexpr std::int32_t kDFlashFirstRow   = 4096;
-constexpr std::int32_t kDFlashSecondRow  = 5120;
+constexpr std::int32_t kOutputRows     = 1024;
+constexpr std::size_t kOutputScanWords = 1U << 20;
 
 // Both observable projections use the same A16 arithmetic profile. T and the selected pair
 // launcher never select another correctness criterion.
@@ -105,16 +102,6 @@ PairFixture make_pair_fixture(std::int32_t k, std::uint32_t seed) {
                                                     options),
             0,
             0,
-        };
-    }
-    if (k == 2048) {
-        return {
-            true,
-            quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, kDFlashParentRows, k, seed,
-                                                    options),
-            {},
-            kDFlashFirstRow,
-            kDFlashSecondRow,
         };
     }
     throw std::invalid_argument("linear_pair test: unsupported K");

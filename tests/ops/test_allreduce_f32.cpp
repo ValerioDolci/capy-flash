@@ -6,11 +6,10 @@
 // IEEE float addition and the test's RNE encoder, so every FP32 and BF16 output bit is compared.
 // Both ranks must hold the same bits (the addition is commutative).
 //
-// Transports: the staged path eagerly and captured, the pipelined mailbox captured (replayed with
-// fresh inputs, back-to-back launches without host steps), the Legacy mailbox (which has no FP32
-// form and must stay staged inside the graph), FP32 payloads (with and without the BF16 output)
-// interleaved with BF16 exchanges so that one mailbox slot carries both in one capture, and node
-// counts proving which transport each capture selected.
+// Transports: the staged path eagerly and captured, the mailbox captured (replayed with fresh
+// inputs, back-to-back launches without host steps), FP32 payloads (with and without the BF16
+// output) interleaved with BF16 exchanges so that one mailbox slot carries both in one capture, and
+// node counts proving which transport each capture selected.
 //
 // --bench: per-exchange cost, inside a graph of 96 exchanges, of the BF16 payload [2560,T] (the
 // attention/GDN output all-reduce) and the FP32 payload [2560,T] (the MoE partials) at T = 1, 2,
@@ -416,7 +415,7 @@ void run_bench(const ExecutionContext& ec) {
     }
 }
 
-// T56: the eager HostExchange transport. `calls` back-to-back exchanges of the same buffers with no
+// The eager HostExchange transport. `calls` back-to-back exchanges of the same buffers with no
 // host step between them and a 64 MB memset skewing rank 1 before each: the first leaves
 // s = fl(a + b), each later one doubles it exactly, so a host buffer overwritten before the peer
 // read it (or an operand overwritten before it was copied out) breaks the bits.
@@ -441,12 +440,11 @@ int run_host_exchange_case(const char* label, std::int32_t ne0, std::int32_t ne1
 }
 
 // The BF16 allreduce_sum through the HostExchange, back to back, against the exact host oracle:
-// s = RNE_bf16(x0 + x1) after the first call, doubled (exactly) by every later call. (T65: this
-// case used to compare with the driver-staged pull of the same calls, but without peer access that
-// pull is not ordered after the previous call's in-place combine on the source device and reads
-// stale operands back to back, ~25 % of runs. The staged result is still computed and reported,
-// not counted: it is the reference no longer, and production eager exchanges take the
-// HostExchange.)
+// s = RNE_bf16(x0 + x1) after the first call, doubled (exactly) by every later call. The
+// driver-staged pull of the same calls is computed and reported, not counted: without peer access
+// that pull is not ordered after the previous call's in-place combine on the source device and
+// reads stale operands back to back (~25 % of runs), and production eager exchanges take the
+// HostExchange.
 int run_host_exchange_bf16_case(const char* label, std::int32_t ne0, std::int32_t ne1, int calls,
                                 std::uint32_t seed, const ExecutionContext& ec,
                                 const ops::PeerEvents& staged, const ops::PeerEvents& host) {
@@ -594,7 +592,7 @@ int run_split_lane_case(const char* label, std::int32_t ne0, std::int32_t ne1, s
     return failures;
 }
 
-// v07/p2p-overlap: with PeerLanes attached next to a HostExchange, a split-phase sum opens on the
+// With PeerLanes attached next to a HostExchange, a split-phase sum opens on the
 // lanes, never on the HostExchange, and allreduce_sum_finish closes it there.
 int run_peer_lane_selection(const ExecutionContext& ec, const ops::PeerEvents& events,
                             const ops::PeerLanes& lanes, const ops::HostExchange& exchange) {
@@ -631,33 +629,18 @@ int run_peer_lane_selection(const ExecutionContext& ec, const ops::PeerEvents& e
     return failures;
 }
 
-// T62: the pipelined prefill exchange (HostExchange::begin_sum_f32 / columns_ready /
-// finish_sum_f32). Oracle, exact: S = fl32(n(a) + n(b)) with n = identity (FP32), RNE to binary16
-// (FP16, the host's _Float16 conversion) or RNE to bfloat16 (BF16); both ranks hold S and
-// RNE_bf16(S). `calls` back-to-back calls on the same buffers (call k sums call k-1's S with
-// itself), each rank reporting its columns in its own groups; with `mixed`, an
-// allreduce_sum_f32 through the same HostExchange (pull path, shared pinned buffers) follows.
-float narrow_host(float v, ops::HostExchange::Payload payload) {
-    switch (payload) {
-    case ops::HostExchange::Payload::FP16: {
-        // T128b: the device payload is f16(sat(v * 2^-k)) * 2^k, k = NINFER_TP_AR_SHIFT (default
-        // 2).
-        const char* e = std::getenv("NINFER_TP_AR_SHIFT");
-        int k         = e != nullptr ? std::atoi(e) : 2;
-        k             = k < 0 ? 0 : (k > 14 ? 14 : k);
-        float x       = std::ldexp(v, -k);
-        if (std::fabs(x) > 65504.0F) { x = std::copysign(65504.0F, x); }
-        return std::ldexp(static_cast<float>(static_cast<_Float16>(x)), k);
-    }
-    case ops::HostExchange::Payload::BF16: {
-        const std::uint32_t bits = static_cast<std::uint32_t>(f32_to_bf16(v)) << 16;
-        float out                = 0.0F;
-        std::memcpy(&out, &bits, sizeof(out));
-        return out;
-    }
-    default:
-        return v;
-    }
+// The pipelined prefill exchange (HostExchange::begin_sum_f32 / columns_ready / finish_sum_f32).
+// Oracle, exact: S = fl32(n(a) + n(b)) with n the payload's rounding (FP16: the host's _Float16
+// conversion of the scaled value; INT8: below); both ranks hold S and RNE_bf16(S). `calls`
+// back-to-back calls on the same buffers (call k sums call k-1's S with itself), each rank
+// reporting its columns in its own groups; with `mixed`, an allreduce_sum_f32 through the same
+// HostExchange (pull path, shared pinned buffers) follows.
+// The FP16 payload: f16(sat(v * 2^-k)) * 2^k with k = 2.
+float narrow_host(float v) {
+    constexpr int k = 2;
+    float x         = std::ldexp(v, -k);
+    if (std::fabs(x) > 65504.0F) { x = std::copysign(65504.0F, x); }
+    return std::ldexp(static_cast<float>(static_cast<_Float16>(x)), k);
 }
 
 // INT8 payload (opt-in): per column, 32-row blocks; s = fp16 rounded up of min(max(amax / 127,
@@ -670,8 +653,7 @@ std::vector<float> narrow_columns_host(const std::vector<float>& v, std::int32_t
     using Payload = ops::HostExchange::Payload;
     std::vector<float> out(v.size());
     if (payload != Payload::INT8 || rows % 32 != 0) {
-        const Payload p = payload == Payload::INT8 ? Payload::FP16 : payload;
-        for (std::size_t i = 0; i < v.size(); ++i) { out[i] = narrow_host(v[i], p); }
+        for (std::size_t i = 0; i < v.size(); ++i) { out[i] = narrow_host(v[i]); }
         return out;
     }
     for (std::size_t base = 0; base < v.size(); base += 32) {
@@ -837,7 +819,7 @@ int run_int8_special_case(const ExecutionContext& ec, ops::HostExchange& exchang
 
 } // namespace
 
-// T68: HostExchange::copy, one way in each direction, sizes across many 4 KiB chunks, against the
+// HostExchange::copy, one way in each direction, sizes across many 4 KiB chunks, against the
 // uploaded bytes; eager_exchange selects the attached exchange.
 int run_host_copy_case(const ExecutionContext& ec, ops::HostExchange& exchange,
                        const ops::PeerEvents& events) {
@@ -952,10 +934,6 @@ int main(int argc, char** argv) {
     ops::PeerMailbox mailbox(ec, static_cast<std::size_t>(kHidden) * 4 * 4);
     ops::PeerEvents mailbox_events(ec);
     mailbox_events.attach_mailbox(&mailbox);
-    ops::PeerMailbox legacy(ec, static_cast<std::size_t>(kHidden) * 4 * 4, 2,
-                            ops::PeerExchangeKernel::Legacy);
-    ops::PeerEvents legacy_events(ec);
-    legacy_events.attach_mailbox(&legacy);
 
     failures += run_captured_case("captured staged [2560]", kHidden, 1, 5, 0, ec, events, nullptr);
     failures += run_captured_case("captured mailbox [2560]", kHidden, 1, 5, 2, ec, mailbox_events,
@@ -970,12 +948,10 @@ int main(int argc, char** argv) {
                                   mailbox_events, &mailbox);
     failures += run_captured_case("captured [5,1] unaligned stays staged", 5, 1, 3, 0, ec,
                                   mailbox_events, &mailbox);
-    failures += run_captured_case("captured legacy mailbox stays staged", kHidden, 4, 3, 0, ec,
-                                  legacy_events, &legacy);
     failures += run_interleaved_case(ec, events, mailbox_events, mailbox);
 
     {
-        // T56: eager exchanges through pinned host buffers. 4 KiB chunks: many chunks per call;
+        // Eager exchanges through pinned host buffers. 4 KiB chunks: many chunks per call;
         // the first [2560,48] call grows the buffers (both devices drained first).
         ops::HostExchange exchange(ec, 4096);
         ops::PeerEvents host_events(ec);
@@ -1014,7 +990,7 @@ int main(int argc, char** argv) {
     }
 
     {
-        // v07/p2p-overlap: the split-phase sums on PeerLanes, issued as the overlapped prefill
+        // The split-phase sums on PeerLanes, issued as the overlapped prefill
         // issues them (run_split_lane_case). Next to a HostExchange (the Program's layout under
         // NINFER_TP_PEER_OVERLAP=force; the closing one-call sum takes the HostExchange) on every
         // pair: without P2P the lane copies are driver-staged and host-ordered (direct = false).
@@ -1108,20 +1084,20 @@ int main(int argc, char** argv) {
     }
 
     {
-        // T62: the pipelined prefill exchange, every payload, uneven per-rank groups, many
-        // 4 KiB chunks per group, back to back, then a pull() through the same pinned buffers.
+        // The pipelined prefill exchange, every payload, uneven per-rank groups, many 4 KiB
+        // chunks per group, back to back, then a pull() through the same pinned buffers.
         using Payload = ops::HostExchange::Payload;
         ops::HostExchange exchange(ec, 4096);
         ops::PeerEvents host_events(ec);
         host_events.attach_host_exchange(&exchange);
-        failures += run_pipelined_case("pipelined fp32 [2560,96] groups 32+64 / 96 x2 + pull",
-                                       kHidden, 96, Payload::FP32, {{{32, 64}, {96}}}, 2, true,
+        failures += run_pipelined_case("pipelined fp16 [2560,96] groups 32+64 / 96 x2 + pull",
+                                       kHidden, 96, Payload::FP16, {{{32, 64}, {96}}}, 2, true,
                                        301u, ec, exchange, host_events);
         failures += run_pipelined_case("pipelined fp16 [2560,100] groups 10+40+50 / 64+36 x3",
                                        kHidden, 100, Payload::FP16, {{{10, 40, 50}, {64, 36}}}, 3,
                                        false, 303u, ec, exchange, host_events);
-        failures += run_pipelined_case("pipelined bf16 [2560,48] one group x2 + pull", kHidden, 48,
-                                       Payload::BF16, {{{48}, {48}}}, 2, true, 305u, ec, exchange,
+        failures += run_pipelined_case("pipelined fp16 [2560,48] one group x2 + pull", kHidden, 48,
+                                       Payload::FP16, {{{48}, {48}}}, 2, true, 305u, ec, exchange,
                                        host_events);
         failures +=
             run_pipelined_case("pipelined fp16 [17,5] empty group", 17, 5, Payload::FP16,
@@ -1140,8 +1116,8 @@ int main(int argc, char** argv) {
         ops::HostExchange wide(ec);
         ops::PeerEvents wide_events(ec);
         wide_events.attach_host_exchange(&wide);
-        failures += run_pipelined_case("pipelined fp32 8 MiB chunks [2560,1024] 512+512 / 1024",
-                                       kHidden, 1024, Payload::FP32, {{{512, 512}, {1024}}}, 2,
+        failures += run_pipelined_case("pipelined fp16 8 MiB chunks [2560,1024] 512+512 / 1024",
+                                       kHidden, 1024, Payload::FP16, {{{512, 512}, {1024}}}, 2,
                                        true, 309u, ec, wide, wide_events);
         failures += run_pipelined_case(
             "pipelined fp16 8 MiB chunks [2560,2048] 4x512 / 2048", kHidden, 2048, Payload::FP16,

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -34,21 +35,6 @@ public:
     ColumnGroupsScope(const ColumnGroupsScope&)            = delete;
     ColumnGroupsScope& operator=(const ColumnGroupsScope&) = delete;
 };
-
-template <class Arena>
-void Qwen4Forward<Arena>::ahead(std::size_t layer, const RankTensors& wide) {
-    if constexpr (kExecute) {
-        if (width_ != 1 || r_[0].columns.prefill || layer + 1 >= config_.layer_types.size()) {
-            return;
-        }
-        const Qwen4BlockParameters& next = block(0, layer + 1);
-        routed_experts(0, layer)->ahead(static_cast<std::int32_t>(layer), wide[0],
-                                        next.ffn_hc.weights.norm, next.moe().router,
-                                        config_.rms_norm_eps, s(0));
-    } else {
-        (void)layer, (void)wide;
-    }
-}
 
 // The operands of one MoE call on every rank: the routing (top-k ids and weights, the shared
 // expert's gate), the shared expert's activations and output, and the FP32 partial of the routed
@@ -91,7 +77,7 @@ void Qwen4Forward<Arena>::moe_route_shared(std::size_t layer, const RankTensors&
         if constexpr (kExecute) {
             // Verify / MTP columns past a lane's valid count route nothing (never committed:
             // no CPU expert work, no cache-policy accesses). The MTP alignment routes only
-            // the accepted column (T52): the other columns' outputs are never read.
+            // the accepted column: the other columns' outputs are never read.
             const Qwen4Columns& col = c(r);
             const Tensor* valid     = col.prefill ? nullptr : col.valid_columns;
             ops::moe_route(x[i], p.router, work(r), b.ids[i], b.weights[i], b.gate[i], s(r), valid,
@@ -123,14 +109,14 @@ void Qwen4Forward<Arena>::moe_combine(std::size_t layer, const RankTensors& x, M
     if constexpr (kExecute) {
         const std::int32_t T   = columns();
         const auto layer_index = static_cast<std::int32_t>(layer);
-        // T62: at tp 2 a prompt chunk's MoE exchange may take the pipelined host exchange
-        // (optionally a narrow payload, optionally by column groups that overlap the routed
-        // experts of the later columns). Decode rounds (prefill == false) never do.
-        const T62Exchange& t62 = t62_exchange();
+        // At tp 2 a prompt chunk's MoE exchange takes the pipelined host exchange when one is
+        // attached (a narrow payload, by column groups that overlap the routed experts of the
+        // later columns). Decode rounds (prefill == false) never do.
+        const PrefillMoeExchange& moe_exchange = prefill_moe_exchange();
         ops::HostExchange* pipe =
-            width_ == 2 && c(0).prefill && t62.enabled ? tp_.events->host_exchange() : nullptr;
+            width_ == 2 && c(0).prefill ? tp_.events->host_exchange() : nullptr;
         if (pipe != nullptr &&
-            !pipe->begin_sum_f32(b.partial, staging, &y, t62.payload, *tp_.execution)) {
+            !pipe->begin_sum_f32(b.partial, staging, &y, moe_exchange.payload, *tp_.execution)) {
             pipe = nullptr;
         }
         const OpenExchangeSum open_sum{pipe};
@@ -152,10 +138,9 @@ void Qwen4Forward<Arena>::moe_combine(std::size_t layer, const RankTensors& x, M
                 pipe->columns_ready(r, first, n);
             };
             Qwen4ColumnGroups groups;
-            const ColumnGroupsScope published(pipe != nullptr && t62.group_columns > 0 ? &groups
-                                                                                       : nullptr);
-            if (pipe != nullptr && t62.group_columns > 0) {
-                groups.group_columns = t62.group_columns;
+            const ColumnGroupsScope published(pipe != nullptr ? &groups : nullptr);
+            if (pipe != nullptr) {
+                groups.group_columns = ops::kMoeGroupedChunkColumns;
                 groups.ready         = ready;
             }
             routed_experts(r, layer)->run(layer_index, expert_bank(r, layer), x[i], b.ids[i],
@@ -186,27 +171,13 @@ void Qwen4Forward<Arena>::moe_combine(std::size_t layer, const RankTensors& x, M
 }
 
 template <class Arena>
-auto Qwen4Forward<Arena>::t62_exchange() -> const T62Exchange& {
-    static const T62Exchange value = [] {
-        T62Exchange v;
-        const auto get = [](const char* name) -> std::string {
-            const char* e = std::getenv(name);
-            return e != nullptr ? std::string(e) : std::string();
-        };
-        if (get("NINFER_TP_AR") == "0") { return v; } // one allreduce_sum_f32 call
-        const std::string payload = get("NINFER_TP_AR_PAYLOAD");
-        if (payload == "fp32") { v.payload = ops::HostExchange::Payload::FP32; }
-        if (payload == "fp16") { v.payload = ops::HostExchange::Payload::FP16; }
-        if (payload == "bf16") { v.payload = ops::HostExchange::Payload::BF16; }
-        if (payload == "int8") { v.payload = ops::HostExchange::Payload::INT8; }
-        const std::string group = get("NINFER_TP_AR_GROUP");
-        if (!group.empty()) {
-            const auto g    = static_cast<std::int32_t>(std::strtol(group.c_str(), nullptr, 10));
-            const auto unit = ops::kMoeGroupedChunkColumns;
-            v.group_columns = g > 0 ? std::max(unit, g / unit * unit) : 0;
+auto Qwen4Forward<Arena>::prefill_moe_exchange() -> const PrefillMoeExchange& {
+    static const PrefillMoeExchange value = [] {
+        PrefillMoeExchange v;
+        const char* payload = std::getenv("NINFER_TP_AR_PAYLOAD");
+        if (payload != nullptr && std::string_view(payload) == "int8") {
+            v.payload = ops::HostExchange::Payload::INT8;
         }
-        v.enabled = v.payload != ops::HostExchange::Payload::FP32 || v.group_columns > 0 ||
-                    get("NINFER_TP_AR_PIPE") == "1";
         return v;
     }();
     return value;

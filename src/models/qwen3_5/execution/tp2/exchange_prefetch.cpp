@@ -28,7 +28,7 @@ RowGeometry row_geometry(const Weight& w) noexcept {
         return {k, 0, 1};
     }
     if (w.qtype == QType::BF16) { return {2 * k, 0, 1}; }
-    if (w.qtype == QType::Q3_G128_FP16 && w.layout == QuantLayout::RowSplit) { // v0.7 27b-16gb
+    if (w.qtype == QType::Q3_G128_FP16 && w.layout == QuantLayout::RowSplit) { // 27b-16gb profile
         const std::size_t groups = static_cast<std::size_t>(w.padded_shape[1]) / 128;
         return {groups * 48, w.scales != nullptr ? groups * 2 : 0, 1};
     }

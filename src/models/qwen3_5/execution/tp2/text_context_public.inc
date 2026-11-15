@@ -1,5 +1,5 @@
 // Class-body fragment of TextContext (execution/text.h), included in its public section: the
-// two-device (tp == 2) entry points. Not a header; our file, see docs/maintainer/upstream-merge.md.
+// two-device (tp == 2) entry points. Not a header.
 //
 // One Text call over the rank-0 operands, and with a non-null `tp` over both ranks of a
 // two-device Model (tp.h). With `tp`, the text and multimodal prefill chunk (with its MTP prompt
@@ -29,22 +29,16 @@ void set_peer_feature_sink(DFlashFeatureSink* sink) noexcept { peer_feature_sink
 
 // Verification with ReplaySSM records (GdnStateAction::RecordForReplay) on each rank. Both
 // ranks keep their normalized hidden [H,W,B]; rank 0's `logits` receive the complete [V,W,B]
-// logits and rank 0 writes the per-column argmax into `target_tokens`.
+// logits and rank 0 writes the per-column argmax into `target_tokens`. With the DFlash2 drafter
+// capturing its target features, `sink` reads rank 0's residual after each captured layer's
+// all-reduce (the complete hidden state) on rank 0's stream; rank 1 captures into the peer sink
+// when one is set (set_peer_feature_sink).
 void target_verify_batch(const RankTensors& ids, const RankTensors& cache_positions,
                          const RankTensors& rope_positions, const RankTensors& valid_columns,
                          const RankTensors& kv_table_rows,
                          const RankTensors& linear_state_source_slots,
                          ops::CausalAttentionExecutionEnvelope envelope, const RankTensors& hidden,
-                         Tensor& logits, Tensor& target_tokens);
-// The same verification with the DFlash2 drafter capturing its target features: `sink` reads
-// rank 0's residual after each captured layer's all-reduce (the complete hidden state) on rank
-// 0's stream; rank 1 captures into the peer sink when one is set (set_peer_feature_sink).
-void target_verify_batch(const RankTensors& ids, const RankTensors& cache_positions,
-                         const RankTensors& rope_positions, const RankTensors& valid_columns,
-                         const RankTensors& kv_table_rows,
-                         const RankTensors& linear_state_source_slots,
-                         ops::CausalAttentionExecutionEnvelope envelope, const RankTensors& hidden,
-                         Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                         Tensor& logits, Tensor& target_tokens, DFlashFeatureSink* sink = nullptr);
 void mtp_forward_decode_batch(const Tensor& ids, const RankTensors& hidden,
                               const RankTensors& cache_positions, const RankTensors& rope_positions,
                               const RankTensors& valid_columns, const RankTensors& kv_table_rows,

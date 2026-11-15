@@ -1,11 +1,11 @@
-// v0.7 27b-16gb: GPU conformance of the q3_g128_fp16 A16 routes against an FP64 host oracle.
-// PREPARED, NOT RUN (GPU locked by the benchmark on 19/10); exits 77 without a device.
+// GPU conformance of the q3_g128_fp16 A16 routes against an FP64 host oracle; exits 77 without a
+// device.
 //
-// Routes: Linear through the public ops::linear entry (GEMV T<=8, tensor-core tiles T>8), and the
-// residual-add, SwiGLU and row-segment epilogues (the routes linear_add, linear_swiglu,
-// attn_input_proj and gdn_input_proj take for a Q3 weight). Shapes = the Qwen3.8-27B Text sites
-// ([5120,6144], [5120,17408], [34816,5120] SwiGLU, [14336,5120] Q|K|Gate|V, [16384,5120] QKV|Z)
-// plus a small odd one.
+// Routes: Linear through the public ops::linear entry (register-direct tensor cores T<=8,
+// tensor-core tiles T>8), and the residual-add, SwiGLU and row-segment epilogues (the routes
+// linear_add, linear_swiglu, attn_input_proj and gdn_input_proj take for a Q3 weight). Shapes =
+// the Qwen3.8-27B Text sites ([5120,6144], [5120,17408], [34816,5120] SwiGLU, [14336,5120]
+// Q|K|Gate|V, [16384,5120] QKV|Z) plus a small odd one.
 //
 // Pre-registered criterion, per output element o (FP64 reference r, L1 magnitude m = sum|w*x|):
 //     |o - r| <= 2^-8 * |r| + 2^-14 * m        (Linear, segments)
@@ -49,8 +49,13 @@ void cuda_ok(cudaError_t e, const char* what) {
 
 struct DeviceBytes {
     void* p = nullptr;
-    explicit DeviceBytes(std::size_t bytes) { cuda_ok(cudaMalloc(&p, bytes ? bytes : 16), "malloc"); }
+
+    explicit DeviceBytes(std::size_t bytes) {
+        cuda_ok(cudaMalloc(&p, bytes ? bytes : 16), "malloc");
+    }
+
     ~DeviceBytes() { cudaFree(p); }
+
     DeviceBytes(const DeviceBytes&)            = delete;
     DeviceBytes& operator=(const DeviceBytes&) = delete;
 };
@@ -72,7 +77,7 @@ std::uint16_t bf16_bits(float f) {
 // Host model of one q3_g128_fp16 matrix.
 struct HostQ3 {
     int n = 0, k = 0;
-    std::vector<std::int8_t> codes; // [n][k]
+    std::vector<std::int8_t> codes;    // [n][k]
     std::vector<std::uint16_t> scales; // [n][k/128] binary16
     std::vector<std::uint8_t> payload; // row-split payload
     std::size_t scale_offset = 0;
@@ -110,22 +115,22 @@ HostQ3 make_q3(int n, int k, std::uint32_t seed) {
 
 Weight device_weight(const HostQ3& h, const DeviceBytes& d) {
     Weight w;
-    w.payload          = d.p;
-    w.payload_bytes    = h.payload.size();
-    w.qtype            = QType::Q3_G128_FP16;
-    w.layout           = QuantLayout::RowSplit;
-    w.group_size       = 128;
-    w.group            = 128;
-    w.ndim             = 2;
+    w.payload       = d.p;
+    w.payload_bytes = h.payload.size();
+    w.qtype         = QType::Q3_G128_FP16;
+    w.layout        = QuantLayout::RowSplit;
+    w.group_size    = 128;
+    w.group         = 128;
+    w.ndim          = 2;
     w.n = w.shape[0] = w.padded_shape[0] = h.n;
     w.k = w.shape[1] = w.padded_shape[1] = h.k;
-    w.qdata          = d.p;
-    w.scales         = static_cast<std::uint8_t*>(d.p) + h.scale_offset;
-    w.scale_dtype    = DType::FP16;
-    w.scale_ne[0]    = h.k / 128;
-    w.scale_ne[1]    = h.n;
-    w.scale_nb[0]    = 2;
-    w.scale_nb[1]    = (h.k / 128) * 2;
+    w.qdata                              = d.p;
+    w.scales                             = static_cast<std::uint8_t*>(d.p) + h.scale_offset;
+    w.scale_dtype                        = DType::FP16;
+    w.scale_ne[0]                        = h.k / 128;
+    w.scale_ne[1]                        = h.n;
+    w.scale_nb[0]                        = 2;
+    w.scale_nb[1]                        = (h.k / 128) * 2;
     w.scale_nb[2] = w.scale_nb[3] = w.scale_nb[1] * h.n;
     return w;
 }
@@ -163,7 +168,8 @@ Oracle oracle(const HostQ3& h, const std::vector<std::uint16_t>& x, int t) {
 
 bool within(double got, double ref, double magnitude, double extra = 0.0) {
     if (!std::isfinite(got)) return false;
-    return std::fabs(got - ref) <= std::ldexp(std::fabs(ref), -8) + std::ldexp(magnitude, -14) + extra;
+    return std::fabs(got - ref) <=
+           std::ldexp(std::fabs(ref), -8) + std::ldexp(magnitude, -14) + extra;
 }
 
 void report(const std::string& name, int bad, int total) {
@@ -185,11 +191,12 @@ void run_linear(const HostQ3& h, const DeviceBytes& dw, int t) {
     ops::linear(tx, w, tout, nullptr);
     cuda_ok(cudaMemcpy(again.data(), dout.p, again.size() * 2, cudaMemcpyDeviceToHost), "again");
     const Oracle o = oracle(h, x, t);
-    int bad = 0;
+    int bad        = 0;
     for (std::size_t i = 0; i < out.size(); ++i) {
         if (!within(bf16_value(out[i]), o.value[i], o.magnitude[i])) ++bad;
     }
-    report("linear [" + std::to_string(h.n) + "," + std::to_string(h.k) + "] T=" + std::to_string(t),
+    report("linear [" + std::to_string(h.n) + "," + std::to_string(h.k) +
+               "] T=" + std::to_string(t),
            bad, static_cast<int>(out.size()));
     report("linear determinism T=" + std::to_string(t), out == again ? 0 : 1, 1);
 }
@@ -208,12 +215,13 @@ void run_add(const HostQ3& h, const DeviceBytes& dw, int t) {
     std::vector<std::uint16_t> out(residual.size());
     cuda_ok(cudaMemcpy(out.data(), dr.p, out.size() * 2, cudaMemcpyDeviceToHost), "out");
     const Oracle o = oracle(h, x, t);
-    int bad = 0;
+    int bad        = 0;
     for (std::size_t i = 0; i < out.size(); ++i) {
         const double ref = o.value[i] + bf16_value(residual[i]);
         if (!within(bf16_value(out[i]), ref, o.magnitude[i])) ++bad;
     }
-    report("linear_add [" + std::to_string(h.n) + "," + std::to_string(h.k) + "] T=" + std::to_string(t),
+    report("linear_add [" + std::to_string(h.n) + "," + std::to_string(h.k) +
+               "] T=" + std::to_string(t),
            bad, static_cast<int>(out.size()));
 }
 
@@ -230,20 +238,20 @@ void run_swiglu(const HostQ3& h, const DeviceBytes& dw, int t) {
     std::vector<std::uint16_t> out(static_cast<std::size_t>(half) * t);
     cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * 2, cudaMemcpyDeviceToHost), "out");
     const Oracle o = oracle(h, x, t);
-    int bad = 0;
+    int bad        = 0;
     for (int tok = 0; tok < t; ++tok) {
         for (int r = 0; r < half; ++r) {
-            const double g  = o.value[static_cast<std::size_t>(tok) * h.n + r];
-            const double u  = o.value[static_cast<std::size_t>(tok) * h.n + r + half];
-            const double mg = o.magnitude[static_cast<std::size_t>(tok) * h.n + r];
-            const double mu = o.magnitude[static_cast<std::size_t>(tok) * h.n + r + half];
+            const double g   = o.value[static_cast<std::size_t>(tok) * h.n + r];
+            const double u   = o.value[static_cast<std::size_t>(tok) * h.n + r + half];
+            const double mg  = o.magnitude[static_cast<std::size_t>(tok) * h.n + r];
+            const double mu  = o.magnitude[static_cast<std::size_t>(tok) * h.n + r + half];
             const double ref = g / (1.0 + std::exp(-g)) * u;
             const double m   = (std::fabs(u) + std::fabs(g)) * std::fmax(mg, mu);
             if (!within(bf16_value(out[static_cast<std::size_t>(tok) * half + r]), ref, m)) ++bad;
         }
     }
-    report("linear_swiglu [" + std::to_string(h.n) + "," + std::to_string(h.k) + "] T=" +
-               std::to_string(t),
+    report("linear_swiglu [" + std::to_string(h.n) + "," + std::to_string(h.k) +
+               "] T=" + std::to_string(t),
            bad, half * t);
 }
 
@@ -274,8 +282,8 @@ void run_segments(const HostQ3& h, const DeviceBytes& dw, int t, std::vector<int
         for (int tok = 0; tok < t; ++tok) {
             for (int r = 0; r < rows[s]; ++r) {
                 const std::size_t i = static_cast<std::size_t>(tok) * h.n + begin + r;
-                if (!within(bf16_value(out[static_cast<std::size_t>(tok) * rows[s] + r]), o.value[i],
-                            o.magnitude[i])) {
+                if (!within(bf16_value(out[static_cast<std::size_t>(tok) * rows[s] + r]),
+                            o.value[i], o.magnitude[i])) {
                     ++bad;
                 }
                 ++total;
@@ -297,14 +305,17 @@ int main() {
         std::printf("no CUDA device: skipped\n");
         return 77;
     }
-    // The A16 routes, whatever NINFER_Q3_A8 says (the A8 prefill route is ninfer_linear_q3_a8_test).
+    // The A16 routes, whatever NINFER_Q3_A8 says (the A8 prefill route is
+    // ninfer_linear_q3_a8_test).
     detail::q3_force_route_for_test(1);
-    // Token counts: every GEMV width, the GEMV/tile boundary, partial and multiple token tiles.
+    // Token counts: every small-T width, the small-T/tile boundary, partial and multiple tiles.
     const std::vector<int> tokens{1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 63, 64, 65, 130};
+
     struct Shape {
         int n, k;
     };
-    // The small odd shape exercises partial row tiles (N % 128 != 0) and a 3-chunk GEMV row.
+
+    // The small odd shape exercises partial row tiles (N % 128 != 0).
     const std::vector<Shape> linear_shapes{{328, 2560}, {5120, 6144}, {5120, 17408}};
     for (const auto& s : linear_shapes) {
         const HostQ3 h = make_q3(s.n, s.k, 7u * s.n + s.k);

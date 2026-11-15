@@ -90,7 +90,7 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     require_same_gate_shape(a, beta, "beta");
     if (n == 0) { return; }
 
-    // a and b may be row slices of one [rows >= H, T] matrix (T49: the GDN a|b projection read in
+    // a and b may be row slices of one [rows >= H, T] matrix (the GDN a|b projection read in
     // place): contiguous heads, any column stride of at least H elements.
     const auto columns_strided = [](const Tensor& t) {
         return t.nb[0] == 2 && t.nb[1] >= 2 * static_cast<std::int64_t>(t.ne[0]) &&

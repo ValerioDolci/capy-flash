@@ -1,7 +1,6 @@
 #pragma once
 
 // Two-device (tp 2) forms of the full-attention projections (attention.h).
-// Our file: the upstream header carries no hook.
 
 #include "models/qwen3_5/execution/attention.h"
 #include "core/device.h"

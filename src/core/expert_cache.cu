@@ -132,6 +132,11 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     if (gpus_ < 1 || gpus_ > kMaxGpus || gpus_ != policy.partitions) {
         throw std::invalid_argument("expert cache: one or two GPUs, one partition per GPU");
     }
+    if (layout_.host_pool != nullptr &&
+        (layout_.exclusive_layer.size() != static_cast<std::size_t>(layers_) ||
+         layout_.tail_first.size() != static_cast<std::size_t>(layers_))) {
+        throw std::invalid_argument("expert cache: exclusive tier geometry");
+    }
     if (layout_.planes < 1 || layout_.planes > kMaxPlanes ||
         layout_.bank_base.size() != static_cast<std::size_t>(layers_ * layout_.planes)) {
         throw std::invalid_argument(
@@ -172,7 +177,7 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     if (max_in_flight_bytes_ < expert_bytes_) {
         throw std::invalid_argument("expert cache: the fill depth must hold at least one expert");
     }
-    // v0.7 pinned fallback: a layer with any plane outside page-locked memory fills through the
+    // Pinned fallback: a layer with any plane outside page-locked memory fills through the
     // staging ring.
     pageable_.assign(static_cast<std::size_t>(layers_), 0);
     bool any_pageable = false;
@@ -185,7 +190,7 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         }
         any_pageable = any_pageable || pageable_[static_cast<std::size_t>(l)] != 0;
     }
-    if (any_pageable) {
+    if (any_pageable || layout_.host_pool != nullptr) {
         std::int64_t staging = kDefaultStagingBytes;
         if (const char* v = std::getenv("NINFER_HOST_STAGING_MIB"); v != nullptr && *v != 0) {
             staging = std::max<std::int64_t>(0, std::atoll(v)) << 20;
@@ -198,6 +203,9 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     published_.assign(cells, -1);
     target_.assign(cells, -1);
     dirty_.assign(cells, 0);
+    if (layout_.host_pool != nullptr) {
+        written_back_.assign(static_cast<std::size_t>(table_entries(policy)), 0);
+    }
     for (std::int32_t p = 0; p < gpus_; ++p) {
         Gpu& g    = gpu_[static_cast<std::size_t>(p)];
         g.binding = gpus[static_cast<std::size_t>(p)];
@@ -210,6 +218,11 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         const auto slots = static_cast<std::size_t>(pool_slots(policy, p));
         g.generation.assign(slots, 0);
         g.staged_at.assign(slots, -1);
+        if (layout_.host_pool != nullptr) {
+            g.occupant.assign(slots, -1);
+            g.writing.assign(slots, 0);
+            g.safe_after.assign(slots, 0);
+        }
         ScopedCurrentDevice scope(g.binding.device);
         CUDA_CHECK(cudaStreamCreateWithFlags(&g.fill_stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&g.fence, cudaEventDisableTiming));
@@ -228,6 +241,7 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
             g.staging = static_cast<std::byte*>(ring);
         }
     }
+    publish_lag_ = layout_.host_pool != nullptr ? 1 : -1;
     if (const char* v = std::getenv("NINFER_QWEN4_FILL_PUBLISH_LAG"); v != nullptr && *v != 0) {
         char* end        = nullptr;
         const long value = std::strtol(v, &end, 10);
@@ -235,6 +249,10 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
             throw std::invalid_argument("NINFER_QWEN4_FILL_PUBLISH_LAG must be -1 or 1..3");
         }
         publish_lag_ = static_cast<std::int32_t>(value);
+    }
+    if (layout_.host_pool != nullptr && publish_lag_ < 0) {
+        throw std::invalid_argument("NINFER_QWEN4_FILL_PUBLISH_LAG: the exclusive expert tier "
+                                    "(NINFER_QWEN4_EXCLUSIVE_LAYERS) needs a lag of 1..3");
     }
     if (const char* v = std::getenv("NINFER_QWEN4_FILL_SM"); v != nullptr && *v != 0) {
         sm_fill_ctas_ = std::clamp(std::atoi(v), 0, 1024);
@@ -311,6 +329,53 @@ void ExpertCache::initialize(std::span<const std::vector<std::int32_t>> profile)
         }
         submit_fills();
         flush();
+        if (layout_.host_pool != nullptr) {
+            // Experts without a host copy must be published before anything can run: nothing can
+            // compute them on the CPU, and the first window is not the first reader of the tables
+            // (graph capture and warmups read them too).
+            for (std::int32_t p = 0; p < gpus_; ++p) {
+                Gpu& g = gpu_[static_cast<std::size_t>(p)];
+                std::vector<std::int32_t> table(static_cast<std::size_t>(layers_ * experts_), -1);
+                for (std::size_t c = 0; c < table.size(); ++c) {
+                    const std::int32_t slot = target_[c];
+                    if (slot < 0 || static_cast<std::int32_t>(c % experts_) % gpus_ != p) {
+                        continue;
+                    }
+                    table[c] = slot;
+                }
+                ScopedCurrentDevice scope(g.binding.device);
+                CUDA_CHECK(cudaMemcpy(g.binding.table, table.data(),
+                                      table.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+            }
+            // The residency mirrors hold every partition's slot.
+            std::vector<std::int32_t> mirror(target_.begin(), target_.end());
+            for (std::int32_t p = 0; p < gpus_; ++p) {
+                Gpu& g = gpu_[static_cast<std::size_t>(p)];
+                if (g.binding.mirror == nullptr) { continue; }
+                ScopedCurrentDevice scope(g.binding.device);
+                CUDA_CHECK(cudaMemcpy(g.binding.mirror, mirror.data(),
+                                      mirror.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice));
+            }
+            for (std::size_t c = 0; c < target_.size(); ++c) {
+                const std::int32_t slot = target_[c];
+                published_[c]           = slot;
+                dirty_[c]               = 0;
+                if (slot < 0) { continue; }
+                const std::int32_t l = static_cast<std::int32_t>(c / experts_);
+                const std::int32_t e = static_cast<std::int32_t>(c % experts_);
+                const std::int32_t q = e % gpus_;
+                if (exclusive_slot(q, l, slot)) {
+                    gpu_[static_cast<std::size_t>(q)].occupant[static_cast<std::size_t>(slot)] =
+                        static_cast<std::int32_t>(c);
+                    if (layout_.host_pool->slot(l, e) != ExpertHostPool::kNoSlot) {
+                        layout_.host_pool->release(l, e, 0);
+                    }
+                }
+            }
+            dirty_list_.clear();
+            layout_.host_pool->retire(0);
+        }
     }
     initialized_ = true;
 }
@@ -319,6 +384,9 @@ void ExpertCache::set_publish_lag(std::int32_t lag) {
     if (initialized_) { throw std::logic_error("expert cache: set_publish_lag after initialize"); }
     if (lag != -1 && (lag < 1 || lag > 3)) {
         throw std::invalid_argument("expert cache: publish lag must be -1 or 1..3");
+    }
+    if (layout_.host_pool != nullptr && lag < 0) {
+        throw std::invalid_argument("expert cache: the exclusive tier needs publish lag 1..3");
     }
     publish_lag_ = lag;
 }
@@ -343,12 +411,26 @@ void ExpertCache::begin_window(std::span<const cudaStream_t> streams) {
         ++launched_;
         return;
     }
-    // Deterministic publication: the batches due now (waited for) and their updates, then the
-    // fill queue.
+    // Deterministic publication: the batches due now (waited for), their updates, then host slots
+    // and the fill queue. The caller synchronized the compute streams before end_window, so the
+    // fence waits below cost nothing; they keep this correct if it ever does not.
     retire_due();
     publish_targets(streams);
+    if (layout_.host_pool != nullptr) {
+        for (std::int32_t p = 0; p < gpus_; ++p) {
+            Gpu& g = gpu_[static_cast<std::size_t>(p)];
+            ScopedCurrentDevice scope(g.binding.device);
+            CUDA_CHECK(cudaEventSynchronize(g.fence));
+        }
+        // Every window up to the last fenced one has ended, including the ones that may read the
+        // host slots this publication parked (release(.., launched_)).
+        if (layout_.host_pool->retire(static_cast<std::uint64_t>(fenced_)) > 0) {
+            for (Gpu& g : gpu_) { g.pumped_windows = -1; } // freed slots can unblock write-backs
+        }
+    }
     // Fills issued from now on wait for a point after this publication on the compute stream, so
-    // after anything that could still read a slot unpublished here.
+    // after anything that could still read a slot unpublished here (retire_due frees such slots
+    // with safe_after = launched_).
     for (std::int32_t p = 0; p < gpus_; ++p) {
         Gpu& g = gpu_[static_cast<std::size_t>(p)];
         ScopedCurrentDevice scope(g.binding.device);
@@ -378,8 +460,10 @@ void ExpertCache::retire_due() {
         } else {
             CUDA_CHECK(status);
         }
-        // Their experts are published by this begin_window, before the window it opens.
-        for (std::size_t i = 0; i < n; ++i) { retire_front(g); }
+        // Their experts are published (and the experts they wrote back unpublished) by this
+        // begin_window, before the window it opens; every fill issued after it waits for the
+        // fence recorded behind that update.
+        for (std::size_t i = 0; i < n; ++i) { retire_front(g, launched_); }
     }
 }
 
@@ -396,7 +480,7 @@ void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
     std::vector<std::int32_t> mirror_index;
     std::vector<std::int32_t> mirror_value;
     // Residency mirrors of every partition's table: GPU 0's (the CPU path's publish), and at tp 2
-    // optionally GPU 1's (its own selection of a miss-split share, T42); updated identically.
+    // optionally GPU 1's (its own selection of a miss-split share); updated identically.
     bool any_mirror = false;
     for (std::int32_t p = 0; p < gpus_; ++p) {
         any_mirror = any_mirror || gpu_[static_cast<std::size_t>(p)].binding.mirror != nullptr;
@@ -438,6 +522,18 @@ void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
         for (std::size_t i = 0; i < index[pi].size(); ++i) {
             const std::int32_t v                               = value[pi][i];
             published_[static_cast<std::size_t>(index[pi][i])] = v;
+            if (v >= 0 && layout_.host_pool != nullptr) {
+                const std::int32_t l = index[pi][i] / experts_;
+                const std::int32_t e = index[pi][i] % experts_;
+                if (exclusive_slot(p, l, v)) {
+                    // The slot now holds the only copy: windows that saw this expert missing may
+                    // still read the host slot until they end.
+                    gpu_[pi].occupant[static_cast<std::size_t>(v)] = index[pi][i];
+                    if (layout_.host_pool->slot(l, e) != ExpertHostPool::kNoSlot) {
+                        layout_.host_pool->release(l, e, static_cast<std::uint64_t>(launched_));
+                    }
+                }
+            }
             ++(v >= 0 ? counters_.published : counters_.unpublished);
         }
     }
@@ -508,7 +604,7 @@ void ExpertCache::apply_prompt(std::int32_t layer, std::span<const Routed> route
     queue_staged(true, /*issue_now=*/false);
 }
 
-// T59: a frozen cache inserts nothing; the policy's hits are the published residents.
+// A frozen cache inserts nothing; the policy's hits are the published residents.
 void ExpertCache::frozen_decision(std::span<const Routed> routed, const LayerView& view) {
     decision_.accesses = 0;
     decision_.hits     = view.device_hits;
@@ -528,6 +624,9 @@ void ExpertCache::restore(std::span<const std::vector<std::int32_t>> profile) {
     if (!initialized_) { throw std::logic_error("expert cache: initialize before restore"); }
     if (fenced_ != launched_) { throw std::logic_error("expert cache: restore inside a window"); }
     if (lent_count_ > 0) { throw std::logic_error("expert cache: restore while layers are lent"); }
+    if (layout_.host_pool != nullptr) {
+        throw std::logic_error("expert cache: restore is not available with the exclusive tier");
+    }
     if (profile.size() != static_cast<std::size_t>(layers_)) {
         throw std::invalid_argument("expert cache: restore needs one list per layer");
     }
@@ -584,7 +683,7 @@ std::span<const cudaEvent_t> ExpertCache::lend_layers(std::int32_t first, std::i
     std::vector<SlotEviction> base_evicted;
     for (std::int32_t l = first; l < first + count; ++l) {
         if (keep_elastic) {
-            // T69: only the base slots go; a base slot's expert may still be published (or its
+            // Only the base slots go; a base slot's expert may still be published (or its
             // fill in flight), so its table entry is cleared like an eviction.
             base_evicted.clear();
             policy_.block_base(l, base_evicted);
@@ -687,14 +786,65 @@ void ExpertCache::set_active_columns(std::int32_t columns, std::span<const cudaS
     // Every policy-resident expert's bytes are in its slot once the fills submitted so far have
     // landed (insertions staged mid-window are submitted first).
     queue_staged(true);
-    flush();
+    if (layout_.host_pool != nullptr) {
+        settle(streams);
+    } else {
+        flush();
+    }
     std::vector<SlotEviction> evicted;
     std::vector<SlotMove> moves;
-    policy_.set_active_columns(columns, evicted, moves);
+    // An evicted expert whose only copy is in its device slot takes the host slot of a survivor
+    // moving into that slot, otherwise a spare one.
+    const auto host_slot_giver = [&](const SlotEviction& v) {
+        const auto mover = std::find_if(moves.begin(), moves.end(), [&](const SlotMove& m) {
+            return m.partition == v.partition && m.layer == v.layer && m.to == v.slot;
+        });
+        return mover != moves.end() &&
+                       layout_.host_pool->slot(v.layer, mover->expert) != ExpertHostPool::kNoSlot
+                   ? mover->expert
+                   : -1;
+    };
+    if (layout_.host_pool != nullptr) {
+        // The policy changes only once the spare host slots are known to suffice.
+        ExpertCachePolicy shrunk = policy_;
+        shrunk.set_active_columns(columns, evicted, moves);
+        std::vector<std::size_t> spares(static_cast<std::size_t>(layers_), 0);
+        for (const SlotEviction& v : evicted) {
+            const Gpu& g = gpu_[static_cast<std::size_t>(v.partition)];
+            if (g.occupant[static_cast<std::size_t>(v.slot)] < 0 || host_slot_giver(v) >= 0) {
+                continue;
+            }
+            if (++spares[static_cast<std::size_t>(v.layer)] >
+                layout_.host_pool->free_slots(v.layer)) {
+                throw std::logic_error("expert cache: no spare host slot for a shrink's eviction");
+            }
+        }
+        policy_ = std::move(shrunk);
+    } else {
+        policy_.set_active_columns(columns, evicted, moves);
+    }
     for (const SlotEviction& v : evicted) {
-        Gpu& g = gpu_[static_cast<std::size_t>(v.partition)];
-        ++g.generation[static_cast<std::size_t>(v.slot)];
+        Gpu& g       = gpu_[static_cast<std::size_t>(v.partition)];
+        const auto s = static_cast<std::size_t>(v.slot);
+        ++g.generation[s];
         set_target(cell(v.layer, v.expert), -1);
+        if (g.occupant.empty() || g.occupant[s] < 0) { continue; }
+        if (const std::int32_t giver = host_slot_giver(v); giver >= 0) {
+            layout_.host_pool->transfer(v.layer, giver, v.expert);
+        } else {
+            (void)layout_.host_pool->reserve(v.layer, v.expert); // counted above
+        }
+        ScopedCurrentDevice scope(g.binding.device);
+        for (std::int32_t q = 0; q < layout_.planes; ++q) {
+            CUDA_CHECK(
+                cudaMemcpyAsync(const_cast<std::byte*>(layout_.bank(v.layer, q, v.expert)),
+                                g.binding.pool_base[q] + layout_.pool_offset(v.layer, q, v.slot),
+                                static_cast<std::size_t>(layout_.bytes(v.layer, q)),
+                                cudaMemcpyDeviceToHost, g.fill_stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(g.fill_stream));
+        g.occupant[s] = -1;
+        ++counters_.writebacks;
     }
     // Moves: device-to-device on the fill stream, after the last launched window (no window
     // reads the destination: it held an evicted expert, which no window of the idle device
@@ -773,9 +923,19 @@ void ExpertCache::set_target(std::size_t c, std::int32_t value) {
 }
 
 void ExpertCache::stage(const Insert& ins, std::int32_t layer) {
-    Gpu& g = gpu_[static_cast<std::size_t>(ins.partition)];
-    if (ins.victim >= 0) { set_target(cell(layer, ins.victim), -1); }
+    Gpu& g       = gpu_[static_cast<std::size_t>(ins.partition)];
     const auto s = static_cast<std::size_t>(ins.slot);
+    if (ins.victim >= 0) {
+        // A victim whose only copy is a device slot stays published until its write-back completed.
+        // That slot need not be this one: the policy may have moved the expert to a slot its fill
+        // has not reached yet, and evicted it from there.
+        const std::size_t victim = cell(layer, ins.victim);
+        const std::int32_t at    = published_[victim];
+        if (g.occupant.empty() || at < 0 ||
+            g.occupant[static_cast<std::size_t>(at)] != static_cast<std::int32_t>(victim)) {
+            set_target(victim, -1);
+        }
+    }
     // A new owner cancels the publication of any earlier fill of this slot still in flight.
     const std::uint32_t generation = ++g.generation[s];
     const PendingFill fill{static_cast<std::int32_t>(cell(layer, ins.expert)), ins.slot,
@@ -847,25 +1007,167 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
 // and wait for nothing. Insertions whose slot was reassigned since are dropped without a copy.
 void ExpertCache::pump(Gpu& g) {
     if (!deterministic()) { retire(g, false); }
+    if (layout_.host_pool != nullptr) {
+        const std::int64_t windows = launched_ + fenced_;
+        if (g.pumped_windows == windows && g.pumped_retired == g.retired &&
+            g.pumped_queue == g.queue.size()) {
+            return;
+        }
+    }
     std::vector<PendingFill> batch;
     std::int32_t staged = 0; // pageable fills in `batch`: each needs a free staging slot
+    // Exclusive tier: fills that must wait step aside, so one slot's victim cannot hold up the
+    // fill another slot's victim (or this one's source) depends on.
+    std::deque<PendingFill> waiting;
     while (!g.queue.empty() &&
            g.in_flight_bytes + static_cast<std::int64_t>(batch.size() + 1) * expert_bytes_ <=
                max_in_flight_bytes_) {
-        const PendingFill f = g.queue.front();
+        PendingFill f = g.queue.front();
         if (g.generation[static_cast<std::size_t>(f.slot)] != f.generation) {
             g.queue.pop_front();
             ++counters_.fills_dropped;
             continue;
         }
-        if (pageable_[static_cast<std::size_t>(f.cell / experts_)] != 0) {
+        if (layout_.host_pool != nullptr) {
+            const Prepared state = prepare(g, f);
+            if (state != Prepared::Ready) {
+                g.queue.pop_front();
+                if (state == Prepared::Wait) { waiting.push_back(f); }
+                continue;
+            }
+            g.queue.front() = f;
+        }
+        if (needs_staging(f.cell)) {
             if (g.staging_in_use + staged >= staging_slots_) { break; } // stays queued
             ++staged;
         }
         g.queue.pop_front();
         batch.push_back(f);
     }
+    g.queue.insert(g.queue.begin(), waiting.begin(), waiting.end());
     issue(g, batch);
+    g.pumped_windows = launched_ + fenced_;
+    g.pumped_retired = g.retired;
+    g.pumped_queue   = g.queue.size();
+}
+
+bool ExpertCache::exclusive_slot(std::int32_t partition, std::int32_t layer,
+                                 std::int32_t slot) const noexcept {
+    return layout_.host_pool != nullptr &&
+           layout_.exclusive_layer[static_cast<std::size_t>(layer)] != 0 &&
+           slot >= policy_.base_offset(partition, layer) &&
+           slot < policy_.base_offset(partition, layer + 1);
+}
+
+// What stands between a queued fill and its copy, in the order of the swap: the slot's occupant
+// goes to its host slot, its unpublication and every window that could read it pass, and the
+// incoming expert must have bytes on the host.
+ExpertCache::Prepared ExpertCache::prepare(Gpu& g, PendingFill& f) {
+    const std::int32_t l = f.cell / experts_;
+    const std::int32_t e = f.cell % experts_;
+    const auto s         = static_cast<std::size_t>(f.slot);
+    const auto p         = static_cast<std::int32_t>(&g - gpu_.data());
+    if (exclusive_slot(p, l, f.slot)) {
+        // First: a write-back in flight ends with the slot empty and its expert unpublished.
+        if (g.writing[s] != 0) { return Prepared::Wait; }
+        const std::int32_t occupant = g.occupant[s];
+        if (occupant == f.cell) {
+            // The policy chose the expert back before its write-back started.
+            set_target(static_cast<std::size_t>(f.cell), f.slot);
+            ++counters_.refound;
+            return Prepared::Done;
+        }
+        if (occupant >= 0) {
+            if (layout_.host_pool->reserve(occupant / experts_, occupant % experts_) ==
+                ExpertHostPool::kNoSlot) {
+                return Prepared::Wait;
+            }
+            issue_writeback(g, occupant, f.slot);
+            return Prepared::Wait;
+        }
+        if (g.safe_after[s] != 0) {
+            if (fenced_ < g.safe_after[s]) { return Prepared::Wait; }
+            f.fenced = true;
+        }
+    }
+    // A source slot being written back is reserved but not yet valid.
+    if (written_back_[static_cast<std::size_t>(f.cell)] != 0) { return Prepared::Wait; }
+    if (layout_.bank(l, 0, e) != nullptr) { return Prepared::Ready; }
+    // No host copy: the expert sits in a device slot of this GPU, unless a move of it is running.
+    const std::int32_t at = published_[static_cast<std::size_t>(f.cell)];
+    if (at < 0 || g.occupant[static_cast<std::size_t>(at)] != f.cell ||
+        g.writing[static_cast<std::size_t>(at)] != 0) {
+        return Prepared::Wait;
+    }
+    if (exclusive_slot(p, l, f.slot)) {
+        // Device to device: no link traffic, and no spare host slot, which is what lets experts
+        // that trade slots with each other finish when the spares run out.
+        issue_move(g, f, at);
+        return Prepared::Done;
+    }
+    // An inclusive slot needs a host copy behind it.
+    if (layout_.host_pool->reserve(l, e) != ExpertHostPool::kNoSlot) {
+        issue_writeback(g, f.cell, at);
+    }
+    return Prepared::Wait;
+}
+
+void ExpertCache::issue_writeback(Gpu& g, std::int32_t occupant, std::int32_t slot) {
+    ScopedCurrentDevice scope(g.binding.device);
+    const std::int32_t l = occupant / experts_;
+    const std::int32_t e = occupant % experts_;
+    copy_dst_.clear();
+    copy_src_.clear();
+    copy_bytes_.clear();
+    for (std::int32_t q = 0; q < layout_.planes; ++q) {
+        const std::int64_t bytes = layout_.bytes(l, q);
+        copy_dst_.push_back(const_cast<std::byte*>(layout_.bank(l, q, e)));
+        copy_src_.push_back(g.binding.pool_base[q] + layout_.pool_offset(l, q, slot));
+        copy_bytes_.push_back(static_cast<std::size_t>(bytes));
+    }
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder    = cudaMemcpySrcAccessOrderStream;
+    attr.flags             = cudaMemcpyFlagPreferOverlapWithCompute;
+    std::size_t attr_index = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(copy_dst_.data(), copy_src_.data(), copy_bytes_.data(),
+                                    copy_dst_.size(), &attr, &attr_index, 1, g.fill_stream));
+    FillBatch batch;
+    batch.writebacks.push_back({occupant, slot});
+    g.writing[static_cast<std::size_t>(slot)]         = 1;
+    written_back_[static_cast<std::size_t>(occupant)] = 1;
+    ++counters_.writebacks;
+    track_copy(g, std::move(batch));
+}
+
+void ExpertCache::issue_move(Gpu& g, const PendingFill& fill, std::int32_t from) {
+    ScopedCurrentDevice scope(g.binding.device);
+    const std::int32_t l = fill.cell / experts_;
+    if (fill.fenced && fenced_ > 0) { CUDA_CHECK(cudaStreamWaitEvent(g.fill_stream, g.fence, 0)); }
+    for (std::int32_t q = 0; q < layout_.planes; ++q) {
+        CUDA_CHECK(cudaMemcpyAsync(g.binding.pool_base[q] + layout_.pool_offset(l, q, fill.slot),
+                                   g.binding.pool_base[q] + layout_.pool_offset(l, q, from),
+                                   static_cast<std::size_t>(layout_.bytes(l, q)),
+                                   cudaMemcpyDeviceToDevice, g.fill_stream));
+    }
+    FillBatch batch;
+    batch.moves.push_back({from, fill});
+    g.writing[static_cast<std::size_t>(from)]      = 1;
+    g.writing[static_cast<std::size_t>(fill.slot)] = 1;
+    ++counters_.device_moves;
+    track_copy(g, std::move(batch));
+}
+
+void ExpertCache::track_copy(Gpu& g, FillBatch batch) {
+    if (!g.spare_events.empty()) {
+        batch.done = g.spare_events.back();
+        g.spare_events.pop_back();
+    } else {
+        CUDA_CHECK(cudaEventCreateWithFlags(&batch.done, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(batch.done, g.fill_stream));
+    g.in_flight_bytes += expert_bytes_;
+    if (deterministic()) { schedule(batch); }
+    g.in_flight.push_back(std::move(batch));
 }
 
 void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
@@ -893,7 +1195,7 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
             // one); the slot is held until the batch's event completes (retire).
             std::byte* stage          = nullptr;
             std::int64_t staged_bytes = 0; // planes packed back to back in the staging slot
-            if (pageable_[static_cast<std::size_t>(l)] != 0) {
+            if (needs_staging(f.cell)) {
                 const std::int64_t at = g.staging_head++ % staging_slots_;
                 stage                 = g.staging + at * expert_bytes_;
                 ++g.staging_in_use;
@@ -964,21 +1266,48 @@ void ExpertCache::retire(Gpu& g, bool wait) {
             if (status == cudaErrorNotReady) { break; }
             CUDA_CHECK(status);
         }
-        retire_front(g);
+        // launched_ + 1: the window that follows the unpublication must have begun.
+        retire_front(g, launched_ + 1);
     }
 }
 
-void ExpertCache::retire_front(Gpu& g) {
+void ExpertCache::retire_front(Gpu& g, std::int64_t safe_after) {
     FillBatch& b = g.in_flight.front();
     for (const PendingFill& f : b.fills) {
         if (g.generation[static_cast<std::size_t>(f.slot)] == f.generation) {
             set_target(static_cast<std::size_t>(f.cell), f.slot);
         }
     }
-    g.in_flight_bytes -= static_cast<std::int64_t>(b.fills.size()) * expert_bytes_;
+    for (const WriteBack& w : b.writebacks) {
+        // The bytes are safe on the host: the victim goes missing at the next begin_window,
+        // and the slot may be rewritten after the windows launched until then.
+        const auto s                                    = static_cast<std::size_t>(w.slot);
+        g.occupant[s]                                   = -1;
+        g.writing[s]                                    = 0;
+        written_back_[static_cast<std::size_t>(w.cell)] = 0;
+        g.safe_after[s]                                 = safe_after;
+        if (target_[static_cast<std::size_t>(w.cell)] == w.slot) {
+            set_target(static_cast<std::size_t>(w.cell), -1);
+        }
+    }
+    for (const DeviceMove& m : b.moves) {
+        const auto from = static_cast<std::size_t>(m.from);
+        const auto to   = static_cast<std::size_t>(m.fill.slot);
+        g.writing[from] = 0;
+        g.writing[to]   = 0;
+        if (g.generation[to] != m.fill.generation) { continue; } // the old slot still holds it
+        // The table moves in one update; the old slot is free after the windows that read it.
+        g.occupant[from]   = -1;
+        g.safe_after[from] = safe_after;
+        set_target(static_cast<std::size_t>(m.fill.cell), m.fill.slot);
+    }
+    g.in_flight_bytes -=
+        static_cast<std::int64_t>(b.fills.size() + b.writebacks.size() + b.moves.size()) *
+        expert_bytes_;
     g.staging_in_use -= b.staged;
     g.spare_events.push_back(b.done);
     g.in_flight.pop_front();
+    ++g.retired;
 }
 
 void ExpertCache::poll() {
@@ -1012,9 +1341,51 @@ void ExpertCache::flush() {
             }
             retire(g, true);
             pump(g);
+            // Exclusive tier: what is left waits for a window or a publication (settle()).
+            if (layout_.host_pool != nullptr && g.in_flight.empty()) {
+                done[static_cast<std::size_t>(p)] = true;
+                continue;
+            }
             busy = true;
         }
     }
+}
+
+void ExpertCache::settle(std::span<const cudaStream_t> streams) {
+    check_streams(streams);
+    if (fenced_ != launched_) { throw std::logic_error("expert cache: settle inside a window"); }
+    constexpr int kMaxRounds = 1 << 16;
+    int rounds               = 0;
+    for (bool pending = true; pending;) {
+        if (++rounds > kMaxRounds) {
+            throw std::logic_error("expert cache: settle cannot finish (no spare host slots?)");
+        }
+        flush();
+        publish_targets(streams);
+        pending = false;
+        for (std::int32_t p = 0; p < gpus_; ++p) {
+            Gpu& g = gpu_[static_cast<std::size_t>(p)];
+            ScopedCurrentDevice scope(g.binding.device);
+            CUDA_CHECK(cudaStreamSynchronize(streams[static_cast<std::size_t>(p)]));
+            // The device is idle: no window can read a victim any more.
+            std::fill(g.safe_after.begin(), g.safe_after.end(), 0);
+            g.pumped_windows = -1; // that can unblock fills without any window passing
+            pending          = pending || !g.queue.empty() || !g.in_flight.empty();
+        }
+        if (layout_.host_pool != nullptr) {
+            layout_.host_pool->retire(static_cast<std::uint64_t>(launched_));
+        }
+    }
+}
+
+void ExpertCache::release_tails() {
+    if (layout_.host_pool == nullptr) { return; }
+    for (std::int32_t p = 0; p < gpus_; ++p) {
+        if (!gpu_[static_cast<std::size_t>(p)].queue.empty()) {
+            throw std::logic_error("expert cache: release_tails with fills queued");
+        }
+    }
+    layout_.tail_base.clear();
 }
 
 std::int64_t ExpertCache::fills_pending() const noexcept {

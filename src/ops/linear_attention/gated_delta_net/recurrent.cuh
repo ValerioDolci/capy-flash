@@ -461,7 +461,7 @@ using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
 using FoldGeometry36x24 = FoldGeometry<36, 8, 24, 5120>;
 // The 4-layer Qwen3.8-Flash-Next synthetic checkpoints (3 GDN layers), so their MTP rounds run.
 using FoldGeometry3x48 = FoldGeometry<3, 16, 48, 10240>;
-// And one rank's shard of them at tp 2 (T33: MTP rounds at tp 2 on the synthetic checkpoints).
+// And one rank's shard of them at tp 2 (MTP rounds at tp 2 on the synthetic checkpoints).
 using FoldGeometry3x24 = FoldGeometry<3, 8, 24, 5120>;
 
 template <class Geometry>
@@ -689,7 +689,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
-    // A programmatic dependent of the kernel before it (T49): the state tile, the valid columns
+    // A programmatic dependent of the kernel before it: the state tile, the valid columns
     // and the slots were complete before that kernel started (launch contract), so they load
     // while it runs; q/k/v/g/beta are read only after the wait.
     load_state_tile(state, access.state_read_base(coord), coord);

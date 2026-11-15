@@ -1,4 +1,4 @@
-// T43: the Qwen4Exp draft shortlist proposal head (execution/qwen4_draft_head.h).
+// The Qwen4Exp draft shortlist proposal head (execution/qwen4_draft_head.h).
 //
 // CPU: the shortlist split (longest ID prefix, cap, rounding to 8 rows with the lowest missing
 // IDs, errors) and the file reader. GPU (skips without a device): a random Q6 RowSplit head

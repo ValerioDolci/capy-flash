@@ -25,8 +25,7 @@ namespace ninfer::ops::host::detail {
                             W4A8Activation a);                                                     \
     void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a);     \
     void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n,                        \
-                  const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo,    \
-                  DotKernel kernel, std::int32_t prefetch_rows);
+                  const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo);
 
 namespace avx512 {
 NINFER_HOST_ISA_ENTRY_POINTS

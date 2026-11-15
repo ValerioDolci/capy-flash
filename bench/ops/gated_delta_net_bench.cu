@@ -2,7 +2,6 @@
 // recurrent/chunked crossover, independently of decode/ReplaySSM.
 // Each sample is a cold-L2 CUDA Graph replay with the flush outside its timer.
 #include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -58,7 +57,6 @@ struct Options {
     int warmup               = 20;
     int repeat               = 100;
     std::size_t flush_bytes  = kDefaultFlushBytes;
-    std::string qk_norm      = "fused";
 };
 
 struct Problem {
@@ -146,11 +144,6 @@ Options parse_options(int argc, char** argv) {
             options.value_heads = parse_integer("--value-heads", take("--value-heads"), 1);
         } else if (arg == "--batch") {
             options.batch = parse_integer("--batch", take("--batch"), 1);
-        } else if (arg == "--qk-norm") {
-            options.qk_norm = take("--qk-norm");
-            if (options.qk_norm != "fused" && options.qk_norm != "composed") {
-                fail("--qk-norm must be fused or composed");
-            }
         } else if (arg == "--breakdown") {
             options.breakdown = true;
         } else if (arg == "--warmup") {
@@ -178,45 +171,39 @@ Options parse_options(int argc, char** argv) {
     if (options.breakdown && options.mode == Mode::BatchUpdate) {
         fail("--breakdown requires a prefill mode");
     }
-    if (options.qk_norm == "composed" && options.mode != Mode::BatchUpdate) {
-        fail("--qk-norm composed is a batch-update comparison");
-    }
-    if (options.batch > 8 || (options.mode != Mode::BatchUpdate && options.batch != 1) ||
-        (options.batch > 1 && options.qk_norm == "composed")) {
-        fail("batch metadata is valid only for a fused-normalization batch update");
+    if (options.batch > 8 || (options.mode != Mode::BatchUpdate && options.batch != 1)) {
+        fail("batch metadata is valid only for a batch update");
     }
     return options;
 }
 
 void print_help(const char* program) {
-    std::printf(
-        "Usage: %s [mode] [options]\n"
-        "\n"
-        "Modes (default: --running):\n"
-        "  --running          public running-state Gated DeltaNet\n"
-        "  --batch-update     public selected-slot Gated DeltaNet update at T=1\n"
-        "  --chunked-only     forced chunked with pre-normalized BF16 inputs\n"
-        "  --force-chunked    forced chunked with fused Q/K normalization\n"
-        "  --recurrent-only   prefill recurrence with fused Q/K normalization\n"
-        "  --breakdown        also time prepare and recurrence/output separately\n"
-        "\n"
-        "Workload:\n"
-        "  --tokens N         exact token extent (running/chunked default: 1024)\n"
-        "  --sweep            short prefill boundaries through T=4096\n"
-        "  --qk-heads N       Q/K heads (default: 16)\n"
-        "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
-        "  --batch B          exact batch-update batch in [1,8] (default: 1)\n"
-        "  --qk-norm MODE     batch-update normalization: fused or composed (default: fused)\n"
-        "\n"
-        "Measurement:\n"
-        "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
-        "  --repeat N         measured cold-L2 graph replays per case (default: 100)\n"
-        "  --flush-mib N      L2 flush allocation in MiB (default: 256)\n"
-        "  --csv              emit CSV instead of human-readable rows\n"
-        "  -h, --help         show this help\n"
-        "\n"
-        "State/head dimension 128 is fixed; running/chunked use batch 1.\n",
-        program);
+    std::printf("Usage: %s [mode] [options]\n"
+                "\n"
+                "Modes (default: --running):\n"
+                "  --running          public running-state Gated DeltaNet\n"
+                "  --batch-update     public selected-slot Gated DeltaNet update at T=1\n"
+                "  --chunked-only     forced chunked with pre-normalized BF16 inputs\n"
+                "  --force-chunked    forced chunked with fused Q/K normalization\n"
+                "  --recurrent-only   prefill recurrence with fused Q/K normalization\n"
+                "  --breakdown        also time prepare and recurrence/output separately\n"
+                "\n"
+                "Workload:\n"
+                "  --tokens N         exact token extent (running/chunked default: 1024)\n"
+                "  --sweep            short prefill boundaries through T=4096\n"
+                "  --qk-heads N       Q/K heads (default: 16)\n"
+                "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
+                "  --batch B          exact batch-update batch in [1,8] (default: 1)\n"
+                "\n"
+                "Measurement:\n"
+                "  --warmup N         cold-L2 graph warmups per case (default: 20)\n"
+                "  --repeat N         measured cold-L2 graph replays per case (default: 100)\n"
+                "  --flush-mib N      L2 flush allocation in MiB (default: 256)\n"
+                "  --csv              emit CSV instead of human-readable rows\n"
+                "  -h, --help         show this help\n"
+                "\n"
+                "State/head dimension 128 is fixed; running/chunked use batch 1.\n",
+                program);
 }
 
 std::vector<std::int32_t> token_values(const Options& options) {
@@ -430,23 +417,11 @@ TrafficBytes recurrence_traffic(const Problem& p, int slices) {
     return {packets + 2.0 * value_tensor_bytes(p) + 2.0 * state_tensor_bytes(p), packets};
 }
 
-TrafficBytes batch_update_traffic(const Problem& problem, bool composed) {
-    const double logical = batch_update_logical_bytes(problem);
-    if (!composed) { return {logical, 0.0}; }
-    const double normalized_qk_round_trip = 4.0 * qk_tensor_bytes(problem);
-    return {
-        logical + normalized_qk_round_trip,
-        normalized_qk_round_trip,
-    };
-}
-
 BenchRow run_batch_update(const Options& options, std::int32_t tokens, bench::L2FlushBuffer& flush,
                           cudaStream_t stream) {
     const Problem problem{options.qk_heads, options.value_heads, tokens, options.batch};
     Operands operands(problem, false);
 
-    const std::size_t qk_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                    problem.qk_heads * tokens * problem.batch;
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
     const std::int32_t slots = problem.batch;
@@ -459,12 +434,6 @@ BenchRow run_batch_update(const Options& options, std::int32_t tokens, bench::L2
     }
     DeviceBuffer state_slots(state_slots_host.size() * sizeof(std::int32_t));
     state_slots.copy_from_host(state_slots_host.data(), state_slots.bytes);
-    DeviceBuffer q_normalized;
-    DeviceBuffer k_normalized;
-    if (options.qk_norm == "composed") {
-        q_normalized = make_zeros(qk_elements * sizeof(std::uint16_t));
-        k_normalized = make_zeros(qk_elements * sizeof(std::uint16_t));
-    }
 
     Tensor q    = operands.query();
     Tensor k    = operands.key();
@@ -476,45 +445,26 @@ BenchRow run_batch_update(const Options& options, std::int32_t tokens, bench::L2
                       {gated_delta_net_detail::kStateDim, gated_delta_net_detail::kStateDim,
                        problem.value_heads, slots});
     Tensor selected_slots(state_slots.p, DType::I32, {problem.batch});
-    Tensor q_norm;
-    Tensor k_norm;
-    if (options.qk_norm == "composed") {
-        q_norm =
-            Tensor(q_normalized.p, DType::BF16,
-                   {gated_delta_net_detail::kStateDim, problem.qk_heads, tokens, problem.batch});
-        k_norm =
-            Tensor(k_normalized.p, DType::BF16,
-                   {gated_delta_net_detail::kStateDim, problem.qk_heads, tokens, problem.batch});
-    }
-
-    const bool composed = options.qk_norm == "composed";
-    auto launch         = [&](cudaStream_t launch_stream) {
-        if (composed) {
-            ops::l2norm(q, kQkNormEpsilon, q_norm, launch_stream);
-            ops::l2norm(k, kQkNormEpsilon, k_norm, launch_stream);
-        }
-        const Tensor& q_input = composed ? q_norm : q;
-        const Tensor& k_input = composed ? k_norm : k;
-        ops::gated_delta_net_batch_update(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                                  !composed, ssm_states, selected_slots, selected_slots,
-                                                  out, launch_stream);
+    auto launch = [&](cudaStream_t launch_stream) {
+        ops::gated_delta_net_batch_update(q, k, v, g, beta, gated_delta_net_scale(), true,
+                                          ssm_states, selected_slots, selected_slots, out,
+                                          launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options, restore);
-    const TrafficBytes traffic         = batch_update_traffic(problem, composed);
+    const double logical               = batch_update_logical_bytes(problem);
 
     return {
         "batch_update",
-        composed ? "composed" : "fused",
-        composed ? "l2norm_x2+public.batch_update.qk_pre_normalized"
-                 : "public.batch_update.qk_fused",
+        "fused",
+        "public.batch_update.qk_fused",
         tokens,
         0,
         0,
         0,
         measurement.graph_nodes,
-        batch_update_logical_bytes(problem),
-        traffic.total,
-        traffic.intermediate,
+        logical,
+        logical,
+        0.0,
         -1.0,
         -1.0,
         measurement.timing,

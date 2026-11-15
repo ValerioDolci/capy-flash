@@ -1,7 +1,7 @@
 #pragma once
 
 // ElasticArena: one device allocation whose physical backing can shrink and grow at runtime
-// without moving any address (T64, elastic KV <-> expert cache).
+// without moving any address (elastic KV <-> expert cache).
 //
 // The arena reserves one virtual address range on one device (CUDA virtual memory management:
 // cuMemAddressReserve) and backs it with physical memory in granules (cuMemCreate, the device's

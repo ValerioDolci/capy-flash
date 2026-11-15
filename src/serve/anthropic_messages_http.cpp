@@ -3,9 +3,6 @@
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -14,13 +11,88 @@
 #include <vector>
 
 namespace ninfer::serve {
+namespace {
+
+class MessagesEndpoint final : public GenerationEndpoint {
+public:
+    MessagesEndpoint(std::string request_id, const AnthropicMessagesRequest& request)
+        : request_id_(std::move(request_id)), model_(request.model),
+          hide_thinking_(request.hide_thinking) {}
+
+    ApiError api_error(const ApiError& error) const override {
+        return normalize_anthropic_error(error);
+    }
+
+    // The body reports every 5xx as api_error; the request logs keep this type.
+    ApiError internal_error(const std::exception& exception) const override {
+        ApiError error = serve::internal_error(exception.what());
+        error.type     = "internal_error";
+        return error;
+    }
+
+    void write_error(httplib::Response& response, const ApiError& error) const override {
+        write_anthropic_error(response, error, request_id_);
+    }
+
+    // An Anthropic message has no cancelled stop reason.
+    bool renders_cancelled() const override { return false; }
+
+    void identify(const PreparedRequest& prepared) override {
+        identity_     = make_anthropic_response_identity(request_id_, model_);
+        input_tokens_ = prepared.prompt_tokens;
+    }
+
+    void render(const PreparedRequest&, const GenerationOutcome& outcome) override {
+        body_ = make_anthropic_messages_response(identity_, outcome, hide_thinking_);
+    }
+
+    std::string body() override { return std::move(body_); }
+
+    void open_stream(const PreparedRequest&) override {
+        encoder_.emplace(identity_, input_tokens_, hide_thinking_);
+    }
+
+    void attach(StreamSink& output, SseTransport& transport) override {
+        output.on_start = [this, &transport](const ninfer::GenerationStart& start) {
+            render_and_write(transport, [&] { return encoder_->start(start); });
+        };
+        output.on_reasoning = [this, &transport](const std::string& text) {
+            render_and_write(transport, [&] { return encoder_->reasoning_delta(text); });
+        };
+        output.on_content = [this, &transport](const std::string& text) {
+            render_and_write(transport, [&] { return encoder_->content_delta(text); });
+        };
+    }
+
+    std::vector<std::string> finish(const GenerationOutcome& outcome) override {
+        return encoder_->finish(outcome);
+    }
+
+    void write_stream_error(SseTransport& transport, const ApiError& error) override {
+        if (!encoder_->started()) {
+            render_and_write(transport, [&] { return encoder_->start(); });
+        }
+        render_and_write(transport, [&] { return encoder_->error(error); });
+    }
+
+private:
+    std::string request_id_;
+    std::string model_;
+    bool hide_thinking_;
+    AnthropicResponseIdentity identity_;
+    int input_tokens_ = 0;
+    std::string body_;
+    std::optional<AnthropicMessagesStream> encoder_;
+};
+
+} // namespace
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = new_anthropic_request_id();
     res.set_header("request-id", request_id);
     try {
-        const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req));
+        const AnthropicCountTokensRequest request = parse_anthropic_count_tokens_request(
+            parse_json_body(req, request_limits_), request_limits_);
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -30,10 +102,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         operational_log_.http_failure(
             "anthropic_count_tokens",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, internal_error(exception.what()), request_id);
     }
 }
 
@@ -44,10 +113,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     AnthropicMessagesRequest request;
     std::optional<std::string> client;
     try {
-        RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
-        client                    = parse_client_label(req);
+        request = parse_anthropic_messages_request(parse_json_body(req, request_limits_),
+                                                   request_limits_);
+        client  = parse_client_label(req);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -55,210 +123,16 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         operational_log_.http_failure(
             "anthropic_messages",
             make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
+        write_anthropic_error(res, internal_error(exception.what()), request_id);
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .client                 = std::move(client),
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
-    PreparedRequest prepared;
-    try {
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
-    } catch (const ApiException& exception) {
-        const ApiError error = normalize_anthropic_error(exception.error());
-        record_request_rejected(make_request_rejection_log_context(
-            req_id, "anthropic_messages", request.generation, metadata, error));
-        write_anthropic_error(res, error, request_id);
-        return;
-    } catch (const std::exception& exception) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        record_request_rejected(make_request_rejection_log_context(
-            req_id, "anthropic_messages", request.generation, metadata, error));
-        write_anthropic_error(res, error, request_id);
-        return;
-    }
-
-    const AnthropicResponseIdentity identity =
-        make_anthropic_response_identity(request_id, request.model);
-    const int input_tokens = prepared.prompt_tokens;
-
-    auto lifecycle = begin_request(make_request_log_context(
-        req_id, "anthropic_messages", request.generation, metadata, prepared));
-
-    if (!request.stream) {
-        GenerationOutcome outcome;
-        try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-        } catch (const ApiException& exception) {
-            const ApiError error = normalize_anthropic_error(exception.error());
-            lifecycle->failure(make_generation_request_failure(error));
-            write_anthropic_error(res, error, request_id);
-            return;
-        } catch (const std::exception& exception) {
-            lifecycle->failure(
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
-            return;
-        }
-        lifecycle->done(outcome);
-        if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
-            // Only the client cancels a non-streaming run (it disconnected): nothing to render,
-            // and an Anthropic message has no cancelled stop reason. Logged as Chat logs it.
-            lifecycle->response_failure(
-                make_client_disconnected_failure(RequestFailurePhase::Transport));
-            return;
-        }
-        try {
-            set_owned_json_content(
-                res, make_anthropic_messages_response(identity, outcome, request.hide_thinking),
-                prepared.lifetime);
-        } catch (const ApiException& exception) {
-            const ApiError error = normalize_anthropic_error(exception.error());
-            lifecycle->response_failure(
-                make_request_failure(RequestFailurePhase::ResponseRender, error));
-            write_anthropic_error(res, error, request_id);
-        } catch (const std::exception& exception) {
-            lifecycle->response_failure(make_internal_request_failure(
-                RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.message = exception.what();
-            write_anthropic_error(res, error, request_id);
-        }
-        return;
-    }
-
-    try {
-        auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
-                                                                 request.hide_thinking);
-
-        prepare_sse_response(res);
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
-                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
-                    sink.done();
-                    return true;
-                }
-                SseTransport transport(sink, stream->cancelled);
-                const auto send_error = [&](const ApiError& error) {
-                    try {
-                        if (!encoder->started()) {
-                            render_and_write(transport, [&] { return encoder->start(); });
-                        }
-                        render_and_write(transport, [&] { return encoder->error(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
-                };
-
-                GenerationOutcome outcome;
-                try {
-                    StreamSink output;
-                    output.on_start = [&](const ninfer::GenerationStart& start) {
-                        render_and_write(transport, [&] { return encoder->start(start); });
-                    };
-                    output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
-                    };
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
-                    };
-                    output.is_cancelled = [&] { return transport.poll(); };
-
-                    outcome = service_->run(stream->prepared, &output);
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    const ApiError error = normalize_anthropic_error(exception.error());
-                    lifecycle->failure(make_generation_request_failure(error));
-                    return send_error(error);
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-
-                lifecycle->done(outcome);
-                if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
-                    // The client closed the stream (SseTransport::poll): no terminal events to
-                    // write, and an Anthropic message has no cancelled stop reason.
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-                std::vector<std::string> terminal;
-                try {
-                    terminal = encoder->finish(outcome);
-                } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-            },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
-    } catch (const std::exception& exception) {
-        lifecycle->failure(
-            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.message = exception.what();
-        write_anthropic_error(res, error, request_id);
-    }
+    serve_generation(req, res, std::make_shared<MessagesEndpoint>(request_id, request),
+                     "anthropic_messages", request.generation, metadata);
 }
 
 } // namespace ninfer::serve

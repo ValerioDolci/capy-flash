@@ -110,7 +110,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
             card.set_peer_feature_sink(&*peer_sink);
         }
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+                                  &sink);
     }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
@@ -141,7 +141,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
             card.set_peer_feature_sink(&*peer_sink);
         }
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
-                                  finalize_at_end, sink);
+                                  finalize_at_end, &sink);
     }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
@@ -187,7 +187,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose, const Tensor* peer_hidden, bool reasoning_guard) {
     const TextConfig& config = state.execution.parameters.model.config().text;
-    // Qwen4Exp retains the wide residual (T66b: a zero-suffix hit of this architecture).
+    // Qwen4Exp retains the wide residual (the stored tail of a zero-suffix reuse).
     const std::int32_t rows =
         config.qwen4() ? dimension(config.residual_width()) : dimension(config.hidden_size);
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != rows || hidden.ne[1] != 1 ||
@@ -715,7 +715,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         if (qwen3_5::PagedKVCache* mtp = decoder->mtp_cache()) {
             mtp->page_pool().trim_host_backing();
         }
-        // T64: before the prompt maps its KV, size the KV backing for the prompt and the first
+        // Before the prompt maps its KV, size the KV backing for the prompt and the first
         // decode tokens (up to one grow step) and give the rest back to the expert cache.
         if (qwen4_elastic) {
             const std::uint32_t ahead = std::min<std::uint32_t>(
@@ -989,7 +989,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
         }
 
-        // T49: a Qwen4Exp MTP commit that keeps every lane active does not wait for its fold:
+        // A Qwen4Exp MTP commit that keeps every lane active does not wait for its fold:
         // the fold and the PLE advance are stream-ordered before the next round on each rank's
         // stream, read only kernel arguments and arena memory that later work reaches in stream
         // order, and the host prepares the next round (PLE rows, expert window) meanwhile. A
@@ -1075,20 +1075,6 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                         }
                     }
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
-                    if (mtp_min_p > 0.0F) {
-                        // T41 adaptive window: the next round verifies the proposals up to the
-                        // first whose probability (chain product or its own) is below the floor.
-                        const float floor  = std::log(mtp_min_p);
-                        float chain        = 0.0F;
-                        std::uint32_t keep = 0;
-                        for (; keep < sequence.mtp_draft_count; ++keep) {
-                            const float lp =
-                                mtp_host_egress->next_draft_logprobs[keep * max_concurrency + row];
-                            chain = mtp_window_rule == MtpWindowRule::Step ? lp : chain + lp;
-                            if (!(chain >= floor)) { break; }
-                        }
-                        sequence.mtp_draft_count = keep;
-                    }
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
@@ -1134,7 +1120,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
-        // Disk tier (v0.7.2): a root prefill first loads the longest saved checkpoint its prompt
+        // Disk tier: a root prefill first loads the longest saved checkpoint its prompt
         // begins with; the loaded tokens count as processed (the admitted Begin stays Root).
         if (disk_kv && !staged.disk_attempted) {
             processed_prompt_tokens += disk_cache_resume(sequence, request);
@@ -1292,8 +1278,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
                 // Routed experts cost each prefill call an expert pass (streamed over PCIe,
                 // or the CPU path below 2 048 columns): splitting at every rewrite frontier (one
-                // per assistant turn) made a 10-turn 1.2k-token prompt 2.4x slower in
-                // ninfer-serve. Rewrite frontiers only keep resumed and root GDN decompositions
+                // per assistant turn) makes a multi-turn prompt over twice as slow. Rewrite
+                // frontiers only keep resumed and root GDN decompositions
                 // bit-identical (they are not captures), so a routed-expert model splits at
                 // capture frontiers only; NINFER_QWEN4_REWRITE_SPLITS=1 restores them.
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
@@ -1437,7 +1423,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
         if (qwen4_replay) {
-            // T59 replay: the reference's first token after the prompt.
+            // Replay: the reference's first token after the prompt.
             if (const execution::Qwen4ReplaySequence* ref = qwen4_replay->match(sequence.ledger);
                 ref != nullptr && sequence.ledger.size() == prompt_tokens) {
                 host_tokens[0] = ref->ids[prompt_tokens];
@@ -1447,7 +1433,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         if (qwen4_replay_record != nullptr) {
             std::fprintf(qwen4_replay_record, "req %u\n", static_cast<unsigned>(prompt_tokens));
         }
-        qwen4_round_follows = false; // T59 round log: the next round starts a request
+        qwen4_round_follows = false; // round log: the next round starts a request
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
@@ -1462,7 +1448,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
             sequence.mtp_draft_count = staged.initial_mtp_extent;
-            // The prompt's proposals carry no recorded probability (T41 calibration skips NaN).
+            // The prompt's proposals carry no recorded probability (MTP calibration skips NaN).
             sequence.mtp_draft_logprobs.fill(std::numeric_limits<float>::quiet_NaN());
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());

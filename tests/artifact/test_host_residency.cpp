@@ -1,4 +1,4 @@
-// v0.7 pinned fallback: the pinned / pageable split of the HostMapped parents
+// Pinned fallback: the pinned / pageable split of the HostMapped parents
 // (artifact/host_residency.h) and the Qwen4Exp layer order (models/qwen3_5/qwen4_layer_profile.h).
 // Pure host code: no CUDA device needed.
 
@@ -175,12 +175,12 @@ void test_order() {
     check(no_mtp.size() == 48 && no_mtp[12] == 0, "without MTP");
 }
 
-// #40: free CMA memory caps the page-locked limit; no CMA or enough RAM outside it = no limit.
+// Free CMA memory caps the page-locked limit; no CMA or enough RAM outside it = no limit.
 void test_cma_limit() {
     const auto mib           = [](std::uint64_t v) { return v << 20; };
     const std::uint64_t host = mib(49'962); // 48.79 GiB: Flash-Next 64 GB edition experts
     check(cma_pinned_limit(mib(64'184), mib(57'000), 0, host, 0, 8 * kGiB) == 0, "no CMA");
-    // The #40 machine: 62.68 GiB, 7.8 GiB CMA free, 47.8 GiB available outside it.
+    // A 62.68 GiB machine with 7.8 GiB CMA free and 47.8 GiB available outside it.
     const std::uint64_t total = mib(64'184), cma = mib(8'000), outside = mib(48'947);
     const std::uint64_t keep = total / 20 + 8 * kGiB;
     check(cma_pinned_limit(total, outside + cma, cma, host, 0, 8 * kGiB) == outside - keep,

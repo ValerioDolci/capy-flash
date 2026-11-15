@@ -131,7 +131,7 @@ void test_prompt_window() {
                                         "prompt window with unsorted ids");
 }
 
-// T211b: decide_prompt with a target cap: only the cap's most routed experts per partition.
+// decide_prompt with a target cap: only the cap's most routed experts per partition.
 void test_prompt_target_cap() {
     ExpertCachePolicy p(base(4, 2)); // 2 slots per partition
     LayerDecision d;
@@ -149,7 +149,7 @@ void test_prompt_target_cap() {
                                         "prompt cap 0");
 }
 
-// T211: a prompt window that keeps the decode's state: classified as decide_prompt, but no
+// A prompt window that keeps the decode's state: classified as decide_prompt, but no
 // insertion, eviction, touch or frequency change.
 void test_count_prompt() {
     PolicyConfig c      = base(3);
@@ -347,7 +347,7 @@ void test_count_routed_and_validation() {
                                         "a partition without slots");
 }
 
-// T61 frequency x recency victim (PolicyConfig::evict_tau_windows). Hand-derived: half-life 4
+// Frequency x recency victim (PolicyConfig::evict_tau_windows). Hand-derived: half-life 4
 // tokens with 4-token windows halves every frequency per window; tau = 1 window halves the score
 // per window of age.
 void test_evict_frequency_recency() {
@@ -426,6 +426,33 @@ void test_evict_frequency_recency() {
         "evict_tau with a non-engine rule");
 }
 
+// Hysteresis of a decode insertion into a full lane: the candidate's decayed frequency must reach
+// hysteresis_ratio x the victim's score + hysteresis_gain.
+void test_hysteresis() {
+    PolicyConfig c       = base(1);
+    c.half_life_tokens   = 4.0; // 4-token windows halve the frequency
+    c.evict_tau_windows  = 1.0;
+    c.hysteresis_ratio   = 1.25;
+    c.hysteresis_gain    = 1.5;
+    PolicyConfig off     = c;
+    off.hysteresis_ratio = 0.0;
+    ExpertCachePolicy p(c), q(off);
+    LayerDecision d, e;
+    p.decide(0, routed({{1, 8}}), 4, d); // window 1: f1 = 8
+    check_eq(experts_of(d.inserts), {1}, "hysteresis: a free slot takes any candidate");
+    // Window 2: f1 = 4 (age 1: score 2), f2 = 1 < 1.25 * 2 + 1.5 = 4.
+    p.decide(0, routed({{2, 1}}), 4, d);
+    check(d.inserts.empty() && d.missing == std::vector<std::int32_t>{2},
+          "hysteresis: a candidate below the bar does not enter a full lane");
+    q.decide(0, routed({{1, 8}}), 4, e);
+    q.decide(0, routed({{2, 1}}), 4, e);
+    check_eq(experts_of(e.inserts), {2}, "without hysteresis the same candidate enters");
+    // Window 3: f1 = 2 (age 2: score 0.5), f2 = 0.5 + 2 = 2.5 >= 1.25 * 0.5 + 1.5 = 2.125.
+    p.decide(0, routed({{2, 2}}), 4, d);
+    check_eq(experts_of(d.inserts), {2}, "hysteresis: a candidate over the bar enters");
+    check_eq(victims_of(d.inserts), {1}, "hysteresis: and replaces the scored victim");
+}
+
 // Randomized invariants for every rule: id <-> slot maps stay a bijection, occupancy never
 // exceeds a partition, insertions respect the cap, reported misses are exactly the routed experts
 // absent at window start, and the engine rule never evicts an expert routed in the same window
@@ -440,7 +467,7 @@ void test_random_invariants() {
                 c.admission        = variant >= 2;
                 c.admit_threshold  = 1.5;
                 c.half_life_tokens = 16.0;
-                // T61: the frequency x recency victim on odd variants (with and without admission).
+                // The frequency x recency victim on odd variants (with and without admission).
                 c.evict_tau_windows = rule == Rule::kEngine && variant % 2 == 1 ? 4.0 : 0.0;
             }
             c.rule = rule;
@@ -496,14 +523,14 @@ void test_random_invariants() {
     }
 }
 
-// T64 elastic columns: the pool-slot numbering (base slots layer-major, then the gap, then the
-// columns column-major), and set_active_columns under random windows: every lane keeps occupying
+// Elastic columns: the pool-slot numbering (base slots layer-major, then the columns
+// column-major), and set_active_columns under random windows: every lane keeps occupying
 // local slots [0, occupied), no expert stays in a released column, a shrink evicts exactly the
 // excess and the coldest (LRU order; ascending decayed frequency with admission, ties by LRU),
 // survivors keep their recency order, and growing makes later insertions use the new slots.
-// T68: the T61 victim over the T64 elastic pool. One base slot + 2 elastic columns, 2 layers; the
-// lane stride is base + elastic columns whatever is active, and a slot moved by a shrink keeps its
-// last use. Hand-derived (half-life 4 tokens = 4-token window, tau 1 window), on both layers:
+// Frequency x recency victim over the elastic pool: one base slot + 2 elastic columns, 2 layers;
+// the lane stride is base + elastic columns whatever is active, and a slot moved by a shrink keeps
+// its last use. Hand-derived (half-life 4 tokens = 4-token window, tau 1 window), on both layers:
 // w1 routes 1, w2 routes 2 (x3), w3 routes 3 (x2): 3 slots full. Shrink to 1 column: 1 (least
 // recently used) goes, 3 moves into its slot. w4 routes 4: f2 = 3/4 at age 2 -> 0.1875,
 // f3 = 2/2 at age 1 -> 0.5 => 2 goes (with 1's stale last use, 3 would score 1/8 and go).
@@ -533,12 +560,11 @@ void test_elastic_columns() {
     {
         PolicyConfig c    = base(4, 2, 3, 32);
         c.elastic_columns = 2;
-        c.elastic_gap     = 5;
         ExpertCachePolicy p(c);
-        // partition 0: base 2, partition 1: base 2; pool slots per partition 3*(2+2)+5 = 17
-        check(ExpertCachePolicy::pool_slot_count(c, 0) == 17, "pool slot count");
-        check(p.pool_slot(0, 1, 1) == 3 && p.pool_slot(0, 2, 2) == 6 + 5 + 2 &&
-                  p.pool_slot(1, 0, 3) == 6 + 5 + 3,
+        // partition 0: base 2, partition 1: base 2; pool slots per partition 3*(2+2) = 12
+        check(ExpertCachePolicy::pool_slot_count(c, 0) == 12, "pool slot count");
+        check(p.pool_slot(0, 1, 1) == 3 && p.pool_slot(0, 2, 2) == 6 + 2 &&
+                  p.pool_slot(1, 0, 3) == 6 + 3,
               "pool slot formula");
         check(p.slots_in_partition(0) == 4 && p.active_columns() == 2, "all columns active");
     }
@@ -546,7 +572,6 @@ void test_elastic_columns() {
     for (int variant = 0; variant < 4; ++variant) {
         PolicyConfig c     = base(3 + variant, 1 + variant % 2, 4, 64);
         c.elastic_columns  = 4;
-        c.elastic_gap      = variant * 3;
         c.insert_cap       = variant % 3;
         c.admission        = variant >= 2;
         c.admit_threshold  = 1.0;
@@ -671,7 +696,7 @@ void test_elastic_columns() {
     }
 }
 
-// T69: lending only the base slots of a layer (block_base): one layer, 2 partitions, base 2 + 2
+// Lending only the base slots of a layer (block_base): one layer, 2 partitions, base 2 + 2
 // elastic columns per partition (pool slots of a partition: base 0..1, elastic columns 2..3).
 // Hand-derived step by step in the comments.
 void test_block_base() {
@@ -810,7 +835,7 @@ void test_layer_slots() {
                                         "odd layers move a slot between the partitions");
 }
 
-// T69: random interleaving of windows, block/unblock + top-up, and elastic resizes (shrinks with
+// Random interleaving of windows, block/unblock + top-up, and elastic resizes (shrinks with
 // free slots and blocked lanes included): every occupant is consistent both ways, occupancy never
 // exceeds the capacity, a blocked lane holds nothing in its base slots, nothing sits in an
 // inactive column, recency lists every occupant, a shrink evicts exactly the excess over the
@@ -826,7 +851,6 @@ void test_block_base_random() {
             if (variant % 4 == 3) { std::swap(c.layer_slots[0], c.layer_slots[2]); }
         }
         c.elastic_columns   = 3;
-        c.elastic_gap       = variant;
         c.admission         = variant >= 3;
         c.admit_threshold   = 1.0;
         c.half_life_tokens  = 16.0;
@@ -889,7 +913,7 @@ void test_block_base_random() {
                         while (p.base_offset(q, layer + 1) <= i.slot) { ++layer; }
                         local = i.slot - p.base_offset(q, layer);
                     } else {
-                        const std::int32_t x = i.slot - p.base_offset(q, c.layers) - c.elastic_gap;
+                        const std::int32_t x = i.slot - p.base_offset(q, c.layers);
                         layer                = x % c.layers;
                         local                = p.base_slots(q, layer) + x / c.layers;
                     }
@@ -952,7 +976,7 @@ void test_block_base_random() {
     }
 }
 
-// T69: recency-weighted prompt counts. half-life 256 tokens: a 16 384-token prompt window adds
+// Recency-weighted prompt counts. half-life 256 tokens: a 16 384-token prompt window adds
 // count * 256 (1 - 2^-64) / (16 384 ln 2) = count * 0.022541; a 4-token window (decide) adds the
 // full count; without the flag the prompt adds the full count (as before).
 void test_recency_weighted_prompts() {
@@ -977,7 +1001,7 @@ void test_recency_weighted_prompts() {
     }
 }
 
-// T69: set_insert_cap changes the cap of the next windows (the post-prompt boost).
+// set_insert_cap changes the cap of the next windows (the post-prompt boost).
 void test_set_insert_cap() {
     PolicyConfig c = base(8, 1, 1, 32);
     c.insert_cap   = 1;
@@ -1008,6 +1032,7 @@ int main() {
     test_prefill();
     test_count_routed_and_validation();
     test_evict_frequency_recency();
+    test_hysteresis();
     test_random_invariants();
     test_elastic_columns();
     test_evict_frequency_recency_elastic();

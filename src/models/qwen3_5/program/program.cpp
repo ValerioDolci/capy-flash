@@ -2,6 +2,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/qwen4_layer_profile.h"
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -578,8 +579,6 @@ std::uint32_t Program::disk_cache_flush_seconds() const noexcept {
     return impl_->disk_kv != nullptr ? impl_->context_cache.disk_flush_seconds : 0U;
 }
 
-bool Program::disk_cache_has_unsaved() const noexcept { return impl_->disk_cache_has_unsaved(); }
-
 DiskCacheSave Program::disk_cache_save_one(const std::function<bool()>& abort) {
     return impl_->disk_cache_save_one(abort);
 }
@@ -660,7 +659,7 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
         constexpr std::int32_t kProbe = 100;
         const auto base               = execution::Qwen4OffloadExperts::layer_slot_profile(
             layers, static_cast<std::int32_t>(parameters.qwen4->layers.size()), kProbe, 0,
-            static_cast<std::int32_t>(options.tp));
+            static_cast<std::int32_t>(options.tp), qwen4_exclusive_layers());
         std::int64_t uniform = 0, weighted = 0;
         for (std::size_t l = 0; l < bytes.size(); ++l) {
             uniform += bytes[l];
@@ -669,13 +668,6 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
         return std::max(uniform, (weighted + kProbe - 1) / kProbe);
     }
     return execution::Qwen4OffloadExperts::slot_bytes(layers);
-}
-
-std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,
-                                            const EngineOptions& options) {
-    if (offloaded_expert_slot_bytes(parameters, options) == 0) { return 0; }
-    return static_cast<std::int64_t>(2U * options.routed_experts.prefetch_slots) *
-           execution::Qwen4OffloadExperts::slot_bytes(1);
 }
 
 std::int64_t offloaded_expert_split_bytes(const execution::Parameters& parameters,

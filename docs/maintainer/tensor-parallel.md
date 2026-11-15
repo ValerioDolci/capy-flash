@@ -1,19 +1,15 @@
 # Two-GPU tensor parallelism
 
-This fork adds a two-device tensor-parallel mode, `--tp 2 --devices A,B`, so that a dense Qwen3.5
-artifact too large for one 16 GB board (Qwen3.8-27B NVFP4, 20.9 GiB of weights) runs split across
-two. This reference records the design of that mode from end to end. Narrower contracts stay with
-their owners: the per-layer mathematics at tp 2 is in
+The two-device tensor-parallel mode, `--tp 2 --devices A,B`, runs a dense Qwen3.5 artifact too large
+for one 16 GB board (Qwen3.8-27B NVFP4, 20.9 GiB of weights) split across two. This reference
+records the design of that mode from end to end. Narrower contracts stay with their owners: the per-layer mathematics at tp 2 is in
 [Qwen3.5 model](qwen3_5-model.md#tensor-parallel-execution), the column- and row-parallel Op forms
 in [Op development](op-development.md#26-tensor-parallel-forms), the KV mirror in
 [Paged KV context store](paged-kv-cache.md#56-tensor-parallel-mirror), parent slicing in
 [Artifact container](artifact-container.md), and DFlash2 at width 2 in
 [DFlash2](dflash.md#tensor-parallel-execution). This document links them and owns the
-contracts that cut across them. It was checked against the tree at `a0369376`; the file layout
-(§12) follows the isolation of `refactor/tp2-isolation`, and [Merging upstream](upstream-merge.md)
-says where the two-GPU code lives relative to upstream's files and how to merge. Points where the
-code, its comments and the development history disagree are collected in
-[Open questions](#open-questions).
+contracts that cut across them; [Two-GPU layer](two-gpu-layer.md) says how the two-GPU code
+attaches to the single-device files.
 
 ## 1. Purpose and constraints
 
@@ -52,7 +48,7 @@ What the mode rejects, and where the first check sits:
 | paired (two-parent) Q4/Q5 input projections | the split routes ([`tp2/attention_split.cpp`](../../src/models/qwen3_5/execution/tp2/attention_split.cpp), [`tp2/gdn_split.cpp`](../../src/models/qwen3_5/execution/tp2/gdn_split.cpp)), first reached by the forward's startup workspace sizing |
 | a shard shape without a registered problem | the Op's shape registry, as for any unregistered shape |
 
-`--tp 1` is meant to be upstream's engine. The mechanism is structural: the width-1 path passes
+`--tp 1` is the single-device engine. The mechanism is structural: the width-1 path passes
 no `ExecutionContext` into loading and Program construction, and every two-device branch keys off
 its presence. §9 describes this path and its gate.
 
@@ -95,8 +91,8 @@ own registered problem. A format has a two-device route only where its shard sha
   `gdn_input_proj` column-parallel), `[5120,3072]` and `[5120,8704]` for `linear_add`,
   `[17408,5120]` for `linear_swiglu`, and the vocabulary half `[124160,5120]`
   ([`linear.h`](../../include/ninfer/ops/linear.h), [`linear_add.h`](../../include/ninfer/ops/linear_add.h)).
-- **NVFP4**: the same projection shards (the attention and GDN input ones since `b14be3d5` and
-  `7a740326`), but no vocabulary half. The MTP layer calls the plain `linear` on its halves, so
+- **NVFP4**: the same projection shards (the attention and GDN input ones included), but no
+  vocabulary half. The MTP layer calls the plain `linear` on its halves, so
   `[17408,5120]`, `[5120,8704]` and `[5120,3072]` also take its MLP and attention output when a
   recipe stores them NVFP4 (`_mtp_nvfp4_layer`, A16); its packed attention input `[7168,5120]` has
   no NVFP4 `linear` half (the target's goes through `attn_input_proj`) and stays Q8.
@@ -125,7 +121,7 @@ in multiples of 64, `RowSplit` columns in multiples of 128, several column range
 ([`materializer.cpp`](../../src/artifact/materializer.cpp)) reads each file chunk once through the
 pinned staging slots and cuts every device's copies from it. A shard-holding arena is created
 zero-filled, since no copy writes the shard's plane-alignment gaps; other arenas, including every
-arena at tp 1, are not zeroed, as upstream. A HostMapped parent (`--embedding-host`) is not in any
+arena at tp 1, are not zeroed. A HostMapped parent (`--embedding-host`) is not in any
 arena: it is read once into one mapped page-locked host allocation, and each rank's parent is that
 rank's address of it. Rank `r` then builds `execution::Parameters(model, r)`, and
 `LoadSummary::devices` reports its sharded, replicated, rank-local and host-mapped bytes.
@@ -164,12 +160,11 @@ rank 1 records `inputs_ready(1)`; rank 0 waits on it, pulls rank 1's contiguous 
 into rank-0 staging with one D2D copy, and `ops::detail::concat_rows_bf16_launch`
 ([`concat_rows.cu`](../../src/ops/launcher/concat_rows.cu)) interleaves both halves column by column
 into the `[V, C]` logits; rank 1's stream waits on `pull_done(0)` before it may overwrite its
-partial. The interleave used to be two `cudaMemcpy2DAsync` copies. `07f76beb` replaced them with the
-kernel because a captured 2D memcpy node cannot be updated in place when its column count or buffers
-change between CUDA Graph profiles of one class (§5). The same gather serves prefill, ordinary
+partial. The interleave is a kernel, not two `cudaMemcpy2DAsync` copies, because a captured 2D
+memcpy node cannot be updated in place when its column count or buffers change between CUDA Graph
+profiles of one class (§5). The same gather serves prefill, ordinary
 decode, verification, the MTP proposals, the zero-suffix head and the score tiles of causal
 scoring (`ProgramImpl::project_score_tile_split`); rank 1 keeps no logits.
-`ops::allgather_rows` ([`allreduce.h`](../../include/ninfer/ops/allreduce.h)) is used only by tests.
 
 **After the gather.** In an ordinary round ([`decode.cpp`](../../src/models/qwen3_5/program/decode.cpp))
 `ops::sample`, the scatter of the final hidden into the continuation store and the egress copy all
@@ -214,18 +209,12 @@ and combines with the staged path's arithmetic, so the two transports are bit-id
 epochs rather than 0/1, so replays need no host reset, and two alternating slots suffice for any
 sequence of captured exchanges (the "slot reuse" argument in the kernel header).
 
-Two kernels implement that protocol. The **pipelined** kernel (the default) makes every warp an
-independent mailbox lane with its own 64-byte release line and epoch per slot: a warp loads all of
-its vectors before storing any, releases once after `__syncwarp`, polls the peer's matching line
-with `ld.acquire.sys` and reads its peer vectors with every load in flight, lane-contiguous (512
-bytes per warp access), then combines from the registers it published. No warp waits on another,
-so the peer starts reading a warp's chunk while later chunks are still being written, and the
-kernel needs no co-residency of its blocks. The **original** kernel publishes the whole payload
-behind one flag per slot after a device-scope arrival count of its blocks, and each thread moves
-its four vectors one dependent round trip at a time (the in-place stores keep the compiler from
-overlapping them). `NINFER_TP_MAILBOX_LEGACY=1` keeps the original kernel for A/B runs on one
-binary; both combine with the same arithmetic, so the choice changes timings only, and the startup
-log names it (`captured all-reduces: mailbox | exchange kernel pipelined`).
+The exchange kernel makes every warp an independent mailbox lane with its own 64-byte release line
+and epoch per slot: a warp loads all of its vectors before storing any, releases once after
+`__syncwarp`, polls the peer's matching line with `ld.acquire.sys` and reads its peer vectors with
+every load in flight, lane-contiguous (512 bytes per warp access), then combines from the registers
+it published. No warp waits on another, so the peer starts reading a warp's chunk while later
+chunks are still being written, and the kernel needs no co-residency of its blocks.
 
 The `ProgramImpl` constructor ([`program_impl.cpp`](../../src/models/qwen3_5/program/program_impl.cpp))
 (`construct_tensor_parallel`, `program/tp2/program_impl_tp2.inc`) sizes the ordinary slot for
@@ -239,12 +228,10 @@ apart because one-request exchanges run slower from a large slab: 80 KiB exchang
 cost ~2 µs more each in the engine (+1.7 % per DFlash2 K=7 round at one request, measured on
 two RTX 5070 Ti; the standalone probe does not show it), and with a slab of their own they run as
 before. The pinned memory is 4 × each slot per set plus one 64-byte flag line per KiB of slot
-(1.25 MiB of wide slots for DFlash2 K=7 at C=4, 640 KiB for MTP3). With the original kernel
-(`NINFER_TP_MAILBOX_LEGACY=1`), which is slower than the copies at those widths (§4.7), or with
-`NINFER_TP_MAILBOX_SLOT=request` (the A/B switch), there are no wide slots and the batched rounds'
-wider payloads take the staged path inside the same graph, as all batched rounds did up to
-v0.4.0. The startup log names the widest slot (`captured all-reduces: mailbox | exchange kernel
-pipelined | slot 320 KiB`).
+(1.25 MiB of wide slots for DFlash2 K=7 at C=4, 640 KiB for MTP3). With
+`NINFER_TP_MAILBOX_SLOT=request` (the A/B switch) there are no wide slots and the batched rounds'
+wider payloads take the staged path inside the same graph. The startup log names the widest slot
+(`captured all-reduces: mailbox | slot 320 KiB`).
 
 A poller gives up after `kPeerSpinLimit` probes, about 0.8 s (the header records 4M probes measured
 at 3.25 s on two RTX 5070 Ti; `run_mailbox_hang_case` in
@@ -266,7 +253,7 @@ nature. With direct P2P the staged path is a direct copy, so the Engine keeps it
 Eager calls (every prefill and warmup) are never captured, so `construct_tensor_parallel` gives
 them their own split transport for the prefill overlap, chosen once from peer access and
 `--elastic` ([`eager_transport.h`](../../src/models/qwen3_5/program/tp2/eager_transport.h)):
-`ops::HostExchange` (pinned-host lanes, T56) without P2P or with `--elastic` (the lent workspace is
+`ops::HostExchange` (pinned-host lanes) without P2P or with `--elastic` (the lent workspace is
 VMM memory a UVA pull cannot read); `ops::PeerLanes` with P2P: at `sum_begin` both ranks record
 their operand complete, a side stream per rank waits on both and pulls the peer's operand
 device-to-device, and `sum_finish` orders the main stream after both pulls and combines with the
@@ -355,12 +342,11 @@ line, and a warning whenever the mailbox was dropped or narrowed
 transport and the probe time. [`tools/tp2/mailbox_probe.cu`](../../tools/tp2/mailbox_probe.cu) runs
 the same check without the engine or a model (nvcc and the CUDA runtime only; it includes the
 production `peer_exchange.cuh`, so it builds from a checkout) and prints driver, devices, P2P, the
-startup exchange, both transports' per-exchange cost (both exchange kernels) and a verdict: exit 0
-mailbox usable, 2 copies, 1 CUDA error or wrong sums, 77 fewer than two devices
+startup exchange, both transports' per-exchange cost and a verdict: exit 0 mailbox usable, 2
+copies, 1 CUDA error or wrong sums, 77 fewer than two devices
 ([Tools](../../tools/README.md#standalone-tp2-mailbox-probe)). `--sweep` times every pipelined
 variant (vectors per lane, block size, poll flavour, sleep) at 4, 10 and 40 KiB, `--timed` stamps the
-phases of one exchange of each kernel with `clock64`, `--work US` puts a spin kernel between
-exchanges.
+phases of one exchange with `clock64`, `--work US` puts a spin kernel between exchanges.
 
 ### 4.7 Measured costs
 
@@ -371,16 +357,13 @@ Only figures already recorded, with their scope:
 | mailbox 8.7 µs vs copies 17.2 µs per 10 KiB exchange in a graph; startup exchange 0.03 ms; missing peer reported after ~0.8 s | 2× RTX 5070 Ti, no P2P, driver 595.91, CUDA 13.1, standalone probe, original kernel | [Tools](../../tools/README.md#standalone-tp2-mailbox-probe) |
 | per exchange in a graph, pipelined vs original kernel vs copies: 3.7 / 8.8 / 17.2 µs at 10 KiB, 6.2 / 19.6 / 20.0 µs at 40 KiB (MTP-3 verify); every variant bit-exact | same pair, PCIe 5.0 x8 each, standalone probe (`--sweep`, `--timed`), 2026-09-27 | [Tools](../../tools/README.md#standalone-tp2-mailbox-probe) |
 | original kernel at 40 KiB, one thread's phases: 1.6 µs publish (four dependent load/store pairs), 7.0-7.4 µs `__threadfence_system` draining 16-byte stores at a 64-byte stride, 5.4-5.5 µs reading (four dependent PCIe round trips); pipelined kernel: 0.5 µs publish, 2.3 µs release fence, 1.1 µs read | same, `mailbox_probe --timed --payload 40960` (pipelined at 256 threads per block) | development measurements |
-| MTP3 decode, pipelined vs original kernel on one binary (`NINFER_TP_MAILBOX_LEGACY=1`): 19.96 vs 21.71 ms/round at 0k (−8.1 %), 20.66 vs 22.46 at 16k (−8.0 %), 22.36 vs 24.07 at 64k (−7.1 %), 108.3 vs 99.6 tok/s at 0k; with `--lm-head-draft` −8.8 / −8.7 / −7.6 %; `--no-tp-mailbox` 23.00 / 23.77 / 25.39 ms/round; identical output text on all three | same pair, QUASAR-QAT artifact, production flags at C=1, 400-token greedy generations, two ABBA rounds, 2026-09-27 | development measurements, not otherwise published |
+| MTP3 decode, pipelined vs original kernel on one binary: 19.96 vs 21.71 ms/round at 0k (−8.1 %), 20.66 vs 22.46 at 16k (−8.0 %), 22.36 vs 24.07 at 64k (−7.1 %), 108.3 vs 99.6 tok/s at 0k; with `--lm-head-draft` −8.8 / −8.7 / −7.6 %; `--no-tp-mailbox` 23.00 / 23.77 / 25.39 ms/round; identical output text on all three | same pair, QUASAR-QAT artifact, production flags at C=1, 400-token greedy generations, two ABBA rounds, 2026-09-27 | development measurements, not otherwise published |
 | MTP3 decode with `--lm-head-draft`, proposal head split vs whole on rank 0 on one binary (`NINFER_TP_DRAFT_HEAD=primary`): 17.93 vs 18.68 ms/round at 0k (−4.0 %), 18.61 vs 19.35 at 16k (−3.8 %), 20.32 vs 21.06 at 64k (−3.5 %), 123.2 vs 118.3 tok/s at 0k; identical output text and acceptance, also against main; weights on rank 0 −170 MiB, on rank 1 +170 MiB; DFlash2 K=4 unchanged | same pair, QUASAR-QAT artifact (DFlash2: `_df2`), production flags at C=1, 400-token greedy generations, two ABBA rounds, 2026-09-28 | development measurements, not otherwise published |
 | per exchange in a graph of 128, pipelined vs original kernel vs copies: 9.5 / 40.9 / 24.6 µs at 80 KiB (DFlash2 K=7, one request), 17.2 / 84.4 / 31.4 µs at 160 KiB, 23.7 / 130.5 / 40.2 µs at 240 KiB, 31.5 / 196.1 / 45.4 µs at 320 KiB (DFlash2 K=7 at C=4), 63.2 / 373.7 / 71.6 µs at 640 KiB | same pair, driver 595.91, CUDA 13.2, standalone probe (`--payload`), 2026-10-01 | development measurements |
 | wide slots vs one-request slot (v0.4.0), production flags at `--max-concurrency 4`, waves of 2 and 4 requests × 512 tokens: MTP3 20.78 → 18.20 ms/round at C=2 (−12.4 %), 23.50 → 21.06 at C=4 (−10.4 %), aggregate 260 → 293 and 439 → 481 tok/s; DFlash2 K=7 23.79 → 21.18 (−11.0 %) and 27.65 → 24.76 (−10.5 %), 296 → 330 and 483 → 543 tok/s; C=1 unchanged (17.15 and 18.45 ms/round) with identical texts; staged exchanges per batched round 131-138 → 0 | 2× RTX 5070 Ti, eco clocks 2085 MHz, QUASAR-QAT artifacts, base/new/new/base, 2026-10-01 | development measurements, not otherwise published |
-| mailbox ~41 µs vs staged ~277 µs per 10 KiB reduction, graph replay | 2× RTX 5060 Ti, Windows 11 WDDM, no P2P | `peer_mailbox.h` header |
+| mailbox ~41 µs vs staged ~277 µs per 10 KiB reduction, graph replay | 2× RTX 5060 Ti, Windows 11 WDDM, no P2P, original kernel | development measurements |
 | copies cost ~220 µs per hop instead of ~17; decode without `--spec` 60 tok/s on the mailbox vs 22.5 on copies; MTP3 49 tok/s on copies everywhere | WSL2, 2× RTX 5070 Ti, reported in issue #1 | [README](../../README.md) |
 | MTP3 decode 102.3 tok/s at step 1, 101.1 at step 2, 97.1 with `--no-tp-mailbox`; plain decode 69.1 vs 59.8 on copies; identical output text on every transport | 2× RTX 5070 Ti, native Linux, QUASAR-QAT artifact, 400-token greedy generation, 3 runs, 2026-09-26 | development measurements, not otherwise published |
-
-Whole-model throughput at tp 2, with its own scope (clocks, weights, benchmark suite), is in
-[Two-GPU performance](../performance/two-gpu.md).
 
 ## 5. CUDA Graphs across two devices
 
@@ -396,7 +379,7 @@ records and waits become edges, not nodes.
 
 Before any capture at tp 2 every batch size is warmed eagerly on both devices, since a module first
 touched inside a capture cannot be loaded there and batch shape selects kernels; tp 1 warms batch 1
-only, as upstream. `run_prepared` launches on rank 0's stream after
+only. `run_prepared` launches on rank 0's stream after
 `DecodeGraphPeerBridge::gate_launch`, which orders the launch after work already issued on rank 1's
 own stream (the round's mirrored page and table updates); the graph's own edges order rank 1's nodes
 only after the graph root. Right after the launch, `gate_peer_after_launch` orders rank 1's stream
@@ -406,16 +389,14 @@ could not overtake the graph's rank 1 nodes either.
 **Topology classes and profile swaps.** As on one device, a graph family keeps one executable per
 topology class and installs a class's other profiles with `DecodeGraphExecutable::update`
 (`cudaGraphExecUpdate`). At tp 2 the captured cross-device nodes are the 1D memcpy nodes of the
-staged pulls, whose parameters update freely, and the mailbox kernel nodes. The one node that could
-not be updated was the 2D memcpy of the old logits interleave. Its column count and buffers differ
-between profiles of one class, and the update failed with `ParametersChanged` only when a swap
-crossed such profiles, hence late and intermittently. The fork first absorbed the rejection with a
-re-instantiate fallback (`440481b2`, `f3846fcb`, narrowed to tp 2 in `f695d347`). Once
-`concat_rows` removed the cause, `fa8c9e39` dropped the fallback again. A rejected update now throws
-at both widths, as upstream, and `update()` keeps a diagnostic that names the update result and the
-rejected node.
+staged pulls, whose parameters update freely, and the mailbox kernel nodes. The logits interleave
+is the `concat_rows` kernel: a 2D memcpy node, whose column count and buffers differ between
+profiles of one class, would fail the update with `ParametersChanged` only when a swap crossed such
+profiles, hence late and intermittently. Graph updates are never retried: a rejected update throws
+at both widths, and `update()` keeps a diagnostic that names the update result and the rejected
+node.
 
-**Graph allowance.** At tp 1 the planner budgets graph classes from upstream constants. At tp 2 it
+**Graph allowance.** At tp 1 the planner budgets graph classes from fixed constants. At tp 2 it
 uses the measured per-GPU values of [`core/tp2/device_tuning.h`](../../src/core/tp2/device_tuning.h):
 `tp2_ordinary_graph_allowance_bytes` (8 MiB per batch size), `tp2_mtp_graph_class_allowance_bytes`
 (8 MiB per topology class and batch size) and `tp2_dflash2_graph_class_allowance_bytes` (11 MiB per
@@ -459,9 +440,9 @@ Program-wide scalars (`io.text_kv_table_row`, `io.backend_kv_table_row`, and ran
 `TpExecution::text_kv_table_row`). `ProgramImpl::publish_kv_rows`
 ([`context.cpp`](../../src/models/qwen3_5/program/storage/context.cpp)) writes both ranks'
 scalars, checking that rank 1's mirrored row index equals rank 0's, at every `bind_sequence_kv`,
-every staged prefill step and every forced-token prefill. Writing only at bind let another lane's
-bind repoint the scalar, so forced tokens prefilled into the wrong lane's pages; the republication
-(`c0f88d56`) also applies at tp 1 (§9). Decode rounds read their rows from the uploaded ingress.
+every staged prefill step and every forced-token prefill. Writing only at bind would let another
+lane's bind repoint the scalar, and forced tokens would prefill into the wrong lane's pages; the
+republication also applies at tp 1 (§9). Decode rounds read their rows from the uploaded ingress.
 
 **Rank 1's execution-row leases.** Rank 1 never calls `acquire`. `KVExecutionTablePool::acquire`
 takes the mirror's lease on the same row first (so a failure changes neither pool) and keeps it in
@@ -496,12 +477,10 @@ prefix at tp 2 carries:
 - under DFlash2, the drafter's rings of each rank's KV heads in that rank's StateImages (rank 0's
   alone with `NINFER_TP_DRAFTER=primary`).
 
-The current code declines no reuse plan at tp 2. `815615e6` briefly made admission decline
-zero-suffix and speculative reuse at tp 2 and turned unmaterializable checkpoints into misses; once
-MTP and DFlash2 resume existed (`c29ccc46` and following), `4534b7bf` restored the upstream
-`logic_error` in `ProgramImpl::inspect_lane`
-([`request_plan.cpp`](../../src/models/qwen3_5/program/planning/request_plan.cpp)). Only reuse that
-needs a Host replica is unavailable.
+No reuse plan is declined at tp 2, zero-suffix and speculative reuse included: a speculative
+checkpoint that cannot be materialized is a fault (a `logic_error` in `ProgramImpl::inspect_lane`,
+[`request_plan.cpp`](../../src/models/qwen3_5/program/planning/request_plan.cpp)), not a miss. Only
+reuse that needs a Host replica is unavailable.
 
 **`--kv-capacity auto`.** Both ranks address the same pages, so they must agree on one page count.
 `construct_model_on` takes each rank's free memory (`rank_free_bytes`), credits a rank with the
@@ -608,35 +587,26 @@ docs recommend the GPU with more free memory as `--vision-device`.
 
 ## 9. tp 1 identity
 
-`--tp 1` keeps upstream's single-device path because nothing two-device is constructed there.
+Nothing two-device is constructed at `--tp 1`.
 `construct_model_on` passes a null `ExecutionContext`, so loading, `materialize`, the sequence planner
 and `create_program` take their single-device overloads; the Binder has no shard resolver, so every
-parent is Replicated and the layout is byte-identical to upstream's. `TextContext` without a
+parent is Replicated. `TextContext` without a
 `TpExecution` runs the single-device forward, and no `PeerEvents`, `PeerMailbox` or
-`DecodeGraphPeerBridge` exists. Arenas are not zero-filled, graph allowances are upstream's
-constants, the private-capture reclaim is off, only batch 1 is warmed before capture, and a
-rejected `cudaGraphExecUpdate` throws (§5).
+`DecodeGraphPeerBridge` exists. Arenas are not zero-filled, graph allowances are the
+single-device constants, the private-capture reclaim is off, only batch 1 is warmed before capture,
+and a rejected `cudaGraphExecUpdate` throws (§5).
 
-Some deliberate differences remain at tp 1: the per-prefill-step KV row publication (`c0f88d56`, a
-fix for a multi-lane forced-token bug that upstream `bace20dc` also has); `FuncAttrPerDevice`
-([`kernel_attr_once.h`](../../src/ops/launcher/kernel_attr_once.h)), which costs one `cudaGetDevice`
-per eager launch of an attribute-carrying kernel; a device synchronization and free-memory queries
-around `prepare_graphs` for the graph observation; and new fields in the public `EngineOptions`,
-`MemorySummary` and `LoadSummary`.
-
-**Golden gate.** [`tools/golden/`](../../tools/golden/README.md) turns the intention into a
-token-identity check. `tp1_golden.cpp` (target `ninfer-tp1-golden` in `apps/CMakeLists.txt`, public
-Engine API only) builds unchanged against this fork and against upstream at the fork's base, and
-decodes a deterministic byte-id prompt greedily, without chat template or prefix reuse. `record.sh`
-runs three cases chosen for their prefill regimes (32, 2,048 and 6,144 prompt tokens over 1, 2 and 6
-chunks, the last with INT8 KV); `diff -r` of the two output directories is the gate. No 27B artifact
+**Golden gate.** [`tools/golden/`](../../tools/golden/README.md) checks tp 1 token for token against a
+recorded reference. `tp1_golden.cpp` (target `ninfer-tp1-golden` in `apps/CMakeLists.txt`, public
+Engine API only) decodes a deterministic byte-id prompt greedily, without chat template or prefix
+reuse. `record.sh` runs three cases chosen for their prefill regimes (32, 2,048 and 6,144 prompt
+tokens over 1, 2 and 6 chunks, the last with INT8 KV); `diff -r` against the reference's output
+directory is the gate. No 27B artifact
 fits one 16 GB board, so the model is the synthetic two-layer Qwen3.5 of
 [`test_text_context_tp2.cpp`](../../tests/models/qwen3_5/test_text_context_tp2.cpp) (one GDN and one
 full-attention block, FP8 projections, BF16 norms, a byte-level tokenizer), written by the `write`
 mode of the `ninfer_qwen3_5_text_context_tp2_test` executable that
-[`tests.cmake`](../../tests/models/qwen3_5/tests.cmake) registers. The recorded runs found fork
-`2e7f7d3a` and upstream `bace20dc` (`recorded/2026-09-25`), and fork `b3f93dd6`, the merge of
-upstream `e31bc99b`, and upstream `e31bc99b` (`recorded/2026-09-27`), identical on all three cases.
+[`tests.cmake`](../../tests/models/qwen3_5/tests.cmake) registers.
 
 The gate covers the Engine, scheduler, prefill and decode programs, attention, GDN, and the FP8 and
 BF16 Ops on one device. It does not cover the NVFP4 and INT-quantized GEMMs, MTP, DFlash2,
@@ -659,7 +629,7 @@ in [`tests/ops/tests.cmake`](../../tests/ops/tests.cmake), `tests/artifact/tests
 
 | Test | Checks |
 |---|---|
-| `ninfer_{allreduce,linear_split,output_head_split,proposal_head_split,attention_headlocal,attn_input_proj_split,gdn_projections_split,gdn_headsplit,linear_swiglu_split,linear_add_split}_test` | each split form at its shard shapes against the single-device Op; the all-reduce and row gather against FP64 and exact oracles; the mailbox (both exchange kernels) inside a replayed graph, its selection by node count, staged, original and pipelined transports bit for bit, and the hang report within the watchdog bound |
+| `ninfer_{allreduce,linear_split,output_head_split,proposal_head_split,attention_headlocal,attn_input_proj_split,gdn_projections_split,gdn_headsplit,linear_swiglu_split,linear_add_split}_test` | each split form at its shard shapes against the single-device Op; the all-reduce against FP64 and exact oracles; the mailbox inside a replayed graph, its selection by node count, staged and mailbox transports bit for bit, and the hang report within the watchdog bound |
 | `ninfer_artifact_sharded_materialization_tp2_test` (+ one-device plan tests, `ninfer_qwen3_5_shard_map_test`) | Replicated, Rows, Columns, PrimaryOnly and SingleDevice parents on both devices, byte-compared with host-applied slices |
 | `ninfer_decode_graph_test`, `ninfer_kv_cache_test` | two-device capture and the update diagnostic; mirror replay of page and row mutations (on one device) |
 | `ninfer_qwen3_5_sharded_load_real_test` (+ `_mtp_real`) | per-device placement and bytes of the loaded artifact |
@@ -682,8 +652,8 @@ run by hand, not a CTest.
 [`tools/tp2/gate.sh`](../../tools/tp2/README.md) runs all of it against a recorded reference in about
 13 minutes: this CTest set with the real tests, the golden, `ninfer-perplexity --tp 2` at two
 windows, 60 greedy prompts through `ninfer-serve` with the production flags (texts and ms/round) and a
-short DFlash2 run. It is the gate of every upstream merge and every change to the tp2 layer
-([Merging upstream](upstream-merge.md#4-the-gate-mandatory-for-every-merge-and-every-tp2-change)).
+short DFlash2 run. It is the gate of every change to the tp2 layer
+([Two-GPU layer](two-gpu-layer.md#4-the-gate-mandatory-for-every-tp2-change)).
 
 ## 11. Known limits and not-done items
 
@@ -712,25 +682,23 @@ short DFlash2 run. It is the gate of every upstream merge and every change to th
 - **Host-less reuse.** Many parallel conversations evict the oldest idle ones. The reclaim does not
   check beforehand whether its releases can make the capture fit, so it can release continuations
   for a capture that is still skipped.
-- **Not ported.** YaRN long-context RoPE from the pre-v3 fork line is not in this tree; RoPE has no
-  per-rank override.
 
 - **Schedules and thresholds are per GPU.** The linear-op selectors (A16→A4 crossovers, MMA bands, TMA tiles
-  and thresholds) are upstream's RTX 5090 measurements, and every half shape inherits its parent's. Measured on
+  and thresholds) were measured on an RTX 5090, and every half shape inherits its parent's. Measured on
   two RTX 5070 Ti (2026-09-27, 2.08 GHz, 707 GB/s pure read): the halves take 0.96-1.10× of parent/2 at
   T=1..8 and the FP8 vocabulary half runs at 99 % of the measured bandwidth, so the shard kernels themselves
   are not the gap; the crossovers are. A4 from T=3 on `linear_swiglu`, the down pair and the output pair
   cut 5.0 % / 4.7 % of the MTP3 round at 0 / 16K, but change the numerics (4-bit activations in the T=4
   verify step): GSM8K on 500 questions fell from 0.974 to 0.962 (7 lost, 1 gained, McNemar p = 0.07), while
   perplexity at 1024-token chunks was bit-identical and could not see it. Only the neutral change is in the
-  tree (`2a596191`: the `[7168,5120]` attention shard keeps the 128-token TMA tile up to T=1024, −6.4 %).
+  tree (the `[7168,5120]` attention shard keeps the 128-token TMA tile up to T=1024, −6.4 %).
   Procedure for another board: `bench/ops` sweeps on each half and its parent at T=1,4,8,16,32,512,1024
   ([Linear tuning](linear-tuning.md) §2-3), then GSM8K on the candidate, not perplexity alone.
 
 ## 12. File map
 
-Our files hold the two-device code; upstream's files keep only the hooks [Merging upstream](upstream-merge.md)
-lists. The `tp2/` directories below are ours throughout.
+The `tp2/` directories below hold only two-device code; the other files keep the hooks
+[Two-GPU layer](two-gpu-layer.md) lists.
 
 | Path | Role in the two-GPU mode |
 |---|---|
@@ -748,13 +716,11 @@ lists. The `tp2/` directories below are ours throughout.
 | `src/models/qwen3_5/state/state_image.h` | StateImage mirror |
 | `src/models/qwen3_5/program/tp2/` | `PeerRuntime`, mirrors, mailbox, probe, step-down (`program_impl_tp2.inc`, `program_impl_{public,private}.inc`); tp2 workspace plan and rejections (`startup_tp2.inc`); MTP bridge, split verification, split prefill head |
 | `src/models/qwen3_5/program/{graphs,prefill,decode,storage/context,transactions/commit}.cpp`, `graph_execution.h`, `planning/startup.*`, `speculative/mtp.cpp` | two-device branches: capture and launch, row publication, rank 1 retained hidden, ingress upload, forced tokens, per-rank layouts, the MTP round |
-| `include/ninfer/ops/tp2/`, `src/ops/wrapper/tp2/`, `src/ops/linear/tp2/` | column/row-parallel Op forms (`linear`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `gdn_gating_proj`) and the split argmax |
-| `src/ops/{attn_input_proj,gdn_input_proj,linear_swiglu}/tp2/` | shard and half problems compiled from upstream's launcher sources ([Merging upstream §2.4](upstream-merge.md#24-shards-compiled-from-upstreams-own-sources-srcopstp2_shard_cu)) |
+| `include/ninfer/ops/tp2/`, the tp2 sections of `src/ops/wrapper/*.cpp` and `src/ops/linear/linear.cpp` | column/row-parallel Op forms (`linear`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `gdn_gating_proj`) and the split argmax |
+| `src/ops/{attn_input_proj,gdn_input_proj,linear_swiglu}/tp2/` | shard and half problems compiled from the parent Ops' launcher sources ([Two-GPU layer §2.4](two-gpu-layer.md#24-shards-compiled-from-the-parent-ops-own-sources-srcopstp2_shard_cu)) |
 | `include/ninfer/ops/allreduce.h`, `peer_mailbox.h`, `src/ops/common/{allreduce,peer_mailbox}.cu`, `src/ops/kernel/peer_exchange.cuh` | staged collectives, `PeerEvents`, mailbox and its exchange kernels (BF16 sum, FP32 partial sum) |
-| `include/ninfer/ops/tp2/hyper_connection.h`, `src/ops/hyper_connection/split.cu` | Qwen4Exp hyper-connection mix split by residual streams (§13) |
 | `src/ops/common/split_launch.h`, `src/ops/launcher/{concat_rows,argmax_split}.*` | pair validation, logits interleave, split argmax launches |
-| `src/ops/tp2/sources.cmake` | registration of every tp2 Op source |
-| `src/serve/tp2/operational_log_tp2.inc` | tensor-parallel startup lines and warnings |
+| `src/serve/operational_log.cpp` (`log_tensor_parallel`) | tensor-parallel startup lines and warnings |
 | `tools/tp2/{gate.sh,gate_client.py,mailbox_probe.cu}`, `tools/golden/` | behavior-preservation gate; standalone mailbox check; tp 1 token-identity gate |
 
 ## 13. Qwen4Exp (Qwen3.8-Flash-Next) at tp 2
@@ -762,13 +728,10 @@ lists. The `tp2/` directories below are ours throughout.
 Status: placement, per-rank slicing at load, the per-rank Op shapes, the FP32 partial all-reduce
 and the execution with the replicated hyper-connection mixers: Prefill, CausalScoring and ordinary
 decode (CUDA Graphs, mailbox) run at `--tp 2` through `execution/qwen4_forward.h` over both ranks
-([Qwen4Exp reference, Execution](qwen4-exp-model.md#execution)). The stream-split
-hyper-connection mix exists as Ops with parity tests but has no execution route: the Program
-refuses `tp_hc_split_streams`, so at tp 2 the mixers always run replicated. It is kept on purpose
-(T36 finding M4, decision of 07/10): T30 measured it slower than the replicated mixers, but it
-halves the mixer bytes per rank and may be revived to free VRAM. Until it has an execution route
-and a gate test it is off; a mailbox change must keep its Ops' tests
-(`ninfer_hyper_connection_split_test`) passing.
+([Qwen4Exp reference, Execution](qwen4-exp-model.md#execution)). The hyper-connection mixers
+run replicated on both ranks: a mix split by residual streams needs two latency-bound exchanges
+per mixer, which cost more than the halved weight stream saves (measured on two RTX 5070 Ti,
+17.1 / 23.1 / 29.2 µs per mixer at T = 1 / 4 / 8 against 7.2 / 7.8 / 8.9 µs replicated).
 
 **Placement** (`qwen4_shard` in [`sharding.cpp`](../../src/models/qwen3_5/load/sharding.cpp),
 documented in [`sharding.h`](../../src/models/qwen3_5/load/sharding.h)). Slicing happens at load,
@@ -783,25 +746,21 @@ from the one artifact, as for the 27B: no per-rank artifact.
 | `moe/router`, `moe/shared_score` | Replicated | `[513,2560]` BF16 |
 | `moe/shared/{gate,up,down}` | SingleDevice(block % 2); MTP block = block 48 → rank 0 | whole: the 640-wide intermediate has no tile-aligned half (NVFP4 rows in 128s, Q8 columns in 128s) |
 | `moe/experts/*` | HostMapped (also at tp 1) | one page-locked copy; rank r computes the experts with `id % 2 == r` |
-| `{attn_hc,ffn_hc}/*`, `{text,mtp}/hc_head/*`, `mtp/hidden_norm` | Replicated; with `hc_split_streams`: Rows (norm, Up) / Columns (Down\|inject) by residual streams | `[324,10240]` → `[324,5120]`, `[10240,320]` → `[5120,320]`, `[10240]` → `[5120]` |
+| `{attn_hc,ffn_hc}/*`, `{text,mtp}/hc_head/*`, `mtp/hidden_norm` | Replicated | `[324,10240]`, `[10240,320]`, `[10240]` |
 | `ple/{key,value}`, `ple/table` | Replicated (one parent; every rank needs all value rows); the table is file-mapped host data | `[12800,2560]` |
-| `ple/{key,query,conv}_norm`, `ple/convolution` | Replicated; split by streams with `hc_split_streams` | `[10240]` → `[5120]`, `[4,10240]` → `[4,5120]` |
+| `ple/{key,query,conv}_norm`, `ple/convolution` | Replicated | `[10240]`, `[4,10240]` |
 | `mtp/{embedding_norm,embedding_projection,hidden_projection}` | Replicated | `[2560,2560]` |
 | `text/token_embedding` | Replicated, or HostMapped with `--embedding-host` | `[248320,2560]` |
 | `text/output_head` | Rows by vocabulary | `[248320,2560]` → `[124160,2560]` |
 
-`execution::shard_text_config(config, 2, hc_split_streams)` gives the per-rank geometry: 12/1
-attention heads, 8/24 GDN heads, half the vocabulary, the MoE geometry unchanged, and with the
-split two hyper-connection streams. `LoadOptions::hc_split_streams` (`EngineOptions::
-tp_hc_split_streams`) selects the stream split; it is ignored at tp 1 and by Qwen3.5.
+`execution::shard_text_config(config, 2)` gives the per-rank geometry: 12/1 attention heads, 8/24
+GDN heads, half the vocabulary, the MoE and hyper-connection geometry unchanged.
 
 **Per-rank Op problems.** NVFP4 (`_nvfp4_dense` recipe): `[6656,2560]`, `[8192,2560]`,
 `[2560,3072]`, `[124160,2560]` (registered on the branch since F0-B). Q8 (`qwen3_8_flash_next_nvfp4`
 recipe and the hyper-connection/a|b parents of both): `[6656,2560]`, `[8192,2560]`, `[48,2560]`,
-`[2560,3072]`, and for the stream split `[324,5120]`, `[320,5120]`, `[5120,320]`
-(`q8_dispatch.cpp`, generic hidden-2560 routes, untuned); Q6 `[124160,2560]`. QSA 12/1 and GDN 8/24
-were registered by their Op suites (`qsa_attention`, `gdn_projected_conv_*` C=5120, `gdn_gating`
-H=24, `gdn_replay_fold` 36 x 8/24).
+`[2560,3072]`; Q6 `[124160,2560]`. QSA 12/1 and GDN 8/24 were registered by their Op suites
+(`qsa_attention`, `gdn_projected_conv_*` C=5120, `gdn_gating` H=24, `gdn_replay_fold` 36 x 8/24).
 
 **One block at tp 2** (HC replicated):
 
@@ -829,75 +788,17 @@ relies on both ranks routing identically: the router input is the same BF16 `x` 
 `allreduce_sum_f32` uses the same mailbox slots, flags and per-lane epochs as the BF16 exchange
 (a pipelined FP32 kernel, `peer_exchange_pipelined_f32_kernel`), so BF16 and FP32 exchanges
 interleave in one round; the Program must size the ordinary slot for the FP32 payload,
-`2560 x (K+1) x 4` bytes (40 KiB at MTP-3, the 27B's MTP-3 BF16 slot). A Legacy-kernel mailbox
-has no FP32 form and keeps those exchanges staged.
-
-**Hyper-connections split by streams** (`ops::hyper_connection_mix_split`,
-[`tp2/hyper_connection.h`](../../include/ninfer/ops/tp2/hyper_connection.h)): rank r holds streams
-`[2r, 2r+2)`; per mixer two FP32 all-reduces, the low-rank projection (`(320+4) x T`) and the
-collapsed block input (`2560 x T`, rounded once). The combine stays local
-(`hyper_connection_combine` over the rank's streams and gates). The PLE projection stays
-replicated (every rank needs all value rows), the PLE per-lane ops follow the rank's streams, and
-the MTP stem's one RMS over all four streams needs a cross-rank sum of squares (one more small
-exchange per MTP forward). Two routes: for T <= 8 inside a captured round, one cooperative kernel
-per rank that exchanges both sums mid-kernel through the mailbox slots
-(`PeerMailbox::exchange_slot`, the pipelined protocol's `peer_exchange_lane`); otherwise a
-composition of the general route (norm, Q8 Linear, element kernels) around two
-`allreduce_sum_f32`. Measured on two RTX 5070 Ti (graph of 24 mixers, both GPUs): the fused split
-costs 21.3 / 26.7 / 33.8 µs per mixer at T = 1 / 4 / 8 against 15.7 / 18.3 / 22.4 µs for the
-replicated fused mix: the two latency-bound exchanges (and three grid barriers) cost more than
-half the mixer's weight stream saves. The split therefore trades about 0.5-0.8 ms per target
-forward for 386 MB per rank and stays off by default.
+`2560 x (K+1) x 4` bytes (40 KiB at MTP-3, the 27B's MTP-3 BF16 slot).
 
 **Exchanges.** HC replicated: two per block (96 per target forward at hidden 2560: 48 BF16 of
 `[2560,T]` and 48 FP32 of `[2560,T]`), two per MTP forward, plus the vocabulary-split head's
-gather or argmax exchange. HC split adds two per mixer: 97 mixers per target forward (2 per block
-and the output mixer), 3 per MTP forward.
+gather or argmax exchange.
 
 **Tests** (two devices; 77 with fewer): `ninfer_allreduce_f32_test` (exact oracle, both
 transports, interleaved with BF16, node counts; `--bench` FP32 vs BF16 payload cost),
 `ninfer_flash_next_tp2_moe_test` (expert-parity partition with CPU-path stand-in vs the
 single-device Op), `ninfer_flash_next_tp2_mixers_test` (QSA 12/1 + replicated indexer vs 24/2, GDN
-8/24 vs 16/48 bit for bit), `ninfer_hyper_connection_split_test` (split mix vs FP64 and vs the
-single-device mix, combine, graph), `ninfer_qwen4_tp2_loading_test --artifact A [--hc-split]`
+8/24 vs 16/48 bit for bit), `ninfer_qwen4_tp2_loading_test --artifact A`
 (placement of every parameter, per-rank bytes, every device parent byte-compared with the
 host-applied slice), and host-only `ninfer_qwen4_shard_map_test` (rules, slicer acceptance of the
 real parents of both recipes, per-rank bytes of the 48-block model).
-
-## Open questions
-
-1. ~~Stale descriptions of changed code.~~ Aligned on 2026-09-27: the comment on
-   `output_logits_split_rank0` in `execution/tp.h` and the [Qwen3.5 model](qwen3_5-model.md#tensor-parallel-execution)
-   note describe the `concat_rows` kernel, the `TpTransportStatus` comment in `program/program.h` lists the
-   intermediate transport, and the serve `tensor parallel` line describes the reclaim before a skip.
-2. **The WSL2 mechanism is a hypothesis.** The comments on `PeerEvents::StagedScope` and in
-   `graphs.cpp` state that a staged copy stalls behind a spinning exchange kernel; the development
-   notes call this a hypothesis not reproducible on native Linux. When they were written it was
-   also unconfirmed whether step 2 fixes the reported hang or the engine ends on step 3.
-3. **DFlash2 under that hypothesis.** The notes say the DFlash2 round has no exchange after a
-   cross-device copy. The code (`dflash_decode_batch_body`) pulls the draft tokens to rank 1 before
-   verification's exchanges, the pattern the hypothesis blames. Step 2 of §4.5 moves its draft phase
-   to the copies as it does MTP's; DFlash2 has not been run under WSL2.
-4. **Placement and test lists in the porting notes.** A porting note counts the GDN convolution
-   among the replicated weights; the current rules split it by Q/K/V channel sections and split
-   `gdn/{a_projection,b_projection,a_log,dt_bias}` by value heads, and only norms and
-   `text/token_embedding` are replicated. The same notes list a `test_engine_yarn_real`: no YaRN code
-   or test exists in this tree (both belong to the pre-v3 line, `cfc8f749` and `b40d17ac`, which are
-   not ancestors of `main`). This document follows the code.
-5. **Notes that describe earlier code.** Declined reuse plans at tp 2, the `cudaGraphExecUpdate`
-   re-instantiate fallback and explicit peer-lease releases in `release_*_strict` appear in the
-   development notes. The first two were removed (`4534b7bf`, `fa8c9e39`); the last describes the pre-v3
-   fork, and the current lease rides inside `KVExecutionTablePool::mirror_rows_`.
-6. **Golden gate re-recorded after the upstream merge.** `839fdea0` and `a0369376` changed
-   `ProgramImpl` construction and turned `prepare_graphs`, which tp 1 also runs, into the retry
-   loop after the first record (`2e7f7d3a`); the second record (`b3f93dd6`, after merging upstream
-   `e31bc99b`) covers them. The gate still does not cover NVFP4, the format upstream rewrote most.
-7. ~~One-way launch gate.~~ Audited on 2026-09-27: at each of the three gated launch sites
-   (ordinary, MTP, DFlash2 rounds in `decode.cpp`) the host issues nothing on rank 1's stream
-   between the launch and the round's `synchronize_devices()`, on the success and the failure path;
-   the startup launches (`probe_peer_mailbox`, `instantiate_graph_family`) are bracketed by
-   synchronizations. `gate_peer_after_launch` now also orders rank 1's stream after each launch,
-   so the property no longer rests on that call-site discipline.
-8. **Unpublished figures.** The step-by-step MTP3 and plain-decode figures in §4.7 come from
-   development measurements published nowhere else in the repository; they are quoted with their
-   scope but cannot be re-derived from repository files.

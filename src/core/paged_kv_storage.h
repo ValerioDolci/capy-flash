@@ -48,10 +48,6 @@ struct PagedKVStorageLayout {
         return 2ULL * logical_vector_bytes();
     }
 
-    [[nodiscard]] std::size_t physical_bytes_per_token_head() const {
-        return key.physical_bytes() + value.physical_bytes();
-    }
-
     friend bool operator==(const PagedKVStorageLayout&, const PagedKVStorageLayout&) = default;
 };
 

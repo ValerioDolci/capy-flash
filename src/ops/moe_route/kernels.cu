@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -52,7 +51,7 @@ __global__ void __launch_bounds__(kRouteWarps * 32)
     uint4 w[kRouteVectors];
 #pragma unroll
     for (int i = 0; i < kRouteVectors; ++i) { w[i] = __ldg(w4 + i * 32 + lane); }
-    // PDL (T49): the router rows above do not depend on the previous kernel, so they stream in
+    // PDL: the router rows above do not depend on the previous kernel, so they stream in
     // while it drains; x is read only after the wait. The top-k kernel waits at its entry.
     pdl::wait_for_dependencies();
     pdl::trigger_dependents();
@@ -68,15 +67,14 @@ __global__ void __launch_bounds__(kRouteWarps * 32)
     }
 }
 
-// Tensor-core router logits for prompt chunks (T >= kMmaMinColumns, T183; default since v0.5.3
-// after the GSM8K/MMLU-Pro check T185; NINFER_QWEN4_ROUTER_MMA=0 restores the SIMT kernel). BF16
-// m16n8k16 MMA with FP32 accumulation, so the logits are still FP32 dot products over the
-// represented BF16 inputs (the Op's numeric contract) but summed in another order than the SIMT
-// kernel: selections can differ where logits are within the FP32 bound. Both operands are
-// K-contiguous (router rows, token columns), and a dot product does not depend on the order of K,
-// so each 32-K step lets lane (g, t) load K 8t..8t+7 of its row/column as one 16-byte vector and
-// feed K 8t..8t+3 to the first MMA and 8t+4..8t+7 to the second, mapping them onto the fragment's
-// logical K (2t, 2t+1, 2t+8, 2t+9) identically for both operands.
+// Tensor-core router logits for prompt chunks (T >= kMmaMinColumns; narrower calls take the SIMT
+// kernel above). BF16 m16n8k16 MMA with FP32 accumulation, so the logits are still FP32 dot
+// products over the represented BF16 inputs (the Op's numeric contract) but summed in another
+// order than the SIMT kernel: selections can differ where logits are within the FP32 bound. Both
+// operands are K-contiguous (router rows, token columns), and a dot product does not depend on the
+// order of K, so each 32-K step lets lane (g, t) load K 8t..8t+7 of its row/column as one 16-byte
+// vector and feed K 8t..8t+3 to the first MMA and 8t+4..8t+7 to the second, mapping them onto the
+// fragment's logical K (2t, 2t+1, 2t+8, 2t+9) identically for both operands.
 constexpr int kMmaWarps      = 4;  // warps per block, along M
 constexpr int kMmaRows       = 32; // router rows per warp (two m16 tiles)
 constexpr int kMmaCols       = 64; // token columns per warp (eight n8 tiles)
@@ -166,14 +164,6 @@ __global__ void __launch_bounds__(kMmaWarps * 32)
     }
 }
 
-bool router_mma_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_QWEN4_ROUTER_MMA");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
-}
-
 __global__ void __launch_bounds__(256)
     moe_route_topk_kernel(const float* __restrict__ logits, std::int32_t columns,
                           std::int32_t* __restrict__ ids, float* __restrict__ weights,
@@ -259,9 +249,9 @@ void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tens
                       bool last_valid_only, cudaStream_t stream) {
     const int columns = x.ne[1];
     const int width   = valid_columns != nullptr ? columns / valid_columns->ne[0] : columns;
-    // Both launches are programmatic dependents of their predecessor (T49): each kernel waits
+    // Both launches are programmatic dependents of their predecessor: each kernel waits
     // before it reads anything a previous kernel wrote.
-    if (columns >= kMmaMinColumns && router_mma_enabled()) {
+    if (columns >= kMmaMinColumns) {
         const int warps = (E + 1 + kMmaRows - 1) / kMmaRows;
         const dim3 grid((warps + kMmaWarps - 1) / kMmaWarps, (columns + kMmaCols - 1) / kMmaCols);
         CUDA_CHECK(pdl::launch_dependent({grid, dim3(kMmaWarps * 32), 0, stream},

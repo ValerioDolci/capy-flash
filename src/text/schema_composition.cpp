@@ -169,7 +169,7 @@ private:
     // references already expanded into this conjunction. A conjunction is idempotent, so a
     // reference reached again through another branch adds nothing: its parts are already in
     // `output` (join dropped them as textual duplicates). Without this, a diamond of
-    // allOf/$ref expanded 2^depth parts (capy-flash, second audit N1).
+    // allOf/$ref would expand 2^depth parts.
     void expand(const Part& part, std::vector<Part>& output, std::set<std::string>& expanded,
                 std::set<std::string> refs = {}) {
         xgrammar::ChargeWork(16);

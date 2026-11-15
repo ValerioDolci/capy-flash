@@ -1,8 +1,8 @@
 #pragma once
 
-// capy-flash: input limits of a structured-output constraint (OutputConstraintLimits). They run
-// before anything recursive or expensive sees the input: the JSON Schema converter of the vendor
-// is recursive (a deep schema overflowed the stack), and compilation cost grows with size. Every
+// Input limits of a structured-output constraint (OutputConstraintLimits). They run before
+// anything recursive or expensive sees the input: the JSON Schema converter of the vendor is
+// recursive (a deep schema overflows the stack), and compilation cost grows with size. Every
 // rejection is RequestError(ConstraintLimitExceeded) naming the limit; JSON Schema rejections
 // carry a JSON Pointer to the offending location.
 

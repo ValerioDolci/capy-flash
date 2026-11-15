@@ -83,7 +83,7 @@ public:
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
-    // Structured output (upstream 08902f73). A constrained session advances its matcher
+    // Structured output (ported from ninfer). A constrained session advances its matcher
     // tentatively in preview_model/preview_control, confirms in commit_preview and rolls back in
     // discard_preview; grammar_masks fills the lookahead masks of a round without changing the
     // committed matcher state (text::GrammarSession::masks).
@@ -92,7 +92,7 @@ public:
     [[nodiscard]] std::uint32_t grammar_masks(std::span<const TokenId> drafts,
                                               std::span<std::uint32_t> words);
     // The error that closes a failed constrained row: ConstraintBudgetExceeded when the matcher
-    // ran out of its time budget (capy-flash), otherwise ConstraintDeadEnd with `dead_end`.
+    // ran out of its time budget, otherwise ConstraintDeadEnd with `dead_end`.
     [[nodiscard]] RequestError constraint_error(std::string dead_end) const;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;

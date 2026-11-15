@@ -83,7 +83,7 @@ struct Qwen4Columns {
     const Tensor* cache_positions = nullptr; // I32 [T]
     const Tensor* rope_positions  = nullptr; // I32 [T] or [T,3] (axis-major)
     const Tensor* valid_columns   = nullptr; // null or I32 [B]
-    // MTP decode (T52): the MoE routes only each lane's last valid column (the alignment of a
+    // MTP decode: the MoE routes only each lane's last valid column (the alignment of a
     // verified window is read only at the accepted column, ops::MoeRouteColumns::LastValid).
     bool moe_last_valid_only        = false;
     const Tensor* table_rows        = nullptr; // I32 [B]
@@ -236,10 +236,6 @@ public:
                  const RankTensors* embeddings, const RankTensors& hidden_wide,
                  RankTensors& wide_out, bool append_only);
 
-    // One device.
-    void run_mtp(const Qwen4MtpParameters& m, const Tensor& ids, const Tensor* embeddings,
-                 const Tensor& hidden_wide, Tensor& wide_out, bool append_only);
-
 private:
     // ---- Operands and arena (qwen4_forward/core.h) ----------------------------------------------
     [[nodiscard]] static std::size_t at(int r) { return static_cast<std::size_t>(r); }
@@ -387,13 +383,8 @@ private:
     void close(const RankTensors& in, std::array<const LinearParameters*, 2> p, RankTensors& out,
                const RankTensors& staging, std::int32_t layer, int site);
 
-    // T128: the taps of the exchanges, when a teacher-forcing dump asks for them (tp 2 prefill).
+    // The taps of the exchanges, when a teacher-forcing dump asks for them (tp 2 prefill).
     [[nodiscard]] Qwen4Taps* exchange_taps() const;
-
-    // At tp 2 the mixer output exchange carries the ranks' FP32 partials (an FP16 payload in prompt
-    // chunks, FP32 in decode) and rounds the sum to BF16 once, as one device does;
-    // NINFER_TP_MIX=bf16 exchanges BF16 partials instead. Read once.
-    static bool mix_fp32_partials();
 
     // ---- Hyper-connection residual and PLE (qwen4_forward/residual.h) ---------------------------
     struct HcStreams;
@@ -409,7 +400,7 @@ private:
     void hc_commit(HcStreams& st);
 
     // Mixes the residual into the next block input with the block's `member` mixer, committing
-    // the pending block output in the same pass when there is one (T10's combine_mix).
+    // the pending block output in the same pass when there is one (hyper_connection_combine_mix).
     void hc_mix(HcStreams& st, HyperConnectionParameters Qwen4BlockParameters::* member,
                 std::size_t layer);
 
@@ -592,9 +583,8 @@ private:
                           RankTensors& vc);
 
     // ---- FFN: dispatch, dense SwiGLU, the plain block's FFN (qwen4_forward/ffn.h) ---------------
-    // The FFN of a hyper-connection block: `wide` holds the committed residual (its FFN mixer
-    // input).
-    void ffn(std::size_t layer, const RankTensors& wide, const RankTensors& x, RankTensors& y,
+    // The FFN of a hyper-connection block.
+    void ffn(std::size_t layer, const RankTensors& x, RankTensors& y,
              const RankTensors& staging_bf16, const RankTensors& staging_fp32);
 
     // Dense SwiGLU FFN: y = down . (silu(gate . x) * (up . x)).
@@ -630,25 +620,15 @@ private:
     void moe_combine(std::size_t layer, const RankTensors& x, MoeBuffers& b, RankTensors& y,
                      const RankTensors& staging);
 
-    // T25 router-ahead prefetch: `wide` holds layer's committed residual (its MLP
-    // hyper-connection input); the backend may predict layer+1's experts from it. Decode rounds at
-    // one device only (the offload backend's prefetch); a no-op for the other backends.
-    void ahead(std::size_t layer, const RankTensors& wide);
-
     // The pipelined MoE exchange of a prompt chunk at tp 2, read once: an FP16 payload (the bytes
-    // of BF16 with an 8x smaller rounding of the partial sums) by column groups of 2048, which
-    // overlap the routed experts of the later columns. NINFER_TP_AR=0 takes one allreduce_sum_f32
-    // call (FP32) instead; NINFER_TP_AR_PAYLOAD = fp32 | fp16 | bf16 | int8 sets the payload (int8
-    // also for the mixer output); NINFER_TP_AR_GROUP the column group (rounded down to whole
-    // 2048-column pieces; 0 = one group); NINFER_TP_AR_PIPE=1 takes the pipelined exchange even at
-    // FP32 with one group.
-    struct T62Exchange {
-        bool enabled                       = false;
+    // of BF16 with an 8x smaller rounding of the partial sums) by column groups of
+    // ops::kMoeGroupedChunkColumns, which overlap the routed experts of the later columns.
+    // NINFER_TP_AR_PAYLOAD=int8 sets the int8 payload (also for the mixer output).
+    struct PrefillMoeExchange {
         ops::HostExchange::Payload payload = ops::HostExchange::Payload::FP16;
-        std::int32_t group_columns         = ops::kMoeGroupedChunkColumns;
     };
 
-    static const T62Exchange& t62_exchange();
+    static const PrefillMoeExchange& prefill_moe_exchange();
 
     // The routed-expert backend and bank of `layer` on rank r (execution only).
     [[nodiscard]] Qwen4RoutedExperts* routed_experts(int r, std::size_t layer) const;

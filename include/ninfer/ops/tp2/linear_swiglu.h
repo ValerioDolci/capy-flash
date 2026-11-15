@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of linear_swiglu. Our file: ninfer/ops/linear_swiglu.h is upstream's and
-// carries no hook.
+// Two-device (tp 2) forms of linear_swiglu.
 //
 // Shapes registered for the two-device forms: NVFP4 and FP8 register the output-row half,
 // weight [17408,5120], x [5120,T], out [8704,T], with the same routes as the whole problem; NVFP4

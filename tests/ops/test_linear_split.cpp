@@ -346,8 +346,8 @@ int verify_registry() {
             }
         }
     }
-    // BF16 has no rejected shape since T103 (f425e087): every shape the registry does not name
-    // takes the generic BF16 route (bf16_generic.cu, checked against FP64 by t103_bf16_generic).
+    // BF16 has no rejected shape: every shape the registry does not name takes the generic BF16
+    // route (bf16_generic.cu, checked against FP64 by ninfer_linear_bf16_a16_test).
     for (const Entry& entry : {Entry{QType::BF16, 8192, 5120}, Entry{QType::BF16, 1000, 777}}) {
         try {
             (void)ops::linear_workspace_capacity_bytes(entry.qtype, entry.n, entry.k,

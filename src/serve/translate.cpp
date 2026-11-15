@@ -314,9 +314,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse) {
     ninfer::RequestOptions options;
-    // Structured output (Neroued/ninfer eb6696ae). options.tool_choice stays at its default
-    // (Auto, ToolConstraintMode::Automatic) until forced tool_choice lands (Tappa B): the serve
-    // layer rejects required/named choices and constrained requests with active tools.
+    // Structured output. options.tool_choice stays at its default (Auto,
+    // ToolConstraintMode::Automatic): the serve layer rejects required/named choices and
+    // constrained requests with active tools.
     options.constraint                        = request.constraint;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
@@ -325,7 +325,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling = resolve_sampling_overrides(request.sampling, server);
-    // D6: a constrained request samples without presence penalty unless the client sets one. The
+    // A constrained request samples without presence penalty unless the client sets one. The
     // grammar narrows the legal tokens; a penalty on the ones already used (quotes, braces, keys)
     // would bias the choice among them. Overrides the server default and the model preset.
     if (request.constraint && !request.sampling.presence_penalty) {

@@ -31,7 +31,6 @@ using MmaR64T64K64Wr32Wt16S2A2B2 =
 
 using SlicedK5120T16 = Q4A16SlicedKMmaSchedule<16, 16, 8, 1, Cache::cg, Cache::ca, 6, 5120, 16>;
 using SlicedK5120T24 = Q4A16SlicedKMmaSchedule<16, 24, 8, 1, Cache::cg, Cache::ca, 6, 5120, 24>;
-using SlicedK2048T4  = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 2048, 4>;
 
 using SlicedK5120T4 = Q4A16SlicedKMmaSchedule<16, 8, 8, 1, Cache::cg, Cache::ca, 6, 5120, 4>;
 
@@ -39,9 +38,6 @@ using MmaR64T48K64Wr16Wt16S2A2B2 =
     Q4A16MmaSchedule<64, 48, 64, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
 
-using MmaR64T72K64Wr32Wt24S2A2B2 =
-    Q4A16MmaSchedule<64, 72, 64, 32, 24, 2, 2, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
-                     Q4ScaleLoad::Pair32>;
 using MmaR64T80K64Wr16Wt40S2A2B1 =
     Q4A16MmaSchedule<64, 80, 64, 16, 40, 2, 1, Q4MmaFragmentPipeline::Serial, Cache::cg, Cache::cg,
                      Q4ScaleLoad::Pair32>;
@@ -75,7 +71,6 @@ using SlicedR32T16W4S1     = Q4A16SlicedKMmaSchedule<32, 16, 4, 1, Cache::cg, Ca
 using SlicedR32T32W4S1     = Q4A16SlicedKMmaSchedule<32, 32, 4, 1, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S2     = Q4A16SlicedKMmaSchedule<32, 32, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W2S2     = Q4A16SlicedKMmaSchedule<32, 32, 2, 2, Cache::cg, Cache::ca, 2>;
-using SlicedR32T64W2S1     = Q4A16SlicedKMmaSchedule<32, 64, 2, 1, Cache::cg, Cache::ca, 2>;
 using MmaR32T32K128S2A2 = Q4A16MmaSchedule<32, 32, 128, 16, 16, 2, 2, Q4MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
 using MmaR64T64K128S2A1 = Q4A16MmaSchedule<64, 64, 128, 16, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
@@ -83,5 +78,4 @@ using MmaR64T64K128S2A1 = Q4A16MmaSchedule<64, 64, 128, 16, 32, 2, 2, Q4MmaFragm
 using MmaR32T128K64S2A2 = Q4A16MmaSchedule<32, 128, 64, 32, 32, 2, 2, Q4MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
 using SimtR4T4W2G8S2    = Q4A16SimtSchedule<4, 4, 2, 8, 2, Cache::ca, 1>;
-using SimtR4T1W2G8S2    = Q4A16SimtSchedule<4, 1, 2, 8, 2, Cache::ca, 1>;
 } // namespace ninfer::ops::detail::q4_instances

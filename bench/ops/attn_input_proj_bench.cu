@@ -34,7 +34,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 
-enum class Format : std::uint8_t { Q4Q5, Q8Qgkv, Q8Qkv, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Q8DFlash2Qkv, Bf16, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -74,7 +74,7 @@ struct Measurement {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_attn_input_proj_bench "
-                 "[--format q4q5|q8-qgkv|q8-qkv|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
+                 "[--format q4q5|q8-dflash2-qkv|bf16|nvfp4|fp8|all] "
                  "[--nvfp4-policy a16|a4] [--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
@@ -122,10 +122,6 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--format requires a value"));
             if (value == "q4q5")
                 options.format = Format::Q4Q5;
-            else if (value == "q8-qgkv")
-                options.format = Format::Q8Qgkv;
-            else if (value == "q8-qkv")
-                options.format = Format::Q8Qkv;
             else if (value == "q8-dflash2-qkv")
                 options.format = Format::Q8DFlash2Qkv;
             else if (value == "bf16")
@@ -137,8 +133,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, q8-qgkv, q8-qkv, q8-dflash2-qkv, bf16, nvfp4, "
-                      "fp8, or all");
+                usage("--format expects q4q5, q8-dflash2-qkv, bf16, nvfp4, fp8, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -338,9 +333,9 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
 
 template <class WeightFixture>
 void run_four_output(const Options& options, const char* format, QType qtype,
-                     ops::LinearPolicy policy, bool implicit_a16_entry, std::int32_t hidden,
-                     std::int32_t q_rows, std::int32_t kv_rows, std::int32_t parent_rows,
-                     WeightFixture& fixture, bench::L2FlushBuffer& flush, cudaStream_t stream,
+                     ops::LinearPolicy policy, std::int32_t hidden, std::int32_t q_rows,
+                     std::int32_t kv_rows, std::int32_t parent_rows, WeightFixture& fixture,
+                     bench::L2FlushBuffer& flush, cudaStream_t stream,
                      std::vector<Result>& results) {
     const std::int32_t min_tokens = *std::min_element(options.tokens.begin(), options.tokens.end());
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
@@ -361,12 +356,8 @@ void run_four_output(const Options& options, const char* format, QType qtype,
         const auto exact_workspace = ops::attn_input_proj_workspace_capacity_bytes(
             qtype, parent_rows, hidden, policy, tokens, tokens);
         const auto launch = [&](cudaStream_t launch_stream) {
-            if (implicit_a16_entry) {
-                ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, launch_stream);
-            } else {
-                ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, policy, workspace,
-                                     launch_stream);
-            }
+            ops::attn_input_proj(x, fixture.weight, tq, tg, tk, tv, policy, workspace,
+                                 launch_stream);
         };
         const CacheState profile_cache =
             options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
@@ -438,8 +429,8 @@ void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t s
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
     auto* data  = static_cast<std::uint8_t*>(weight.storage.p);
-    run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
-                    6144, 1024, 14336, weight, flush, stream, results);
+    run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, 5120, 6144,
+                    1024, 14336, weight, flush, stream, results);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -488,26 +479,18 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
 
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::Q8Qgkv)) {
-            auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048, 507U);
-            run_four_output(options, "q8-qgkv", QType::Q8_G32_FP16, ops::LinearPolicy::A16Only,
-                            true, 2048, 4096, 512, 9216, weight, flush, stream, results);
-        }
-        if (selected(options.format, Format::Q8Qkv)) {
-            run_q8_qkv(options, "q8-qkv", 2048, flush, stream, results);
-        }
         if (selected(options.format, Format::Q8DFlash2Qkv)) {
             run_q8_qkv(options, "q8-dflash2-qkv", 5120, flush, stream, results);
         }
         if (selected(options.format, Format::Bf16)) {
             auto weight = bench::make_direct_bf16_weight(14336, 5120);
-            run_four_output(options, "bf16", QType::BF16, ops::LinearPolicy::A16Only, false, 5120,
-                            6144, 1024, 14336, weight, flush, stream, results);
+            run_four_output(options, "bf16", QType::BF16, ops::LinearPolicy::A16Only, 5120, 6144,
+                            1024, 14336, weight, flush, stream, results);
         }
         if (selected(options.format, Format::Nvfp4)) {
             auto weight = bench::make_nvfp4_weight(14336, 5120);
-            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, false, 5120, 6144,
-                            1024, 14336, weight, flush, stream, results);
+            run_four_output(options, "nvfp4", QType::NVFP4, options.nvfp4_policy, 5120, 6144, 1024,
+                            14336, weight, flush, stream, results);
         }
         if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
         write_csv(options, results);

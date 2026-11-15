@@ -14,9 +14,6 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/tp2/linear_add.h"
 
-#include <cstdlib>
-#include <string>
-
 namespace ninfer::models::qwen3_5::execution {
 
 // Abandons the HostExchange sum a forward opened (null: none) when the work before its
@@ -50,15 +47,6 @@ Qwen4Taps* Qwen4Forward<Arena>::exchange_taps() const {
 }
 
 template <class Arena>
-bool Qwen4Forward<Arena>::mix_fp32_partials() {
-    static const bool on = [] {
-        const char* v = std::getenv("NINFER_TP_MIX");
-        return v == nullptr || std::string(v) != "bf16";
-    }();
-    return on;
-}
-
-template <class Arena>
 void Qwen4Forward<Arena>::output_projection(const RankTensors& x,
                                             std::array<const LinearParameters*, 2> p,
                                             RankTensors& y, const RankTensors& staging,
@@ -67,8 +55,10 @@ void Qwen4Forward<Arena>::output_projection(const RankTensors& x,
         linear(0, x[0], *p[0], y[0]);
         return;
     }
-    if (mix_fp32_partials() && (p[0]->weight.qtype == QType::Q8_G32_FP16 ||
-                                p[0]->weight.qtype == QType::MXFP8_E4M3FN_G32_UE8M0)) {
+    // The mixer output exchange carries the ranks' FP32 partials (an FP16 payload in prompt
+    // chunks, FP32 in decode) and rounds the sum to BF16 once, as one device does.
+    if (p[0]->weight.qtype == QType::Q8_G32_FP16 ||
+        p[0]->weight.qtype == QType::MXFP8_E4M3FN_G32_UE8M0) {
         const std::int32_t T = columns();
         auto scope           = scopes();
         RankTensors part     = alloc(DType::FP32, {hidden(), T});
@@ -76,7 +66,7 @@ void Qwen4Forward<Arena>::output_projection(const RankTensors& x,
         each([&](int r) { linear(r, x[at(r)], *p[at(r)], part[at(r)]); });
         if constexpr (kExecute) {
             (void)staging;
-            if (Qwen4Taps* taps = exchange_taps()) { // T128c check: FP32 partials of the mixer
+            if (Qwen4Taps* taps = exchange_taps()) { // FP32 partials of the mixer
                 taps->capture_exchange(layer, site, part[0], part[1], c(0).first_position, s(0),
                                        s(1));
             }
@@ -84,7 +74,7 @@ void Qwen4Forward<Arena>::output_projection(const RankTensors& x,
             if (pipe != nullptr &&
                 pipe->begin_sum_f32(
                     part, stage, &y,
-                    t62_exchange().payload == ops::HostExchange::Payload::INT8
+                    prefill_moe_exchange().payload == ops::HostExchange::Payload::INT8
                         ? ops::HostExchange::Payload::INT8 // same payload as the MoE exchange
                         : ops::HostExchange::Payload::FP16,
                     *tp_.execution)) {

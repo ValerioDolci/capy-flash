@@ -73,42 +73,6 @@ int scatter_case(std::int32_t rows, const std::vector<std::int32_t>& indices,
     return failures;
 }
 
-int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
-                 std::int32_t source_offset, std::int32_t tokens) {
-    const auto source = bit_pattern(static_cast<std::size_t>(source_rows) * tokens, 0x1357'9bdfu);
-    std::vector<std::uint16_t> expected(static_cast<std::size_t>(destination_rows) * tokens);
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t row = 0; row < destination_rows; ++row) {
-            expected[static_cast<std::size_t>(token) * destination_rows + row] =
-                source[static_cast<std::size_t>(token) * source_rows + source_offset + row];
-        }
-    }
-
-    GuardedDeviceBuffer device_source(source.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_destination(expected.size() * sizeof(std::uint16_t));
-    device_source.copy_from_host(source.data(), source.size() * sizeof(std::uint16_t));
-    device_destination.fill(0xcd);
-    Tensor source_tensor(device_source.data(), DType::BF16, {source_rows, tokens});
-    Tensor destination_tensor(device_destination.data(), DType::BF16, {destination_rows, tokens});
-    ops::extract_bf16_columns(source_tensor, source_offset, destination_tensor, nullptr);
-    cuda_synchronize();
-
-    const std::string label = "extract_bf16_columns source=" + std::to_string(source_rows) +
-                              " offset=" + std::to_string(source_offset) +
-                              " rows=" + std::to_string(destination_rows) +
-                              " T=" + std::to_string(tokens);
-    int failures = 0;
-    failures += verify_exact(label.c_str(),
-                             from_device<std::uint16_t>(device_destination.data(), expected.size()),
-                             expected);
-    failures +=
-        verify_exact((label + " preserves source").c_str(),
-                     from_device<std::uint16_t>(device_source.data(), source.size()), source);
-    failures += device_source.verify_guards((label + " source").c_str());
-    failures += device_destination.verify_guards((label + " destination").c_str());
-    return failures;
-}
-
 int continuation_case(int width, int batch) {
     constexpr int rows = 5120, slots = 11;
     const auto hidden  = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 1709U + width);
@@ -182,8 +146,6 @@ int main() {
     failures += continuation_case(5, 3);
     failures += scatter_case(5120, {4, 0, 7, 2}, 9);
     failures += scatter_case(2048, {5, 1, 3}, 7);
-    failures += extract_case(10240, 6144, 4096, 6);
-    failures += extract_case(8192, 2048, 2048, 1);
-    std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
+    std::cout << (failures ? "FAIL" : "OK") << " scatter\n";
     return failures ? 1 : 0;
 }

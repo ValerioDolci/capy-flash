@@ -9,15 +9,9 @@ void launch_q6_a16_simt_r8_t4(const Tensor& x, const Weight& weight, Tensor& out
                               cudaStream_t stream);
 void launch_q6_a16_gemv_r4_w2_g16(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream);
-// T43: T = 1 draft proposal head candidates (q6_instances.cuh).
-void launch_q6_a16_gemv_r4_w2_g20_cg(const Tensor& x, const Weight& weight, Tensor& out,
-                                     cudaStream_t stream);
+// T = 1 draft proposal head route (q6_instances.cuh).
 void launch_q6_a16_gemv_r8_w1_g8_s4_cg(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
-void launch_q6_a16_gemv_r4_w2_g12_s3_cg(const Tensor& x, const Weight& weight, Tensor& out,
-                                        cudaStream_t stream);
-void launch_q6_a16_gemv_r2_w4_g12_cg(const Tensor& x, const Weight& weight, Tensor& out,
-                                     cudaStream_t stream);
 void launch_q6_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream);
 void launch_q6_a16_sliced_r32_t16_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,

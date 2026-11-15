@@ -31,7 +31,7 @@ on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RA
   experts that stay on the host are one 64.6 GiB page-locked allocation, `--profile flash-next` keeps the token
   embedding and up to 4 GiB of idle conversations' KV in RAM as well, and the server refuses to start without room for
   the experts plus a reserve (`NINFER_RAM_GUARD=0` skips the check) or for the RAM caches plus a reserve
-  (`NINFER_HOST_TIER_RAM_GUARD=0`); `install.sh` warns below 70 GiB free. In practice a 96 GB machine; the 64 GB edition (GSQ-RCO
+  (`NINFER_HOST_TIER_RAM_GUARD=0`); `install.sh` warns below 75 GiB free. In practice a 96 GB machine; the 64 GB edition (GSQ-RCO
   experts, 48 GiB) needs about 56 GiB and fits a 64 GB machine.
 
 ## Run
@@ -55,18 +55,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"capy-flash","messages":[{"role":"user","content":"What is 17*23?"}]}'
 ```
 
-Artifacts (`install.sh --model NAME` downloads exactly one of these repositories; the Flash-Next Vision artifact is
-only downloaded by hand):
-- Qwen3.8-Flash-Next: `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` (126.6 GB, NVIDIA's NVFP4 experts as published,
-  SHA-256 in its `SHA256SUMS`), or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself with `tools/capy_flash/convert.py`
-  from the source tree (same result).
-- Qwen3.8-27B: `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` (17.4 GB, SHA-256 in its `SHA256SUMS`) or the official
-  `Qwen3.8-27B-nvfp4-NInfer`; both run with the same flags. For artifacts without a vision component set `NINFER_VISION=0`.
-- Qwen3.8-Flash-Next with images: `Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash` (the NVFP4 artifact plus the Q8
-  vision tower), served with `./serve-flash-next.sh <artifact> --vision`. The other Flash-Next artifacts are text only.
-- Qwen3.8-Flash-Next, 64 GB edition: `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` (102 GB).
-- Qwen3.8-27B 3-bit for one GPU: `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` (12.5 GB; MMLU-Pro below the NVFP4 27B, see
-  the main README).
+Artifacts: `install.sh --model NAME` downloads one Hugging Face repository; the models, their sizes and the RAM and
+disk they need are in the main README (https://github.com/ValerioDolci/capy-flash#pick-a-model).
 
 Vision: the two 27B artifacts contain the vision tower and `serve-tp2.sh` / `serve-27b-16gb.sh` load it by default
 (it takes VRAM from the KV pool); `NINFER_VISION=0` before the launcher, or `--no-vision` after the artifact, turns it

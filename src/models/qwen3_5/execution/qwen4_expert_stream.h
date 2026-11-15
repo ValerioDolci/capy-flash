@@ -41,7 +41,7 @@ public:
         std::vector<const std::byte*> bank_base; // [layers * 4] pinned host planes
         std::array<std::byte*, 4> pool_base{};   // device pool planes
         // Bytes between consecutive slots of plane q: 0 = plane_bytes[q] (planar pool); the slot
-        // size for a slot-major pool (T42).
+        // size for a slot-major pool.
         std::array<std::int64_t, 4> pool_stride{};
         std::int32_t ring_first = 0;       // first ring slot (pool slot index)
         std::int32_t ring_slots = 0;       // >= experts / partitions (one layer of the partition)
@@ -50,7 +50,7 @@ public:
         // GPU, each over its own link); the others are -1 in its tables and never copied.
         std::int32_t partitions = 1;
         std::int32_t partition  = 0;
-        // v0.7 pinned fallback: [layers] 0 = the layer's bank is pageable and never streamed
+        // Pinned fallback: [layers] 0 = the layer's bank is pageable and never streamed
         // (its prefill calls take the backend's CPU path); empty = every layer streams. release()
         // issues the next streamed layer's copies; exchanged(l) only when l + 1 streams.
         std::vector<std::uint8_t> streamable;
@@ -91,12 +91,12 @@ public:
     // layer's copies (unless deferred, below).
     void release(std::int32_t layer, cudaStream_t compute);
 
-    // T56, tp 2: the copies of layer l+1 are issued by exchanged(l) instead of release(l), behind
+    // At tp 2: the copies of layer l+1 are issued by exchanged(l) instead of release(l), behind
     // an event recorded on `compute` after layer l's MoE all-reduce. Without P2P that exchange
     // crosses the same host link in the H2D direction as the expert copies, and a link's copies
     // run in submission order: issued at release(l), the next layer's copies (needed only a whole
-    // dense block later) delayed the exchange on the critical path by their full duration.
-    // A layer whose exchanged() never comes is issued by its acquire(), as before.
+    // dense block later) would delay the exchange on the critical path by their full duration.
+    // A layer whose exchanged() never comes is issued by its acquire().
     void set_defer_to_exchange(bool defer) noexcept { defer_ = defer; }
 
     void exchanged(std::int32_t layer, cudaStream_t compute);
@@ -130,9 +130,9 @@ private:
     cudaStream_t copy_         = nullptr;
     std::vector<cudaEvent_t> ready_;     // [layers]
     std::vector<cudaEvent_t> done_;      // [layers]
-    std::vector<cudaEvent_t> exchanged_; // [layers] after the layer's MoE all-reduce (T56)
+    std::vector<cudaEvent_t> exchanged_; // [layers] after the layer's MoE all-reduce
     bool defer_                = false;
-    cudaEvent_t wait_next_     = nullptr; // waited before the next issue() (T56)
+    cudaEvent_t wait_next_     = nullptr; // waited before the next issue()
     std::int32_t* host_tables_ = nullptr; // pinned [layers * experts]
 
     // Window state.

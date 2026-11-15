@@ -1,6 +1,6 @@
 // Class-body fragment of TextContext (execution/text.h), included at the end of its private
-// section: the two-device (tp == 2) bindings, accessors and Qwen3.5 MTP head. The definitions are in
-// tp2/text_tp2.inc. Not a header; our file, see docs/maintainer/upstream-merge.md.
+// section: the two-device (tp == 2) bindings, accessors and Qwen3.5 MTP head. The definitions are
+// in tp2/text_tp2.inc. Not a header.
 
 private:
 // --- tp == 2 -------------------------------------------------------------------------------

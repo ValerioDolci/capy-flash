@@ -1,21 +1,18 @@
 #pragma once
-// yarn.h - YaRN (Yet another RoPE extensioN) frequency scaling, host side.
+// YaRN (Peng et al., "YaRN: Efficient Context Window Extension of Large Language Models") for
+// text RoPE, host side: the inverse-frequency table and the attention factor of Hugging Face
+// transformers' rope_type "yarn" (_compute_yarn_parameters in modeling_rope_utils.py).
 //
-// WHY THIS IS HOST-SIDE AND TABLE-SHAPED: ninfer already feeds text RoPE from
-// kTextRopeInvFrequency[32], which is __device__ __constant__ memory. __constant__ is writable
-// from the host via cudaMemcpyToSymbol, so YaRN needs NO change to the rotation math in the
-// kernel - only a different table, plus the attention temperature below.
+// Rotary pairs whose wavelength completes more than beta_fast turns across the original window
+// keep their frequency (extrapolation); pairs completing fewer than beta_slow turns are divided
+// by the factor (interpolation); a linear ramp in the pair index blends the two in between. The
+// attention factor multiplies cos and sin, compensating the flatter attention of the stretched
+// positions.
 //
-// THE ALGORITHM (Peng et al., "YaRN"): plain RoPE extrapolates every frequency, which breaks
-// past the trained window; pure position-interpolation (divide all frequencies by the factor)
-// preserves long range but crushes local detail. YaRN splits by WAVELENGTH:
-//   - high-frequency dims (wavelength << trained window) are EXTRAPOLATED unchanged - these
-//     carry local ordering and interpolating them is what destroys short-context quality
-//   - low-frequency dims (wavelength >> trained window) are INTERPOLATED by 1/factor - the
-//     model never saw these phases, so they must be compressed into the range it did see
-//   - a linear RAMP between the two boundaries, so nothing changes discontinuously
-// The boundaries come from beta_fast/beta_slow expressed as "number of full rotations across
-// the original window" (32 and 1 are the paper's values and Qwen's defaults).
+// The correction range is computed in FP64 and every per-pair value in FP32, operation by
+// operation as transformers does. On the reference build (x86-64, no FMA contraction) the table
+// equals the bits transformers 5.16.1 gave (ninfer_yarn_test); another libm or torch build may
+// round a pow differently in the last place.
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -24,71 +21,54 @@
 namespace ninfer::rope {
 
 struct YarnParams {
-    float factor                       = 1.0F;      // 1.0 = disabled
-    int   original_max_position        = 262144;    // Qwen3.8-27B native
-    float beta_fast                    = 32.0F;
-    float beta_slow                    = 1.0F;
-    float theta                        = 1.0e7F;    // Qwen3.8-27B rope_theta
-    // rotary_dim is 64 for this target: the shipped kTextRopeInvFrequency[32] table
-    // equals 1e7^(-2j/64) exactly, which is how the geometry was confirmed rather
-    // than assumed (a 128 assumption produced frequencies that did not match).
-    int   rotary_dim                   = 64;
+    float factor              = 1.0F;
+    int original_max_position = 262144;
+    float beta_fast           = 32.0F;
+    float beta_slow           = 1.0F;
+    float theta               = 1.0e7F;
+    int rotary_dim            = 64;
 };
 
-// The dim index whose wavelength completes `rotations` full turns across the original window.
+// The (fractional) pair index whose wavelength completes `rotations` turns across the original
+// window.
 inline double correction_dim(double rotations, int dim, double base, int original_max_position) {
-    const double kTwoPi = 6.283185307179586;
+    const double kPi = 3.141592653589793;
     return (static_cast<double>(dim) *
-            std::log(static_cast<double>(original_max_position) / (rotations * kTwoPi))) /
+            std::log(static_cast<double>(original_max_position) / (rotations * 2.0 * kPi))) /
            (2.0 * std::log(base));
 }
 
-// Inverse frequencies for `dim` (the FULL head/rotary dim; the table holds dim/2 entries).
-// Returns exactly dim/2 values, matching kTextRopeInvFrequency's layout.
-inline std::vector<float> yarn_inv_freq(const YarnParams& p, int dim) {
-    const int half = dim / 2;
-    std::vector<float> out(static_cast<std::size_t>(half));
-    if (p.factor <= 1.0F) {                       // disabled: plain RoPE, unchanged behaviour
-        for (int i = 0; i < half; ++i) {
-            out[static_cast<std::size_t>(i)] =
-                static_cast<float>(1.0 / std::pow(static_cast<double>(p.theta),
-                                                  (2.0 * i) / static_cast<double>(dim)));
-        }
-        return out;
-    }
-    double low = std::floor(correction_dim(p.beta_fast, dim, p.theta, p.original_max_position));
-    double high = std::ceil(correction_dim(p.beta_slow, dim, p.theta, p.original_max_position));
-    low  = std::max(low, 0.0);
-    high = std::min(high, static_cast<double>(dim - 1));
-    if (high - low < 1e-3) { high = low + 1e-3; }   // guard a degenerate ramp (div by zero)
+// rotary_dim / 2 inverse frequencies, pair i first.
+inline std::vector<float> yarn_inv_freq(const YarnParams& p) {
+    const int dim     = p.rotary_dim;
+    const double base = p.theta;
+    double low        = std::floor(correction_dim(p.beta_fast, dim, base, p.original_max_position));
+    double high       = std::ceil(correction_dim(p.beta_slow, dim, base, p.original_max_position));
+    low               = std::max(low, 0.0);
+    high              = std::min(high, static_cast<double>(dim - 1));
+    if (low == high) { high += 0.001; }
+    const float ramp_low  = static_cast<float>(low);
+    const float ramp_span = static_cast<float>(high - low);
 
-    for (int i = 0; i < half; ++i) {
-        const double pos_freq =
-            std::pow(static_cast<double>(p.theta), (2.0 * i) / static_cast<double>(dim));
-        const double extrapolation = 1.0 / pos_freq;                        // keep as trained
-        const double interpolation = 1.0 / (static_cast<double>(p.factor) * pos_freq);
-        // The ramp is indexed by the PAIR index i directly against low/high, because
-        // correction_dim() already divides by 2*log(base) and therefore returns PAIR-space
-        // indices, not full-dim indices. (Halving them here was a bug: it shifted the whole
-        // extrapolate/interpolate boundary, which would have silently degraded deep retrieval
-        // while every frequency still looked plausible. Caught by checking factor=1.0 against
-        // the engine's own shipped kTextRopeInvFrequency table.)
-        double ramp = (static_cast<double>(i) - low) / (high - low);
-        ramp = std::clamp(ramp, 0.0, 1.0);
-        const double extrapolation_weight = 1.0 - ramp;   // 1 at high freq, 0 at low freq
-        out[static_cast<std::size_t>(i)] = static_cast<float>(
-            interpolation * (1.0 - extrapolation_weight) + extrapolation * extrapolation_weight);
+    std::vector<float> out(static_cast<std::size_t>(dim / 2));
+    for (int i = 0; i < dim / 2; ++i) {
+        const float exponent      = static_cast<float>(2 * i) / static_cast<float>(dim);
+        const float pos_freq      = std::pow(p.theta, exponent);
+        const float extrapolation = 1.0F / pos_freq;
+        const float interpolation = 1.0F / (p.factor * pos_freq);
+        const float ramp = std::clamp((static_cast<float>(i) - ramp_low) / ramp_span, 0.0F, 1.0F);
+        const float extrapolation_weight = 1.0F - ramp;
+        const float interpolated         = interpolation * (1.0F - extrapolation_weight);
+        const float extrapolated         = extrapolation * extrapolation_weight;
+        out[static_cast<std::size_t>(i)] = interpolated + extrapolated;
     }
     return out;
 }
 
-// YaRN's SECOND half, and the one that gets forgotten: attention temperature. Stretching the
-// positions spreads attention thinner, so logits are scaled by mscale to compensate. Omitting
-// it looks exactly like the frequency scaling having failed - diffuse attention, poor deep
-// retrieval - which is why it is stated here rather than left to the call site.
+// 0.1 ln(factor) + 1 in FP64, rounded once to FP32; 1 for factor <= 1.
 inline float yarn_attention_scale(const YarnParams& p) {
     if (p.factor <= 1.0F) { return 1.0F; }
-    return 0.1F * std::log(static_cast<float>(p.factor)) + 1.0F;
+    return static_cast<float>(0.1 * std::log(static_cast<double>(p.factor)) + 1.0);
 }
 
-}  // namespace ninfer::rope
+} // namespace ninfer::rope

@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/engine_options.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
@@ -111,26 +112,6 @@ std::string tool_choice_name(const ToolChoice& choice) {
 Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffort>& requested) {
     return requested ? Json(std::string(requested_reasoning_effort_name(*requested)))
                      : Json(nullptr);
-}
-
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-row256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    return "unknown";
-}
-
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
@@ -548,7 +529,7 @@ std::string format_server_start_json(
     record["engine"] =
         Json{{"device", engine_options.device},
              {"max_context", engine_options.max_context},
-             {"kv_capacity_mode", kv_capacity_mode_name(memory.kv_capacity_mode)},
+             {"kv_capacity_mode", product::kv_capacity_mode_name(memory.kv_capacity_mode)},
              {"kv_capacity", memory.kv_capacity},
              {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
              {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
@@ -558,7 +539,7 @@ std::string format_server_start_json(
              {"prefill_chunk", engine_options.prefill_chunk},
              {"kv_lease_window_tokens", engine_options.kv_lease_window_tokens},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
-             {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+             {"kv_cache", product::kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"embedding_host", engine_options.embedding_host},

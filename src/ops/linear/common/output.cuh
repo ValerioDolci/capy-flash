@@ -26,7 +26,7 @@ struct LinearBf16Output {
     }
 };
 
-// T128c: FP32 output (row-parallel partials that are exchanged before the single BF16 rounding).
+// FP32 output (row-parallel partials that are exchanged before the single BF16 rounding).
 struct LinearF32Output {
     float* data;
     std::int32_t rows;

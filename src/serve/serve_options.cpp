@@ -1,12 +1,12 @@
 #include "serve/serve_options.h"
 #include "core/byte_size.h"
+#include "product/engine_options.h"
 #include "product/speculative_options.h"
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
 
 #include <cmath>
 #include <algorithm>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -41,7 +41,7 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
     return static_cast<float>(value);
 }
 
-// --api-key-file (issue #25): the whole file is the key, minus one trailing newline.
+// --api-key-file: the whole file is the key, minus one trailing newline.
 std::string read_api_key_file(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) { throw std::invalid_argument("--api-key-file: cannot read " + path); }
@@ -55,29 +55,7 @@ std::string read_api_key_file(const std::string& path) {
     return key;
 }
 
-std::uint64_t parse_u64(const char* text, const char* label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
-        throw std::invalid_argument(std::string("invalid ") + label + ": " +
-                                    (text == nullptr ? "" : text));
-    }
-    errno                          = 0;
-    char* end                      = nullptr;
-    const unsigned long long value = std::strtoull(text, &end, 10);
-    if (errno == ERANGE || end == text || *end != '\0') {
-        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
-    }
-    return static_cast<std::uint64_t>(value);
-}
-
-KvCacheStorage parse_kv_dtype(const char* text) {
-    const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("invalid kv-dtype: " + value);
-}
+using product::parse_u64;
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
     if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
@@ -157,11 +135,11 @@ const std::vector<ServeProfile>& serve_profiles() {
           "8192",
           "--prefill-chunk",
           "2048"}},
-        // v0.7: Qwen3.8-Flash-Next on ONE 16 GB GPU (T242: GSQ-RCO 64 GB edition, 57 GiB of RAM,
-        // LocalMaxxing 110 tok/s): the flash-next configuration at one device with small RAM
-        // caches. v0.7.1: 8 Host StateImages (+0.66 GiB pinned): at one device only 1 Device
-        // StateImage fits, and with 2 Host ones three interleaved agent sessions lost their turn
-        // checkpoints (prompt reuse 34 % -> 83 %, replay 858 -> 276 s, T247).
+        // Qwen3.8-Flash-Next on ONE 16 GB GPU (GSQ-RCO 64 GB edition, 57 GiB of RAM): the
+        // flash-next configuration at one device with small RAM caches. 8 Host StateImages
+        // (+0.66 GiB pinned): at one device only 1 Device StateImage fits, and with 2 Host ones
+        // three interleaved agent sessions lose their turn checkpoints (prompt reuse 34 % instead
+        // of 83 %).
         {"flash-next-1gpu",
          {"--device",
           "0",
@@ -181,7 +159,7 @@ const std::vector<ServeProfile>& serve_profiles() {
           "1024",
           "--host-state-slots",
           "8"}},
-        // v0.7: Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
+        // Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
         // (docs/serving.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9
         // GiB).
         {"27b-16gb",
@@ -303,149 +281,363 @@ std::string serve_usage_text(const char* argv0) {
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
-           "[--frequency-penalty F] [--seed N] [--greedy]\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n"
-           "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --profile applies the tested configuration of a model before the other "
-           "flags, which override it (27b-16gb: one 16 GB GPU, 3-bit GSQ 27B artifact):\n"
-           "         flash-next: " +
+           "[--frequency-penalty F] [--seed N] [--greedy] "
+           "[--log-level trace|debug|info|warning|error|critical|off]\n"
+           "\n"
+           "Serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints.\n"
+           "\n"
+           "General:\n"
+           "  --profile <flash-next|flash-next-1gpu|27b|27b-16gb>\n"
+           "    Apply the tested configuration of a model before the other flags, which override "
+           "it (27b-16gb: one 16 GB GPU, 3-bit GSQ 27B artifact).\n"
+           "    flash-next: " +
            profile_text("flash-next") +
            "\n"
-           "         27b:        " +
+           "    27b: " +
            profile_text("27b") +
            "\n"
-           "         flash-next-1gpu: " +
+           "    flash-next-1gpu: " +
            profile_text("flash-next-1gpu") +
            "\n"
-           "         27b-16gb:   " +
+           "    27b-16gb: " +
            profile_text("27b-16gb") +
            "\n"
-           "       --default-max-tokens defaults to " +
-           std::to_string(kDefaultMaxTokens) +
-           " when omitted\n"
-           "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
-           "       --max-request-json-depth defaults to " +
-           std::to_string(kDefaultMaxRequestJsonDepth) + " (at most " +
-           std::to_string(kMaximumMaxRequestJsonDepth) +
-           ") nested objects/arrays in a body or in tool-call arguments, checked before "
-           "parsing\n"
-           "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
-           "       structured output limits (docs/serving.md): --constraint-max-kib (256), "
-           "--constraint-max-depth (256, at most 1000) and --constraint-max-items (4096) bound a "
-           "schema, grammar, regex or choice list before compilation; a compilation runs at most "
-           "--constraint-compile-timeout-ms (5000) once it holds one of "
-           "--constraint-compile-concurrency (2) slots, waited for at most "
-           "--constraint-compile-wait-ms (30000, then 429), into a --constraint-cache-mib (64) "
-           "cache; a generating constrained request may "
-           "spend --constraint-round-budget-ms (20) of matcher time per decode round and "
-           "--constraint-request-budget-ms (1000) plus --constraint-round-allowance-ms (5) per "
-           "round in total and keep --constraint-matcher-mib (512) of matcher history, or it "
-           "alone fails (0 disables a time or memory limit); --constraint-json-strict on (default, "
-           "as XGrammar/vLLM) closes JSON Schema objects without additionalProperties and arrays "
-           "without items, off keeps literal JSON Schema\n"
-           "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
-           "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
-           "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --log-speculation-detail adds the per-step accepted draft lengths and the "
-           "output/prompt 4-gram overlap to every request_done record (requires "
-           "--request-log-jsonl; off by default);\n"
-           "       --log-speculation-detail-max-steps caps them per request (default " +
-           std::to_string(kDefaultSpeculationDetailMaxSteps) + ", at most " +
-           std::to_string(kMaximumSpeculationDetailMaxSteps) +
-           "; longer requests are marked truncated)\n"
-           "       --prefill-miss-dump diagnoses prefix-reuse misses: when a request recomputes at "
-           "least --prefill-miss-min-tokens prompt tokens (default 10000), shares at least "
-           "--prefill-miss-min-match of its prompt (default 0.5) with one of the last 16 "
-           "contexts, and either the server recomputed that many tokens identical to it or "
-           "the client changed that many of its tokens, both texts, their token IDs and a "
-           "summary.json with the divergence point go to a new directory under DIR (at most 64 "
-           "per process; contains conversation text; off by default)\n"
-           "       --model-id overrides the artifact metadata.name reported by the server\n"
-           "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
-           "default\n"
-           "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
-           "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --vision-device selects the CUDA device that holds the Vision tower and encodes "
-           "(default: rank 0's); it must equal --device on one GPU and be one of --devices with "
-           "--tp 2, where the other GPU only receives the encoded embeddings\n"
-           "       --max-vision-tokens caps the merged Vision tokens of one image or video item "
-           "(64-16384, default 16384): larger media are resized and the encode workspace is "
-           "planned for N\n"
-           "       --kv-capacity auto leaves " +
+           "  --model-id <ID>\n"
+           "    Override the artifact metadata.name reported by the server.\n"
+           "  --log-level <trace|debug|info|warning|error|critical|off>\n"
+           "    Verbosity of the stderr log.\n"
+           "    default: info\n"
+           "  --log-stats-interval-ms <N>\n"
+           "    Periodic throughput log interval in milliseconds; 0 disables periodic throughput "
+           "logs.\n"
+           "    default: 5000\n"
+           "\n"
+           "Serving:\n"
+           "  --host <H>\n"
+           "    Address to listen on.\n"
+           "    default: 127.0.0.1\n"
+           "  --port <N>\n"
+           "    Port to listen on.\n"
+           "    default: 8080\n"
+           "  --api-key <KEY>, --api-key-file <FILE>\n"
+           "    API key; --api-key-file reads the key from FILE (one trailing newline stripped).\n"
+           "    Without --api-key or --api-key-file the key comes from NINFER_API_KEY when it is "
+           "set.\n"
+           "  --max-context <N>\n"
+           "    Maximum context length in tokens.\n"
+           "  --rope-yarn-factor <F>\n"
+           "    YaRN RoPE context extension in [1,4], as Hugging Face's rope_type \"yarn\": "
+           "raises the --max-context ceiling to the native window x F; 1 leaves RoPE unchanged.\n"
+           "    default: 1\n"
+           "  --rope-original-max-position <N>\n"
+           "    The native window YaRN scales from (Hugging Face "
+           "original_max_position_embeddings), used only with --rope-yarn-factor above 1.\n"
+           "    default: 262144\n"
+           "  --max-concurrency <N>\n"
+           "    Maximum number of concurrent requests.\n"
+           "  --max-pending-requests <N>\n"
+           "    Maximum number of pending requests.\n"
+           "  --pending-timeout-ms <N>\n"
+           "    Timeout in milliseconds for pending requests.\n"
+           "  --cors\n"
+           "    Enable CORS.\n"
+           "  --request-log-jsonl <FILE>\n"
+           "    Append full-precision server/request records.\n"
+           "\n"
+           "Request limits:\n"
+           "  --max-request-mib <N>\n"
+           "    Maximum request body size in MiB, enforced before JSON parsing.\n"
+           "    default: 384\n"
+           "  --max-request-json-depth <N>\n"
+           "    Maximum nested objects/arrays in a body or in tool-call arguments, checked before "
+           "parsing.\n"
+           "    default: " +
+           std::to_string(kDefaultMaxRequestJsonDepth) +
+           ", max: " + std::to_string(kMaximumMaxRequestJsonDepth) +
+           "\n"
+           "\n"
+           "Structured output limits (docs/serving.md): a compilation runs at most "
+           "--constraint-compile-timeout-ms once it holds one of --constraint-compile-concurrency "
+           "slots, waited for at most --constraint-compile-wait-ms (then 429); a generating "
+           "constrained request may spend --constraint-round-budget-ms of matcher time per decode "
+           "round and --constraint-request-budget-ms plus --constraint-round-allowance-ms per "
+           "round in total and keep --constraint-matcher-mib of matcher history, or it alone "
+           "fails (0 disables a time or memory limit).\n"
+           "  --constraint-max-kib <N>\n"
+           "    Bound a schema, grammar, regex or choice list size in KiB before compilation.\n"
+           "    default: 256\n"
+           "  --constraint-max-depth <N>\n"
+           "    Bound the depth of a schema before compilation.\n"
+           "    default: 256, max: 1000\n"
+           "  --constraint-max-items <N>\n"
+           "    Bound the item count of a choice list before compilation.\n"
+           "    default: 4096\n"
+           "  --constraint-compile-timeout-ms <N>\n"
+           "    Timeout in milliseconds for one compilation while it holds a concurrency slot.\n"
+           "    default: 5000\n"
+           "  --constraint-compile-concurrency <N>\n"
+           "    Concurrent compilation slots.\n"
+           "    default: 2\n"
+           "  --constraint-compile-wait-ms <N>\n"
+           "    Time in milliseconds to wait for a compilation slot before answering 429.\n"
+           "    default: 30000\n"
+           "  --constraint-cache-mib <N>\n"
+           "    Cache size in MiB for compiled constraints.\n"
+           "    default: 64\n"
+           "  --constraint-round-budget-ms <N>\n"
+           "    Matcher time budget in milliseconds per decode round for a constrained request; 0 "
+           "disables.\n"
+           "    default: 20\n"
+           "  --constraint-request-budget-ms <N>\n"
+           "    Total matcher time budget in milliseconds per request; 0 disables.\n"
+           "    default: 1000\n"
+           "  --constraint-round-allowance-ms <N>\n"
+           "    Per-round allowance in milliseconds added to the request budget.\n"
+           "    default: 5\n"
+           "  --constraint-matcher-mib <N>\n"
+           "    Matcher history size in MiB per constrained request; 0 disables.\n"
+           "    default: 512\n"
+           "  --constraint-json-strict <on|off>\n"
+           "    On (default, as XGrammar/vLLM) closes JSON Schema objects without "
+           "additionalProperties and arrays without items; off keeps literal JSON Schema.\n"
+           "\n"
+           "Media:\n"
+           "  --media-cache-mib <N>\n"
+           "    Retained media reuse cache in MiB; 0 disables retained media reuse.\n"
+           "    default: 1024\n"
+           "  --media-live-mib <N>\n"
+           "    Bound all live BF16 patch payloads in MiB.\n"
+           "    default: 2048\n"
+           "  --media-preprocess-threads <N>\n"
+           "    Media preprocessing workers; 0 is auto, at most 16 workers.\n"
+           "    default: 0\n"
+           "\n"
+           "KV cache:\n"
+           "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>\n"
+           "    KV cache data type.\n"
+           "    default: bf16\n"
+           "  --kv-capacity <N|auto>\n"
+           "    KV capacity in tokens; auto leaves --vram-headroom-mib of sizing headroom.\n"
+           "  --vram-headroom-mib <N>\n"
+           "    VRAM in MiB that --kv-capacity auto leaves free after sizing the KV pool; requires "
+           "auto.\n"
+           "    default: " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom; --vram-headroom-mib N changes that margin (requires auto)\n"
-           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       Qwen4Exp: --elastic backs the KV on demand and lends unused KV to the expert "
-           "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps the "
-           "KV of every request together); --kv-ram-active keeps the text attention KV in pinned "
-           "host RAM, taken "
-           "8192 tokens at a time as conversations grow (at most --kv-capacity tokens), and "
-           "copies only the indexer's selected blocks to the GPU (results unchanged); "
-           "--miss-split auto lets the GPU read part of each window's missing "
-           "experts (best at one GPU), calibrate does the same with costs measured on this machine "
-           "(GPU copy rate at startup, CPU time per expert over the first decode calls, logged), "
-           "off keeps them all on the CPU (default); prompt chunks of "
-           "at least --stream-min-tokens N tokens stream the non-resident experts to the GPU "
-           "over PCIe, shorter ones compute them on the CPU (default " +
+           "\n"
+           "  --max-private-continuations <N>\n"
+           "    Private continuation cache entries.\n"
+           "    default: 2x concurrency\n"
+           "  --max-shared-prefixes <N>\n"
+           "    Shared prefix cache entries.\n"
+           "    default: max(max-concurrency, 4)\n"
+           "  --max-long-anchors-per-continuation <N>\n"
+           "    Long anchors per continuation.\n"
+           "  --turn-anchors <N>\n"
+           "    Anchors per turn.\n"
+           "    default: 2\n"
+           "  --kv-lease-window <N>\n"
+           "    A request reserves its prompt plus N output tokens of Device KV and grows as its "
+           "answer grows; 0 reserves the whole max_tokens at admission.\n"
+           "    default: 4096\n"
+           "  --device-state-slots <N>\n"
+           "    Extra checkpoint capacity beyond active lanes.\n"
+           "    default: max-concurrency\n"
+           "  --host-state-slots <N>\n"
+           "    Host state slots.\n"
+           "    default: 8\n"
+           "  --host-kv-mib <N>\n"
+           "    Host KV tier size in MiB.\n"
+           "    default: 8192\n"
+           "\n"
+           "Qwen4Exp:\n"
+           "  --elastic\n"
+           "    Enable on-demand KV backing; lends unused KV to the expert slot cache.\n"
+           "  --kv-grow <N>\n"
+           "    KV grow step in tokens for --elastic.\n"
+           "    default: 8192\n"
+           "  --kv-budget-gib <N>\n"
+           "    Cap the KV of every request together, in GiB.\n"
+           "  --kv-ram-active\n"
+           "    Use pinned host RAM for the text attention KV, taken 8192 tokens at a time as "
+           "conversations grow (at most --kv-capacity tokens), and copies only the indexer's "
+           "selected blocks to the GPU (results unchanged).\n"
+           "  --miss-split <auto|calibrate|off>\n"
+           "    Auto lets the GPU read part of each window's missing experts (best at one GPU); "
+           "calibrate does the same with costs measured on this machine (GPU copy rate at startup, "
+           "CPU time per expert over the first decode calls, logged); off keeps them all on the "
+           "CPU.\n"
+           "    default: off\n"
+           "  --stream-min-tokens <N>\n"
+           "    Prompt chunks of at least N tokens stream the non-resident experts to the GPU over "
+           "PCIe; shorter ones compute them on the CPU; 0 never streams.\n"
+           "    default: " +
            std::to_string(RoutedExpertOptions{}.stream_min_tokens) +
-           ", 0 = never stream); --expert-cpu-threads N: CPU threads of the missing experts "
-           "(default auto from the machine, logged at startup: max(6, cores/2, 2 per L3 domain), "
-           "one per physical core with ggml block expert banks)\n"
-           "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
-           "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
-           "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
-           "ordinary, --spec mtp or --spec dflash2 --lm-head-draft decoding, with or without "
-           "--vision, with bf16, int8 or nvfp4 KV; "
-           "it defaults device-state to "
-           "max(2x concurrency,8), private to max(2x concurrency,8) and the Host tiers to 0 "
-           "unless set (--profile 27b: 8 slots, 8192 MiB)\n"
-           "       --kv-lease-window N: a request reserves its prompt plus N output tokens of "
-           "Device KV (default 4096) and grows as its answer grows; 0 reserves the whole "
-           "max_tokens at admission\n"
-           "       --no-tp-mailbox keeps the captured --tp 2 all-reduces on cross-device copies\n"
-           "       --embedding-host keeps the token embedding table in one copy in pinned host "
-           "memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees "
-           "the table's VRAM (1.18 GiB per GPU on Qwen3.8-27B) for the KV pool, identical "
-           "results\n"
-           "       --host-pinned-max-gib G keeps at most G GiB of the host-mapped weights "
-           "(Flash-Next expert banks) page-locked; the banks of the least used layers beyond it "
-           "stay in pageable memory (CPU reads them in place, GPU copies go through a pinned "
-           "staging ring, no prefill streaming on them). Without it the whole page-locked "
-           "allocation is tried first and the fallback starts only if the driver refuses it "
-           "(Windows WDDM / WSL2 allow about half the RAM). Same results, slower where "
-           "pageable; the Host KV planes of --kv-ram-active count in G "
-           "(NINFER_HOST_PINNED_MAX_GIB also sets it)\n"
-           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
-           "--host-kv-mib uses MiB\n"
-           "       --disk-cache-dir DIR --disk-cache-gib N (off by default): disk tier of the "
-           "context cache, at most N GiB in DIR (least recently used out). Retained "
-           "conversations are written after --disk-cache-idle-ms of inactivity (default 5000; 0 "
-           "= only at shutdown) and on SIGTERM/SIGINT (at most --disk-cache-flush-seconds, "
-           "default 60); after a restart a prompt that begins with a saved conversation loads "
-           "it from disk instead of prefilling it. KV is stored in 256-token blocks addressed by "
-           "the prefix, written once and shared between turns and conversations. Records carry a "
-           "validity key (artifact, executable, KV dtype, tp, speculative mode, layouts): another "
-           "key is ignored. One directory per server (locked). --disk-cache-min-free-gib N keeps N "
-           "GiB free on the file system (default max(10 GiB, 5 %): the cache evicts, then skips "
-           "saves)\n"
-           "       --default-thinking-budget caps model-origin thinking for enabled requests; "
-           "control tokens count toward the request output limit\n"
-           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
-           "       --reasoning-close-retry: a reply that ends with the model's terminal token "
-           "inside "
-           "its thinking (or right after </think> with blank content and no tool call) is closed "
-           "with \"\\n</think>\\n\\n\" and continued once (on by default; "
-           "--no-reasoning-close-retry turns it off)\n"
-           "       --reasoning-eos-guard: the first token of a reply that starts in thinking is "
-           "never "
-           "a terminal token (a terminal draw is redrawn without them; on by default; "
-           "--no-reasoning-eos-guard turns it off)\n"
-           "       sampler defaults come from the resolved thinking mode; server flags and request "
-           "fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n"
-           "       --api-key-file FILE reads the key from FILE (one trailing newline stripped); "
-           "without --api-key or --api-key-file the key comes from NINFER_API_KEY when it is "
-           "set.\n";
+           "\n"
+           "  --expert-cpu-threads <N>\n"
+           "    CPU threads of the missing experts; default auto from the machine, logged at "
+           "startup: max(6, cores/2, 2 per L3 domain), one per physical core with ggml block "
+           "expert banks.\n"
+           "  --host-pinned-max-gib <N>\n"
+           "    Keep at most N GiB of the host-mapped weights (Flash-Next expert banks) "
+           "page-locked; the banks of the least used layers beyond it stay in pageable memory "
+           "(CPU reads them in place, GPU copies go through a pinned staging ring, no prefill "
+           "streaming on them).\n"
+           "    Without it the whole page-locked allocation is tried first and the fallback "
+           "starts only if the driver refuses it (Windows WDDM / WSL2 allow about half the RAM). "
+           "Same results, slower where pageable; the Host KV planes of --kv-ram-active count in "
+           "N (NINFER_HOST_PINNED_MAX_GIB also sets it).\n"
+           "\n"
+           "TP and devices:\n"
+           "  --device <N>\n"
+           "    CUDA device to run on.\n"
+           "  --tp <1|2>, --devices <A,B>\n"
+           "    Split the dense model across two GPUs (rank 0 on A) for ordinary, --spec mtp or "
+           "--spec dflash2 --lm-head-draft decoding, with or without --vision, with bf16, int8 "
+           "or nvfp4 KV.\n"
+           "    Defaults device-state to max(2x concurrency, 8), private to max(2x concurrency, "
+           "8) and the host tiers to 0 unless set (--profile 27b: 8 slots, 8192 MiB).\n"
+           "  --no-tp-mailbox\n"
+           "    Keep the captured --tp 2 all-reduces on cross-device copies.\n"
+           "  --embedding-host\n"
+           "    Use a single copy of the token embedding table in pinned host memory that every "
+           "GPU reads in place over PCIe, instead of one copy per GPU: frees the table's VRAM "
+           "(1.18 GiB per GPU on Qwen3.8-27B) for the KV pool, identical results.\n"
+           "  --context-cost-presets <FILE>\n"
+           "    File with context cost presets.\n"
+           "\n"
+           "Speculative decoding:\n"
+           "  --spec <mtp|dflash2|off>\n"
+           "    Speculative decoding mode.\n"
+           "  --draft-tokens <N>\n"
+           "    Draft tokens per speculative step: 1..5 with mtp, 1..15 with dflash2.\n"
+           "  --lm-head-draft\n"
+           "    Propose with the artifact's optimized proposal head.\n"
+           "\n"
+           "Prefill and response store:\n"
+           "  --prefill-chunk <N>\n"
+           "    Prefill chunk size in tokens, a multiple of 128.\n"
+           "    default: 1024\n"
+           "  --decode-share <F>\n"
+           "    While a prompt runs, the requests already decoding get F times the time of each "
+           "prompt unit (at least one decode round per unit); 1 gives both equal time.\n"
+           "    default: 0, max: 16\n"
+           "  --prefill-miss-dump <DIR>\n"
+           "    Diagnose prefix-reuse misses: when a request recomputes at least "
+           "--prefill-miss-min-tokens prompt tokens, shares at least --prefill-miss-min-match of "
+           "its prompt with one of the last 16 contexts, and either the server recomputed that "
+           "many tokens identical to it or the client changed that many of its tokens, both "
+           "texts, their token IDs and a summary.json with the divergence point go to a new "
+           "directory under DIR (at most 64 per process; contains conversation text; off by "
+           "default).\n"
+           "  --prefill-miss-min-tokens <N>\n"
+           "    Minimum recomputed prompt tokens to trigger a prefill miss dump.\n"
+           "    default: 10000\n"
+           "  --prefill-miss-min-match <F>\n"
+           "    Minimum fraction of the prompt shared with a recent context to trigger a dump.\n"
+           "    default: 0.5\n"
+           "  --response-store-max-records <N>\n"
+           "    Maximum records in the process-local Responses state store.\n"
+           "    default: " +
+           std::to_string(kDefaultResponseStoreRecords) +
+           "\n"
+           "  --response-store-max-mib <N>\n"
+           "    Maximum size in MiB of the process-local Responses state store.\n"
+           "    default: " +
+           std::to_string(kDefaultResponseStoreBytes >> 20) +
+           "\n"
+           "\n"
+           "Defaults and thinking:\n"
+           "  --default-max-tokens <N>\n"
+           "    Default output limit per request when omitted.\n"
+           "    default: " +
+           std::to_string(kDefaultMaxTokens) +
+           "\n"
+           "  --default-thinking-budget <N>\n"
+           "    Cap model-origin thinking for enabled requests; control tokens count toward the "
+           "request output limit.\n"
+           "  --no-thinking\n"
+           "    Disable thinking.\n"
+           "  --preserve-thinking\n"
+           "    Enable retaining closed-turn assistant reasoning in later prompts.\n"
+           "  --reasoning-close-retry, --no-reasoning-close-retry\n"
+           "    Enable closing a reply that ends with the model's terminal token inside its "
+           "thinking (or right after </think> with blank content and no tool call) with "
+           "\"\\n</think>\\n\\n\" and continuing once (on by default).\n"
+           "  --reasoning-eos-guard, --no-reasoning-eos-guard\n"
+           "    Enable the guard that the first token of a reply that starts in thinking is never "
+           "a terminal token; a terminal draw is redrawn without them (on by default).\n"
+           "\n"
+           "Vision:\n"
+           "  --vision, --no-vision\n"
+           "    Enable media and load the fixed Vision GPU allocations.\n"
+           "  --vision-device <N>\n"
+           "    CUDA device that holds the Vision tower and encodes; must equal --device on one "
+           "GPU and be one of --devices with --tp 2, where the other GPU only receives the "
+           "encoded embeddings.\n"
+           "    default: rank 0's device\n"
+           "  --max-vision-tokens <N>\n"
+           "    Cap the merged Vision tokens of one image or video item; larger media are "
+           "resized and the encode workspace is planned for N.\n"
+           "    min: 64, max: 16384, default: 16384\n"
+           "\n"
+           "Disk cache:\n"
+           "  --disk-cache-dir <DIR>\n"
+           "    Enable the disk tier of the context cache in DIR; requires --disk-cache-gib (off "
+           "by default).\n"
+           "    Retained conversations are written after --disk-cache-idle-ms of inactivity and on "
+           "SIGTERM/SIGINT; after a restart a prompt that begins with a saved conversation loads "
+           "it from disk instead of prefilling it.\n"
+           "    KV is stored in 256-token blocks addressed by the prefix, written once and shared "
+           "between turns and conversations. Records carry a validity key (artifact, executable, "
+           "KV dtype, tp, speculative mode, layouts): another key is ignored. One directory per "
+           "server (locked).\n"
+           "  --disk-cache-gib <N>\n"
+           "    Disk cache size in GiB in DIR (least recently used out); used with "
+           "--disk-cache-dir.\n"
+           "  --disk-cache-min-free-gib <N>\n"
+           "    Keep N GiB free on the file system; the cache evicts, then skips saves.\n"
+           "    default: max(10 GiB, 5%)\n"
+           "  --disk-cache-idle-ms <N>\n"
+           "    Write retained conversations after N ms of inactivity; 0 only at shutdown.\n"
+           "    default: 5000\n"
+           "  --disk-cache-flush-seconds <N>\n"
+           "    Maximum flush time in seconds on SIGTERM/SIGINT.\n"
+           "    default: 60\n"
+           "\n"
+           "Sampling: the defaults come from the resolved thinking mode; server flags and request "
+           "fields override single values.\n"
+           "  --temperature <F>\n"
+           "    Sampling temperature.\n"
+           "  --top-p <F>\n"
+           "    Nucleus sampling probability.\n"
+           "  --top-k <N>\n"
+           "    Top-k sampling.\n"
+           "  --min-p <F>\n"
+           "    Minimum probability threshold.\n"
+           "  --presence-penalty <F>\n"
+           "    Presence penalty.\n"
+           "  --frequency-penalty <F>\n"
+           "    Frequency penalty.\n"
+           "  --seed <N>\n"
+           "    Random seed.\n"
+           "  --greedy\n"
+           "    Force temperature 0 (exact argmax).\n"
+           "\n"
+           "Misc:\n"
+           "  --no-cuda-graph\n"
+           "    Disable CUDA graphs.\n"
+           "  --no-prefix-reuse\n"
+           "    Disable compatible-prefix caching (enabled by default).\n"
+           "  --chat-template <FILE>\n"
+           "    Jinja chat template used instead of the one in the artifact.\n"
+           "  --log-speculation-detail\n"
+           "    Add the per-step accepted draft lengths and the output/prompt 4-gram overlap to "
+           "every request_done record (requires --request-log-jsonl; off by default).\n"
+           "  --log-speculation-detail-max-steps <N>\n"
+           "    Cap speculation detail records per request; longer requests are marked truncated.\n"
+           "    default: " +
+           std::to_string(kDefaultSpeculationDetailMaxSteps) +
+           ", max: " + std::to_string(kMaximumSpeculationDetailMaxSteps) + "\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -511,12 +703,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
         } else if (arg == "--vram-headroom-mib") {
-            const std::uint64_t mib =
-                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib");
-            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("--vram-headroom-mib is out of range");
-            }
-            vram_headroom_mib = static_cast<std::size_t>(mib);
+            vram_headroom_mib =
+                product::parse_vram_headroom_mib(require_value("--vram-headroom-mib"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -809,31 +997,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.devices = product::parse_devices(require_value("--devices"));
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor = std::stof(require_value("--rope-yarn-factor"));
-            // PORT NOTE (2026-10-24): the upstream patch allowed [1,8]; the follow-up commit
-            // caps it at 4 because the attention visible-keys ceiling cannot serve more, so a
-            // factor that cannot work is refused at the command line, not at engine start.
+            // The attention visible-keys ceiling cannot serve a factor above 4: it is refused at
+            // the command line, not at engine start.
             if (!(options.rope_yarn_factor >= 1.0F) || options.rope_yarn_factor > 4.0F) {
                 throw std::invalid_argument(
                     "--rope-yarn-factor must be in [1,4] (1 disables YaRN; 4 is the attention "
                     "visible-keys ceiling)");
             }
         } else if (arg == "--rope-original-max-position") {
-            options.rope_original_max_position = static_cast<std::uint32_t>(
-                std::stoul(require_value("--rope-original-max-position")));
+            options.rope_original_max_position = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--rope-original-max-position"), "rope-original-max-position"));
             if (options.rope_original_max_position == 0) {
                 throw std::invalid_argument("--rope-original-max-position must be positive");
             }
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            options.kv_cache = product::parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
-            options.speculative.backend =
-                product::parse_speculative_backend(require_value("--spec"));
-            if (options.speculative.backend == SpeculativeBackend::None) {
-                // --spec off also drops a profile's draft window and proposal head (like
-                // --no-vision)
-                options.speculative.draft_tokens  = 0;
-                options.speculative.proposal_head = ProposalHead::Full;
-            }
+            product::set_speculative_backend(options.speculative, require_value("--spec"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
@@ -936,12 +1116,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--log-speculation-detail-max-steps requires --log-speculation-detail");
     }
-    if (vram_headroom_mib.has_value()) {
-        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
-        }
-        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
-    }
+    product::apply_vram_headroom(options.kv_capacity, vram_headroom_mib);
     if (options.context_cache.disk_directory.empty() !=
         (options.context_cache.disk_capacity_bytes == 0)) {
         throw std::invalid_argument("--disk-cache-dir and --disk-cache-gib go together");
@@ -964,11 +1139,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // per StateImage), so --host-kv-mib and --host-state-slots work as at tp 1. Unset, they
         // stay 0 at tp 2: on Qwen3.8-Flash-Next the routed experts already pin most of the RAM,
         // and the PLE table is read through the page cache. --profile 27b turns them on;
-        // --profile flash-next sets 4 GiB of Host KV for the idle conversations' KV (v0.6) and 8
-        // Host StateImages (884 MiB pinned): without them a capture that finds the 8+1 Device
+        // --profile flash-next sets 4 GiB of Host KV for the idle conversations' KV and 8 Host
+        // StateImages (884 MiB pinned): without them a capture that finds the 8+1 Device
         // StateImages full releases a whole idle conversation (reclaim_private_owners_for_capture),
-        // and agents with parallel subagents (Claude Code) re-prefilled the smaller conversation
-        // from the root at almost every turn (banco B4 19/10: 71 of 114 subagent turns).
+        // and agents with parallel subagents (Claude Code) re-prefill the smaller conversation from
+        // the root at almost every turn (71 of 114 subagent turns in a measured session).
         if (!host_state_explicit) { options.context_cache.host_state_slots = 0; }
         if (!host_kv_explicit) { options.context_cache.host_kv_capacity_bytes = 0; }
     }

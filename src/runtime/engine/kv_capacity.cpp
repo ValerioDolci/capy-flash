@@ -1,5 +1,7 @@
 #include "runtime/engine/kv_capacity.h"
 
+#include "core/checked.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -7,18 +9,6 @@
 
 namespace ninfer::runtime {
 namespace {
-
-std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
-    if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
-    return a + b;
-}
-
-std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(label);
-    }
-    return a * b;
-}
 
 void validate_curve(const SequenceCapacityCurve& curve) {
     if (curve.main_page_tokens == 0 || curve.minimum_main_page_groups == 0 ||

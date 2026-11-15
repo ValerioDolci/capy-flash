@@ -1,4 +1,4 @@
-// v0.7 27b-16gb: CPU-only checks of the q3_g128_fp16 storage decode the GPU kernels run
+// CPU-only checks of the q3_g128_fp16 storage decode the GPU kernels run
 // (src/ops/linear/q3/q3_rowsplit_storage.cuh). No CUDA device or runtime is used.
 //
 // Pre-registered criteria (all exact):
@@ -63,7 +63,8 @@ int main() {
         const auto bytes = pack_group(codes, false);
         check(bytes.size() == 3 && bytes[0] == 0xac && bytes[1] == 0x8f && bytes[2] == 0x68,
               "reference vector -4..3 -> ac 8f 68");
-        for (int i = 0; i < 8; ++i) check(q3_row_code(bytes.data(), i) == codes[i], "reference decode");
+        for (int i = 0; i < 8; ++i)
+            check(q3_row_code(bytes.data(), i) == codes[i], "reference decode");
     }
 
     std::mt19937 rng(20261019u);
@@ -99,13 +100,14 @@ int main() {
                     kGroups * 128, scalar_bad, unit_bad);
 
         // 3. compressed-tensors offset stream XOR 24 49 92 == stored plane.
-        int xor_bad = 0;
+        int xor_bad                            = 0;
         static constexpr std::uint8_t kMask[3] = {0x24, 0x49, 0x92};
         for (int g = 0; g < kGroups; ++g) {
             std::vector<int> group(codes.begin() + g * 128, codes.begin() + (g + 1) * 128);
             const auto offset = pack_group(group, true);
             for (int b = 0; b < 48; ++b) {
-                if (static_cast<std::uint8_t>(offset[b] ^ kMask[b % 3]) != plane[g * 48 + b]) ++xor_bad;
+                if (static_cast<std::uint8_t>(offset[b] ^ kMask[b % 3]) != plane[g * 48 + b])
+                    ++xor_bad;
             }
         }
         check(xor_bad == 0, "offset stream xor 24 49 92 equals the stored plane");

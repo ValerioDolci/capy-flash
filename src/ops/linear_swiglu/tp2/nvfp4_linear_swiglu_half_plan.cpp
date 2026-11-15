@@ -1,4 +1,4 @@
-// The two-device [17408,5120] half's copy of upstream's nvfp4/nvfp4_linear_swiglu_plan.cpp: the
+// The two-device [17408,5120] half's copy of nvfp4/nvfp4_linear_swiglu_plan.cpp: the
 // same source, compiled with the half's geometry and entry points (linear_swiglu_half.h).
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"

@@ -190,9 +190,8 @@ int test_standard_field_policy() {
     return failures;
 }
 
-// Structured output (constrained decoding), ported from Neroued/ninfer 08902f73, eb6696ae,
-// 8ffa3131 and 2734a56e (test_openai_schema.cpp) and adapted to Tappa A: JSON output with active
-// tools stays rejected until the tool grammar lands.
+// Structured output (constrained decoding). JSON output with active tools is rejected: there is no
+// tool-call grammar.
 int test_constrained_decoding_extensions() {
     int failures = 0;
 
@@ -359,9 +358,9 @@ int test_constrained_decoding_extensions() {
                       "inactive tools blocked a constraint");
     body["tool_choice"] = "required";
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "forced tool_choice is still rejected in Tappa A");
+                      "forced tool_choice was accepted");
 
-    // D6: constrained requests sample without presence penalty unless the client sets one.
+    // Constrained requests sample without presence penalty unless the client sets one.
     body                    = base_request();
     body["response_format"] = Json{{"type", "json_object"}};
     failures += check(options(parse(body).generation).execution.sampling.presence_penalty ==
@@ -433,7 +432,7 @@ int test_constrained_decoding_extensions() {
         "text.format.schema");
     failures += check(unlocated.param == "text.format.schema",
                       "combination error without pointer lost the constraint field");
-    // Vendor errors carry a timestamp and the server's source path: not for clients (N6).
+    // Vendor errors carry a timestamp and the server's source path: not for clients.
     const auto vendor = request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::InvalidRegex,
                              "[21:04:30] /home/u/xgrammar/cpp/regex_converter.cc:85: Regex parsing "
@@ -445,7 +444,7 @@ int test_constrained_decoding_extensions() {
     return failures;
 }
 
-// capy-flash structured output limits (OutputConstraintLimits): over-limit inputs are 400s in the
+// Structured output limits (OutputConstraintLimits): over-limit inputs are 400s in the
 // HTTP layer that name the limit and the location, before anything recursive sees them. Deep
 // documents are built from text and only moved: copying or dumping them would recurse.
 std::string nested_items(std::size_t levels) {
@@ -467,7 +466,7 @@ int test_constraint_limits() {
         return error.status == 400 && error.code == "constraint_limit_exceeded" &&
                error.param.starts_with(param) && error.message.find(flag) != std::string::npos;
     };
-    // B2: the audit's 5 000-level schema killed the server (stack overflow in the converter).
+    // A 5 000-level schema overflows the stack of the converter.
     for (const std::size_t levels : {300U, 5000U, 100000U}) {
         failures += check(limited(schema_error(nested_items(levels)),
                                   "response_format.json_schema.schema/items/items",
@@ -512,7 +511,7 @@ int test_constraint_limits() {
     failures += check(outputs_error(Json{{"regex", "[(]{3}\\((a)"}}).status == 0,
                       "escaped or bracketed parentheses counted as regex groups");
 
-    // Tool-call arguments are JSON in a string: checked where they are read (capy-flash).
+    // Tool-call arguments are JSON in a string: checked where they are read.
     Json history        = base_request();
     history["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "hi"}},
@@ -531,12 +530,18 @@ int test_constraint_limits() {
                   deep_arguments.param == "messages",
               "deeply nested tool-call arguments were not refused");
 
-    // Configurable; set once at startup by the HTTP server.
-    configure_output_constraint_limits({.max_depth = 8});
-    failures += check(limited(schema_error(nested_items(10)), "response_format.json_schema.schema",
-                              "--constraint-max-depth"),
-                      "the configured depth limit was not applied");
-    configure_output_constraint_limits({});
+    // Configurable (--constraint-max-depth).
+    RequestLimits shallow  = limits();
+    shallow.constraints    = {.max_depth = 8};
+    const Json deep_schema = Json::parse(
+        R"({"model":"qwen","messages":[{"role":"user","content":"hello"}],)"
+        R"("response_format":{"type":"json_schema","json_schema":{"name":"x","schema":)" +
+        nested_items(10) + "}}}");
+    const auto configured =
+        api_error([&] { (void)parse_chat_completion_request(deep_schema, shallow); });
+    failures +=
+        check(limited(configured, "response_format.json_schema.schema", "--constraint-max-depth"),
+              "the configured depth limit was not applied");
 
     // The exact-number check reads the raw body and searches the schema recursively: a deep schema
     // with an inexact bound must stop at the depth limit, not overflow the stack.
@@ -545,8 +550,8 @@ int test_constraint_limits() {
     for (int i = 0; i < 100000; ++i) text += R"({"type":"array","items":)";
     text += R"({"type":"number","maximum":0.30000000000000001})";
     text += std::string(100000, '}') + "}}}";
-    const auto inexact =
-        api_error([&] { validate_schema_number_input(ninfer::text::parse_json_numbers(text)); });
+    const auto inexact = api_error(
+        [&] { validate_schema_number_input(ninfer::text::parse_json_numbers(text), limits()); });
     failures += check(limited(inexact, "response_format.json_schema.schema/items/items",
                               "--constraint-max-depth"),
                       "a deep schema with an inexact number was not stopped at the depth limit");

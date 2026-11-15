@@ -8,7 +8,7 @@ ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)
 
-# v0.7 27b-16gb: q3_g128_fp16. The storage test is CPU-only; the A16 test needs a GPU (exit 77).
+# 27b-16gb: q3_g128_fp16. The storage test is CPU-only; the A16 test needs a GPU (exit 77).
 ninfer_add_test(ninfer_q3_storage_host_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q3_storage_host.cpp")
 
@@ -16,7 +16,7 @@ ninfer_add_op_test(ninfer_linear_q3_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q3_a16.cpp"
   LIBRARIES ninfer_ops)
 
-# v0.7 q3-prefill: the A8 prefill routes (tall workspace route == in-kernel quantizing tile, bit for
+# Q3 prefill: the A8 prefill routes (tall workspace route == in-kernel quantizing tile, bit for
 # bit, and == a host emulation); NINFER_Q3_BENCH=1|2 adds (2: only) a timing table.
 ninfer_add_op_test(ninfer_linear_q3_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q3_a8.cpp"

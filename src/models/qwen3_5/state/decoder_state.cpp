@@ -16,7 +16,7 @@ namespace {
 
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
-    return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    return kv_pages_for_tokens(capacity);
 }
 
 std::int32_t checked_region_pages(std::uint64_t pages) {

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/state/state_image.h"
 
+#include "core/checked.h"
 #include "core/device.h"
 #include "core/device_scope.h"
 
@@ -12,20 +13,6 @@ namespace ninfer::models::qwen3_5 {
 namespace {
 
 constexpr std::size_t kStateImageAlignment = 256;
-
-std::size_t checked_mul(std::size_t left, std::size_t right, const char* label) {
-    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
-        throw std::overflow_error(label);
-    }
-    return left * right;
-}
-
-std::size_t checked_add(std::size_t left, std::size_t right, const char* label) {
-    if (right > std::numeric_limits<std::size_t>::max() - left) {
-        throw std::overflow_error(label);
-    }
-    return left + right;
-}
 
 std::uint32_t padded_dflash_capacity(std::uint32_t capacity) {
     if (capacity == 0) {

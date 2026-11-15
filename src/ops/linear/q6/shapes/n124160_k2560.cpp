@@ -3,7 +3,7 @@
 namespace ninfer::ops::detail {
 
 // Qwen4Exp at tp 2: one rank's vocabulary half of the Q6 output head of the
-// qwen3_8_flash_next_nvfp4 recipe ([248320,2560] split by rows). Routes of the
+// qwen3_8_flash_next_nvfp4 recipe ([248320,2560] split by rows). Routes measured on a
 // [248320,2048] head (the nearest hidden width), untuned on the RTX 5070 Ti.
 Q6Launch select_q6_n124160_k2560(std::int32_t tokens) {
     if (tokens <= 1) return launch_q6_a16_gemv_r4_w2_g16;

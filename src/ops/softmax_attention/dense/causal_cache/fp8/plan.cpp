@@ -11,9 +11,8 @@ constexpr int kGroupedPrefillMaxWidth = 80;
 
 Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                         CausalAttentionExecutionEnvelope envelope) {
-    if ((heads != 24 && heads != 16) || width < 1 || batch < 1 || batch > 8 ||
-        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+    if (heads != 24 || width < 1 || batch < 1 || batch > 8 || (batch > 1 && width > 16) ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("FP8 attention: invalid plan inputs");
     constexpr int grouped_limit = Fp8KvCausalPlan::kTokenTile;
@@ -25,7 +24,7 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                 batch,  envelope, mxfp8_tiled_partition(heads, width, envelope.max_visible_keys)};
     const int tiles =
         family == Fp8KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = batch * 4 * tiles;
     // Decode permits two resident CTAs per SM. Spec uses one; add a wave when
     // rounding to complete query tiles would leave over 10% of the 170 SMs idle.
     constexpr int sms   = kCausalAttentionSmCount;
@@ -34,7 +33,7 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
     CausalKvPartition partition{
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.key_shift = width == 1 ? 7 : 8;
     partition.capacity  = partition.active(envelope.max_visible_keys);
     return {family, heads, width, batch, envelope, partition};
 }

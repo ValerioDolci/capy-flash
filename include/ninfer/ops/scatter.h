@@ -51,28 +51,4 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
                         Tensor& destination, cudaStream_t stream);
 
-/**
- * Op: extract_bf16_columns
- *
- * Math / indexing:
- *   For source [D,T] and destination [D',T]:
- *   destination[d,t] = source[source_column + d,t], 0<=d<D', 0<=t<T.
- *
- * Logical shapes:
- *   Contiguous BF16 source [D,T] and destination [D',T]. Despite the historical parameter name,
- *   source_column is an offset in the fastest (ne[0]) dimension; 0<=source_column and
- *   source_column+D'<=D.
- *
- * Numeric:
- *   Exact BF16 element copies.
- *
- * Effects:
- *   Writes the full destination; source and destination must not alias.
- *
- * Workspace:
- *   None. The Op has no persistent state side effect.
- */
-void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
-                          cudaStream_t stream);
-
 } // namespace ninfer::ops

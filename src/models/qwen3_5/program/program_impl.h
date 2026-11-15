@@ -58,14 +58,6 @@ using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 // it at a decode-round boundary; a full window is asked first, a step-sized extension when the
 // pool cannot spare one.
 
-[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
-[[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
-    return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
-}
-
 using ReusePath = ninfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
@@ -392,7 +384,7 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
-    // T41 calibration (NINFER_QWEN4_MTP_CALIB): the log-probabilities of the pending proposals.
+    // Calibration (NINFER_QWEN4_MTP_CALIB): the log-probabilities of the pending proposals.
     std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_logprobs{};
     bool tail_hidden_valid = false;
     bool endpoint_valid    = false;
@@ -464,7 +456,7 @@ struct RequestControl {
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
-        // Disk tier (v0.7.2): the resume was tried; the frontier it loaded (0: none). The MTP
+        // Disk tier: the resume was tried; the frontier it loaded (0: none). The MTP
         // bridge then runs at this frontier instead of `base` (which stays the admitted reuse).
         bool disk_attempted     = false;
         std::uint32_t disk_base = 0;
@@ -639,9 +631,8 @@ public:
     [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
     DeviceKVCompaction compact_device_kv();
 
-    // Disk tier (v0.7.2, storage/disk_kv.cpp).
+    // Disk tier (storage/disk_kv.cpp).
     void initialize_disk_cache();
-    [[nodiscard]] bool disk_cache_has_unsaved() const noexcept;
     DiskCacheSave disk_cache_save_one(const std::function<bool()>& abort);
     DiskCacheSave disk_cache_save(std::uint32_t slot, const std::function<bool()>& abort);
     void disk_synchronize() const;
@@ -667,14 +658,11 @@ public:
     const std::uint32_t continuation_capacity;
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
-    // T42: Qwen4Exp prompt chunks of more than this many columns run on lent workspace and
+    // Qwen4Exp prompt chunks of more than this many columns run on lent workspace and
     // prefill_hidden holds this many columns (0 = off: prefill_hidden holds prefill_chunk).
     const std::uint32_t qwen4_prompt_base_chunk;
     const std::uint32_t kv_lease_window_tokens; // EngineOptions::kv_lease_window_tokens
     const std::uint32_t draft_window;
-    // T41 adaptive MTP window (SpeculativeOptions::min_draft_probability; 0 = off).
-    const float mtp_min_p;
-    const MtpWindowRule mtp_window_rule;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -688,7 +676,7 @@ public:
     const WorkspacePlan workspace_plan;
 #include "models/qwen3_5/program/tp2/program_impl_public.inc"
 
-    // T64 elastic KV (plan.elastic_kv): the KV page planes and the expert slot pools, in their own
+    // Elastic KV (plan.elastic_kv): the KV page planes and the expert slot pools, in their own
     // VMM arena (PersistentLayout::elastic_bytes) whose KV pages and elastic expert columns are
     // backed on demand (Qwen4ElasticVram); everything else stays in `persistent`.
     std::unique_ptr<ElasticArena> elastic_arena;
@@ -707,7 +695,7 @@ public:
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
-    // Disk tier (v0.7.2, storage/disk_kv.cpp): null when off. The pinned scratch holds one Host
+    // Disk tier (storage/disk_kv.cpp): null when off. The pinned scratch holds one Host
     // StateImage, the read buffer two resume read-ahead chunks.
     std::unique_ptr<DiskKVCache> disk_kv;
     std::optional<PinnedHostBuffer> disk_state_scratch;
@@ -796,12 +784,13 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
 
-    // Qwen4Exp (T20/M1, tp 2 T31): routed-expert backend, n-gram gather and its pinned staging,
+    // Qwen4Exp (one device or tp 2): routed-expert backend, n-gram gather and its pinned staging,
     // the validation dump, and the runtime record every Qwen4Exp TextContext reads.
     std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_experts;
-    std::uint32_t qwen4_expert_slots    = 0;
-    std::size_t qwen4_expert_pool_bytes = 0;
-    // T64: the elastic KV <-> expert slot manager (null unless plan.elastic_kv.enabled).
+    std::uint32_t qwen4_expert_slots      = 0;
+    std::size_t qwen4_expert_pool_bytes   = 0;
+    std::int32_t qwen4_expert_publish_lag = 0;
+    // The elastic KV <-> expert slot manager (null unless plan.elastic_kv.enabled).
     std::unique_ptr<Qwen4ElasticVram> qwen4_elastic;
     std::optional<execution::Qwen4ExpertBank> qwen4_mtp_bank;
     // Host copy of the MTP bank's expanded weight divisors (gate|up [2E] then down [E]) for the
@@ -838,7 +827,7 @@ public:
     std::unique_ptr<execution::PleGather> qwen4_ple_gather;
     std::optional<PinnedHostBuffer> qwen4_ple_host;
     std::optional<PinnedHostBuffer> qwen4_decode_ple_buffer;
-    // T49: rank 1's commit work (fold) joined into rank 0's stream when the commit does not wait.
+    // Rank 1's commit work (fold) joined into rank 0's stream when the commit does not wait.
     std::optional<CudaCompletionEvent> qwen4_peer_commit_event;
     std::uint16_t* qwen4_decode_ple_host = nullptr;
     // Deferred decode rows (Qwen4Runtime::decode_ple_staged): the mapped words of rank 0 and rank
@@ -858,12 +847,12 @@ public:
     // Runs stage_qwen4_ple_round() of a graph round after its launch (created with the words).
     std::unique_ptr<Qwen4PleStager> qwen4_ple_stager;
     std::unique_ptr<execution::Qwen4TfDump> qwen4_tfdump;
-    // T59 fast bench: teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY, see
+    // Teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY, see
     // qwen4_tfdump.h) and its recorder (NINFER_QWEN4_REPLAY_RECORD=<file>: "req <prompt tokens>"
     // at every first token, "win <frontier> <extent> <accepted> <drafts...>" per MTP round).
     std::unique_ptr<execution::Qwen4Replay> qwen4_replay;
     std::FILE* qwen4_replay_record = nullptr;
-    // T59 (NINFER_QWEN4_ROUND_LOG=<file>, measurement): one line per decode round,
+    // Round log (NINFER_QWEN4_ROUND_LOG=<file>, measurement): one line per decode round,
     // "<o|m> <frontier> <extent> <accepted> <round us> <host gap us> <missing> <cpu experts>
     // <gpu-share experts> <expert window wall us> <fill wait us> <elastic expert columns>" (gap =
     // previous round's end -> this round's start, -1 for a request's first round; columns -1
@@ -874,7 +863,7 @@ public:
     void log_qwen4_round(char kind, std::uint32_t frontier, std::uint32_t extent,
                          std::int32_t accepted, double round_seconds);
     std::optional<execution::Qwen4Runtime> qwen4_runtime_record;
-    // T43: the draft shortlist proposal head (Qwen4Runtime::draft_head of rank 0), when planned.
+    // The draft shortlist proposal head (Qwen4Runtime::draft_head of rank 0), when planned.
     std::optional<execution::Qwen4DraftHead> qwen4_draft_head;
     // tp 2: rank 1's expert backend (the odd expert IDs) and runtime record (TpExecution::qwen4).
     std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_peer_experts;
@@ -923,10 +912,9 @@ public:
     // Qwen4Exp PLE n-gram rows of a decode window into the pinned round buffer: columns
     // [first_column, first_column + tokens.size()) are the tokens `tokens` at positions
     // frontier.., with `ledger` (the committed tokens before `frontier`) as their history.
-    // T53: page prefetch of the next round's n-gram rows (an MTP round's anchor and drafts, or
+    // Page prefetch of the next round's n-gram rows (an MTP round's anchor and drafts, or
     // an ordinary round's sampled token, are in the egress once this round has synchronized), so
     // the storage reads overlap the commit and the next round's host preparation.
-    // NINFER_T53_PLE_PREFETCH=0 disables it.
     void prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> lanes, bool mtp);
     void stage_qwen4_ple_rows(std::span<const TokenId> ledger, std::uint32_t frontier,
                               std::span<const TokenId> tokens, std::size_t first_column);

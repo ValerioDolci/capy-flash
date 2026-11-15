@@ -1,7 +1,7 @@
 #pragma once
 
 // What the two-device (tp 2) parts of the Qwen3.5 Program need, in one include for
-// program/program_impl.h. Our file.
+// program/program_impl.h.
 
 #include "core/device.h"
 #include "core/device_scope.h"

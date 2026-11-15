@@ -183,9 +183,9 @@ concurrent requests, sampling penalties, and prefix reuse. An artifact without t
 weights reports a missing DFlash2 component when selected. Vision and MTP follow the same
 rule: their weights are required only when that component is enabled at startup.
 
-Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash2 with seven draft tokens (block length eight), both with
-the optimized proposal head. Seven forms the measured block length eight, while fifteen uses the
+Only one speculative backend can be enabled per Engine. The gate (`tools/tp2/gate.sh`) runs MTP with
+three draft tokens and DFlash2 with seven draft tokens (block length eight), both with the optimized
+proposal head. Seven forms the measured block length eight, while fifteen uses the
 maximum supported block length sixteen.
 
 ## Common options
@@ -210,7 +210,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vision-device N` | CUDA device that holds the Vision tower and encodes; equal to `--device` on one GPU, one of `--devices` at `--tp 2` | `--device` |
 | `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus). Without it the mailbox is probed once at startup and dropped by itself when the probe times out or exceeds 50 ms (`NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback); an exchange that hangs in a decode graph's first launch moves the MTP draft phase, then everything, to the copies (`NINFER_TP_MAILBOX_DRAFT=copies` starts with the draft phase there; `NINFER_TP_MAILBOX_FAULT=draft\|any` simulates the hang); `NINFER_TP_MAILBOX_LEGACY=1` runs the mailbox with its original exchange kernel (slower, same results); with `--spec mtp --lm-head-draft` the optimized proposal head is split by vocabulary across the two GPUs, and `NINFER_TP_DRAFT_HEAD=primary` keeps it whole on the first (slower, same results) | mailbox on without P2P, probed at startup |
+| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus). Without it the mailbox is probed once at startup and dropped by itself when the probe times out or exceeds 50 ms (`NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback); an exchange that hangs in a decode graph's first launch moves the MTP draft phase, then everything, to the copies (`NINFER_TP_MAILBOX_DRAFT=copies` starts with the draft phase there; `NINFER_TP_MAILBOX_FAULT=draft\|any` simulates the hang); with `--spec mtp --lm-head-draft` the optimized proposal head is split by vocabulary across the two GPUs, and `NINFER_TP_DRAFT_HEAD=primary` keeps it whole on the first (slower, same results) | mailbox on without P2P, probed at startup |
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU; frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B), identical results ([serving guide](serving.md#two-gpus)) | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |

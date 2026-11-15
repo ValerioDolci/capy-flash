@@ -1,6 +1,6 @@
-// Renames that turn upstream's NVFP4 gdn_input_proj sources into the [8192,5120] shard's when a
+// Renames that turn the parent's NVFP4 gdn_input_proj sources into the [8192,5120] shard's when a
 // translation unit of this directory includes them. Include it once, after
-// nvfp4_gdn_input_shard_prelude.h and right before the upstream source.
+// nvfp4_gdn_input_shard_prelude.h and right before the parent's source.
 
 #define Nvfp4GdnInputOutput                      Nvfp4GdnInputShardOutput
 #define nvfp4_gdn_input_a16_launch               nvfp4_gdn_input_shard_a16_launch

@@ -27,7 +27,7 @@ std::uint32_t divide(std::uint32_t extent, int width, const char* label) {
 
 } // namespace
 
-TextConfig shard_text_config(const TextConfig& config, int width, bool hc_split_streams) {
+TextConfig shard_text_config(const TextConfig& config, int width) {
     if (width != 1 && width != kTensorParallelWidth) {
         throw std::invalid_argument("tensor-parallel Text config: width must be 1 or 2");
     }
@@ -40,10 +40,6 @@ TextConfig shard_text_config(const TextConfig& config, int width, bool hc_split_
         // PLE are replicated.
         if (const auto* dense = std::get_if<DenseConfig>(&out.ffn)) {
             out.ffn = DenseConfig{divide(dense->intermediate_size, width, "intermediate_size")};
-        }
-        if (hc_split_streams) {
-            auto& hc    = out.hyper_connection.value();
-            hc.hc_count = divide(hc.hc_count, width, "hc_count");
         }
     } else {
         const auto& dense = std::get<DenseConfig>(out.ffn);
@@ -108,7 +104,7 @@ void output_logits_split_rank0(const std::array<Tensor, 2>& hidden,
     CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(1), 0));
     // The one cross-device transfer: a plain D2D cudaMemcpyAsync over UVA, the form the
     // collectives use because it is capturable with and without peer access. Eagerly with a
-    // HostExchange attached it goes through pinned host memory instead (T68: rank 1's half may
+    // HostExchange attached it goes through pinned host memory instead (rank 1's half may
     // sit in the elastic VMM pool lent to a prompt chunk, which rank 0 cannot address without P2P).
     if (ops::HostExchange* exchange = ops::eager_exchange(execution, events)) {
         exchange->copy(1, partial[1].data, staging.data, bytes1 * height, execution, events);

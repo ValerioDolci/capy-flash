@@ -154,7 +154,7 @@ void Qwen4Forward<Arena>::gdn_controls(std::size_t layer, const RankTensors& in,
             each([&](int r) {
                 linear(r, x[at(r)], generic_projection(p(r).control), control[at(r)]);
                 if constexpr (kExecute) {
-                    // a|b read in place from the projection (T49: no row-split copies).
+                    // a|b read in place from the projection (no row-split copies).
                     ops::gdn_gating(control[at(r)].slice(0, 0, heads),
                                     control[at(r)].slice(0, heads, heads), p(r).a_log, p(r).dt_bias,
                                     decay[at(r)], beta[at(r)], s(r));

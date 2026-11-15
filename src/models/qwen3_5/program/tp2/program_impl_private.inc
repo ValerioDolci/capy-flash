@@ -1,6 +1,6 @@
 // Class-body fragment of ProgramImpl (program/program_impl.h), included at the end of its private
 // section: the two-device (tp 2) helpers. Definitions in program/tp2/program_impl_tp2.inc and
-// the other program/tp2 fragments. Not a header; our file, see docs/maintainer/upstream-merge.md.
+// the other program/tp2 fragments. Not a header.
 
 private:
 // Constructor steps at tensor-parallel width 2: the width checks and rank 1's runtime, events

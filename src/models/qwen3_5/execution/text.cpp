@@ -685,23 +685,12 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
-                                      Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
-    require_single_device("target verification");
-    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                        linear_state_source_slots, envelope, hidden, logits, target_tokens);
-}
-
-void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                                      const Tensor& rope_positions, const Tensor& valid_columns,
-                                      const Tensor& kv_table_rows,
-                                      const Tensor& linear_state_source_slots,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink) {
+                                      DFlashFeatureSink* sink) {
     require_single_device("target verification");
     // A drafter's feature sink rides along on the Qwen4 forward (plain residual only).
     qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                        linear_state_source_slots, envelope, hidden, logits, target_tokens, &sink);
+                        linear_state_source_slots, envelope, hidden, logits, target_tokens, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -840,45 +829,21 @@ void TextContext::mtp_prompt_chunk(std::span<const int> alignment_ids,
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
-                                              std::uint32_t nominal_length, bool finalize_at_end) {
-    if (begin >= full_ids.size() || nominal_length == 0 ||
-        nominal_length > full_ids.size() - begin) {
-        throw std::invalid_argument("text prefill chunk is outside the prompt");
-    }
-    const TextPrefill text_prefill{full_ids, begin};
-    return qwen4_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
-                         finalize_at_end);
-}
-
-PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
-                                              DFlashFeatureSink& sink) {
+                                              DFlashFeatureSink* sink) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
     return qwen4_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
-                         finalize_at_end, &sink);
-}
-
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
-                                              std::uint32_t begin, std::uint32_t nominal_length,
-                                              VisionPrefillSession& vision, bool finalize_at_end) {
-    if (begin >= input.token_ids.size() || nominal_length == 0 ||
-        nominal_length > input.token_ids.size() - begin) {
-        throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
-    }
-    const std::span<const int> tokens(input.token_ids);
-    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
-    return qwen4_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
-                         finalize_at_end);
+                         finalize_at_end, sink);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end,
-                                              DFlashFeatureSink& sink) {
+                                              DFlashFeatureSink* sink) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
@@ -886,7 +851,7 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     return qwen4_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
-                         finalize_at_end, &sink);
+                         finalize_at_end, sink);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -1,8 +1,8 @@
 // Replays a llama.cpp routing trace (routing.bin of the F0 expert statistics) through the
-// expert-cache policy with the window semantics of the offline LRU simulator (T14), and prints
-// one line per counted window: "hits accesses missing inserts" (missing = distinct experts absent
-// at window start, inserts = slot insertions). T14 compared these lines
-// with the simulators window by window (the simulators are not part of this repository).
+// expert-cache policy with the window semantics of the offline LRU simulator, and prints one line
+// per counted window: "hits accesses missing inserts" (missing = distinct experts absent at window
+// start, inserts = slot insertions). These lines were compared with the simulators window by
+// window (the simulators are not part of this repository).
 //
 // routing.bin: int32 header {48, 10, 512}, then packed records {u8 dom, u8 phase, i32 token,
 // i32 pos, u16 experts[48][10]} (0xFFFF = not recorded). Layers 0..46 are used (layer 47 is only

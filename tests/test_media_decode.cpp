@@ -10,9 +10,9 @@
 
 namespace {
 
-// Neroued/ninfer#20: this 300x200 yuvj420p JPEG selected an swscale SIMD path that overwrote a
-// width-tight RGB24 destination. Keep the exact public reproducer so the test does not depend on
-// an encoder or external files.
+// This 300x200 yuvj420p JPEG selects an swscale SIMD path that can overwrite a width-tight RGB24
+// destination. Keep the exact reproducer so the test does not depend on an encoder or external
+// files.
 constexpr std::string_view issue_20_jpeg_base64 = R"jpeg(
 /9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAx
 NDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy

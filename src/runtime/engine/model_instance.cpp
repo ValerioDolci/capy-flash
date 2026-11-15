@@ -5,6 +5,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen3_5/program/program.h"
+#include "ninfer/ops/rope.h"
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
 #include <algorithm>
@@ -186,6 +187,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         };
         cache.disk_identity =
             "artifact=" + identity(options.artifact_path) + ";exe=" + identity("/proc/self/exe");
+        // Keys stored under YaRN carry its rotation: they resume only a run with the same YaRN.
+        if (options.rope_yarn_factor > 1.0F) {
+            cache.disk_identity += ";yarn=" + std::to_string(options.rope_yarn_factor) + "/" +
+                                   std::to_string(options.rope_original_max_position);
+        }
     }
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
@@ -308,7 +314,7 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     if (instance->parameters.qwen4 &&
         instance->parameters.model.config().text.qwen4_routed_experts()) {
         // CPU threads of the missing experts: an explicit value (--expert-cpu-threads) wins, 0 is
-        // resolved from this machine (v0.7.2, issue #11).
+        // resolved from this machine.
         auto& e                = options.routed_experts;
         std::uint32_t& threads = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
         std::string reason     = "set by the caller (--expert-cpu-threads)";
@@ -321,30 +327,26 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
                      threads, reason.c_str());
     }
     if (gguf_banks) {
-        // capy-flash v0.7: ggml block expert banks run without prefill expert streaming, the
-        // router-ahead prefetch and the miss split (not implemented for them): plan and run so.
+        // ggml block expert banks run without prefill expert streaming and the
+        // miss split (not implemented for them): plan and run so.
         auto& e = options.routed_experts;
-        // capy-flash v0.11.2: without --stream-min-tokens the threshold follows the device count
-        // (13/11, server TTFT, 9900X DDR5 + RTX 5070 Ti PCIe 5.0 x8, 64 GB edition): at tp 2 the
-        // CPU path costs ~0.45 s + ~1 ms per token and the ring a flat ~0.85-0.95 s, even at
-        // ~600 tokens (355 tokens: 0.59 s vs 0.84 s); at one GPU the ring leaves part of each
-        // layer to the CPU (Qwen4OffloadOptions::gguf_cpu_hybrid).
+        // Without --stream-min-tokens the threshold follows the device count: at tp 2 the CPU
+        // path costs ~0.45 s + ~1 ms per token of TTFT and the ring a flat ~0.85-0.95 s up to
+        // ~600 tokens; at one GPU the ring leaves part of each layer to the CPU
+        // (Qwen4OffloadOptions::gguf_cpu_hybrid).
         const std::uint32_t gguf_min = e.stream_min_tokens_set ? e.stream_min_tokens
                                        : execution != nullptr  ? 600U
                                                                : 256U;
-        if (e.stream_min_tokens > 0 || e.prefetch_slots > 0 || e.device_reads > 0 ||
-            e.miss_split.mode != MissSplitMode::Off) {
+        if (e.stream_min_tokens > 0 || e.miss_split.mode != MissSplitMode::Off) {
             std::fprintf(stderr,
                          "routed experts: ggml block banks; prefill experts on the GPU from "
-                         "%u tokens%s, prefetch and miss split off\n",
+                         "%u tokens%s, miss split off\n",
                          gguf_min,
                          e.stream_min_tokens_set ? "" : " (default for this device count)");
         }
         e.gguf_stream_min_tokens = e.stream_min_tokens > 0 ? gguf_min : 0; // the GGUF prefill ring
         e.cpu_threads            = e.gguf_cpu_threads;
         e.stream_min_tokens      = 0;
-        e.prefetch_slots         = 0;
-        e.device_reads           = 0;
         e.miss_split.mode        = MissSplitMode::Off;
     }
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
@@ -372,7 +374,7 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         return budgets;
     };
     EngineOptions planned_options = options;
-    // T64 elastic KV: the reservation's KV pool keeps max_context's addresses, but only its first
+    // Elastic KV: the reservation's KV pool keeps max_context's addresses, but only its first
     // grow step is backed at startup; the rest of its bytes are address space only.
     std::size_t elastic_unbacked = 0;
     // Each elastic KV plane and expert plane may cost one 2 MiB granule more than its bytes.
@@ -411,8 +413,6 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
             const std::size_t fixed =
                 sizing.runtime_reservation_bytes - kv_full +
                 options.routed_experts.slot_headroom_bytes + slack +
-                static_cast<std::size_t>(models::qwen3_5::offloaded_expert_staging_bytes(
-                    instance->parameters, options)) +
                 static_cast<std::size_t>(
                     models::qwen3_5::offloaded_expert_split_bytes(instance->parameters, options));
             const std::size_t kv_max = options.elastic_kv.kv_budget_bytes > 0
@@ -464,13 +464,10 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         const std::size_t budget = *std::min_element(budgets.begin(), budgets.end());
         // Each of the pool's four planes may cost one arena alignment more.
         constexpr std::size_t kPoolSlack = std::size_t(1) << 20;
-        // The prefetch staging slots (T25) and the staged miss split's scratch slots (T18) come
-        // out of the same budget.
+        // The staged miss split's scratch slots come out of the same budget.
         const std::size_t used =
             sizing.runtime_reservation_bytes + options.routed_experts.slot_headroom_bytes +
             kPoolSlack +
-            static_cast<std::size_t>(
-                models::qwen3_5::offloaded_expert_staging_bytes(instance->parameters, options)) +
             static_cast<std::size_t>(
                 models::qwen3_5::offloaded_expert_split_bytes(instance->parameters, options));
         const std::size_t slots =
@@ -498,6 +495,16 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     instance->kv_capacity_resolution = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
+    // The YaRN table goes to every rank before the Program runs a kernel; factor 1 removes the one
+    // an earlier Engine of this process installed.
+    std::vector<int> rope_devices{device.device};
+    for (int rank = 1; execution != nullptr && rank < execution->tp; ++rank) {
+        rope_devices.push_back(execution->dev[static_cast<std::size_t>(rank)]->device);
+    }
+    const auto& rope = *instance->parameters.model.config().text.rope_parameters;
+    ops::rope_install_text_yarn(rope_devices, options.rope_yarn_factor,
+                                options.rope_original_max_position,
+                                static_cast<int>(rope.rotary_dim), rope.rope_theta);
     instance->program =
         execution != nullptr
             ? models::qwen3_5::create_program(instance->parameters, *instance->peer_parameters,
@@ -553,7 +560,6 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     summary.tp_transport          = instance->program->tp_transport().transport;
     summary.tp_mailbox_probe_ms   = instance->program->tp_transport().probe_ms;
     summary.tp_mailbox_fallback   = instance->program->tp_transport().fallback;
-    summary.tp_mailbox_kernel     = instance->program->tp_transport().exchange_kernel;
     summary.tp_mailbox_slot_bytes = instance->program->tp_transport().slot_bytes;
     summary.tp_proposal_head      = instance->program->tp_transport().proposal_head;
     summary.tp_drafter            = instance->program->tp_transport().drafter;

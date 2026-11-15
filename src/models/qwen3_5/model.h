@@ -86,6 +86,9 @@ public:
         return backing_.stats();
     }
 
+    // Exclusive expert tier: the expert banks' start-up tails (artifact::HostTails), or null.
+    [[nodiscard]] artifact::HostTails* host_tails() const noexcept { return backing_.host_tails(); }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);

@@ -137,7 +137,7 @@ private:
 
 // Plain pageable host memory aligned to 2 MiB with transparent huge pages requested (advisory),
 // for host-resident data that the CPU reads in place and that reaches devices only through
-// pinned staging (v0.7 pinned fallback: expert banks beyond the page-locked limit). Not
+// pinned staging (pinned fallback: expert banks beyond the page-locked limit). Not
 // registered with CUDA: no kernel may read it.
 class PageableHostBuffer {
 public:

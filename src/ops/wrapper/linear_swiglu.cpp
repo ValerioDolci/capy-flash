@@ -13,7 +13,11 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/tp2/linear_swiglu_half.h"
+#include "ninfer/ops/tp2/linear_swiglu.h"
+#include "ops/common/split_launch.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
@@ -65,9 +69,8 @@ bool linear_swiglu_registered(QType qtype, std::int32_t gate_up_rows, std::int32
     const bool fused = fused_gate_up_problem(gate_up_rows, input_rows);
     switch (qtype) {
     case QType::Q4_G64_FP16:
-        return large;
     case QType::Q8_G32_FP16:
-        return large || (gate_up_rows == 12288 && input_rows == 2048);
+        return large;
     case QType::NVFP4:
         return fused || ffn14336_gate_up_problem(gate_up_rows, input_rows);
     case QType::FP8_E4M3FN_ROW_BF16:
@@ -147,14 +150,13 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
     const bool large_shape = matches_problem(x, gate_up_weight, out, kGateUpRows, kGateUpInputRows);
     const bool shard_shape =
         matches_problem(x, gate_up_weight, out, kShardGateUpRows, kGateUpInputRows);
-    const bool q8_shape = matches_problem(x, gate_up_weight, out, 12288, 2048);
     const bool ffn14336_shape =
         matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336Rows,
                         kGateUpInputRows) ||
         matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336HalfRows,
                         kGateUpInputRows);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !shard_shape && !q8_shape && !ffn14336_shape)) {
+        out.ne[3] != 1 || (!large_shape && !shard_shape && !ffn14336_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -173,15 +175,15 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool q8_weight =
-        (q8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
-        gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
-        gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
+    const bool q8_weight = large_shape && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
+                           gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
+                           gate_up_weight.qhigh == nullptr &&
+                           gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool fused_shape = large_shape || shard_shape;
     const bool nvfp4_weight =
         (fused_shape || ffn14336_shape) && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight = fused_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    // v0.7 27b-16gb: the GSQ-3 gate|up parent [34816,5120] (and its [17408,5120] half).
+    // The GSQ-3 gate|up parent [34816,5120] (and its [17408,5120] half).
     const bool q3_weight = fused_shape && gate_up_weight.qtype == QType::Q3_G128_FP16;
     if (q3_weight) {
         detail::validate_q3_weight(gate_up_weight, "linear_swiglu");
@@ -270,6 +272,41 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
-} // namespace ninfer::ops
+// Two-device (tp 2) column-parallel form of linear_swiglu, declared in
+// ninfer/ops/tp2/linear_swiglu.h.
 
-#include "ops/wrapper/tp2/linear_swiglu_tp2.inc"
+void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x,
+                                   const std::array<Weight, 2>& gate_up_weight,
+                                   const std::array<Tensor, 2>& out, LinearPolicy policy,
+                                   const std::array<WorkspaceArena*, 2>& workspace,
+                                   const ExecutionContext& ec) {
+    constexpr const char* kOp = "linear_swiglu column-parallel";
+    detail::require_split_pair(ec, x, gate_up_weight, detail::SplitAxis::Output, kOp);
+    // Both ranks are validated before either issues work, so a rejected pair enqueues nothing.
+    std::array<Tensor, 2> destination{out[0], out[1]};
+    std::array<std::size_t, 2> required{};
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        validate_linear_swiglu(x[rank], gate_up_weight[rank], destination[rank], policy);
+        detail::require_rank_residency(
+            ec, static_cast<int>(rank), x[rank].data, gate_up_weight[rank].payload, out[rank].data,
+            "linear_swiglu column-parallel: rank arguments must reside on its device");
+        required[rank] = linear_swiglu_workspace_capacity_bytes(
+            gate_up_weight[rank].qtype, gate_up_weight[rank].n, gate_up_weight[rank].k, policy,
+            x[rank].ne[1], x[rank].ne[1]);
+    }
+    detail::require_split_workspace(workspace, required, kOp);
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        dispatch_linear_swiglu(x[slot], gate_up_weight[slot], destination[slot], policy,
+                               workspace[slot], ec.dev[slot]->stream);
+    });
+}
+
+void linear_swiglu_column_parallel(const std::array<Tensor, 2>& x,
+                                   const std::array<Weight, 2>& gate_up_weight,
+                                   const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
+    linear_swiglu_column_parallel(x, gate_up_weight, out, LinearPolicy::A16Only, {nullptr, nullptr},
+                                  ec);
+}
+
+} // namespace ninfer::ops

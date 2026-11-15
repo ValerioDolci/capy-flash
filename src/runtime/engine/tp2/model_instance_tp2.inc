@@ -1,6 +1,5 @@
 // Translation-unit fragment of src/runtime/engine/model_instance.cpp, included once at its end
 // (after its closing namespace): the Engine option checks of the two-device mode. Not a header.
-// Our file; see docs/maintainer/upstream-merge.md.
 
 namespace ninfer::runtime {
 namespace {

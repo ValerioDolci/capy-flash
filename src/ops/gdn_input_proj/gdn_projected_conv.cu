@@ -121,12 +121,6 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                         initial_state_slots, query, key, value, publish, stream);
         return;
     }
-    if (projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
-        value.ne[0] == 4096) {
-        launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
-                                       initial_state_slots, query, key, value, publish, stream);
-        return;
-    }
     // Two-device half of the 27B geometry: one rank's 8 of 16 key heads and 24 of 48 value heads,
     // in the parent's Q|K|V channel order.
     if (projected.ne[0] == 5120 && query.ne[0] == 1024 && key.ne[0] == 1024 &&

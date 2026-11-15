@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of gdn_gating_proj. Our file: ninfer/ops/gdn_gating_proj.h is upstream's
-// and carries no hook.
+// Two-device (tp 2) forms of gdn_gating_proj.
 
 #include "ninfer/ops/gdn_gating_proj.h"
 #include <array>

@@ -1,9 +1,12 @@
-// Modified for capy-flash from fngine:src/kernels/moe/iq_device.cuh @ c20a885 (satellitedown/fngine). See NOTICE.
-// Modified for fngine from llama.cpp/ggml:ggml/src/ggml-cuda/vecdotq.cuh, ggml/src/ggml-cuda/quantize.cu, ggml/src/ggml-quants.c, ggml/src/ggml-common.h @ 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
+// Modified for capy-flash from fngine:src/kernels/moe/iq_device.cuh @ c20a885
+// (satellitedown/fngine). See NOTICE.
+// Modified for fngine from llama.cpp/ggml:ggml/src/ggml-cuda/vecdotq.cuh,
+// ggml/src/ggml-cuda/quantize.cu, ggml/src/ggml-quants.c, ggml/src/ggml-common.h @
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
 // SPDX-License-Identifier: MIT (ggml portions)
 //
-// Device-side GGUF expert formats used by the moe_slots_gguf / moe_grouped_gguf kernels:
-//   * block structs (ggml-common.h layout),
+// Device-side GGUF expert formats used by the moe_slots_gguf / moe_grouped_gguf kernels, over the
+// block structs of ggml-iq.h (ggml-common.h layout):
 //   * Sub32 integer decode of one 32-element sub-block for dp4a dot products (ported from the
 //     vec_dot_*_q8_1 functions of vecdotq.cuh; the IQ2_S / IQ3_XXS "+0.5" scale terms are carried
 //     as exact odd integer multipliers instead of ggml's truncating integer division),
@@ -16,6 +19,8 @@
 #pragma once
 
 #include "ninfer/ops/moe_slots_gguf.h"
+
+#include "ggml-iq/ggml-iq.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -33,74 +38,49 @@ namespace ninfer::ops::gguf_device {
 
 using Format = MoeGgufFormat;
 
-struct BlockIq2S {
-    uint16_t d;
-    uint8_t qs[64]; // 32 grid-low bytes, then 32 sign bytes
-    uint8_t qh[8];
-    uint8_t scales[8];
-};
-struct BlockIq3Xxs {
-    uint16_t d;
-    uint8_t qs[96]; // 64 grid bytes, then 8 x uint32 scales_and_signs
-};
-struct BlockIq3S {
-    uint16_t d;
-    uint8_t qs[64];
-    uint8_t qh[8];
-    uint8_t signs[32];
-    uint8_t scales[4];
-};
-struct BlockIq4Xs {
-    uint16_t d;
-    uint16_t scales_h;
-    uint8_t scales_l[4];
-    uint8_t qs[128];
-};
-struct BlockIq4Nl {
-    uint16_t d;
-    uint8_t qs[16];
-};
-struct BlockQ2_0 {
-    uint16_t d;
-    uint8_t qs[16];
-};
-static_assert(sizeof(BlockIq2S) == 82);
-static_assert(sizeof(BlockIq3Xxs) == 98);
-static_assert(sizeof(BlockIq3S) == 110);
-static_assert(sizeof(BlockIq4Xs) == 136);
-static_assert(sizeof(BlockIq4Nl) == 18);
-static_assert(sizeof(BlockQ2_0) == 18);
+static_assert(sizeof(block_iq2_s) == 82);
+static_assert(sizeof(block_iq3_xxs) == 98);
+static_assert(sizeof(block_iq3_s) == 110);
+static_assert(sizeof(block_iq4_xs) == 136);
+static_assert(sizeof(block_iq4_nl) == 18);
+static_assert(sizeof(block_q2_0) == 18);
 
 template <Format F>
 struct FormatInfo;
+
 template <>
 struct FormatInfo<Format::IQ2_S> {
-    using Block                      = BlockIq2S;
+    using Block                      = block_iq2_s;
     static constexpr int kBlockElems = 256;
 };
+
 template <>
 struct FormatInfo<Format::IQ3_XXS> {
-    using Block                      = BlockIq3Xxs;
+    using Block                      = block_iq3_xxs;
     static constexpr int kBlockElems = 256;
 };
+
 template <>
 struct FormatInfo<Format::IQ3_S> {
-    using Block                      = BlockIq3S;
+    using Block                      = block_iq3_s;
     static constexpr int kBlockElems = 256;
 };
+
 template <>
 struct FormatInfo<Format::IQ4_XS> {
-    using Block                      = BlockIq4Xs;
+    using Block                      = block_iq4_xs;
     static constexpr int kBlockElems = 256;
 };
+
 template <>
 struct FormatInfo<Format::IQ4_NL> {
-    using Block                      = BlockIq4Nl;
+    using Block                      = block_iq4_nl;
     static constexpr int kBlockElems = 32;
 };
+
 template <>
 struct FormatInfo<Format::Q2_0> {
-    using Block                      = BlockQ2_0;
+    using Block                      = block_q2_0;
     static constexpr int kBlockElems = 64;
 };
 
@@ -117,6 +97,7 @@ __device__ __forceinline__ int get_int_b2(const void* x, int i32) {
     const uint16_t* x16 = static_cast<const uint16_t*>(x);
     return int(uint32_t(x16[2 * i32]) | (uint32_t(x16[2 * i32 + 1]) << 16));
 }
+
 __device__ __forceinline__ int get_int_b4(const void* x, int i32) {
     return static_cast<const int*>(x)[i32];
 }
@@ -175,10 +156,14 @@ inline constexpr int kGridBytes<Format::IQ3_S> = 512 * 4;
 
 template <Format F>
 __device__ __forceinline__ const void* grid_table() {
-    if constexpr (F == Format::IQ2_S) return iq2s_grid;
-    else if constexpr (F == Format::IQ3_XXS) return iq3xxs_grid;
-    else if constexpr (F == Format::IQ3_S) return iq3s_grid;
-    else return nullptr;
+    if constexpr (F == Format::IQ2_S)
+        return iq2s_grid;
+    else if constexpr (F == Format::IQ3_XXS)
+        return iq3xxs_grid;
+    else if constexpr (F == Format::IQ3_S)
+        return iq3s_grid;
+    else
+        return nullptr;
 }
 
 // `grid`: the format's codebook (grid_table<F>() or a shared-memory copy; unused without one).
@@ -189,7 +174,7 @@ __device__ __forceinline__ void decode_sub32(const uint8_t* row, int sub, Sub32&
 template <>
 __device__ __forceinline__ void decode_sub32<Format::IQ2_S>(const uint8_t* row, int sub, Sub32& s,
                                                             const void* grid_base) {
-    const BlockIq2S* b    = reinterpret_cast<const BlockIq2S*>(row) + (sub >> 3);
+    const block_iq2_s* b  = reinterpret_cast<const block_iq2_s*>(row) + (sub >> 3);
     const int ib32        = sub & 7;
     const int qs_packed   = get_int_b2(b->qs, ib32);
     const uint8_t* qs     = reinterpret_cast<const uint8_t*>(&qs_packed);
@@ -214,10 +199,10 @@ __device__ __forceinline__ void decode_sub32<Format::IQ2_S>(const uint8_t* row, 
 }
 
 template <>
-__device__ __forceinline__ void decode_sub32<Format::IQ3_XXS>(const uint8_t* row, int sub,
-                                                              Sub32& s, const void* grid) {
-    const BlockIq3Xxs* b = reinterpret_cast<const BlockIq3Xxs*>(row) + (sub >> 3);
-    const int ib32       = sub & 7;
+__device__ __forceinline__ void decode_sub32<Format::IQ3_XXS>(const uint8_t* row, int sub, Sub32& s,
+                                                              const void* grid) {
+    const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + (sub >> 3);
+    const int ib32         = sub & 7;
     const int2 q3_packed = make_int2(get_int_b2(b->qs, 2 * ib32), get_int_b2(b->qs, 2 * ib32 + 1));
     const uint8_t* q3    = reinterpret_cast<const uint8_t*>(&q3_packed);
     const uint32_t aux32 = uint32_t(get_int_b2(b->qs, 16 + ib32));
@@ -238,7 +223,7 @@ __device__ __forceinline__ void decode_sub32<Format::IQ3_XXS>(const uint8_t* row
 template <>
 __device__ __forceinline__ void decode_sub32<Format::IQ3_S>(const uint8_t* row, int sub, Sub32& s,
                                                             const void* grid) {
-    const BlockIq3S* b    = reinterpret_cast<const BlockIq3S*>(row) + (sub >> 3);
+    const block_iq3_s* b  = reinterpret_cast<const block_iq3_s*>(row) + (sub >> 3);
     const int ib32        = sub & 7;
     const int2 qs_packed  = make_int2(get_int_b2(b->qs, 2 * ib32), get_int_b2(b->qs, 2 * ib32 + 1));
     const uint8_t* qs     = reinterpret_cast<const uint8_t*>(&qs_packed);
@@ -265,8 +250,8 @@ __device__ __forceinline__ void decode_sub32<Format::IQ3_S>(const uint8_t* row, 
 template <>
 __device__ __forceinline__ void decode_sub32<Format::IQ4_XS>(const uint8_t* row, int sub, Sub32& s,
                                                              const void*) {
-    const BlockIq4Xs* b = reinterpret_cast<const BlockIq4Xs*>(row) + (sub >> 3);
-    const int ib32      = sub & 7;
+    const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>(row) + (sub >> 3);
+    const int ib32        = sub & 7;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int2 v = iq4nl_lookup(get_int_b4(b->qs, 4 * ib32 + j));
@@ -282,7 +267,7 @@ __device__ __forceinline__ void decode_sub32<Format::IQ4_XS>(const uint8_t* row,
 template <>
 __device__ __forceinline__ void decode_sub32<Format::IQ4_NL>(const uint8_t* row, int sub, Sub32& s,
                                                              const void*) {
-    const BlockIq4Nl* b = reinterpret_cast<const BlockIq4Nl*>(row) + sub;
+    const block_iq4_nl* b = reinterpret_cast<const block_iq4_nl*>(row) + sub;
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
         const int2 v = iq4nl_lookup(get_int_b2(b->qs, l));
@@ -297,8 +282,8 @@ __device__ __forceinline__ void decode_sub32<Format::IQ4_NL>(const uint8_t* row,
 template <>
 __device__ __forceinline__ void decode_sub32<Format::Q2_0>(const uint8_t* row, int sub, Sub32& s,
                                                            const void*) {
-    const BlockQ2_0* b = reinterpret_cast<const BlockQ2_0*>(row) + (sub >> 1);
-    const uint16_t* qs = reinterpret_cast<const uint16_t*>(b->qs) + (sub & 1) * 4;
+    const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + (sub >> 1);
+    const uint16_t* qs  = reinterpret_cast<const uint16_t*>(b->qs) + (sub & 1) * 4;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const uint32_t q  = qs[j];
@@ -331,7 +316,7 @@ __device__ __forceinline__ void dequant8(const uint8_t* row, int g, float out[8]
 
 template <>
 __device__ __forceinline__ void dequant8<Format::IQ2_S>(const uint8_t* row, int g, float out[8]) {
-    const BlockIq2S* b = reinterpret_cast<const BlockIq2S*>(row) + (g >> 5);
+    const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + (g >> 5);
     const int ib32 = (g >> 2) & 7, l = g & 3;
     const float d    = fp16_bits_to_float(b->d);
     const int ls     = (b->scales[ib32] >> (4 * (l >> 1))) & 0x0F;
@@ -347,9 +332,8 @@ __device__ __forceinline__ void dequant8<Format::IQ2_S>(const uint8_t* row, int 
 }
 
 template <>
-__device__ __forceinline__ void dequant8<Format::IQ3_XXS>(const uint8_t* row, int g,
-                                                          float out[8]) {
-    const BlockIq3Xxs* b = reinterpret_cast<const BlockIq3Xxs*>(row) + (g >> 5);
+__device__ __forceinline__ void dequant8<Format::IQ3_XXS>(const uint8_t* row, int g, float out[8]) {
+    const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + (g >> 5);
     const int ib32 = (g >> 2) & 7, l = g & 3;
     const float d        = fp16_bits_to_float(b->d);
     const uint32_t aux32 = uint32_t(get_int_b2(b->qs, 16 + ib32));
@@ -367,11 +351,11 @@ __device__ __forceinline__ void dequant8<Format::IQ3_XXS>(const uint8_t* row, in
 
 template <>
 __device__ __forceinline__ void dequant8<Format::IQ3_S>(const uint8_t* row, int g, float out[8]) {
-    const BlockIq3S* b = reinterpret_cast<const BlockIq3S*>(row) + (g >> 5);
+    const block_iq3_s* b = reinterpret_cast<const block_iq3_s*>(row) + (g >> 5);
     const int ib32 = (g >> 2) & 7, l = g & 3;
-    const float d  = fp16_bits_to_float(b->d);
-    const float db = d * float(1 + 2 * ((b->scales[ib32 >> 1] >> ((ib32 & 1) * 4)) & 0x0F));
-    const int qh   = b->qh[ib32];
+    const float d       = fp16_bits_to_float(b->d);
+    const float db      = d * float(1 + 2 * ((b->scales[ib32 >> 1] >> ((ib32 & 1) * 4)) & 0x0F));
+    const int qh        = b->qh[ib32];
     const uint32_t g1   = iq3s_grid[b->qs[8 * ib32 + 2 * l + 0] | ((qh << (8 - 2 * l)) & 256)];
     const uint32_t g2   = iq3s_grid[b->qs[8 * ib32 + 2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
     const uint8_t signs = b->signs[4 * ib32 + l];
@@ -384,12 +368,12 @@ __device__ __forceinline__ void dequant8<Format::IQ3_S>(const uint8_t* row, int 
 
 template <>
 __device__ __forceinline__ void dequant8<Format::IQ4_XS>(const uint8_t* row, int g, float out[8]) {
-    const BlockIq4Xs* b = reinterpret_cast<const BlockIq4Xs*>(row) + (g >> 5);
+    const block_iq4_xs* b = reinterpret_cast<const block_iq4_xs*>(row) + (g >> 5);
     const int ib = (g >> 2) & 7, part = g & 3;
     const float d = fp16_bits_to_float(b->d);
     const int ls =
         ((b->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((b->scales_h >> (2 * ib)) & 3) << 4);
-    const float dl     = d * float(ls - 32);
+    const float dl      = d * float(ls - 32);
     const uint32_t* q32 = reinterpret_cast<const uint32_t*>(b->qs + 16 * ib + 8 * (part & 1));
     const uint2 q = make_uint2(q32[0], q32[1]); // 4-byte aligned (staged rows may not be 8-aligned)
     const int2 v0 = iq4nl_lookup(int(q.x)), v1 = iq4nl_lookup(int(q.y));
@@ -401,11 +385,11 @@ __device__ __forceinline__ void dequant8<Format::IQ4_XS>(const uint8_t* row, int
 
 template <>
 __device__ __forceinline__ void dequant8<Format::IQ4_NL>(const uint8_t* row, int g, float out[8]) {
-    const BlockIq4Nl* b = reinterpret_cast<const BlockIq4Nl*>(row) + (g >> 2);
-    const int part      = g & 3;
-    const float d       = fp16_bits_to_float(b->d);
-    const uint32_t q0   = uint32_t(get_int_b2(b->qs, 2 * (part & 1)));
-    const uint32_t q1   = uint32_t(get_int_b2(b->qs, 2 * (part & 1) + 1));
+    const block_iq4_nl* b = reinterpret_cast<const block_iq4_nl*>(row) + (g >> 2);
+    const int part        = g & 3;
+    const float d         = fp16_bits_to_float(b->d);
+    const uint32_t q0     = uint32_t(get_int_b2(b->qs, 2 * (part & 1)));
+    const uint32_t q1     = uint32_t(get_int_b2(b->qs, 2 * (part & 1) + 1));
     const int2 v0 = iq4nl_lookup(int(q0)), v1 = iq4nl_lookup(int(q1));
     const uint32_t w0 = uint32_t(part >> 1 ? v0.y : v0.x), w1 = uint32_t(part >> 1 ? v1.y : v1.x);
 #pragma unroll
@@ -415,10 +399,10 @@ __device__ __forceinline__ void dequant8<Format::IQ4_NL>(const uint8_t* row, int
 
 template <>
 __device__ __forceinline__ void dequant8<Format::Q2_0>(const uint8_t* row, int g, float out[8]) {
-    const BlockQ2_0* b = reinterpret_cast<const BlockQ2_0*>(row) + (g >> 3);
-    const int part     = g & 7;
-    const float d      = fp16_bits_to_float(b->d);
-    const uint32_t q   = reinterpret_cast<const uint16_t*>(b->qs)[part];
+    const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + (g >> 3);
+    const int part      = g & 7;
+    const float d       = fp16_bits_to_float(b->d);
+    const uint32_t q    = reinterpret_cast<const uint16_t*>(b->qs)[part];
 #pragma unroll
     for (int j = 0; j < 8; ++j) out[j] = float(int((q >> (2 * j)) & 3) - 1) * d;
 }

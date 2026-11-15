@@ -2,6 +2,7 @@
 #include "ninfer/ops/moe_slots.h"
 
 #include "ops/moe_slots/launch.h"
+#include "ops/common/validate.h"
 
 #include <cmath>
 #include <cstdint>
@@ -39,12 +40,6 @@ void require_plane(const MoeSlotPlane& plane, std::int64_t bytes, std::int64_t a
             std::string(label) + " plane base and stride must be " + std::to_string(alignment) +
                 "-byte aligned");
     require(plane.stride >= bytes, std::string(label) + " plane stride must hold one expert");
-}
-
-bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
-    const auto pa = reinterpret_cast<std::uintptr_t>(a);
-    const auto pb = reinterpret_cast<std::uintptr_t>(b);
-    return pa < pb + b_bytes && pb < pa + a_bytes;
 }
 
 } // namespace
@@ -97,10 +92,10 @@ void moe_slots_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& ro
             "insufficient workspace capacity");
     for (const Tensor* t : {&x, &routed_ids, &routed_weights, &layer.slot_table,
                             &layer.gate_up_divisors, &layer.down_divisors}) {
-        require(!overlaps(out.data, out.bytes(), t->data, t->bytes()),
+        require(!detail::overlaps(out.data, out.bytes(), t->data, t->bytes()),
                 "out must not overlap an input");
     }
-    require(!overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()),
+    require(!detail::overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()),
             "out must not overlap the workspace");
 
     auto scope           = workspace.scope();

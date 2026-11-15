@@ -4,6 +4,9 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
+#include <cstdint>
+#include <vector>
+
 namespace ninfer::ops {
 
 /**
@@ -22,6 +25,10 @@ namespace ninfer::ops {
  * - Vision 2-D: positions I32 [T,2], head_dim=rotary_dim=72; pairs 0..17 use axis 0 and pairs
  *   18..35 use axis 1, each with local frequency theta^(-2*(i%18)/36).
  *
+ * With a YaRN table installed on the device (rope_install_text_yarn below) for this rotary_dim and
+ * theta, both Text modes take phi(i,t) = positions[axis(i),t] * inv_freq[i] (the FP32 product)
+ * from the table, with the same axes, and multiply cos(phi) and sin(phi) by its attention factor.
+ *
  * positions is contiguous and theta is positive and finite. Q/K tensors are BF16
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional
  * padded token stride. The registered optimized domains are D256/R64 Text Q/K head geometries
@@ -31,7 +38,7 @@ namespace ninfer::ops {
  * represented inputs. The updated BF16 values are promoted and compared directly with that result;
  * output storage rounding belongs to the Op's numerical criterion, not the oracle. Unrotated
  * dimensions remain bit-exact. Private kernel arithmetic is implementation-defined. The Op uses no
- * workspace or persistent state.
+ * workspace; its only persistent state is the YaRN table.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream);
@@ -39,5 +46,16 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
+
+/**
+ * YaRN for Text RoPE, as Hugging Face rope_type "yarn": with factor > 1, computes the inverse
+ * frequencies and the attention factor of rotary_dim 64 (ops/kernel/yarn.h) and puts them in the
+ * constant memory of each of `devices`. From then on every Text RoPE of this rotary_dim and theta
+ * takes them: rope above, rmsnorm_rope_text_shard and the QSA indexer (sparse_attention.h); such
+ * a launch on a device not in `devices` throws. factor <= 1 removes the table: every route is the
+ * plain RoPE again, bit for bit. One table per process, set before the launches that use it.
+ */
+void rope_install_text_yarn(const std::vector<int>& devices, float factor,
+                            std::uint32_t original_max_position, int rotary_dim, float theta);
 
 } // namespace ninfer::ops

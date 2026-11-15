@@ -30,6 +30,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen3_5/execution/qwen4_experts.h"
+#include "models/qwen3_5/qwen4_layer_profile.h"
 #include "ninfer/ops/moe_slots.h"
 #include "ops/sparse_moe/host/host_moe_executor.h"
 
@@ -181,12 +182,12 @@ struct Memory {
         view.table = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kLayers * kExperts));
         view.divisors = static_cast<float*>(
             alloc(sizeof(float) * kLayers * Qwen4OffloadExperts::kDivisorsPerLayer));
-        view.identity = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kExperts));
-        view.reads    = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kTopK * 8));
+        view.reads  = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kTopK * 8));
+        auto* table = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kExperts));
         std::vector<std::int32_t> ids(kExperts);
         for (std::int32_t e = 0; e < kExperts; ++e) { ids[e] = e; }
-        CUDA_CHECK(cudaMemcpy(view.identity, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
-        identity = Tensor(view.identity, DType::I32, {kExperts});
+        CUDA_CHECK(cudaMemcpy(table, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+        identity = Tensor(table, DType::I32, {kExperts});
     }
 
     void* alloc(std::size_t bytes) {
@@ -277,13 +278,14 @@ struct Fixture {
 
     ~Fixture() { (void)cudaStreamDestroy(stream); }
 
+    // The Engine's default policy on the fixture's sizes.
     Qwen4OffloadOptions options() const {
-        Qwen4OffloadOptions o;
+        Qwen4OffloadOptions o{RoutedExpertOptions{}};
         o.slots_per_layer     = kSlots;
         o.cpu_threads         = 2;
-        o.insert_cap          = 2;
         o.prompt_tokens       = kPrompt;
         o.text_layers         = 1;
+        o.stream_min_tokens   = 0;    // the fixture has no streaming tables
         o.freeze_after_prompt = true; // prompt fills land before the window closes
         return o;
     }
@@ -383,7 +385,7 @@ void lifecycle(Fixture& f) {
 void fills_hits_misses(Fixture& f) {
     Qwen4OffloadOptions o   = f.options();
     o.freeze_after_prompt   = false; // the engine's policy: decode windows are observed too
-    o.keep_decode_residency = false; // T69's rule: the prompt's routed experts become resident
+    o.keep_decode_residency = false; // the prompt's routed experts become resident
     auto backend            = f.make(o);
     Qwen4OffloadExperts& b  = *backend;
     // Prompt window: 12 columns per layer over experts 0..15 (every one routed), nothing resident.
@@ -441,8 +443,8 @@ void fills_hits_misses(Fixture& f) {
     check(miss < kCpuRelativeBound, "decode window: CPU column within the W4A8 bound");
 }
 
-// T211 (the default): a prompt window inserts nothing; the decode after it inserts up to the
-// post-prompt boost cap (T69, on by default since T211).
+// keep_decode_residency (the default): a prompt window inserts nothing; the decode after it
+// inserts up to the post-prompt boost cap (boost_windows / boost_cap, on by default).
 void prompt_keeps_residency(Fixture& f) {
     Qwen4OffloadOptions o           = f.options();
     o.freeze_after_prompt           = false;
@@ -476,10 +478,10 @@ void prompt_keeps_residency(Fixture& f) {
           "keep: the decode window after it inserts up to the boost cap");
 }
 
-// T211b: the request's first text chunk decides. Neither kind of prompt inserts during its windows;
+// The request's first text chunk decides. Neither kind of prompt inserts during its windows;
 // when the first decode window begins, a new conversation (less than half of the prompt restored
-// from the cache) applies its routing as T69 did, with at most new_prompt_cap targets per layer,
-// and a continuation applies nothing.
+// from the cache) applies its routing (ExpertCache::apply_prompt) with at most new_prompt_cap
+// targets per layer, and a continuation applies nothing.
 void prompt_new_conversation(Fixture& f) {
     for (const bool continuation : {false, true}) {
         Qwen4OffloadOptions o          = f.options();
@@ -684,7 +686,6 @@ void unrouted_columns(Fixture& f) {
 // The prompt ring the startup planner counts (startup.cpp) is the one the runtime lends: half a
 // layer of experts per GPU at tp 2 (o-prefill: the 1-GPU count halved FP4-Local's prompt chunk).
 void test_ring_layers() {
-    ::unsetenv("NINFER_QWEN4_TP2_HALF_RING");
     const auto uniform = [](std::int32_t K, std::size_t layers = 48) {
         return std::vector<std::int32_t>(layers, K);
     };
@@ -694,10 +695,6 @@ void test_ring_layers() {
     check(Qwen4OffloadExperts::ring_layers(576, uniform(61), 48, 1) == 10,
           "tp 1 ring layers at 61 slots");
     check(Qwen4OffloadExperts::ring_layers(512, uniform(64), 48, 1) == 8, "exact layers");
-    ::setenv("NINFER_QWEN4_TP2_HALF_RING", "0", 1);
-    check(Qwen4OffloadExperts::ring_layers(576, uniform(59), 48, 2) == 10,
-          "HALF_RING=0 keeps the 1-GPU ring");
-    ::unsetenv("NINFER_QWEN4_TP2_HALF_RING");
     check(Qwen4OffloadExperts::layers_below(uniform(10), 5, 51) == 6,
           "layers_below: end + 1 when the layers below do not hold the slots");
     // A ring wider than every Text layer (ring_layers = text_layers + 1) leaves the workspace an
@@ -715,14 +712,13 @@ void test_ring_layers() {
           "uniform layers, one GPU: at most 43 of 48 lent (0.9)");
 }
 
-// prod/cache: the per-layer slot profile keeps the pool (layers * slots_per_layer base slots),
+// The per-layer slot profile keeps the pool (layers * slots_per_layer base slots),
 // stays within a partition's experts next to the elastic columns, applies to Flash-Next at tp 2
-// only (NINFER_QWEN4_SLOT_PROFILE=0: uniform), and still lends the production prompt workspace.
+// only, and still lends the production prompt workspace.
 void test_slot_profile() {
-    ::unsetenv("NINFER_QWEN4_SLOT_PROFILE");
     for (const std::int32_t layers : {48, 49}) {
         for (const std::int32_t K : {10, 59, 61, 66, 120, 200}) {
-            const auto b     = Qwen4OffloadExperts::layer_slot_profile(layers, 48, K, 21, 2);
+            const auto b     = Qwen4OffloadExperts::layer_slot_profile(layers, 48, K, 21, 2, 0);
             std::int64_t sum = 0;
             bool bounded     = b.size() == static_cast<std::size_t>(layers);
             for (const std::int32_t x : b) {
@@ -733,19 +729,15 @@ void test_slot_profile() {
                   "profile: layers * K base slots, each within the partition");
         }
     }
-    const auto b = Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 2);
+    const auto b = Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 2, 0);
     check(b[0] == 149 && b[1] == 119 && b[15] == 29 && b[47] == 59 && b[48] == 109,
           "profile at the production 66 slots: the fitted table");
     const std::vector<std::int32_t> uniform(49, 66);
-    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 1) == uniform,
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 1, 0) == uniform,
           "profile: tp 1 stays uniform");
-    check(Qwen4OffloadExperts::layer_slot_profile(41, 40, 66, 21, 2) ==
+    check(Qwen4OffloadExperts::layer_slot_profile(41, 40, 66, 21, 2, 0) ==
               std::vector<std::int32_t>(41, 66),
           "profile: other layer counts stay uniform");
-    ::setenv("NINFER_QWEN4_SLOT_PROFILE", "0", 1);
-    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 2) == uniform,
-          "NINFER_QWEN4_SLOT_PROFILE=0 keeps every layer at slots_per_layer");
-    ::unsetenv("NINFER_QWEN4_SLOT_PROFILE");
     // The 16384-column prompt workspace of production (24 uniform layers of 66 slots) and the
     // tp 2 ring still fit the lendable layers.
     const std::int32_t ring = Qwen4OffloadExperts::ring_layers(576, b, 48, 2);
@@ -754,9 +746,41 @@ void test_slot_profile() {
           "profile: ring + workspace lendable at 66 slots");
 }
 
+// The exclusive tier (NINFER_QWEN4_EXCLUSIVE_LAYERS) holds tail / 2 experts per GPU in the base
+// slots of its layers: those base slots are a floor of the profile, taken from the other layers
+// when the pool is short.
+void test_slot_profile_exclusive_floor() {
+    constexpr std::int32_t kExclusive = 17;
+    const auto plain103 = Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2, 0);
+    const auto plain80  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2, 0);
+    const auto plain30  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 30, 3, 2, 0);
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2, kExclusive) == plain103,
+          "exclusive floor: a profile already above the floors is unchanged");
+    const auto b     = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2, kExclusive);
+    std::int64_t sum = 0;
+    bool floors      = true;
+    bool bounded     = true;
+    for (std::int32_t l = 0; l < 49; ++l) {
+        const std::int32_t x = b[static_cast<std::size_t>(l)];
+        sum += x;
+        bounded = bounded && x >= 1 && x + 3 <= 256;
+        floors  = floors && x >= models::qwen3_5::qwen4_exclusive_tail(l, kExclusive) / 2;
+    }
+    check(plain80[0] < models::qwen3_5::qwen4_exclusive_tail(0, kExclusive) / 2 &&
+              b[0] == models::qwen3_5::qwen4_exclusive_tail(0, kExclusive) / 2,
+          "exclusive floor: layer 0 below its floor is raised to it");
+    check(sum == 49 * 80 && bounded && floors,
+          "exclusive floor: every exclusive layer at its floor or above, the pool kept, within the "
+          "partition");
+    check(b[30] < plain80[30], "exclusive floor: the other layers give the slots");
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 30, 3, 2, kExclusive) == plain30,
+          "exclusive floor: floors larger than the pool are left to the startup check");
+}
+
 int main() {
     test_ring_layers();
     test_slot_profile();
+    test_slot_profile_exclusive_floor();
     int count             = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess || count == 0) {

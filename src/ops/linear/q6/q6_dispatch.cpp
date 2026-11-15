@@ -1,7 +1,6 @@
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q6/q6_shapes.h"
 #include <array>
-#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -13,7 +12,6 @@ struct ShapeEntry {
 
 constexpr std::array kShapes{
     ShapeEntry{248320, 5120, select_q6_n248320_k5120},
-    ShapeEntry{248320, 2048, select_q6_n248320_k2048},
     ShapeEntry{248320, 2560, select_q6_n248320_k2560},
     ShapeEntry{1152, 1536, select_q6_n1152_k1536},
     // Qwen4Exp at tp 2: one rank's vocabulary half of the Q6 output head.
@@ -21,7 +19,7 @@ constexpr std::array kShapes{
 };
 } // namespace
 
-// T43: Qwen4Exp draft proposal heads, rows of the K = 2560 output head (a prefix view or the
+// Qwen4Exp draft proposal heads, rows of the K = 2560 output head (a prefix view or the
 // gathered rows of a draft token shortlist, models/qwen3_5/execution/qwen4_draft_head.h): any row
 // count below the full head, T = 1 only (the proposal runs one GEMV per column).
 constexpr std::int32_t kDraftHeadK       = 2560;
@@ -29,30 +27,10 @@ constexpr std::int32_t kDraftHeadMaxRows = 248320;
 
 Q6Launch select_q6_draft_head(std::int32_t t) {
     if (t != 1) throw std::invalid_argument("q6 linear: draft-head row blocks run at T = 1 only");
-    // NINFER_Q6_DRAFT_ROUTE=<i> (benchmarks): candidate i of the T = 1 routes below.
-    static const int route = [] {
-        const char* v = std::getenv("NINFER_Q6_DRAFT_ROUTE");
-        return v != nullptr ? std::atoi(v) : -1;
-    }();
-    switch (route) {
-    case 0:
-        return launch_q6_a16_gemv_r4_w2_g16;
-    case 1:
-        return launch_q6_a16_gemv_r4_w2_g20_cg;
-    case 2:
-        return launch_q6_a16_gemv_r8_w1_g8_s4_cg;
-    case 3:
-        return launch_q6_a16_gemv_r4_w2_g12_s3_cg;
-    case 4:
-        return launch_q6_a16_gemv_r2_w4_g12_cg;
-    case 5:
-        return launch_q6_a16_simt_r8_t4;
-    default:
-        // Measured (T43, RTX 5070 Ti eco, cold L2, T = 1, K = 2560): 708 us for 248 072 rows =
-        // 701 GB/s, 317 us for 108 856, vs 999 us / 498 GB/s for the full head's T <= 2 route
-        // (simt_r8_t4, which the full-head shape keeps: plain decode output is unchanged).
-        return launch_q6_a16_gemv_r8_w1_g8_s4_cg;
-    }
+    // RTX 5070 Ti, cold L2, T = 1, K = 2560: 708 us for 248 072 rows = 701 GB/s, 317 us for
+    // 108 856, vs 999 us / 498 GB/s for the full head's T <= 2 route (simt_r8_t4, which the
+    // full-head shape keeps: plain decode output is unchanged).
+    return launch_q6_a16_gemv_r8_w1_g8_s4_cg;
 }
 
 Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {

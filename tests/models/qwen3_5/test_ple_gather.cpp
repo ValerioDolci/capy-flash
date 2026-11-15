@@ -2,11 +2,12 @@
 //  1. Hash: the 16 table rows of every column equal the independent Python reference
 //     (ninfer-ext tests/models/qwen4_exp/reference.py ngram_row_ids) at the published constants,
 //     including sequence start, EOS-closed windows and repeated EOS (exact oracle).
-//  2. Residency: mapped (with and without WILLNEED prefetch) and streamed (O_DIRECT) gathers give
-//     the same BF16 embedding over a table split across two volume files at unaligned offsets, so
-//     rows straddle 4 KiB pages; mapped decode equals E4M3 x BF16 multiplier rounded once to BF16.
+//  2. Residency: mapped gathers with and without WILLNEED prefetch give the same BF16 embedding
+//     over a table split across two volume files at unaligned offsets, so rows straddle 4 KiB
+//     pages; mapped decode equals E4M3 x BF16 multiplier rounded once to BF16. A plane with one
+//     multiplier on every row is kept as that multiplier (2 bytes) and passes the same checks.
 //  3. NVFP4 rows (nvfp4_row_e4m3_g16, row_interleaved_v1): every value of every gathered column,
-//     mapped (with and without prefetch) and streamed, equals bf16_rn((e2m1 * e4m3) * G) decoded
+//     mapped with and without prefetch, equals bf16_rn((e2m1 * e4m3) * G) decoded
 //     from the definition, on a synthetic table (all code pairs, all finite scales, a row
 //     straddling two volumes) and, with NINFER_TEST_FP4_LOCAL_CHECKPOINT set to the FP4-Local
 //     checkpoint, on >= 1000 real rows read from its n-gram fragments.
@@ -21,7 +22,6 @@
 #include <set>
 #include <string>
 #include <cstdio>
-#include <memory>
 #include <stdexcept>
 #include <cstdint>
 #include <cstring>
@@ -71,8 +71,8 @@ int hash_case() {
     table.row_width   = 160;
     table.row_bytes   = 160;
     table.scale_plane = table.rows * 160;
-    table.segments    = {{0, sizeof(placeholder), placeholder, {}, 0}};
-    PleGather gather(table, official_hash(), PleResidency::Mapped);
+    table.segments    = {{0, sizeof(placeholder), placeholder}};
+    PleGather gather(table, official_hash());
     const std::vector<std::int32_t> tokens(std::begin(kHashTokens), std::end(kHashTokens));
     int failures = 0;
     std::vector<std::uint64_t> rows(16);
@@ -100,9 +100,6 @@ void write_file(const std::filesystem::path& path, std::uint64_t leading, const 
     const std::vector<char> pad(leading, 'x');
     out.write(pad.data(), static_cast<std::streamsize>(pad.size()));
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
-    // Trailing bytes so the last direct page read is not short.
-    const std::vector<char> tail(8192, 'y');
-    out.write(tail.data(), static_cast<std::streamsize>(tail.size()));
 }
 
 struct Mapping {
@@ -126,7 +123,7 @@ struct Mapping {
     }
 };
 
-int residency_case(std::uint64_t split_bytes_extra = 0) {
+int residency_case(std::uint64_t split_bytes_extra = 0, bool uniform_scale = false) {
     // Two 2-gram heads and two 3-gram heads of 16 columns: a 64-wide embedding.
     PleHashConfig hash;
     hash.ngram_size      = 3;
@@ -150,14 +147,15 @@ int residency_case(std::uint64_t split_bytes_extra = 0) {
         object[i] = std::byte{code};
     }
     for (std::uint32_t r = 0; r < kRows; ++r) {
-        const std::uint16_t scale = static_cast<std::uint16_t>(0x3C00 + (rng() % 0x0300));
+        const auto random = static_cast<std::uint16_t>(rng() % 0x0300);
+        const std::uint16_t scale =
+            static_cast<std::uint16_t>(0x3C00 + (uniform_scale ? 0x40 : random));
         std::memcpy(object.data() + scale_plane + r * 2, &scale, 2);
     }
     // split_bytes_extra != 0 puts the volume boundary inside row 1777 (as a real artifact whose
     // part files end at 4 KiB-aligned payloads does): that row's codes straddle two segments.
     const std::uint64_t split = 1777 * kRowWidth + split_bytes_extra;
-    // Direct I/O needs a filesystem that supports O_DIRECT: use the working directory.
-    const auto dir = std::filesystem::current_path() / "ple_gather_test_volumes";
+    const auto dir            = std::filesystem::current_path() / "ple_gather_test_volumes";
     std::filesystem::create_directories(dir);
     write_file(dir / "a.bin", 1234, object.data(), split);
     write_file(dir / "b.bin", 777, object.data() + split, object.size() - split);
@@ -171,15 +169,15 @@ int residency_case(std::uint64_t split_bytes_extra = 0) {
         table.row_bytes   = kRowWidth;
         table.scale_plane = scale_plane;
         table.segments    = {
-            {0, split, a.at(1234), dir / "a.bin", 1234},
-            {split, object.size() - split, b.at(777), dir / "b.bin", 777},
+            {0, split, a.at(1234)},
+            {split, object.size() - split, b.at(777)},
         };
         std::vector<std::int32_t> tokens(300);
         for (auto& token : tokens) { token = static_cast<std::int32_t>(rng() % 50000); }
         tokens[5] = tokens[140] = static_cast<std::int32_t>(kEos);
         if (split_bytes_extra != 0) {
             // Plant a 3-token context at positions 200..202 whose rows include the straddling row.
-            PleGather probe(table, hash, PleResidency::Mapped, false);
+            PleGather probe(table, hash, false);
             const std::uint64_t target = split / kRowWidth;
             std::vector<std::uint64_t> r(hash.heads());
             bool found = false;
@@ -200,32 +198,23 @@ int residency_case(std::uint64_t split_bytes_extra = 0) {
             failures += check(found, "no context reaches the straddling row");
         }
 
-        PleGather mapped(table, hash, PleResidency::Mapped);
-        PleGather plain(table, hash, PleResidency::Mapped, false);
-        std::unique_ptr<PleGather> streamed;
-        try {
-            streamed = std::make_unique<PleGather>(table, hash, PleResidency::Stream);
-        } catch (const std::runtime_error& error) {
-            std::cerr << "note: direct I/O unavailable here (" << error.what()
-                      << "); stream residency not compared\n";
-        }
+        PleGather mapped(table, hash);
+        PleGather plain(table, hash, false);
+        failures +=
+            check(mapped.resident_scale_bytes() == (uniform_scale ? 2 : kRows * 2),
+                  "resident multipliers: the plane, or the one multiplier of a uniform plane");
         for (const auto [first, count] :
              {std::pair<std::size_t, std::size_t>{0, 1}, {6, 3}, {141, 1}, {10, 290}}) {
-            std::vector<std::uint16_t> a_out(count * mapped.width()), b_out(a_out.size()),
-                c_out(a_out.size());
+            std::vector<std::uint16_t> a_out(count * mapped.width()), c_out(a_out.size());
             mapped.gather(tokens, first, count, a_out);
             plain.gather(tokens, first, count, c_out);
             failures += check(a_out == c_out, "prefetched mapped rows differ from plain mapped");
-            // T53: an earlier prefetch() of the same columns (and a no-op one on plain) is a hint.
+            // An earlier prefetch() of the same columns (and a no-op one on plain) is a hint.
             std::vector<std::uint16_t> d_out(a_out.size());
             mapped.prefetch(tokens, first, count);
             plain.prefetch(tokens, first, count);
             mapped.gather(tokens, first, count, d_out);
             failures += check(a_out == d_out, "rows gathered after prefetch() differ");
-            if (streamed) {
-                streamed->gather(tokens, first, count, b_out);
-                failures += check(a_out == b_out, "streamed n-gram rows differ from mapped rows");
-            }
         }
         // Mapped decode is independently the E4M3 row times its BF16 multiplier.
         std::vector<std::uint16_t> column(mapped.width());
@@ -359,7 +348,7 @@ int check_nvfp4_columns(const PleGather& gather, const std::vector<std::int32_t>
 }
 
 // Writes `object` as two volume files split at `split` (leading bytes before each payload, so
-// rows sit at unaligned file offsets) and checks every residency against the oracle.
+// rows sit at unaligned file offsets) and checks mapped gathers against the oracle.
 int nvfp4_volumes_case(const std::vector<std::byte>& object, std::uint64_t rows, float global,
                        const PleHashConfig& hash, std::uint64_t split,
                        std::vector<std::int32_t> tokens, std::mt19937& rng, const char* label,
@@ -378,14 +367,14 @@ int nvfp4_volumes_case(const std::vector<std::byte>& object, std::uint64_t rows,
         table.row_bytes    = kNvfp4Record;
         table.global_scale = global;
         table.segments     = {
-            {0, split, a.at(1234), dir / "a.bin", 1234},
-            {split, object.size() - split, b.at(777), dir / "b.bin", 777},
+            {0, split, a.at(1234)},
+            {split, object.size() - split, b.at(777)},
         };
         failures += check(table.row_record_bytes() == kNvfp4Record, "NVFP4 record is not 90 B");
         // Plant a 3-token context at positions 200..202 whose rows include the row straddling
         // the volume boundary (when the split falls inside a row).
         if (split % kNvfp4Record != 0 && tokens.size() > 202) {
-            PleGather probe(table, hash, PleResidency::Mapped, false);
+            PleGather probe(table, hash, false);
             const std::uint64_t target = split / kNvfp4Record;
             std::vector<std::uint64_t> r(hash.heads());
             bool found = false;
@@ -405,15 +394,8 @@ int nvfp4_volumes_case(const std::vector<std::byte>& object, std::uint64_t rows,
             }
             failures += check(found, "no context reaches the straddling NVFP4 row");
         }
-        PleGather mapped(table, hash, PleResidency::Mapped);
-        PleGather plain(table, hash, PleResidency::Mapped, false);
-        std::unique_ptr<PleGather> streamed;
-        try {
-            streamed = std::make_unique<PleGather>(table, hash, PleResidency::Stream);
-        } catch (const std::runtime_error& error) {
-            std::cerr << "note: direct I/O unavailable here (" << error.what()
-                      << "); NVFP4 stream residency not checked\n";
-        }
+        PleGather mapped(table, hash);
+        PleGather plain(table, hash, false);
         std::set<std::uint64_t> checked;
         const std::size_t columns = tokens.size() - 2;
         for (const auto [first, count] :
@@ -427,20 +409,13 @@ int nvfp4_volumes_case(const std::vector<std::byte>& object, std::uint64_t rows,
             plain.gather(tokens, first, count, out);
             failures += check_nvfp4_columns(plain, tokens, first, count, out, object, global,
                                             checked, label);
-            if (streamed) {
-                std::fill(out.begin(), out.end(), 0xFFFF);
-                streamed->gather(tokens, first, count, out);
-                failures += check_nvfp4_columns(*streamed, tokens, first, count, out, object,
-                                                global, checked, label);
-            }
         }
         if (split % kNvfp4Record != 0) {
             failures += check(checked.count(split / kNvfp4Record) == 1,
                               "the straddling NVFP4 row was not checked");
         }
-        std::cout << label << ": " << checked.size() << " distinct NVFP4 rows bit-exact"
-                  << (streamed ? " (mapped, mapped without prefetch, stream)\n"
-                               : " (mapped, mapped without prefetch)\n");
+        std::cout << label << ": " << checked.size()
+                  << " distinct NVFP4 rows bit-exact (mapped, mapped without prefetch)\n";
         failures += check(checked.size() >= minimum_rows, "too few distinct NVFP4 rows checked");
     }
     std::filesystem::remove_all(dir);
@@ -570,7 +545,8 @@ int main() {
     try {
         int failures = hash_case();
         failures += residency_case();
-        failures += residency_case(5); // a row straddling two volume segments (T155)
+        failures += residency_case(5);                    // a row straddling two volume segments
+        failures += residency_case(5, true);              // one multiplier on every row
         failures += nvfp4_synthetic_case(3.3242362e-05F); // the FP4-Local table's scale
         failures += nvfp4_synthetic_case(0.7310586F);
         failures += nvfp4_checkpoint_case();

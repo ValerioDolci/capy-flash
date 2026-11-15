@@ -130,7 +130,7 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
         const std::string detail = describe_update_failure(err, result);
         if (err != cudaSuccess) { (void)cudaGetLastError(); }
-        // T132 (14/10): a rejected update (e.g. a memcpy node whose parameters cannot change in
+        // A rejected update (e.g. a memcpy node whose parameters cannot change in
         // place, seen intermittently at MTP startup) is not an error of the graph: re-instantiate
         // the executable from the same definition (same work, a few ms). Only an update that fails
         // for another reason, or a failed re-instantiation, still throws.

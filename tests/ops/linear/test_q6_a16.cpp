@@ -28,7 +28,8 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {248320, 5120, 191U, Comparison::Sampled, false, kN248320K5120});
 
-    constexpr std::array kN248320K2048{
+    // Qwen4Exp tp 2 vocabulary half of the output head.
+    constexpr std::array kN124160K2560{
         a16(1),   a16(2),    a16(3),   a16(4),   a16(8),    a16(15),   a16(16),    a16(17),
         a16(24),  a16(31),   a16(32),  a16(33),  a16(39),   a16(40),   a16(41),    a16(47),
         a16(48),  a16(49),   a16(55),  a16(56),  a16(57),   a16(63),   a16(64),    a16(65),
@@ -37,7 +38,7 @@ int q6_a16_conformance() {
         a16(512), a16(1024), graph(1), graph(2), graph(17), graph(57), graph(128),
     };
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
-                          {248320, 2048, 193U, Comparison::Sampled, false, kN248320K2048});
+                          {124160, 2560, 193U, Comparison::Sampled, false, kN124160K2560});
 
     // Qwen4Exp output head (ninfer-ext's selector boundaries).
     constexpr std::array kN248320K2560{
@@ -47,8 +48,8 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {248320, 2560, 199U, Comparison::Sampled, false, kN248320K2560});
 
-    // T43: draft proposal head row blocks of the K = 2560 head (prefix views and gathered
-    // shortlist rows: any row count, T = 1; NINFER_Q6_DRAFT_ROUTE picks the candidate route).
+    // Draft proposal head row blocks of the K = 2560 head (prefix views and gathered shortlist
+    // rows: any row count, T = 1).
     constexpr std::array kDraftRows{a16(1), graph(1)};
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {98304, 2560, 211U, Comparison::Sampled, false, kDraftRows});

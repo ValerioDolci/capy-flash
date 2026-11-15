@@ -1,4 +1,4 @@
-// capy-flash structured output limits (OutputConstraintLimits): input limits before anything
+// Structured output limits (OutputConstraintLimits): input limits before anything
 // recursive, compilation deadline, empty languages, matcher time budgets of a generating request,
 // and the vendor cache that must not keep failed compilations. CPU only; a byte-level vocabulary
 // makes every language tokenizable.
@@ -71,7 +71,7 @@ constexpr int kEos = 256;
 
 void test_json_document_limits() {
     const OutputConstraintLimits limits;
-    // 100 000 levels: iterative check, no stack overflow (the audit's crash was at 5 000).
+    // 100 000 levels: iterative check, no stack overflow (the recursive converter fails at 5 000).
     const Json deep  = Json::parse(nested_items_text(100000));
     const auto error = request_error([&] { ninfer::text::check_json_schema_limits(deep, limits); });
     check(error && error->kind() == RequestErrorKind::ConstraintLimitExceeded &&
@@ -210,7 +210,7 @@ int walk(ninfer::text::GrammarSession& session, int token, int steps) {
 
 void test_matcher_budget() {
     using ninfer::text::GrammarCompiler;
-    // B3: the audit's ambiguous grammar and regex. Without a budget each mask costs more as the
+    // An ambiguous grammar and regex. Without a budget each mask costs more as the
     // output grows (seconds per token after ~1000 tokens); with it only this session fails, fast.
     const OutputConstraintLimits tight{
         .round_budget_ms = 20, .request_budget_ms = 200, .round_allowance_ms = 1};
@@ -306,8 +306,8 @@ void test_cache_drops_failures() {
 
 } // namespace
 
-// Second audit N1: allOf/$ref diamonds expanded 2^depth parts, outside any deadline, and the vendor
-// semaphore made later compilations wait for ever.
+// allOf/$ref diamonds would expand 2^depth parts outside any deadline, and the vendor semaphore
+// would make later compilations wait for ever.
 std::string diamond(const char* op, int levels, const std::string& leaf, const std::string& salt) {
     Json defs = Json::object();
     for (int i = 0; i < levels; ++i) {
@@ -367,8 +367,8 @@ void test_composition_dag() {
     std::cout << "exponential normalization refused after " << seconds << " s (deadline 0.5 s)\n";
     check(seconds < 2.0, "the compilation deadline was not respected in the normalization");
     // A legitimate schema queued behind slow ones: the wait for a slot does not count against its
-    // compilation timeout (rel/v0.10 verification). Concurrency 1, two slow compilations that run
-    // to their 0.8 s timeout one after the other: the third waits ~1.5 s, then compiles.
+    // compilation timeout. Concurrency 1, two slow compilations that run to their 0.8 s timeout
+    // one after the other: the third waits ~1.5 s, then compiles.
     const auto queued = [&](std::uint32_t wait_ms) {
         GrammarCompiler busy(
             byte_vocabulary(), {kEos}, 64U << 20,
@@ -405,7 +405,7 @@ void test_composition_dag() {
           "the wait for a slot was not bounded by --constraint-compile-wait-ms");
 }
 
-// Second audit N3: the matcher budget is CPU time of the thread, the wall clock only a wider net.
+// The matcher budget is CPU time of the thread, the wall clock only a wider net.
 void test_cpu_time_budget() {
     using namespace std::chrono_literals;
     {
@@ -434,9 +434,9 @@ void test_cpu_time_budget() {
     }
 }
 
-// Third audit N9: strict JSON Schema by default (XGrammar's and vLLM's default). An open object
-// with declared properties let the model add keys whose masks cost 56-95 ms each, so the matcher
-// budget closed most realistic requests.
+// Strict JSON Schema by default (XGrammar's and vLLM's default). An open object with declared
+// properties lets the model add keys whose masks cost 56-95 ms each, so the matcher budget would
+// close most realistic requests.
 bool generates(ninfer::text::GrammarCompiler& compiler, const OutputConstraint& constraint,
                std::string_view text) {
     auto session = compiler.compile(constraint, {}, {});

@@ -4,7 +4,7 @@
 #include <string_view>
 
 int run_softmax_attention_causal_cache_tests(std::optional<ninfer::KvCacheStorage> storage);
-int run_softmax_attention_plain_and_packed_tests();
+int run_softmax_attention_packed_tests();
 
 int main(int argc, char** argv) {
     bool causal_only = false;
@@ -32,10 +32,10 @@ int main(int argc, char** argv) {
     if (causal == 77) return 77;
     if (causal_only) return causal;
 
-    const int plain_and_packed = run_softmax_attention_plain_and_packed_tests();
-    if (plain_and_packed == 77) return 77;
+    const int packed = run_softmax_attention_packed_tests();
+    if (packed == 77) return 77;
 
-    const int failures = causal + plain_and_packed;
+    const int failures = causal + packed;
     std::cout << (failures == 0 ? "softmax_attention: PASS\n" : "softmax_attention: FAIL\n");
     return failures == 0 ? 0 : 1;
 }

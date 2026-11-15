@@ -10,7 +10,8 @@
 // by both devices. Skips (77) without two CUDA devices.
 //
 // Both runs also place two parents HostMapped: one mapped page-locked host copy, outside every
-// device capacity, that each device's parent addresses in place.
+// device capacity, that each device's parent addresses in place; and once with the last row of
+// one of them in the temporary tails of the exclusive expert tier.
 
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
@@ -651,6 +652,49 @@ void large_upload(ExecutionContext& execution) {
     }
 }
 
+// Exclusive tier: the last row of "shared" goes to the artifact's temporary tails instead of the
+// mapped copy, which keeps the other rows and one spare row; every device's address of the parent
+// finds the tail, until release().
+void host_mapped_tails(const Fixture& fixture, std::span<DeviceContext* const> devices) {
+    Reader reader(fixture.entry);
+    Binder binder(reader, static_cast<int>(devices.size()));
+    binder.set_shard_resolver([&reader](ObjectHandle object, const WeightGeometry&) {
+        return host_mapped_resolver(reader, object);
+    });
+    (void)bind_all(binder);
+    auto plan                 = std::move(binder).finish();
+    constexpr std::size_t row = 64 * 2;
+    const ObjectHandle shared = reader.find("shared");
+    for (auto& placement : plan.host_mapped_objects) {
+        if (placement.object == shared) {
+            placement.tail_bytes  = row;
+            placement.spare_bytes = row;
+        }
+    }
+    auto backing     = materialize(reader, std::move(plan), devices);
+    HostTails* tails = backing.host_tails();
+    require(tails != nullptr, "no tails for a parent with tail bytes");
+    const auto expected = reader.read_object(shared);
+    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+        const auto& parent    = backing.device_parent(shared, static_cast<int>(rank));
+        const std::byte* tail = tails->tail_of(parent.data);
+        require(tail != nullptr && std::equal(expected.end() - static_cast<std::ptrdiff_t>(row),
+                                              expected.end(), tail),
+                "the tail does not hold the parent's last bytes");
+        CUDA_CHECK(cudaSetDevice(devices[rank]->device));
+        std::vector<std::byte> head(expected.size() - row);
+        CUDA_CHECK(cudaMemcpy(head.data(), parent.data, head.size(), cudaMemcpyDefault));
+        require(std::equal(head.begin(), head.end(), expected.begin()),
+                "the mapped copy lost bytes before the tail");
+    }
+    CUDA_CHECK(cudaSetDevice(devices[0]->device));
+    require(tails->tail_of(backing.device_parent(reader.find("fp8"), 0).data) == nullptr,
+            "a parent without tail bytes has a tail");
+    tails->release();
+    require(tails->tail_of(backing.device_parent(shared, 0).data) == nullptr,
+            "a released tail is still found");
+}
+
 // Exercise the materializer's explicit cap, including mandatory parents and active Host KV.
 // Run the same cases on one and two devices; shared host storage must obey one host budget.
 void host_mapped_reservation(const Fixture& fixture, std::span<DeviceContext* const> devices) {
@@ -760,6 +804,7 @@ int main(int argc, char** argv) {
             DeviceContext* const one[] = {&device};
             host_mapped_upload(fixture, one);
             host_mapped_reservation(fixture, one);
+            host_mapped_tails(fixture, one);
             std::cout << "one-device artifact placement checks passed\n";
             return 0;
         }
@@ -773,6 +818,7 @@ int main(int argc, char** argv) {
         DeviceContext* const pair[] = {&*execution.dev[0], &*execution.dev[1]};
         host_mapped_upload(fixture, pair);
         host_mapped_reservation(fixture, pair);
+        host_mapped_tails(fixture, pair);
         std::cout << "two-device artifact placement checks passed\n";
         return 0;
     } catch (const std::exception& error) {

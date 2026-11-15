@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
@@ -94,7 +95,7 @@ struct MtpBatchContext {
     // and rank 1's continuation hidden store.
     qwen3_5::MtpDecodeState* peer_frame    = nullptr;
     Tensor* peer_continuation_hidden_store = nullptr;
-    // T41: also write every proposal's log-probability to the egress (adaptive window).
+    // Also write every proposal's log-probability to the egress (NINFER_QWEN4_MTP_CALIB).
     bool draft_logprobs = false;
 };
 
@@ -125,7 +126,7 @@ struct MtpCausalAttentionEnvelopes {
 
 struct DFlashEnvelopes {
     ops::SlidingWindowAttentionExecutionEnvelope local;
-    ops::KVCacheAppendPrefixExecutionEnvelope append;
+    ops::ContextKVMaterializeExecutionEnvelope append;
 };
 
 struct TargetVerifyFrameView {
@@ -149,7 +150,7 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
-    // T59 replay (NINFER_QWEN4_REPLAY): when bound, copied over target_tokens before acceptance,
+    // Replay (NINFER_QWEN4_REPLAY): when bound, copied over target_tokens before acceptance,
     // so the accepted count and the bonus token follow the reference continuation.
     Tensor forced_targets;
     const GdnReplayRecords* replay_records = nullptr;
@@ -174,7 +175,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           TargetVerifyFrameView peer, Tensor& peer_continuation_hidden_store,
                           ops::CausalAttentionExecutionEnvelope envelope);
 
-// T123 rank-consistency probe (NINFER_TP_RANK_PROBE=<log path>): after every tp 2 verification both
+// Rank-consistency probe (NINFER_TP_RANK_PROBE=<log path>): after every tp 2 verification both
 // ranks' verification hidden are copied to pinned host memory; tp_rank_probe_check compares them,
 // column by column, after the round's synchronization and logs any divergence. First call (from
 // Program setup, outside any capture) allocates the staging.
@@ -243,10 +244,11 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
 void dflash_append_context(DFlashAppendContext& state, const Tensor& features,
                            const Tensor& positions, const Tensor& commit_counts,
-                           const Tensor& lanes, ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                           const Tensor& lanes,
+                           ops::ContextKVMaterializeExecutionEnvelope envelope);
 void dflash_append_context(PrefillContext& state, const Tensor& features, const Tensor& positions,
                            const Tensor& commit_counts, const Tensor& lanes,
-                           ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                           ops::ContextKVMaterializeExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,

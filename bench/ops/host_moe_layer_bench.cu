@@ -13,10 +13,10 @@
 //                 a ping-pong calibration (offset at minimum round trip, +-RTT/2).
 //   --mode calib  only the clock calibration and a pure handshake graph (no stand-in work)
 // --fill-gpus N runs a continuous H2D copy from the pinned bank on N GPUs during the measurement
-// (the expert-cache fill traffic of F0-E / T14).
+// (the expert-cache fill traffic).
 //
 // Stand-ins: a kernel holding every SM for a fixed time (globaltimer spin), for the dense part and
-// for the resident experts (T15 qf_moe; F0-A: ~8.5 us + 3.37 us per expert at T=4).
+// for the resident experts (~8.5 us + 3.37 us per expert at T=4).
 #include "ops/sparse_moe/host/host_moe_mailbox.h"
 
 #include <cuda.h>
@@ -58,16 +58,13 @@ constexpr double kExpertBytes = 2764800.0;
 
 struct Args {
     std::string mode = "graph";
-    int threads = 6, layers = 48, tokens = 4, replays = 30, warmup = 3, min_mt = 1, fill_gpus = 0,
-        slices      = 4;
+    int threads = 6, layers = 48, tokens = 4, replays = 30, warmup = 3, fill_gpus = 0;
     double bank_gib = 3.0, resident_us = 47.0, dense_us = 150.0, p2 = 0.47;
     int umin = 3, umax = 5, calls = 400;
     std::string tag;
-    // T35 (cpu mode): executor options, pool placement, engine-like conditions.
-    std::string schedule = "static", placement = "spread", fill_mode = "cont", grid_u = "1,2,4,5,8",
-                grid_m = "1,2,3,4";
-    int member_quant = 1, prefetch_rows = 0, timeline = 0, cold_x = 0, huge = 1, decode_case = 1,
-        steal = 1, blocks = 1;
+    // cpu mode: pool placement, engine-like conditions.
+    std::string placement = "spread", fill_mode = "cont", grid_u = "1,2,4,5,8", grid_m = "1,2,3,4";
+    int timeline = 0, cold_x = 0, huge = 1, decode_case = 1, blocks = 1;
     std::string variants;
     double gap_us = 0.0, fill_experts = 1.34;
 };
@@ -109,12 +106,8 @@ Args parse(int argc, char** argv) {
             a.replays = std::stoi(next());
         else if (k == "--warmup")
             a.warmup = std::stoi(next());
-        else if (k == "--min-mt")
-            a.min_mt = std::stoi(next());
         else if (k == "--fill-gpus")
             a.fill_gpus = std::stoi(next());
-        else if (k == "--slices")
-            a.slices = std::stoi(next());
         else if (k == "--bank-gib")
             a.bank_gib = std::stod(next());
         else if (k == "--resident-us")
@@ -131,18 +124,10 @@ Args parse(int argc, char** argv) {
             a.calls = std::stoi(next());
         else if (k == "--tag")
             a.tag = next();
-        else if (k == "--schedule")
-            a.schedule = next();
-        else if (k == "--member-quant")
-            a.member_quant = std::stoi(next());
-        else if (k == "--steal")
-            a.steal = std::stoi(next());
         else if (k == "--variants")
             a.variants = next();
         else if (k == "--blocks")
             a.blocks = std::stoi(next());
-        else if (k == "--prefetch-rows")
-            a.prefetch_rows = std::stoi(next());
         else if (k == "--placement")
             a.placement = next();
         else if (k == "--timeline")
@@ -687,7 +672,7 @@ void run_probe(const Args& a, const Bank& bank) {
 // ------------------------------------------------------------------ cpu mode
 // Per-call expert-cache fill (fill_mode overlap | gap, --fill-gpus 1): a helper thread pinned to a
 // core outside the pool issues expert-sized H2D copies (random bank offsets) when triggered, as
-// the engine's policy thread does once per layer (T22: 64.5 fills per token = 1.34 per layer).
+// the engine's policy thread does once per layer (measured 64.5 fills per token = 1.34 per layer).
 struct CallFill {
     std::atomic<int> pending{0};
     std::atomic<bool> stop{false};
@@ -748,18 +733,16 @@ void spin_us(double us) {
 
 // One executor configuration of the cpu mode. --variants "name:key=val,key=val;name2:..." runs
 // several over the same bank, interleaved in --blocks blocks per case (pool rebuilt per block, so
-// only one pool spins at a time); keys: schedule (dynamic|static), mq, steal, pf, placement,
-// threads, fill (none|overlap|gap; needs --fill-gpus 1). Without --variants: one from the flags.
+// only one pool spins at a time); keys: placement, threads, fill (none|overlap|gap; needs
+// --fill-gpus 1). Without --variants: one from the flags.
 struct Variant {
     std::string name;
-    std::string schedule, placement, fill;
-    int mq = 1, steal = 1, pf = 0, threads = 6;
+    std::string placement, fill;
+    int threads = 6;
 };
 
 std::vector<Variant> parse_variants(const Args& a) {
-    Variant base{
-        a.tag,          a.schedule, a.placement,     a.fill_gpus > 0 ? a.fill_mode : "none",
-        a.member_quant, a.steal,    a.prefetch_rows, a.threads};
+    Variant base{a.tag, a.placement, a.fill_gpus > 0 ? a.fill_mode : "none", a.threads};
     if (a.variants.empty()) return {base};
     std::vector<Variant> out;
     std::size_t i = 0;
@@ -785,15 +768,7 @@ std::vector<Variant> parse_variants(const Args& a) {
                 std::exit(2);
             }
             const std::string key = item.substr(0, eq), val = item.substr(eq + 1);
-            if (key == "schedule")
-                v.schedule = val;
-            else if (key == "mq")
-                v.mq = std::stoi(val);
-            else if (key == "steal")
-                v.steal = std::stoi(val);
-            else if (key == "pf")
-                v.pf = std::stoi(val);
-            else if (key == "placement")
+            if (key == "placement")
                 v.placement = val;
             else if (key == "threads")
                 v.threads = std::stoi(val);
@@ -868,13 +843,7 @@ void run_cpu(const Args& a, const Bank& bank) {
                 va.threads = v.threads, va.placement = v.placement;
                 HostCpuPool pool(pool_cpus(va));
                 HostMoeExecutor::Options opt;
-                opt.min_multi_token = a.min_mt;
-                opt.slices_per_item = a.slices;
-                opt.schedule = v.schedule == "dynamic" ? Schedule::Dynamic : Schedule::Static;
-                opt.member_quantize = v.mq != 0;
-                opt.steal           = v.steal != 0;
-                opt.prefetch_rows   = v.pf;
-                opt.record_members  = a.timeline != 0;
+                opt.record_members = a.timeline != 0;
                 HostMoeExecutor ex(pool, H, I, kHostMaxTokens, TOPK, opt);
                 const bool vfill   = a.fill_gpus > 0 && (v.fill == "overlap" || v.fill == "gap");
                 const long issued0 = fill.issued.load();
@@ -954,22 +923,20 @@ void run_cpu(const Args& a, const Bank& bank) {
             }
             char cfg[640];
             std::snprintf(cfg, sizeof cfg,
-                          "\"variant\":\"%s\",\"schedule\":\"%s\",\"member_quant\":%d,\"steal\":%d,"
-                          "\"prefetch_rows\":%d,"
+                          "\"variant\":\"%s\","
                           "\"placement\":\"%s\",\"gap_us\":%.0f,\"cold_x\":%d,\"huge\":%d,\"thp\":%"
                           ".3f,\"fill_mode\":\"%s\","
                           "\"fill_experts\":%.2f,\"fills\":%ld,\"blocks\":%d",
-                          v.name.c_str(), v.schedule.c_str(), v.mq, v.steal, v.pf,
-                          v.placement.c_str(), a.gap_us, a.cold_x, a.huge, g_thp,
+                          v.name.c_str(), v.placement.c_str(), a.gap_us, a.cold_x, a.huge, g_thp,
                           a.fill_gpus > 0 ? v.fill.c_str() : "none", a.fill_experts, cs.fills,
                           blocks);
             std::printf("{\"mode\":\"cpu\",\"tag\":\"%s\",\"case\":\"%s\",\"threads\":%d,"
-                        "\"slices\":%d,\"min_mt\":%d,\"fill_gpus\":%d,%s,"
+                        "\"fill_gpus\":%d,%s,"
                         "\"T\":%d,\"experts_mean\":%.3f,\"tokens_per_expert\":%.3f,\"call_us\":%s,"
                         "\"us_per_expert\":%s,"
                         "\"gbps_med\":%.2f,\"prep_us\":%s,\"gate_up_us\":%s,\"down_us\":%s%s}\n",
-                        a.tag.c_str(), label.c_str(), v.threads, a.slices, a.min_mt, a.fill_gpus,
-                        cfg, T, mean_u, cs.pairs / cs.experts, js(s).c_str(), js(pe).c_str(),
+                        a.tag.c_str(), label.c_str(), v.threads, a.fill_gpus, cfg, T, mean_u,
+                        cs.pairs / cs.experts, js(s).c_str(), js(pe).c_str(),
                         mean_u * kExpertBytes / (s.med * 1e3), js(stat(cs.ph0)).c_str(),
                         js(stat(cs.ph1)).c_str(), js(stat(cs.ph2)).c_str(), tl.c_str());
         }
@@ -1033,7 +1000,6 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
     cfg.device = 0, cfg.layers = L, cfg.max_tokens = kHostMaxTokens, cfg.top_k = TOPK,
     cfg.hidden = H, cfg.intermediate = I;
     cfg.cpus           = spread_cpus(a.threads);
-    cfg.executor       = {a.min_mt, a.slices};
     cfg.trace_capacity = L * 4;
     HostMoeMailbox mailbox(cfg,
                            std::vector<HostExpertLayer>(static_cast<std::size_t>(L), bank.layer));
@@ -1157,11 +1123,11 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
             CK(cudaGraphExecDestroy(exec));
             std::printf("{\"mode\":\"%s\",\"tag\":\"%s\",\"arm\":\"%s\",\"stamps\":%d,\"layers\":%"
                         "d,\"T\":%d,\"threads\":%d,"
-                        "\"min_mt\":%d,\"dense_us\":%.1f,\"resident_us\":%.1f,\"experts\":\"%d-%"
+                        "\"dense_us\":%.1f,\"resident_us\":%.1f,\"experts\":\"%d-%"
                         "d\",\"p2\":%.2f,"
                         "\"fill_gpus\":%d,\"window_us\":%s",
                         calib_only ? "calib" : "graph", a.tag.c_str(), arm.name.c_str(),
-                        stamps ? 1 : 0, L, T, a.threads, a.min_mt, dense_us, res_us,
+                        stamps ? 1 : 0, L, T, a.threads, dense_us, res_us,
                         arm.host_work ? a.umin : 0, arm.host_work ? a.umax : 0, a.p2, a.fill_gpus,
                         js(stat(window_us)).c_str());
             if (stamps && arm.handshake) {

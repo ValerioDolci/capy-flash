@@ -445,7 +445,7 @@ void test_rebuild_work_prompt_frontier_boundary() {
 
 } // namespace
 
-// Issue #14: an underflow report names the accounting step and the dimension that disagreed.
+// An underflow report names the accounting step and the dimension that disagreed.
 void test_resource_difference_names_the_failing_ledger() {
     q36::detail::PhysicalResources held;
     held.device.main_kv_pages = 513;

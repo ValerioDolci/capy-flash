@@ -36,9 +36,10 @@ public:
         (void)layer, (void)rank0, (void)rank1, (void)stream0, (void)stream1;
     }
 
-    // T128: the two rank partials of a TP2 prefill exchange, before the sum (eager only).
-    // site 0 = mixer output projection (BF16 [H,T]), 1 = FFN: MoE (FP32 [H,T], NINFER_TP_AR=0
-    // path) or the dense FFN's row-parallel down projection (as the mixer's).
+    // The two rank partials of a TP2 prefill exchange, before the sum (eager only).
+    // site 0 = mixer output projection (BF16 [H,T]), 1 = FFN: MoE (FP32 [H,T], when the chunk's
+    // exchange is one allreduce_sum_f32 call) or the dense FFN's row-parallel down projection (as
+    // the mixer's).
     [[nodiscard]] virtual bool wants_exchange() const { return false; }
 
     virtual void capture_exchange(std::int32_t layer, int site, const Tensor& rank0,
@@ -48,7 +49,7 @@ public:
             (void)stream1;
     }
 
-    // MTP teacher forcing (T24): every prompt column runs the whole MTP layer and its draft
+    // MTP teacher forcing: every prompt column runs the whole MTP layer and its draft
     // logits (BF16 [V,1] of the column at `position`, predicting the token at position + 2) are
     // captured, with the prompt tokens.
     [[nodiscard]] virtual bool wants_mtp_logits() const { return false; }
@@ -58,8 +59,8 @@ public:
     virtual void capture_tokens(std::span<const std::int32_t>) {}
 };
 
-// Host probe of a routed-expert call's inputs (eager validation only; T24 calibrates the MTP
-// layer's activation ranges with it): x BF16 [H,T], ids I32 [10,T], weights FP32 [10,T].
+// Host probe of a routed-expert call's inputs (eager validation only; the MTP layer's
+// activation ranges are calibrated with it): x BF16 [H,T], ids I32 [10,T], weights FP32 [10,T].
 class Qwen4MoeProbe {
 public:
     virtual ~Qwen4MoeProbe()                                         = default;
@@ -93,7 +94,7 @@ public:
 struct Qwen4Runtime {
     // This rank's routed-expert backend: at tp 2 it computes the experts of the rank's ID parity.
     Qwen4RoutedExperts* experts = nullptr;
-    // MTP layer (T24): its routed-expert backend and its bank with per-expert divisor planes (the
+    // MTP layer: its routed-expert backend and its bank with per-expert divisor planes (the
     // Program expands a bank-wide divisor; Qwen4MtpParameters). The backend may be `experts`
     // itself (the offload backend serves the MTP layer as layer num_hidden_layers). Null without
     // MTP.
@@ -102,7 +103,7 @@ struct Qwen4Runtime {
     // PLE convolution states of the PLE layer, BF16 [rows, slots] (StateImage).
     Tensor ple_states;
     // Speculative verification: the PLE convolution inputs of the round, BF16 [rows, K+1,
-    // max_concurrency]; the commit advances the history by each row's accepted prefix (T10's
+    // max_concurrency]; the commit advances the history by each row's accepted prefix (the
     // record/fold contract). Empty without a speculative backend.
     Tensor ple_record;
     // Prefill: host n-gram gather and pinned BF16 staging [embed_dim, prefill_chunk].
@@ -121,7 +122,7 @@ struct Qwen4Runtime {
     std::uint32_t* decode_ple_staged = nullptr;
     Qwen4Taps* taps                  = nullptr;
     Qwen4MoeProbe* moe_probe         = nullptr;
-    // T43: the MTP proposal head over a draft token shortlist (rank 0's at tp 2), null = the full
+    // The MTP proposal head over a draft token shortlist (rank 0's at tp 2), null = the full
     // Text output head. Program-owned (qwen4_draft_head.h).
     const Qwen4DraftHead* draft_head = nullptr;
 };

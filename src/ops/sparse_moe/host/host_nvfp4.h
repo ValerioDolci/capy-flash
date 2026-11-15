@@ -15,13 +15,9 @@
 // (python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp @555efd8, Apache-2.0, FlashML-org /
 // FreeToken authors), read here from the swizzled scale plane used by the GPU kernels.
 //
-// Two dot kernels share the activation form:
-//   PerToken    FreeToken's dot_nvfp4_i8_avx512vnni (four accumulators): one pass over the row
-//               per token, weights decoded again for every token.
-//   MultiToken  T03 (variants V1/V4 of a standalone CPU probe): every 64-weight
-//               group decoded once, one vpdpbusd per token. The result of a token does not
-//               depend on how many tokens share the call (bit-identical for T = 1..8).
-// The two kernels differ only in accumulation order (relative ~1e-7 of sum |w*a|).
+// The dot decodes every 64-weight group once for all the tokens of the call, one vpdpbusd per
+// token. The result of a token does not depend on how many tokens share the call (bit-identical
+// for T = 1..8).
 
 #include <cstddef>
 #include <cstdint>
@@ -108,8 +104,6 @@ private:
     std::byte* qu_   = nullptr;
 };
 
-enum class DotKernel { PerToken, MultiToken };
-
 // Instruction set of the host expert kernels.
 enum class HostIsa : std::uint8_t {
     Avx2,       // AVX2 + FMA + F16C (Haswell / Zen 1 and later)
@@ -138,8 +132,7 @@ struct HostNvfp4Kernels {
                                W4A8Activation a);
     void (*quantize_bf16_a4)(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a);
     void (*rows_dot)(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n,
-                     const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo,
-                     DotKernel kernel, std::int32_t prefetch_rows);
+                     const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo);
 };
 
 // Throws std::runtime_error when the CPU does not run `isa`.
@@ -151,7 +144,7 @@ struct HostNvfp4Kernels {
 void quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks, W4A8Activation a);
 // Quantizes a whole BF16 row of length k (raw BF16 bits).
 void quantize_bf16(const std::uint16_t* x, std::int32_t k, W4A8Activation a);
-// T98 (default; NINFER_HOST_MOE_A4=0 turns it off): the GPU's NVFP4 activation codec in the same
+// A4 (default; NINFER_HOST_MOE_A4=0 turns it off): the GPU's NVFP4 activation codec in the same
 // prepared form, so the W4A8 dots compute W4A4: per 16 values sf = e4m3_rn(gs * amax / 6), code =
 // e2m1_rn(x * gs / sf) (moe_slots_nvfp4 / test_moe_slots quant16), stored as q = 2 * code (|q| <=
 // 12) with block scale sf / (2 gs); `gs` = the layer's input divisor of this activation.
@@ -160,11 +153,8 @@ void quantize_blocks_a4(const float* x, std::int32_t block0, std::int32_t blocks
 void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a);
 
 // out[t * ldo + i] = sum_k w[r0 + i, k] * a_t[k] for i < n, t < tokens (1..kHostMaxTokens).
-// prefetch_rows > 0 (MultiToken only): while dotting row r, software-prefetch the codes of row
-// r + prefetch_rows (may lie past the range; a prefetch never faults). Results do not change.
 void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
-              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
-              std::int32_t prefetch_rows = 0);
+              std::int32_t tokens, float* out, std::size_t ldo);
 
 // Decoded weight w[row, k] (exact; the test oracle uses its own decoder).
 [[nodiscard]] float e4m3_value(std::uint8_t code) noexcept;

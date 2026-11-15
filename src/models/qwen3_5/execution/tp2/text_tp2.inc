@@ -3,8 +3,7 @@
 // which the Qwen4 forward runs on both ranks (execution/qwen4_text.cpp, qwen4_forward.h): the
 // binding checks, the rank accessors, the rank-pair entry points that hand over to it, the
 // vocabulary-split logits and the Qwen3.5 MTP head over both ranks. It shares text.cpp's private
-// helpers (require_tensor_shape, ScopedValue, ...) without copying them. Not a header. Our file;
-// see docs/maintainer/upstream-merge.md.
+// helpers (require_tensor_shape, ScopedValue, ...) without copying them. Not a header.
 
 #include "core/device_scope.h"
 #include "models/qwen3_5/execution/tp2/split.h"
@@ -325,19 +324,9 @@ void TextContext::target_verify_batch(
     const RankTensors& ids, const RankTensors& cache_positions, const RankTensors& rope_positions,
     const RankTensors& valid_columns, const RankTensors& kv_table_rows,
     const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
-    const RankTensors& hidden, Tensor& logits, Tensor& target_tokens) {
+    const RankTensors& hidden, Tensor& logits, Tensor& target_tokens, DFlashFeatureSink* sink) {
     qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                            linear_state_source_slots, envelope, hidden, logits, target_tokens);
-}
-
-void TextContext::target_verify_batch(
-    const RankTensors& ids, const RankTensors& cache_positions, const RankTensors& rope_positions,
-    const RankTensors& valid_columns, const RankTensors& kv_table_rows,
-    const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
-    const RankTensors& hidden, Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink) {
-    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                            linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                            &sink);
+                        linear_state_source_slots, envelope, hidden, logits, target_tokens, sink);
 }
 
 void TextContext::mtp_forward_stem_tp2(const Tensor& ids, const RankTensors& hidden,
@@ -775,7 +764,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const RankTensors&
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     if (qwen4_mtp_layer()) {
         qwen4_mtp_forward_decode(ids, hidden, cache_positions, rope_positions, valid_columns,
-                                     kv_table_rows, envelope, mtp_hidden);
+                                 kv_table_rows, envelope, mtp_hidden);
         return;
     }
     const std::int32_t width = ids.ne[0];
@@ -852,7 +841,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const RankTensors& hidden
     if (qwen4_mtp_layer()) {
         const ScopedCurrentDevice device(ctx_.device);
         qwen4_mtp_forward_batch(ids, hidden, positions, rope_positions, envelope, mtp_hidden,
-                                    logits_column, logits, draft_token, input_embeddings);
+                                logits_column, logits, draft_token, input_embeddings);
         return;
     }
     const int T = ids.ne[0];
@@ -920,7 +909,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const RankTensors& pr
                                       rope[r], rank_stream(rank));
         }
         qwen4_mtp_forward_batch(token, previous_hidden, position, rope, envelope, mtp_hidden, 0,
-                                    &logits, &draft_token, nullptr);
+                                &logits, &draft_token, nullptr);
         return;
     }
     const std::int32_t H = dimension(config_.hidden_size);

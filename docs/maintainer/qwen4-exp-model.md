@@ -288,13 +288,13 @@ prompt lends them as streaming ring and workspace), the MTP layer, then the othe
 weight. A pageable layer is read in place by the CPU executor; the expert cache fills its slots through a pinned
 staging ring per GPU (`ExpertCache`, 128 MiB, `NINFER_HOST_STAGING_MIB`; a slot is reused once its batch's event
 completed); prefill chunks do not stream it (residents on the GPU, the rest on the CPU, as without streaming); the miss
-split is turned off, and the prefetch and the mapped backend refuse to start. A pageable layer inside the lent range
+split is turned off, and the mapped backend refuses to start. A pageable layer inside the lent range
 turns streaming (ring) or the lent prompt workspace off. When everything fits, the plan's single allocation and offsets
 are used unchanged.
 
 At `--tp 2` the dense parameters split by heads, the routed experts stay one host-mapped copy
 partitioned by expert ID at run time, the hyper-connections, router, indexer and PLE are
-replicated (or the mixers split by residual streams), and the shared expert alternates between
+replicated, and the shared expert alternates between
 the ranks by block: [Two-GPU tensor parallelism §13](tensor-parallel.md#13-qwen4exp-qwen38-flash-next-at-tp-2).
 
 The n-gram table stays in the artifact file: `Residency::HostFile` maps its object ranges
@@ -349,7 +349,7 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
 - **MoE**: `moe_route` (top-10 renormalized, sigmoid shared gate), the shared expert as Q8 Linear,
   the routed experts through a backend that returns the FP32 partial sum, and `moe_combine_shared`
   (one BF16 rounding). Backends (`execution/qwen4_experts.h`, `EngineOptions::routed_experts`):
-  - **Offload** (default): a device slot cache per layer (T14 `ExpertCache`, slot table read by
+  - **Offload** (default): a device slot cache per layer (`ExpertCache`, slot table read by
     `moe_slots_nvfp4`, W4A4) for the hot experts, and the CPU for the routed experts the table does
     not hold (`ops/sparse_moe/host`: `HostMoeMailbox` + `HostMoeExecutor`, NVFP4 W4A8 in AVX-512
     VNNI or AVX2 by `host_isa()`, same bits, 6 pinned threads). Per layer, inside the round's CUDA Graph: right after the router a publish
@@ -358,8 +358,9 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
     accumulate kernel add the CPU's FP32 partial; `moe_combine_shared` rounds once. A prefill chunk
     is one handshake per layer for all its columns (the CPU reads each missing expert once per
     chunk, in dot groups of <= 8 tokens), the resident experts in calls of <= 8 columns. Optionally
-    (`device_reads`, decode calls) the first N missing experts are read by the GPU itself from the
-    host bank over PCIe on a second stream while the CPU computes the rest.
+    (`--miss-split auto|calibrate`, decode calls) the GPU copies part of the missing experts from
+    the host bank over PCIe into scratch slots on a second stream and computes them there while the
+    CPU computes the rest.
   - Cache policy on the host, overlapped with the device: every execution is one window
     (`begin_window`/`observe_window`/`end_window`, decode round or prefill chunk). The publish
     kernel also logs each layer's full routing to mapped memory; during a decode round the execution
@@ -367,33 +368,31 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
     layer per window) and issues the copies (`ExpertCache::submit_fills_unfenced`) as soon as the GPU
     has published the next layer, i.e. has left the layer whose slots are rewritten; a copied expert
     is published at the first window that begins after its copy. A prefill chunk is a prompt
-    window. A prompt that continues a cached conversation (T211b: its first text chunk starts at
+    window. A prompt that continues a cached conversation (its first text chunk starts at
     position >= half the prompt, i.e. at least half of it restored from the context cache) changes
     neither the residency nor the decayed frequencies (`count_prompt`): on agentic turns the
     decode after a prompt routes like the decode before it, not like the prompt. A new
     conversation's prompt routes like its own decode: its routing counts are summed over its
     prompt windows and applied once, when its first decode window begins
     (`ExpertCache::apply_prompt`), by default to the decayed frequencies only, so the post-prompt
-    boost inserts the prompt's hottest experts first (`NINFER_QWEN4_PROMPT_NEW_CAP` > 0 also
-    makes that many targets per layer and GPU resident, as T69 did); copies issued during the
-    prompt would slow it (T194: TTFT 0.58 -> 0.69 s with the T69 rule). Either way the layers a prompt lends (streaming ring, borrowed workspace)
-    refill afterwards with the experts they held when lent, most recently used first.
-    `NINFER_QWEN4_PROMPT_KEEP=0` restores the T69 rule (the prompt's most routed experts per layer
-    become resident, `decide_prompt`, no cap; lent layers refill with the prompt's hottest).
+    boost inserts the prompt's hottest experts first; copies issued during the prompt would slow
+    it (TTFT 0.58 -> 0.69 s with the prompt's experts made resident). Either way the layers a
+    prompt lends (streaming ring, borrowed workspace) refill afterwards with the experts they held
+    when lent, most recently used first.
     Prompt chunks of at least `routed_experts.stream_min_tokens` tokens (`--stream-min-tokens`)
     stream the non-resident experts over PCIe and run every routed expert on the GPU; shorter
     chunks leave them to the CPU.
   - Slots per layer: `routed_experts.slots_per_layer`, or 0 = the device memory the rest of the
     Program leaves minus `slot_headroom_bytes` (Engine resolves it before the final plan;
     `MemorySummary::routed_expert_slots`).
-  - Elastic KV (T64, `EngineOptions::elastic_kv`, driver `--elastic [--kv-grow T]
+  - Elastic KV (`EngineOptions::elastic_kv`, driver `--elastic [--kv-grow T]
     [--kv-budget-gib G]`): instead of a fixed partition sized for `max_context`, the KV pools keep
     max_context's addresses but are backed page by page, and the expert cache takes every other
     byte. Each rank's persistent arena is a `core/elastic_arena.h` VMM reservation (2 MiB granules)
     whose elastic ranges are the KV page planes (page-major) and the tail of each expert plane. The
     slots are `slots_per_layer` base slots (sized for max_context's KV, or `kv_budget_bytes`;
     layer-major, lent to prompts as before) plus `routed_experts.elastic_columns` columns of one
-    slot per layer, numbered column-major after the base and prefetch staging slots so the last
+    slot per layer, numbered column-major after the base slots so the last
     columns are one contiguous tail per plane (`ExpertCachePolicy::pool_slot`). A KV pool that
     hands out a page past its backing calls `program/storage/qwen4_elastic.h` first: the backing
     rises to the next multiple of `grow_tokens`, and while the arena would exceed its startup bytes
@@ -428,14 +427,14 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
   rounded to BF16 once). The output head is split by vocabulary and gathered to rank 0, which
   samples. Rank 1's PLE rows come from rank 0's host gather (uploaded to both), its PLE
   convolution states from its StateImage mirror. The mailbox slot carries `hidden x (K+1)` FP32.
-  The stream-split hyper-connection mixers are refused at tp 2. MTP at tp 2 runs the verification,
+  MTP at tp 2 runs the verification,
   the MTP layer (stem replicated, its QSA heads and expert partition per rank, shared expert on
   rank 0) and the proposal (replicated MTP output mixer, vocabulary-split head) over both ranks;
   rank 1 keeps its own PLE record and folds it with the same commit rows. The prefix-reuse bridge
   (`qwen4_mtp_forward_batch` over both ranks) runs the MTP column of the reuse frontier and its
   proposal steps the same way, each rank from its own retained copy of the target hidden: rank 1
   keeps its prompt chunk's wide residual in its own `prefill_hidden` and writes its capture
-  checkpoints (T66b).
+  checkpoints.
 - **MTP** (`Qwen4Forward::run_mtp`, round schedule `program/speculative/mtp.cpp`): the stem over
   the target's wide residual and the shifted token, one QSA block over the MTP KV cache (layer 0,
   its own index planes) with the MTP experts, the MTP output mixer and the Text output head. Prompt
@@ -460,7 +459,7 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
   checkpoint calibrates no activation scale for them (recipes store them A16Only): the
   W4A4 expert Op takes the widest calibrated range of the 48 Text layers times 32
   (`kQwen4MtpActivationRangeMargin`: inside the range where the W4A4 error is flat for both
-  inputs; measurement T24 in `docs/capy-flash/development-log.md`). A bank with one
+  inputs). A bank with one
   weight divisor (ninfer-ext's artifact) is expanded into per-expert planes by the Program.
 - **Validation dumps**: `NINFER_QWEN4_TFDUMP=<dir>` writes tfdump/1 files (format in
   `src/models/qwen3_5/execution/qwen4_tfdump.h`): logits per scored or decoded position, and the wide residual after each layer in
@@ -522,8 +521,8 @@ in every Qwen4Exp block (A/B). The blocks of a dense Qwen3.5 model always take t
 
 | route | fused Ops (one device / tp 2) | registered for |
 |---|---|---|
-| `gdn_input` | `gdn_input_proj` (+ conv snapshot / record) / `*_column_parallel` | single parent [16384,5120] NVFP4, FP8, Q3; [12288,2048] Q8 (hidden 2048, an Op qualification point) |
-| `gdn_gating` | `gdn_gating_proj` / `gdn_gating_proj_column_parallel` (plain residual at one device: `gdn_norm_gating_proj`, fused with the input norm) | BF16 a\|b [96,5120]; [64,2048] (hidden 2048, an Op qualification point) |
+| `gdn_input` | `gdn_input_proj` (+ conv snapshot / record) / `*_column_parallel` | single parent [16384,5120] NVFP4, FP8, Q3 |
+| `gdn_gating` | `gdn_gating_proj` / `gdn_gating_proj_column_parallel` (plain residual at one device: `gdn_norm_gating_proj`, fused with the input norm) | BF16 a\|b [96,5120] |
 | `attn_input` | `attn_input_proj` / `attn_input_proj_column_parallel` (QSA input projection; the dense mixer's is `attention_projection`) | q\|k\|gate\|v [14336,5120] (24 Q / 4 KV x 256) BF16, NVFP4, FP8 |
 | `swiglu` | `linear_swiglu` / `linear_swiglu_column_parallel` | [34816,5120] (FFN 17408) NVFP4, FP8, Q4, Q8, Q3; [28672,5120] (FFN 14336) NVFP4; their tp 2 halves |
 

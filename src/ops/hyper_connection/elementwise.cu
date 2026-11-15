@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <initializer_list>
 
 namespace ninfer::ops::detail {
@@ -184,7 +183,7 @@ __global__ void grouped_offset_rmsnorm_vector_kernel(const __nv_bfloat16* __rest
     }
 }
 
-// T56: prefill-width (>= kVectorColumns columns) forms of collapse and combine: one thread per 8
+// Prefill-width (>= kVectorColumns columns) forms of collapse and combine: one thread per 8
 // consecutive features of one column (16-byte loads and stores, one 64-bit division per 8
 // elements instead of per element), each element computed with the scalar kernels' arithmetic in
 // the same order, so the bits are those of the scalar kernels.
@@ -264,13 +263,7 @@ __global__ void hyper_connection_combine_vector_kernel(const __nv_bfloat16* __re
 }
 
 bool vector_ready(std::int32_t width, std::int64_t columns, std::initializer_list<const void*> p) {
-    // NINFER_HC_SCALAR=1 keeps the scalar kernels at every width (A/B runs on one binary; same
-    // bits).
-    static const bool scalar = [] {
-        const char* v = std::getenv("NINFER_HC_SCALAR");
-        return v != nullptr && v[0] == '1';
-    }();
-    if (scalar || width % 8 != 0 || columns < kVectorColumns) { return false; }
+    if (width % 8 != 0 || columns < kVectorColumns) { return false; }
     for (const void* q : p) {
         if ((reinterpret_cast<std::uintptr_t>(q) & 0xfu) != 0) { return false; }
     }

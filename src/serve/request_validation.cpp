@@ -17,16 +17,12 @@ namespace {
 constexpr const char* kUnsupportedCombination = "unsupported_output_combination";
 constexpr const char* kLimitExceeded          = "constraint_limit_exceeded";
 
-ninfer::OutputConstraintLimits& configured_limits() noexcept {
-    static ninfer::OutputConstraintLimits limits;
-    return limits;
-}
-
 // Source-level limits of a grammar, regex or choice list (text/constraint_limits.h). A source the
 // vendor lexer cannot read is left to the compiler, which reports it with its own error kind.
-void check_source_limits(const ninfer::OutputConstraint& constraint, const std::string& param) {
+void check_source_limits(const ninfer::OutputConstraint& constraint, const std::string& param,
+                         const RequestLimits& limits) {
     try {
-        text::check_constraint_limits(constraint, output_constraint_limits());
+        text::check_constraint_limits(constraint, limits.constraints);
     } catch (const ninfer::RequestError& error) {
         if (error.kind() != ninfer::RequestErrorKind::ConstraintLimitExceeded) { throw; }
         bad_request(error.what(), param, kLimitExceeded);
@@ -59,16 +55,16 @@ void validate_constraint_combinations(const GenerationRequest& request) {
         bad_request("output constraints require the model EOS and cannot use custom stop strings",
                     request.constraint_param, kUnsupportedCombination);
     }
-    // JSON output combined with callable tools needs the tool-call grammar (Tappa B). Until then
-    // a constrained request must not leave tools active: tool_choice "none" keeps them declared
-    // but inactive.
+    // JSON output combined with callable tools needs a tool-call grammar, which does not exist: a
+    // constrained request must not leave tools active. tool_choice "none" keeps them declared but
+    // inactive.
     if (request.uses_tools()) {
         bad_request("output constraints cannot be combined with active tools yet; remove the "
                     "tools or set tool_choice to none",
                     request.constraint_param, kUnsupportedCombination);
     }
-    // D7: continuing a final assistant message under a grammar needs the template continuation
-    // content in the matcher; not supported in this release.
+    // Continuing a final assistant message under a grammar would need the template continuation
+    // content in the matcher.
     if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant) {
         bad_request("a final assistant prefill cannot be combined with an output constraint",
                     "messages", "assistant_prefill_not_supported");
@@ -77,46 +73,28 @@ void validate_constraint_combinations(const GenerationRequest& request) {
 
 } // namespace
 
-namespace {
-std::uint32_t& configured_json_depth() noexcept {
-    static std::uint32_t depth = 1000; // kDefaultMaxRequestJsonDepth (serve_options.h)
-    return depth;
-}
-} // namespace
-
-void configure_max_request_json_depth(std::uint32_t depth) { configured_json_depth() = depth; }
-
-std::uint32_t max_request_json_depth() noexcept { return configured_json_depth(); }
-
-void check_request_json_nesting(std::string_view text, const std::string& param) {
-    if (const auto offset = text::json_nesting_exceeds(text, max_request_json_depth())) {
-        bad_request("JSON nests deeper than " + std::to_string(max_request_json_depth()) +
+void check_request_json_nesting(std::string_view text, const std::string& param,
+                                const RequestLimits& limits) {
+    if (const auto offset = text::json_nesting_exceeds(text, limits.max_json_depth)) {
+        bad_request("JSON nests deeper than " + std::to_string(limits.max_json_depth) +
                         " levels at byte " + std::to_string(*offset) +
                         " (--max-request-json-depth)",
                     param, "request_json_too_deep");
     }
 }
 
-void configure_output_constraint_limits(const ninfer::OutputConstraintLimits& limits) {
-    configured_limits() = limits;
-}
-
-const ninfer::OutputConstraintLimits& output_constraint_limits() noexcept {
-    return configured_limits();
-}
-
-void validate_schema_number_input(const text::ParsedJsonNumbers& parsed) {
+void validate_schema_number_input(const text::ParsedJsonNumbers& parsed,
+                                  const RequestLimits& limits) {
     if (parsed.inexact_numbers.empty() || !parsed.value.is_object()) { return; }
     for (const auto& [path, param] :
          {std::pair{"/response_format/json_schema/schema", "response_format.json_schema.schema"},
           std::pair{"/text/format/schema", "text.format.schema"},
           std::pair{"/output_config/format/schema", "output_config.format.schema"}}) {
-        // The search below is recursive: an over-deep schema stops here (capy-flash).
+        // The search below is recursive: an over-deep schema stops here.
         const RequestJson::json_pointer pointer(path);
         if (parsed.value.contains(pointer)) {
             try {
-                text::check_json_schema_limits(parsed.value.at(pointer),
-                                               output_constraint_limits());
+                text::check_json_schema_limits(parsed.value.at(pointer), limits.constraints);
             } catch (const ninfer::RequestError& error) {
                 bad_request(error.what(), param + error.pointer(), kLimitExceeded);
             }
@@ -148,7 +126,8 @@ bool is_output_constraint_param(std::string_view param) noexcept {
 }
 
 void parse_json_output_format(const RequestJson& format, GenerationRequest& request,
-                              const std::string& param, JsonFormatProtocol protocol) {
+                              const std::string& param, JsonFormatProtocol protocol,
+                              const RequestLimits& request_limits) {
     if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
         bad_request("output format must contain a string type", param);
     }
@@ -216,7 +195,7 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
     // Depth, members and value count are checked iteratively before anything recursive (dump,
     // the schema validation, the vendor converter) walks the document.
     const RequestJson& schema = spec->at("schema");
-    const auto& limits        = output_constraint_limits();
+    const auto& limits        = request_limits.constraints;
     try {
         text::check_json_schema_limits(schema, limits);
     } catch (const ninfer::RequestError& error) {
@@ -232,10 +211,11 @@ void parse_json_output_format(const RequestJson& format, GenerationRequest& requ
                    schema_param + ".schema");
 }
 
-void parse_structured_outputs(const RequestJson& body, GenerationRequest& request) {
-    // llama.cpp exposes grammar; vLLM previously exposed the guided_* spellings. Each promises
-    // constrained generation, so they are rejected rather than ignored. An empty llama.cpp
-    // grammar is the neutral client default and stays accepted, as before.
+void parse_structured_outputs(const RequestJson& body, GenerationRequest& request,
+                              const RequestLimits& limits) {
+    // llama.cpp exposes grammar; vLLM exposed the guided_* spellings. Each promises constrained
+    // generation, so they are rejected rather than ignored. An empty llama.cpp grammar is the
+    // neutral client default and is accepted.
     for (const char* alias :
          {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
         if (!body.contains(alias) || body.at(alias).is_null()) { continue; }
@@ -262,12 +242,11 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
             if (!source.is_array() || source.empty()) {
                 bad_request("choice requires a nonempty array of strings", param, "invalid_choice");
             }
-            if (source.size() > output_constraint_limits().max_items) {
-                bad_request("choice has " + std::to_string(source.size()) +
-                                " entries; the limit is " +
-                                std::to_string(output_constraint_limits().max_items) +
-                                " (--constraint-max-items)",
-                            param, kLimitExceeded);
+            if (source.size() > limits.constraints.max_items) {
+                bad_request(
+                    "choice has " + std::to_string(source.size()) + " entries; the limit is " +
+                        std::to_string(limits.constraints.max_items) + " (--constraint-max-items)",
+                    param, kLimitExceeded);
             }
             std::vector<std::string> choices;
             choices.reserve(source.size());
@@ -279,21 +258,21 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
                 choices.push_back(source[i].get<std::string>());
             }
             auto constraint = ninfer::OutputConstraint::choice(std::move(choices));
-            check_source_limits(constraint, param);
+            check_source_limits(constraint, param, limits);
             set_constraint(request, std::move(constraint), param);
         } else if (kind == "regex") {
             if (!source.is_string()) {
                 bad_request("regex must be a string", param, "invalid_regex");
             }
             auto constraint = ninfer::OutputConstraint::regex(source.get<std::string>());
-            check_source_limits(constraint, param);
+            check_source_limits(constraint, param, limits);
             set_constraint(request, std::move(constraint), param);
         } else if (kind == "grammar") {
             if (!source.is_string() || source.get_ref<const std::string&>().empty()) {
                 bad_request("grammar must be a nonempty string", param, "invalid_grammar");
             }
             auto constraint = ninfer::OutputConstraint::grammar(source.get<std::string>());
-            check_source_limits(constraint, param);
+            check_source_limits(constraint, param, limits);
             set_constraint(request, std::move(constraint), param);
         } else {
             bad_request("unknown structured_outputs option: " + kind, param);
@@ -310,6 +289,10 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
     error.param   = std::move(param);
     error.code    = std::move(code);
     throw ApiException(std::move(error));
+}
+
+void require_object_body(const RequestJson& body) {
+    if (!body.is_object()) { bad_request("request body must be a JSON object"); }
 }
 
 std::optional<int> optional_int(const RequestJson& object, const char* key) {
@@ -351,6 +334,26 @@ bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept
         if (std::isalnum(character) == 0 && character != '_' && character != '-') { return false; }
     }
     return true;
+}
+
+std::string require_function_name(const RequestJson& object, const char* param) {
+    if (!object.contains("name") || !object.at("name").is_string()) {
+        bad_request("function name must be a string", param);
+    }
+    std::string name = object.at("name").get<std::string>();
+    if (!valid_tool_name(name, 64)) {
+        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+    }
+    return name;
+}
+
+void keep_allowed_tools(GenerationRequest& request,
+                        const std::unordered_set<std::string>& allowed) {
+    std::erase_if(request.tools, [&](const ToolDefinition& tool) {
+        if (allowed.contains(tool.name)) { return false; }
+        request.filtered_out_tool_names.push_back(tool.name);
+        return true;
+    });
 }
 
 } // namespace ninfer::serve

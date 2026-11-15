@@ -24,17 +24,7 @@ int main() {
     using namespace ninfer::test::linear_swiglu;
 
     try {
-        // One public numerical case begins each materially distinct Q8 implementation interval;
-        // selected endpoints exercise exact-T and predicated tails without inspecting selectors.
-        constexpr std::array<std::int32_t, 25> kTokenCases{
-            1,   2,   6,   32,  33,  40,  41,  48,  49,  65,  81,  97,  129,
-            193, 241, 256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
-        };
-        int failures = run_profile(
-            "LinearSwiGLU Q8_A16",
-            {QType::Q8_G32_FP16, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
-
-        failures += dflash2_conformance();
+        const int failures = dflash2_conformance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q8_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -6,7 +6,7 @@
 // All are distances to gdn_ref.h's exact FP64 recurrence over a whole output block, fitted on
 // test_gated_delta_net.cpp's fixture. The recurrence accumulates BF16 error with its length, so
 // applying them far outside that fixture's range measures the length, not the implementation.
-// Since upstream 0784e76f the chunked prefill route (T >= 16) is qualified per precision profile.
+// The chunked prefill route (T >= 16) is qualified per precision profile.
 
 #include "ops/op_check.h"
 

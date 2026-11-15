@@ -12,7 +12,12 @@
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_a8.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ninfer/ops/tp2/linear.h"
+#include "ops/common/split_launch.h"
+#include "ops/linear/linear_dispatch.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -50,9 +55,13 @@ void validate_linear_policy(LinearPolicy policy) {
     throw std::invalid_argument("linear: invalid compute policy");
 }
 
+} // namespace
+
+namespace detail {
+
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    // T128c: Q8 and MXFP8 weights may also write FP32 out (TP2 partials exchanged before the BF16
+    // Q8 and MXFP8 weights may also write FP32 out (TP2 partials exchanged before the BF16
     // rounding).
     const bool fp32_out = out.dtype == DType::FP32 && (w.qtype == QType::Q8_G32_FP16 ||
                                                        w.qtype == QType::MXFP8_E4M3FN_G32_UE8M0);
@@ -86,8 +95,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
     case QType::Q3_G128_FP16: {
-        // v0.7: A16 for T < 64; prefill widths take the A8 route when it is enabled
-        // (NINFER_Q3_A8), with its activation scratch from the caller workspace.
+        // A16 for T < 64; prefill widths take the A8 route when it is enabled (NINFER_Q3_A8),
+        // with its activation scratch from the caller workspace.
         const detail::Q3ArenaWorkspace q3ws(workspace, w.k, x.ne[1]);
         detail::q3_linear_dispatch(x, w, out, stream, q3ws.get());
         return;
@@ -126,7 +135,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     throw std::invalid_argument("linear: unsupported weight qtype");
 }
 
-} // namespace
+} // namespace detail
 
 std::size_t linear_optional_workspace_bytes(QType qtype, std::int32_t output_rows,
                                             std::int32_t input_rows, std::int32_t max_tokens) {
@@ -191,15 +200,87 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream) {
-    validate_linear_semantics(x, w, out, policy);
-    dispatch_linear(x, w, out, policy, &workspace, stream);
+    detail::validate_linear_semantics(x, w, out, policy);
+    detail::dispatch_linear(x, w, out, policy, &workspace, stream);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
-    dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+    detail::validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    detail::dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+}
+
+// Two-device (tp 2) column- and row-parallel linear, declared in ninfer/ops/tp2/linear.h.
+
+namespace {
+
+// Validates both ranks before either is issued, so a rejected pair enqueues nothing, and returns
+// the mutable output views the dispatch takes. Only the pair can check the cross-rank agreement;
+// the split axis itself may be uneven.
+std::array<Tensor, 2> validate_split(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                                     const std::array<Tensor, 2>& out, LinearPolicy policy,
+                                     const std::array<WorkspaceArena*, 2>& workspace,
+                                     const ExecutionContext& ec, detail::SplitAxis axis) {
+    const char* op =
+        axis == detail::SplitAxis::Output ? "linear column-parallel" : "linear row-parallel";
+    detail::require_split_pair(ec, x, w, axis, op);
+    std::array<Tensor, 2> destination{out[0], out[1]};
+    std::array<std::size_t, 2> required{};
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        detail::validate_linear_semantics(x[rank], w[rank], destination[rank], policy);
+        detail::require_rank_residency(ec, static_cast<int>(rank), x[rank].data, w[rank].payload,
+                                       out[rank].data,
+                                       "linear split: rank arguments must reside on its device");
+        required[rank] = linear_workspace_capacity_bytes(w[rank].qtype, w[rank].n, w[rank].k,
+                                                         policy, x[rank].ne[1], x[rank].ne[1]);
+    }
+    detail::require_split_workspace(workspace, required, op);
+    return destination;
+}
+
+void issue_ranks(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                 std::array<Tensor, 2>& out, LinearPolicy policy,
+                 const std::array<WorkspaceArena*, 2>& workspace, const ExecutionContext& ec) {
+    detail::for_each_rank(ec, [&](int rank) {
+        const auto slot = static_cast<std::size_t>(rank);
+        detail::dispatch_linear(x[slot], w[slot], out[slot], policy, workspace[slot],
+                                ec.dev[slot]->stream);
+    });
+}
+
+} // namespace
+
+void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                            const std::array<Tensor, 2>& out, LinearPolicy policy,
+                            const std::array<WorkspaceArena*, 2>& workspace,
+                            const ExecutionContext& ec) {
+    std::array<Tensor, 2> destination =
+        validate_split(x, w, out, policy, workspace, ec, detail::SplitAxis::Output);
+    issue_ranks(x, w, destination, policy, workspace, ec);
+}
+
+void linear_column_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                            const std::array<Tensor, 2>& out, const ExecutionContext& ec) {
+    linear_column_parallel(x, w, out, LinearPolicy::A16Only, {nullptr, nullptr}, ec);
+}
+
+void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+                         LinearPolicy policy, const std::array<WorkspaceArena*, 2>& workspace,
+                         const ExecutionContext& ec, const PeerEvents& events) {
+    std::array<Tensor, 2> destination =
+        validate_split(x, w, out, policy, workspace, ec, detail::SplitAxis::Input);
+    if (!events.live()) { throw std::invalid_argument("linear row-parallel: events must be live"); }
+    detail::require_allreduce_sum_arguments(out, staging, ec, events);
+    // Each partial lands in out[r] on rank r's stream; allreduce_sum records its inputs_ready event
+    // on that same stream, which orders the peer's read after the partial.
+    issue_ranks(x, w, destination, policy, workspace, ec);
+    allreduce_sum(out, staging, ec, events);
+}
+
+void linear_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                         const std::array<Tensor, 2>& out, const std::array<Tensor, 2>& staging,
+                         const ExecutionContext& ec, const PeerEvents& events) {
+    linear_row_parallel(x, w, out, staging, LinearPolicy::A16Only, {nullptr, nullptr}, ec, events);
 }
 
 } // namespace ninfer::ops
-
-#include "ops/linear/tp2/linear_tp2.inc"

@@ -11,17 +11,6 @@
 namespace ninfer::ops::detail {
 
 enum class Q8LinearSwiGluScheduleId {
-    DecodePairR16,
-    SplitKMmaExactT,
-    MmaR32C64,
-    MmaR32C80,
-    MmaR32C96,
-    MmaR32C128,
-    MmaR64C64,
-    MmaR64C96,
-    MmaR64C128,
-    MmaR128C64,
-    MmaR128C80,
     DFlash2SmallT,
     DFlash2MmaR32C64K128,
     DFlash2MmaR64C64K128,
@@ -43,7 +32,6 @@ struct Q8LinearSwiGluPlan {
 };
 
 const char* q8_linear_swiglu_schedule_name(Q8LinearSwiGluScheduleId schedule) noexcept;
-bool q8_linear_swiglu_schedule_uses_mma(Q8LinearSwiGluScheduleId schedule) noexcept;
 bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept;
 Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& problem);
 

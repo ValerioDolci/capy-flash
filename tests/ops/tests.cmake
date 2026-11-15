@@ -7,9 +7,7 @@ set(ninfer_op_tests
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
-  l2norm
   gated_delta_net
-  kimi_delta_attention
   causal_conv1d_silu
   layer_norm
   embedding
@@ -20,7 +18,6 @@ set(ninfer_op_tests
   vision_pos_embed
   sampling
   scalar
-  cast
   prepare_ragged_prefix
   scatter
   scatter_bf16_batch
@@ -40,27 +37,18 @@ set(ninfer_op_tests
   linear_swiglu_split
   linear_add_split
   hyper_connection
-  hyper_connection_split
   ple
   moe_slots
   moe_grouped
-  moe_route
-  moe_predict)
+  moe_route)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
     LIBRARIES ninfer_ops)
 endforeach()
 
-# The SIMT router logits (NINFER_QWEN4_ROUTER_MMA=0; tensor cores are the default, T183) through the same test.
-add_test(NAME ninfer_moe_route_simt_test COMMAND ninfer_moe_route_test)
-set_tests_properties(ninfer_moe_route_simt_test PROPERTIES ENVIRONMENT "NINFER_QWEN4_ROUTER_MMA=0")
-
-# The T62 exchange receives by kernel on a pair without peer access by default (since v0.11.1); the same test
-# with NINFER_TP_XIN_KERNEL=0 keeps the copy-engine path covered. Skips with fewer than two GPUs like the test.
-add_test(NAME ninfer_allreduce_f32_xin_test COMMAND ninfer_allreduce_f32_test)
-set_tests_properties(ninfer_allreduce_f32_xin_test PROPERTIES ENVIRONMENT "NINFER_TP_XIN_KERNEL=1"
-                     SKIP_RETURN_CODE 77)
+# The prefill exchange receives by kernel on a pair without peer access by default; the same test with
+# NINFER_TP_XIN_KERNEL=0 keeps the copy-engine path covered. Skips with fewer than two GPUs like the test.
 add_test(NAME ninfer_allreduce_f32_copy_test COMMAND ninfer_allreduce_f32_test)
 set_tests_properties(ninfer_allreduce_f32_copy_test PROPERTIES ENVIRONMENT "NINFER_TP_XIN_KERNEL=0"
                      SKIP_RETURN_CODE 77)
@@ -95,11 +83,17 @@ ninfer_add_op_test(ninfer_host_moe_mailbox_test
 # another process on the GPU or the CPU cores stretches it past a millisecond, so it runs alone.
 set_tests_properties(ninfer_host_moe_mailbox_test PROPERTIES RUN_SERIAL TRUE)
 
+# ggml's reference code (third_party/ggml-iq, MIT), the oracle of the GGUF tests, built without FMA
+# contraction.
+add_library(ninfer_ggml_iq_reference STATIC "${PROJECT_SOURCE_DIR}/third_party/ggml-iq/ggml-iq.c")
+target_include_directories(ninfer_ggml_iq_reference PUBLIC "${PROJECT_SOURCE_DIR}/third_party")
+target_compile_options(ninfer_ggml_iq_reference PRIVATE -fno-fast-math -ffp-contract=off)
+
 # GGUF routed-expert Ops; real banks with NINFER_GGUF_BANKS, --bench for timings. The FP64 oracle
 # is host code of a .cu file: keep its host compiler from contracting.
 ninfer_add_op_test(ninfer_moe_slots_gguf_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_slots_gguf.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_ggml_iq_reference)
 target_compile_options(ninfer_moe_slots_gguf_test PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 
@@ -130,7 +124,7 @@ ninfer_add_op_test(ninfer_qsa_staging_test
 ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
-          "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
+          "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/packed.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
@@ -147,6 +141,12 @@ ninfer_add_op_test(ninfer_rmsnorm_rope_test
 
 ninfer_add_op_test(ninfer_rmsnorm_rope_text_shard_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope_text_shard.cpp"
+  LIBRARIES ninfer_ops)
+
+# YaRN text RoPE on every Text route and each device against the Hugging Face formula; with the
+# table removed every route is bit-identical to before.
+ninfer_add_op_test(ninfer_rope_yarn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_yarn.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_context_kv_materialize_test
@@ -217,28 +217,18 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
-# T98 validation probe (docs/capy-flash/development-log.md): engine CPU W4A8 vs GPU W4A4 on real experts
-add_executable(t98_expert_probe "${CMAKE_CURRENT_LIST_DIR}/t98_expert_probe.cu")
-ninfer_test_includes(t98_expert_probe)
-target_link_libraries(t98_expert_probe PRIVATE ninfer_ops)
-
-# T103 check (docs/capy-flash/development-log.md): generic BF16 linear on Flash-Next shapes
-add_executable(t103_bf16_generic "${CMAKE_CURRENT_LIST_DIR}/t103_bf16_generic.cu")
-ninfer_test_includes(t103_bf16_generic)
-target_link_libraries(t103_bf16_generic PRIVATE ninfer_ops)
-
 # GGUF host kernels (fngine port) against ggml reference code; real GSQ-RCO rows when
 # NINFER_GGUF_BANKS names a tools/convert/gguf_experts.py extract directory.
 ninfer_add_test(ninfer_host_gguf_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_gguf.cpp"
-  LIBRARIES ninfer_host_moe ninfer::json)
+  LIBRARIES ninfer_host_moe ninfer_ggml_iq_reference ninfer::json)
 set_tests_properties(ninfer_host_gguf_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_op_oracle_options(ninfer_host_gguf_test)
 
 # The host MoE executor on GGUF layers against an FP64 oracle (CPU only).
 ninfer_add_test(ninfer_host_moe_gguf_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe_gguf.cpp"
-  LIBRARIES ninfer_host_moe ninfer::json)
+  LIBRARIES ninfer_host_moe ninfer_ggml_iq_reference ninfer::json)
 set_tests_properties(ninfer_host_moe_gguf_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_op_oracle_options(ninfer_host_moe_gguf_test)
 
@@ -252,12 +242,11 @@ set_tests_properties(ninfer_host_moe_gguf_avx2_test PROPERTIES ENVIRONMENT "NINF
 # NINFER_GGUF_BANKS).
 ninfer_add_test(ninfer_host_gguf_isa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_gguf_isa.cpp"
-  LIBRARIES ninfer_host_moe ninfer::json)
+  LIBRARIES ninfer_host_moe ninfer_ggml_iq_reference ninfer::json)
 set_tests_properties(ninfer_host_gguf_isa_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_op_oracle_options(ninfer_host_gguf_isa_test)
 
-# gate on the YaRN frequency table (ported 2026-10-24): factor 1 must reproduce the shipped
-# kTextRopeInvFrequency exactly; a wrong table does not crash, it silently stops finding things.
+# The YaRN table (ops/kernel/yarn.h) against Hugging Face transformers, bit for bit.
 ninfer_add_op_test(ninfer_yarn_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_yarn.cpp"
   LIBRARIES ninfer_ops)

@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/engine_options.h"
 #include "product/speculative_options.h"
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
@@ -15,19 +16,7 @@
 namespace ninfer::cli {
 namespace {
 
-std::uint64_t parse_u64(const char* text, std::string_view label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
-        throw std::invalid_argument("invalid " + std::string(label) + ": " +
-                                    (text == nullptr ? "" : text));
-    }
-    errno                          = 0;
-    char* end                      = nullptr;
-    const unsigned long long value = std::strtoull(text, &end, 10);
-    if (errno == ERANGE || end == text || *end != '\0') {
-        throw std::invalid_argument("invalid " + std::string(label) + ": " + text);
-    }
-    return static_cast<std::uint64_t>(value);
-}
+using product::parse_u64;
 
 std::uint32_t parse_u32(const char* text, std::string_view label, bool allow_zero = false) {
     const std::uint64_t value = parse_u64(text, label);
@@ -54,15 +43,6 @@ float parse_float(const char* text, std::string_view label, float minimum, float
         throw std::invalid_argument("invalid " + std::string(label) + ": " + text);
     }
     return static_cast<float>(value);
-}
-
-KvCacheStorage parse_kv_cache(std::string_view text) {
-    if (text == "bf16") { return KvCacheStorage::BFloat16; }
-    if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -157,11 +137,7 @@ Options parse_options(int argc, char** argv) {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
         } else if (arg == "--vram-headroom-mib") {
-            const std::uint64_t mib = parse_u64(value(arg), "vram-headroom-mib");
-            if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
-                throw std::invalid_argument("--vram-headroom-mib is out of range");
-            }
-            vram_headroom_mib = static_cast<std::size_t>(mib);
+            vram_headroom_mib = product::parse_vram_headroom_mib(value(arg));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -172,13 +148,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--devices") {
             options.devices = product::parse_devices(value(arg));
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value(arg));
+            options.kv_cache = product::parse_kv_dtype(value(arg));
         } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value(arg));
-            if (options.speculative.backend == SpeculativeBackend::None) {
-                options.speculative.draft_tokens  = 0;
-                options.speculative.proposal_head = ProposalHead::Full;
-            }
+            product::set_speculative_backend(options.speculative, value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--lm-head-draft") {
@@ -250,12 +222,7 @@ Options parse_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
-    if (vram_headroom_mib.has_value()) {
-        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
-        }
-        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
-    }
+    product::apply_vram_headroom(options.kv_capacity, vram_headroom_mib);
     product::resolve_tensor_parallel_devices(options.tp, options.devices, options.device,
                                              device_explicit);
     product::validate_vision_options(options.enable_vision, options.vision_device,

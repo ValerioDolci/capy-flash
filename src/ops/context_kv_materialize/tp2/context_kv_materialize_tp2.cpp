@@ -1,7 +1,7 @@
-// Implements: include/ninfer/ops/tp2/context_kv_materialize.h. Our file.
-// The four-KV-head block of context_kv_materialize: upstream's checks with the block's shapes,
-// upstream's routes (ops/context_kv_materialize/launch.h) and upstream's kernels compiled for four
-// heads (materialize_shard_h4.cu).
+// Implements: include/ninfer/ops/tp2/context_kv_materialize.h.
+// The four-KV-head block of context_kv_materialize: the parent's checks with the block's shapes,
+// the parent's routes (ops/context_kv_materialize/launch.h) and the parent's kernels compiled for
+// four heads (materialize_shard_h4.cu).
 #include "core/weight.h"
 #include "ninfer/ops/tp2/context_kv_materialize.h"
 

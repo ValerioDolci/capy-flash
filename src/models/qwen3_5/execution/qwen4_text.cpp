@@ -58,23 +58,15 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 
 // The next prefill chunk's PLE rows are read from storage on a helper thread while the GPUs run
-// this chunk (T165, from T164: a gather of rows that are not in the page cache otherwise stalls
+// this chunk (a gather of rows that are not in the page cache otherwise stalls
 // both GPUs before every chunk). prefetch() only issues MADV_WILLNEED for the rows and touches no
 // shared state, so the next chunk's gather() decodes the same bytes, sooner. Joined on scope exit.
-// Diagnostics (T166): NINFER_QWEN4_PLE_TIMING=1 prints the duration of every prefill PLE gather and
-// prefetch to stderr; NINFER_QWEN4_PLE_NEXT_PREFETCH=0 turns the next-chunk prefetch off (A/B).
+// Diagnostics: NINFER_QWEN4_PLE_TIMING=1 prints the duration of every prefill PLE gather and
+// prefetch to stderr.
 bool ple_timing() {
     static const bool on = [] {
         const char* v = std::getenv("NINFER_QWEN4_PLE_TIMING");
         return v != nullptr && *v != 0 && *v != '0';
-    }();
-    return on;
-}
-
-bool ple_next_prefetch_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("NINFER_QWEN4_PLE_NEXT_PREFETCH");
-        return v == nullptr || *v != '0';
     }();
     return on;
 }
@@ -97,7 +89,7 @@ public:
 
     void start(PleGather& gather, std::span<const std::int32_t> history, std::size_t first,
                std::size_t count) {
-        if (!ple_next_prefetch_enabled() || count == 0 || first >= history.size()) { return; }
+        if (count == 0 || first >= history.size()) { return; }
         count   = std::min(count, history.size() - first);
         thread_ = std::thread([&gather, history, first, count] {
             try {
@@ -132,7 +124,7 @@ void require_shape(const Tensor& t, DType dtype, std::initializer_list<std::int3
     }
 }
 
-// T42: one prompt chunk wider than the Program's arena runs on workspace memory the expert
+// One prompt chunk wider than the Program's arena runs on workspace memory the expert
 // backend lends (Qwen4RoutedExperts::prompt_workspace). The TextContext's arena object belongs to
 // the Program; for the chunk it is moved aside and replaced by a non-owning arena over the lent
 // span, and restored afterwards (also on unwinding, after the window helper waited for the device).
@@ -165,7 +157,7 @@ private:
 };
 
 // The carried hidden of a prompt chunk: the persistent prefill_hidden when it holds the chunk,
-// else (a chunk on lent workspace, T42) a matrix of the chunk's arena.
+// else (a chunk on lent workspace) a matrix of the chunk's arena.
 Tensor chunk_hidden(const Tensor& prefill_hidden, WorkspaceArena& work, std::int32_t rows,
                     std::int32_t len) {
     if (prefill_hidden.data != nullptr && len <= prefill_hidden.ne[1]) {
@@ -175,7 +167,7 @@ Tensor chunk_hidden(const Tensor& prefill_hidden, WorkspaceArena& work, std::int
 }
 
 // A chunk whose hidden is not prefill_hidden leaves its last column in prefill_hidden's last
-// column: the Program's copy_tail reads the final chunk's last column there (T42).
+// column: the Program's copy_tail reads the final chunk's last column there.
 void keep_last_column(const Tensor& xf, const Tensor& prefill_hidden, cudaStream_t stream) {
     if (prefill_hidden.data == nullptr || xf.data == prefill_hidden.data) { return; }
     const Tensor last   = xf.slice(1, xf.ne[1] - 1, 1);
@@ -329,7 +321,7 @@ void TextContext::validate_tensor_parallel_qwen4() {
         // A dense Qwen3.5 model's own MTP head (text_tp2.inc).
         validate_tensor_parallel_mtp();
     } else if (mtp_enabled()) {
-        // T33: MTP over both ranks (each rank's MTP QSA heads, expert partition, MTP KV).
+        // MTP over both ranks (each rank's MTP QSA heads, expert partition, MTP KV).
         if (qwen4_mtp_ == nullptr || !tp.parameters->qwen4_mtp || !tp.mtp_complete() ||
             batch_mtp_kv_ == nullptr || !batch_mtp_kv_->has_qsa_index() ||
             !tp.mtp_cache->has_qsa_index()) {
@@ -528,7 +520,7 @@ void TextContext::upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len,
 // the chunk's inputs and rank 0's host gather of the PLE rows; rank 0 keeps the chunk's carried
 // hidden in prefill_hidden (causal scoring's staged columns) and rank 1 its copy for the last
 // column's vocabulary-split head (and, under MTP, its own prefill_hidden for the prefix-reuse
-// bridge, T66b). Rank 0 samples.
+// bridge). Rank 0 samples.
 PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
                                               const TextPrefill* text_prefill,
                                               const MultimodalPrefill* multimodal,
@@ -555,7 +547,7 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
         throw std::logic_error("Qwen4Exp MTP prefill has no MTP layer or exceeds the draft window");
     }
     // A multimodal prompt sets its RoPE delta; a text chunk continuing a cached multimodal prefix
-    // keeps the sequence's (T209); a chunk at base 0 resets it. Each rank offsets its own
+    // keeps the sequence's; a chunk at base 0 resets it. Each rank offsets its own
     // positions by its own copy of the delta.
     if (multimodal != nullptr) {
         rope_delta_ = multimodal->rope_delta;
@@ -599,7 +591,7 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
     reset_qwen4_arenas();
     // One expert window per chunk (with its MTP prompt calls; rank 0's backend drives both GPUs'
     // slot tables): the backend observes the chunk's routing once it completed. A chunk wider
-    // than the Program's arenas runs on each GPU's lent memory (T42). A dense FFN has no backend:
+    // than the Program's arenas runs on each GPU's lent memory. A dense FFN has no backend:
     // the chunk runs on the Program's arenas, outside any window.
     const std::array<Qwen4RoutedExperts*, 2> experts{runtime[0]->experts,
                                                      width == 2 ? runtime[1]->experts : nullptr};
@@ -736,7 +728,7 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
         }
 
         qwen4_retain_chunk(xf, len, split_rel > 0 && len == split_rel, sink);
-        // Observe, wait and close inside the try (T36 M2): a failure here must not leave any
+        // Observe, wait and close inside the try: a failure here must not leave any
         // rank's window open for the next execution.
         prefill_split_frontier_ = -1;
         timing.begin_wait();
@@ -801,8 +793,8 @@ void TextContext::qwen4_prompt_token(Qwen4Forward<WorkspaceArena>& forward, cons
 }
 
 // What a prompt chunk leaves for later calls: at the rewrite frontier the checkpoint hidden of
-// its last column (rank 1's too: the MTP bridge resumes rank 1's half of the MTP head from it,
-// T66b), the last column in prefill_hidden's last column when the chunk ran on lent workspace,
+// its last column (rank 1's too: the MTP bridge resumes rank 1's half of the MTP head from it),
+// the last column in prefill_hidden's last column when the chunk ran on lent workspace,
 // and a drafter sink's chunk.
 void TextContext::qwen4_retain_chunk(const RankTensors& xf, int len, bool rewrite,
                                      DFlashFeatureSink* sink) {
@@ -1190,7 +1182,7 @@ void TextContext::qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidde
 }
 
 // One sequence's MTP forward over T consecutive positions on every rank's prefill MTP KV row,
-// each rank from its own copy of the target hidden (T66b at tp 2). With `logits_column` >= 0 rank
+// each rank from its own copy of the target hidden (at tp 2). With `logits_column` >= 0 rank
 // 0 proposes from that column. `rope_positions` are each rank's [T] positions or, for one visual
 // bridge column, its [1,3] three-axis position. `input_embeddings` (rank 0's BF16 [H,T]) replaces
 // embed(ids) on every rank: rank 1 runs from its own copy.
@@ -1265,7 +1257,7 @@ void TextContext::qwen4_mtp_forward_batch(const Tensor& ids, const RankTensors& 
 }
 
 // Draft proposal from MTP hiddens on every rank: the replicated MTP output mixer, then the Text
-// output head over the full vocabulary (vocabulary-split at tp 2) and rank 0's argmax, or (T43)
+// output head over the full vocabulary (vocabulary-split at tp 2) and rank 0's argmax, or
 // the draft shortlist head of Qwen4Runtime::draft_head. (The artifact proposal-head hook of
 // TextContext stays refused for this architecture.)
 void TextContext::qwen4_mtp_propose(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
@@ -1320,8 +1312,8 @@ void TextContext::qwen4_mtp_propose(const RankTensors& hidden, Tensor& logits, T
         // rank 0 selects (lower row on ties) and maps the row to its token, per column.
         if (draft_logprobs != nullptr) {
             throw std::invalid_argument(
-                "the split draft shortlist has no log-probabilities (--mtp-min-p at tp 2: set "
-                "NINFER_QWEN4_DRAFT_SPLIT=0)");
+                "the split draft shortlist has no log-probabilities (NINFER_QWEN4_MTP_CALIB at tp "
+                "2: set NINFER_QWEN4_DRAFT_SPLIT=0)");
         }
         const auto ws = workspaces();
         for (std::int32_t b = 0; b < B; ++b) {

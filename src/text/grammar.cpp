@@ -16,7 +16,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -185,7 +184,7 @@ using Clock = std::chrono::steady_clock;
 
 std::string milliseconds(std::uint32_t value) { return std::to_string(value) + " ms"; }
 
-// capy-flash: at most `limit` compilations at once (0 = no limit); cache hits never take a slot.
+// At most `limit` compilations at once (0 = no limit); cache hits never take a slot.
 class CompileSlots {
 public:
     explicit CompileSlots(std::uint32_t limit) : limit_(limit) {}
@@ -282,45 +281,16 @@ RequestErrorKind constraint_error_kind(OutputConstraintKind kind) {
     throw std::invalid_argument("unknown output constraint kind");
 }
 
-class GrammarVocabulary::Impl {
-public:
-    explicit Impl(std::vector<std::string> value) : pieces(std::move(value)) {}
-
-    std::vector<std::string> pieces;
-    mutable std::mutex mutex;
-    mutable std::map<unsigned char, std::vector<std::int32_t>> indexes;
-};
-
-GrammarVocabulary::GrammarVocabulary(std::vector<std::string> pieces)
-    : impl_(std::make_unique<Impl>(std::move(pieces))) {}
-
-GrammarVocabulary::~GrammarVocabulary() = default;
-
-const std::vector<std::string>& GrammarVocabulary::pieces() const noexcept { return impl_->pieces; }
-
-const std::vector<std::int32_t>& GrammarVocabulary::containing(unsigned char byte) const {
-    std::lock_guard lock(impl_->mutex);
-    const auto found = impl_->indexes.find(byte);
-    if (found != impl_->indexes.end()) return found->second;
-    std::vector<std::int32_t> ids;
-    for (std::size_t i = 0; i < impl_->pieces.size(); ++i)
-        if (impl_->pieces[i].find(static_cast<char>(byte)) != std::string::npos)
-            ids.push_back(static_cast<std::int32_t>(i));
-    return impl_->indexes.emplace(byte, std::move(ids)).first->second;
-}
-
 class GrammarCompiler::Impl {
 public:
     Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes,
          const OutputConstraintLimits& limits_)
-        : vocabulary(std::make_shared<GrammarVocabulary>(std::move(vocab_))),
-          vocab(vocabulary->pieces()), eos(std::move(eos_)),
+        : vocab(std::move(vocab_)), eos(std::move(eos_)),
           tokenizer(vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab.size()), eos),
           compiler(tokenizer, 1, true, static_cast<std::int64_t>(bytes)), limits(limits_),
           slots(limits_.compile_concurrency) {}
 
-    std::shared_ptr<const GrammarVocabulary> vocabulary;
-    const std::vector<std::string>& vocab;
+    std::vector<std::string> vocab;
     std::vector<std::int32_t> eos;
     xgrammar::TokenizerInfo tokenizer;
     xgrammar::GrammarCompiler compiler;
@@ -338,16 +308,14 @@ public:
     std::size_t words;
     int tentative = 0;
     ConstraintObservation observed;
-    std::shared_ptr<const GrammarVocabulary> token_bytes;
-    std::unique_ptr<GrammarStateConstraint> state;
 
-    // capy-flash matcher budget (OutputConstraintLimits): per call, cumulative as
+    // Matcher budget (OutputConstraintLimits): per call, cumulative as
     // request + allowance x rounds, and history memory. Once `failure` is set every mask is dead,
     // so the Engine closes the request at its next round. After an interrupted parser step
     // (`interrupted`) the matcher is in an unspecified state and is never touched again; otherwise
     // it stays consistent, so a pending accept (a control span) still succeeds.
     OutputConstraintLimits limits;
-    std::chrono::nanoseconds spent{}; // matcher CPU time of this request (second audit N3)
+    std::chrono::nanoseconds spent{}; // matcher CPU time of this request
     std::uint64_t rounds = 0;
     std::optional<std::string> failure;
     bool interrupted = false;
@@ -415,7 +383,6 @@ public:
         DLTensor tensor{target.data(), {kDLCPU, 0}, 2, {kDLInt, 32, 1}, shape, nullptr, 0};
         matcher.FillNextTokenBitmask(&tensor);
         if (vocabulary % 32) { target.back() &= (1u << (vocabulary % 32)) - 1u; }
-        if (state) state->filter(target);
     }
 };
 
@@ -425,50 +392,14 @@ GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std
 
 GrammarCompiler::~GrammarCompiler() = default;
 
-std::shared_ptr<const GrammarVocabulary> GrammarCompiler::vocabulary() const {
-    return impl_->vocabulary;
-}
-
-std::unique_ptr<GrammarSession>
-GrammarCompiler::compile_model(std::string_view identity,
-                               const std::function<xgrammar::Grammar()>& build,
-                               std::string_view close, std::string_view continuation,
-                               std::unique_ptr<GrammarStateConstraint> state) {
-    const std::string key =
-        "model:" + std::to_string(close.size()) + ":" + std::string(close) + std::string(identity);
-    xgrammar::CompilationCacheAccess access;
-    auto compiled = impl_->compiler.CompileCachedGrammar(
-        key,
-        [&] {
-            auto grammar = build();
-            return close.empty() ? grammar
-                                 : xgrammar::Grammar::Concat({reasoning_prefix(close), grammar});
-        },
-        &access);
-    auto session =
-        std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab.size()));
-    session->observed.cache = cache_access(access);
-    session->token_bytes    = impl_->vocabulary;
-    session->state          = std::move(state);
-    session->limits         = impl_->limits;
-    if (!continuation.empty()) {
-        if (!session->matcher.AcceptString(std::string(continuation)) ||
-            (session->state && !session->state->accept(continuation)))
-            throw RequestError(RequestErrorKind::InvalidToolConstraint,
-                               "assistant continuation is not a prefix of the tool constraint");
-        if (session->state) session->state->confirm();
-    }
-    return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
-}
-
 std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
                                                          std::string_view close,
                                                          std::string_view continuation) {
     const auto error_kind = constraint_error_kind(constraint.kind);
     const auto& limits    = impl_->limits;
     const auto started    = Clock::now();
-    // capy-flash: the compilation itself runs under --constraint-compile-timeout-ms, counted from
-    // the moment it holds a slot; the wait for a slot is bounded apart by
+    // The compilation itself runs under --constraint-compile-timeout-ms, counted from the moment it
+    // holds a slot; the wait for a slot is bounded apart by
     // --constraint-compile-wait-ms and ends in "busy" (429), so slow schemas of one client cannot
     // make the legitimate schemas of others look too complex.
     const std::optional<std::chrono::milliseconds> timeout =
@@ -624,24 +555,19 @@ std::uint32_t GrammarSession::masks(std::span<const std::int32_t> drafts,
                 draft < impl_->vocabulary && (mask[draft / 32] & (1u << (draft % 32))) != 0 &&
                 impl_->matcher.AcceptToken(draft)) {
                 ++advanced;
-                if (impl_->state && !impl_->state->accept(impl_->token_bytes->pieces()[draft]))
-                    throw std::logic_error("grammar state mask admitted an invalid draft");
             } else {
                 reachable = false;
             }
         }
     } catch (const xgrammar::WorkBudgetExceeded&) {
         // The interrupted parser is not rolled back: the session is failed for good.
-        if (impl_->state) impl_->state->discard();
         impl_->fail_round(true);
         return impl_->all_dead(words, positions);
     } catch (...) {
         if (advanced) { impl_->matcher.Rollback(advanced); }
-        if (impl_->state) impl_->state->discard();
         throw;
     }
     if (advanced) { impl_->matcher.Rollback(advanced); }
-    if (impl_->state) impl_->state->discard();
     work.reset();
     if (impl_->charge(Impl::cpu_since(started), true)) return impl_->all_dead(words, positions);
     return dead;
@@ -660,10 +586,6 @@ void GrammarSession::accept(std::span<const std::int32_t> tokens) {
             if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token))
                 throw std::logic_error("selected token violates the request grammar");
             ++impl_->tentative;
-            if (impl_->state && !impl_->state->accept(impl_->token_bytes->pieces()[token])) {
-                discard();
-                throw std::logic_error("selected token violates the request grammar state");
-            }
         }
     } catch (const xgrammar::WorkBudgetExceeded&) {
         impl_->fail_round(true);
@@ -703,15 +625,11 @@ ConstraintObservation GrammarSession::observation() const {
     return result;
 }
 
-void GrammarSession::confirm() noexcept {
-    impl_->tentative = 0;
-    if (impl_->state) impl_->state->confirm();
-}
+void GrammarSession::confirm() noexcept { impl_->tentative = 0; }
 
 void GrammarSession::discard() {
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
     if (impl_->tentative && !impl_->interrupted) { impl_->matcher.Rollback(impl_->tentative); }
     impl_->tentative = 0;
-    if (impl_->state) impl_->state->discard();
 }
 } // namespace ninfer::text

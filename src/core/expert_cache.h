@@ -4,9 +4,9 @@
 //
 // Every GPU p holds the experts e with e % gpus == p (partition by id) in a slot pool and a slot
 // table `int32 [layers, experts]` (slot on this GPU, or -1). The device only ever reads the
-// table: a kernel maps routed ids to slots with expert_cache_map_slots (-1 = not here, the
-// "skipped" id of the expert kernels) and the expert kernel reads the slots. All decisions run on
-// the host between windows:
+// table: the expert kernels look routed ids up in it (-1 = not here, the "skipped" id) and read
+// the slots; expert_cache_map_slots reads it back the same way (tests). All decisions run on the
+// host between windows:
 //
 //   begin_window(streams)   apply pending table updates on each GPU's compute stream
 //   <launch the window (CUDA graph) on those streams>
@@ -23,14 +23,14 @@
 // whose slot was reassigned before it was issued (a backlog never copies stale experts). The
 // queue advances whenever the cache is called (begin_window, submit_fills, poll).
 //
-// SM fills (NINFER_QWEN4_FILL_SM=<ctas>, off by default; v07/decode-overheads A): the batches are
+// SM fills (NINFER_QWEN4_FILL_SM=<ctas>, off by default): the batches are
 // copied by a kernel of <ctas> blocks on the fill stream that reads the host bank in place (mapped
 // pinned memory) instead of the copy engine. Same bytes, same events, same ordering. A copy engine
 // keeps enough reads in flight to fill the link, and every small PCIe read of the same GPU (the TP
-// exchange's flag and payload, the host experts' partial) waits behind them: T201 measured the
-// decode exchange at 5.3 us without a fill on either link, 16.1 with one on GPU 0's, 27.0 with one
-// on both (0.42 ms per round). A kernel of a few blocks bounds the fill's reads in flight (256
-// threads x 4 x 16 B = 16 KiB per block) at the price of a slower fill.
+// exchange's flag and payload, the host experts' partial) waits behind them: a fill measurably
+// slows the decode exchange (about 3x with one link busy, 5x with both). A kernel of a few blocks
+// bounds the fill's reads in flight (256 threads x 4 x 16 B = 16 KiB per block) at the price of a
+// slower fill.
 //
 // Epoch fence: an evicted expert is unpublished (table entry -1) at the next begin_window, and
 // every fill batch first waits for the fence of the last window launched before it is issued, so
@@ -39,17 +39,18 @@
 // names complete slots. Until then the policy counts the expert as resident and the device does
 // not (observe reports it missing).
 //
-// Deterministic publication (publish lag >= 1, opt-in; set_publish_lag or
-// NINFER_QWEN4_FILL_PUBLISH_LAG): a batch is instead published at the begin_window fixed when it
-// was issued: with lag 1 the next one for a batch issued inside a window (it ran beside the rest of
-// the window, as a timed copy usually does), the one after for a batch issued between windows (it
-// would be waited for at once); begin_window waits for it if it has not completed. poll() does
-// nothing, and nothing else retires a batch except flush() (between windows, and while a prompt
-// chunk runs). Every decision then depends on the sequence of calls alone, never on how fast a
-// copy ran: with timed publication which experts the GPU holds, and so which ones the CPU computes
-// with another rounding, follows copy speed, and the greedy text can change between runs.
+// Deterministic publication (publish lag >= 1, opt-in, and required with a host pool;
+// set_publish_lag or NINFER_QWEN4_FILL_PUBLISH_LAG): a batch is instead published at the
+// begin_window fixed when it was issued: with lag 1 the next one for a batch issued inside a window
+// (it ran beside the rest of the window, as a timed copy usually does), the one after for a batch
+// issued between windows (it would be waited for at once); begin_window waits for it if it has not
+// completed. Host pool slots are released at begin_window too, poll() does nothing, and nothing
+// else retires a batch except flush() (between windows, and while a prompt chunk runs). Every
+// decision then depends on the sequence of calls alone, never on how fast a copy ran: with timed
+// publication which experts the GPU holds, and so which ones the CPU computes with another
+// rounding, follows copy speed, and the greedy text can change between runs.
 //
-// Pageable banks (v0.7 pinned fallback): a layer whose bank planes are not page-locked host memory
+// Pageable banks (pinned fallback): a layer whose bank planes are not page-locked host memory
 // (cudaPointerGetAttributes: unregistered) is filled through a ring of pinned staging slots of one
 // expert each, per GPU: the execution thread copies the expert into a free staging slot (memcpy)
 // and the slot joins the batch's cudaMemcpyBatchAsync; it is free again once that batch's event
@@ -61,6 +62,7 @@
 // keeps them alive until the ExpertCache is destroyed.
 
 #include "core/expert_cache_policy.h"
+#include "core/expert_host_pool.h"
 
 #include <cuda_runtime.h>
 
@@ -82,7 +84,7 @@ inline constexpr int kMaxGpus   = 2;
 // pool_base[p][q] + s * pool_stride[q] (one contiguous slot of all planes, as ninfer-ext's
 // kExpertSlotBytes layout, or one array per plane, as qf_moe's).
 //
-// Variable expert sizes (capy-flash v0.7, ggml block banks: the bytes of an expert depend on its
+// Variable expert sizes (ggml block banks: the bytes of an expert depend on its
 // layer's formats): when `slot_offset` is not empty, plane q of (layer l, expert e) has
 // layer_plane_bytes[l * planes + q] bytes at bank_base[l * planes + q] + e *
 // layer_bank_stride[l * planes + q], and plane q of slot s (holding an expert of layer l) begins
@@ -99,6 +101,15 @@ struct ExpertLayout {
     std::vector<std::int64_t> layer_plane_offset; // [layers * planes]
     std::vector<std::int64_t> slot_offset;        // [pool slots of one GPU]
 
+    // Exclusive tier: with `host_pool`, the host copy of an expert sits at its pool slot instead
+    // of its id, and a base slot of an `exclusive_layer` holds the only copy of its expert. Expert
+    // e >= tail_first[l] with no pool slot still has its start-up bytes in the temporary tail
+    // (tail_base[l * planes + q] + (e - tail_first[l]) * stride).
+    ExpertHostPool* host_pool = nullptr;
+    std::vector<std::uint8_t> exclusive_layer; // [layers]
+    std::vector<std::int32_t> tail_first;      // [layers]
+    std::vector<const std::byte*> tail_base;   // [layers * planes], null after release_tails()
+
     [[nodiscard]] bool variable() const noexcept { return !slot_offset.empty(); }
 
     [[nodiscard]] std::int64_t bytes(std::int32_t layer, std::int32_t q) const noexcept {
@@ -109,9 +120,17 @@ struct ExpertLayout {
     [[nodiscard]] const std::byte* bank(std::int32_t layer, std::int32_t q,
                                         std::int32_t expert) const noexcept {
         const auto i = static_cast<std::size_t>(layer * planes + q);
-        return bank_base[i] +
-               static_cast<std::int64_t>(expert) *
-                   (variable() ? layer_bank_stride[i] : bank_stride[static_cast<std::size_t>(q)]);
+        const std::int64_t stride =
+            variable() ? layer_bank_stride[i] : bank_stride[static_cast<std::size_t>(q)];
+        if (host_pool != nullptr) {
+            const std::int32_t slot = host_pool->slot(layer, expert);
+            if (slot != ExpertHostPool::kNoSlot) { return bank_base[i] + slot * stride; }
+            const std::int32_t first = tail_first[static_cast<std::size_t>(layer)];
+            return tail_base.empty() || tail_base[i] == nullptr || expert < first
+                       ? nullptr
+                       : tail_base[i] + (expert - first) * stride;
+        }
+        return bank_base[i] + static_cast<std::int64_t>(expert) * stride;
     }
 
     [[nodiscard]] std::int64_t pool_offset(std::int32_t layer, std::int32_t q,
@@ -131,7 +150,7 @@ struct GpuBinding {
     // Optional: device [layers * experts] residency of every partition (the owner GPU's slot, or
     // -1), updated with the tables at every begin_window on this GPU's compute stream. A host path
     // on GPU 0 that must skip the experts resident on any GPU reads it; GPU 1's copy lets it pick
-    // the same miss-split share as GPU 0's publish (T42).
+    // the same miss-split share as GPU 0's publish.
     std::int32_t* mirror = nullptr;
 };
 
@@ -164,11 +183,16 @@ struct CacheCounters {
     std::int64_t published      = 0;
     std::int64_t unpublished    = 0;
     std::int64_t table_launches = 0;
-    // Elastic columns (T64): experts dropped and moved by set_active_columns shrinks.
+    // Elastic columns: experts dropped and moved by set_active_columns shrinks.
     std::int64_t shrink_evicted = 0;
     std::int64_t moved          = 0;
-    // v0.7 pinned fallback: fills from pageable banks, copied through the staging ring.
+    // Pinned fallback: fills from pageable banks, copied through the staging ring.
     std::int64_t staged_fills = 0;
+    // Exclusive tier: victims written back to a host slot, fills found already in place, and
+    // experts moved between device slots.
+    std::int64_t writebacks   = 0;
+    std::int64_t refound      = 0;
+    std::int64_t device_moves = 0;
     // Deterministic publication: begin_window calls that had to wait for a copy, and the wait.
     std::int64_t publish_waits = 0;
     double publish_wait_us     = 0;
@@ -209,14 +233,14 @@ public:
 
     [[nodiscard]] const ExpertCachePolicy& policy() const noexcept { return policy_; }
 
-    // T69: ExpertCachePolicy::set_insert_cap (between windows).
+    // ExpertCachePolicy::set_insert_cap (between windows).
     void set_insert_cap(std::int32_t cap) { policy_.set_insert_cap(cap); }
 
     [[nodiscard]] const CacheCounters& counters() const noexcept { return counters_; }
 
     [[nodiscard]] std::int32_t gpus() const noexcept { return gpus_; }
 
-    // v0.7 pinned fallback: whether `layer`'s bank is in pageable host memory (filled through the
+    // Pinned fallback: whether `layer`'s bank is in pageable host memory (filled through the
     // staging ring), and the staging ring of each GPU (experts; 0 when every bank is pinned).
     [[nodiscard]] bool pageable_layer(std::int32_t layer) const noexcept {
         return layer >= 0 && layer < layers_ && pageable_[static_cast<std::size_t>(layer)] != 0;
@@ -239,8 +263,8 @@ public:
     [[nodiscard]] LayerView observe(std::int32_t layer, std::span<const Routed> routed,
                                     std::int32_t tokens);
     // observe() of a prompt window (prefill chunk): ExpertCachePolicy::decide_prompt (with
-    // `target_cap` > 0 at most that many targets per partition, T211b), or with `insert` false
-    // ExpertCachePolicy::count_prompt (T211: the residency stays as it is).
+    // `target_cap` > 0 at most that many targets per partition), or with `insert` false
+    // ExpertCachePolicy::count_prompt (the residency stays as it is).
     [[nodiscard]] LayerView observe_prompt(std::int32_t layer, std::span<const Routed> routed,
                                            std::int32_t tokens, bool insert = true,
                                            std::int32_t target_cap = 0);
@@ -248,7 +272,7 @@ public:
     void submit_fills();
 
     /**
-     * T211b: a prompt's routing applied between windows (after the prompt's last window, before
+     * A prompt's routing applied between windows (after the prompt's last window, before
      * the next window begins): ExpertCachePolicy::decide_prompt with at most `target_cap` targets
      * per partition (0 = the slot count; < 0: the frequencies only, ExpertCachePolicy::count_prompt
      * with frequencies), its fills queued behind the backlog, fenced to the last
@@ -282,8 +306,16 @@ public:
     // issues queued fills up to the in-flight limit. Deterministic publication: does nothing (the
     // other calls issue and retire at fixed points).
     void poll();
-    // Issues and waits for every submitted fill.
+    // Issues and waits for every submitted fill. With a host pool it stops at the fills that wait
+    // for a window or a publication (a victim's unpublication, a host slot): settle() finishes
+    // those.
     void flush();
+    // Exclusive tier, between windows with the device idle: flush, including the fills that wait
+    // for a victim's write-back and unpublication, publishing on `streams`.
+    void settle(std::span<const cudaStream_t> streams);
+    // The temporary start-up tail is about to be freed: every expert must have its bytes in a pool
+    // or device slot by now (settled).
+    void release_tails();
 
     /**
      * Lending (prefill staging): the slots of layers [first, first + count) of every GPU go to the
@@ -297,7 +329,7 @@ public:
      * [policy().base_offset(p, first), policy().base_offset(p, first + count)) of partition p
      * (one contiguous run); the layers' elastic slots stay empty while lent.
      *
-     * T69 `keep_elastic`: only the base slots are lent (ExpertCachePolicy::block_base): the
+     * `keep_elastic`: only the base slots are lent (ExpertCachePolicy::block_base): the
      * layers keep the experts of their elastic slots (published, their fills not dropped), and
      * observe()/observe_prompt() of those layers decide as for any layer within the active
      * elastic columns (a prompt fills them with its hottest experts while the base slots are
@@ -313,12 +345,12 @@ public:
      * queue, published as their copies complete. With a non-empty `rank`, the whole queue
      * (these refills and every fill submitted before) is reordered by `rank` (prioritize_queue)
      * before any refill is issued, e.g. the experts' rank in their layer's profile, so the
-     * hottest experts of every reclaimed layer land first (T69).
+     * hottest experts of every reclaimed layer land first.
      */
     void reclaim_layers(std::span<const std::vector<std::int32_t>> profile,
                         std::span<const std::int32_t> rank = {});
     /**
-     * T69: reclaim_layers of the first `count` lent layers only (between windows): layers
+     * reclaim_layers of the first `count` lent layers only (between windows): layers
      * [lent_first(), lent_first() + count) return to the cache and refill from `profile` (one
      * list per reclaimed layer, or empty), the others stay lent (their lend events stand); with
      * count == lent_count() this is reclaim_layers.
@@ -342,7 +374,7 @@ public:
     }
 
     /**
-     * Elastic columns (T64, ExpertCachePolicy::set_active_columns): between windows, with every
+     * Elastic columns (ExpertCachePolicy::set_active_columns): between windows, with every
      * window's device work complete. Growing only raises the capacity. Shrinking waits for every
      * submitted fill, drops the coldest experts beyond the new capacity, copies the survivors of
      * the released columns device-to-device into freed kept slots and applies the table updates on
@@ -362,9 +394,9 @@ public:
     // Insertions observed but not yet copied (staged, queued) and copies in flight.
     [[nodiscard]] std::int64_t fills_pending() const noexcept;
 
-    // T59 measurement aid: a frozen cache classifies routed experts (counters, resident slots,
-    // missing list) exactly as before but never asks the policy: no insertion, no eviction, the
-    // policy state does not move. Residency stays what it was when frozen.
+    // Measurement aid: a frozen cache classifies routed experts (counters, resident slots,
+    // missing list) exactly as an unfrozen one but never asks the policy: no insertion, no
+    // eviction, the policy state does not move. Residency stays what it was when frozen.
     void set_frozen(bool frozen) noexcept { frozen_ = frozen; }
 
     /**
@@ -373,7 +405,8 @@ public:
      * fixed when it was issued (lag 1: the next one for a copy issued inside a window, the one
      * after for a copy issued between windows; each step of lag adds one), waiting for it if
      * needed, so the residency depends on the routing history alone.
-     * Before initialize() only. Default -1; NINFER_QWEN4_FILL_PUBLISH_LAG overrides.
+     * Before initialize() only. Default: 1 with a host pool (exclusive tier, which takes 1..3
+     * only), else -1; NINFER_QWEN4_FILL_PUBLISH_LAG overrides.
      */
     void set_publish_lag(std::int32_t lag);
 
@@ -381,7 +414,7 @@ public:
 
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
 
-    // T59: replace the whole residency by `profile` (one list per layer, as initialize), between
+    // Replace the whole residency by `profile` (one list per layer, as initialize), between
     // windows: every layer is cleared and refilled, the copies are waited for and published at the
     // next begin_window. Policy frequencies are unchanged.
     void restore(std::span<const std::vector<std::int32_t>> profile);
@@ -396,10 +429,24 @@ private:
         bool fenced              = true; // waits for the fence of the last launched window
     };
 
+    // A victim's bytes on their way from its device slot to its reserved host slot.
+    struct WriteBack {
+        std::int32_t cell = 0;
+        std::int32_t slot = 0;
+    };
+
+    // An expert with no host copy, on its way between two device slots.
+    struct DeviceMove {
+        std::int32_t from = 0;
+        PendingFill fill;
+    };
+
     struct FillBatch {
         cudaEvent_t done = nullptr;
         std::int64_t due = 0; // deterministic publication: begin_window (launched_) it is due at
         std::vector<PendingFill> fills;
+        std::vector<WriteBack> writebacks;
+        std::vector<DeviceMove> moves;
         std::int32_t staged = 0; // staging slots it holds (pageable fills)
     };
 
@@ -418,6 +465,18 @@ private:
         std::byte* staging          = nullptr;
         std::int64_t staging_head   = 0; // slots handed out, ever
         std::int32_t staging_in_use = 0;
+        // Exclusive tier, per pool slot: the cell whose only copy the slot holds, or -1; a
+        // write-back in flight; and the windows that must have ended before the slot is rewritten
+        // (the ones launched before its victim was unpublished).
+        std::vector<std::int32_t> occupant;
+        std::vector<std::uint8_t> writing;
+        std::vector<std::int64_t> safe_after;
+        // What could unblock a waiting fill, at the last pass over the queue: nothing changed, no
+        // pass (the queue can be thousands long and pump runs on the execution thread).
+        std::int64_t pumped_windows = -1;
+        std::int64_t pumped_retired = -1;
+        std::size_t pumped_queue    = 0;
+        std::int64_t retired        = 0;
     };
 
     [[nodiscard]] std::size_t cell(std::int32_t layer, std::int32_t expert) const noexcept {
@@ -434,11 +493,29 @@ private:
     // Launches the pending table updates on `streams` and commits them to the host mirror.
     void publish_targets(std::span<const cudaStream_t> streams);
     void set_target(std::size_t cell, std::int32_t value);
+
+    // Pageable source: a pageable bank, or a start-up tail. Copied from it directly, CUDA would
+    // stage through a driver buffer that stays resident.
+    [[nodiscard]] bool needs_staging(std::int32_t c) const {
+        const std::int32_t l = c / experts_;
+        return pageable_[static_cast<std::size_t>(l)] != 0 ||
+               (layout_.host_pool != nullptr &&
+                layout_.host_pool->slot(l, c % experts_) == ExpertHostPool::kNoSlot);
+    }
+
     void pump(Gpu& gpu);
+    enum class Prepared : std::uint8_t { Ready, Wait, Done };
+    [[nodiscard]] Prepared prepare(Gpu& gpu, PendingFill& fill);
+    void issue_writeback(Gpu& gpu, std::int32_t occupant, std::int32_t slot);
+    void issue_move(Gpu& gpu, const PendingFill& fill, std::int32_t from);
+    void track_copy(Gpu& gpu, FillBatch batch);
+    [[nodiscard]] bool exclusive_slot(std::int32_t partition, std::int32_t layer,
+                                      std::int32_t slot) const noexcept;
     void issue(Gpu& gpu, std::span<const PendingFill> fills);
     void retire(Gpu& gpu, bool wait);
-    // The front batch's bookkeeping (its fills publish at the next begin_window).
-    void retire_front(Gpu& gpu);
+    // The front batch's bookkeeping (its fills publish at the next begin_window); `safe_after` for
+    // the slots it frees.
+    void retire_front(Gpu& gpu, std::int64_t safe_after);
 
     [[nodiscard]] bool deterministic() const noexcept { return publish_lag_ > 0; }
 
@@ -456,8 +533,9 @@ private:
     std::int32_t layers_              = 0;
     std::int32_t experts_             = 0;
     std::array<Gpu, kMaxGpus> gpu_{};
-    std::vector<std::uint8_t> pageable_; // [layers] bank in pageable host memory
-    std::int32_t staging_slots_ = 0;     // per GPU
+    std::vector<std::uint8_t> pageable_;     // [layers] bank in pageable host memory
+    std::vector<std::uint8_t> written_back_; // [cells] exclusive tier: write-back in flight
+    std::int32_t staging_slots_ = 0;         // per GPU
 
     std::vector<std::int32_t> published_; // [cells] table value on the owner GPU
     std::vector<std::int32_t> target_;    // [cells] value to publish at the next begin_window
@@ -466,14 +544,14 @@ private:
 
     std::int32_t lent_first_ = 0;
     std::int32_t lent_count_ = 0;
-    bool lent_keep_          = false; // T69: the lent layers keep their elastic slots
+    bool lent_keep_          = false; // the lent layers keep their elastic slots
     std::array<cudaEvent_t, kMaxGpus> lend_events_{};
 
     std::int64_t launched_ = 0; // windows begun
     std::int64_t fenced_   = 0; // windows whose fence is recorded
     bool initialized_      = false;
     bool frozen_           = false;
-    // NINFER_QWEN4_FILL_SM=<ctas> (v07/decode-overheads A): CTAs of the kernel that copies fills
+    // NINFER_QWEN4_FILL_SM=<ctas>: CTAs of the kernel that copies fills
     // from the mapped host bank instead of the copy engine; 0 = copy engine (cudaMemcpyBatchAsync).
     std::int32_t sm_fill_ctas_ = 0;
     std::int32_t publish_lag_  = -1; // set_publish_lag

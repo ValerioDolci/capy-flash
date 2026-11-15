@@ -49,7 +49,7 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
     static const std::vector<ContextCostMachinePreset> defaults{
         ContextCostMachinePreset{
             .hardware_class = "nvidia-geforce-rtx-5090-sm120",
-            // Unified from the measured 2026-08-24 transfer corpus. A fresh machine-only transfer
+            // Unified from a measured transfer corpus. A fresh machine-only transfer
             // calibration can replace this whole array without loading a model.
             .transfer =
                 std::array{

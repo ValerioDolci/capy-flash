@@ -7,7 +7,7 @@
 # (default: all but build):
 #   build    cmake --build <build-dir> (no GPU)
 #   shards   tools/tp2/check_shard_sources.py on the source tree (no GPU): the shards compiled from
-#            upstream's sources (docs/maintainer/upstream-merge.md 2.4) cannot go silently wrong
+#            their parent Ops' sources (docs/maintainer/two-gpu-layer.md 2.4) cannot go silently wrong
 #   ctest    the unit, Op and two-device tests that a tp2 change can reach, plus the tp2 *_real tests
 #            (NINFER_TEST_ARTIFACT); --attention adds ninfer_softmax_attention_test (~12 min)
 #   golden   tools/golden/record.sh on the synthetic tp1 model; ids must equal the reference's
@@ -16,9 +16,10 @@
 #            GATE_PPL_PAIRED=1 (for commits meant to change bits): a table that differs is compared
 #            window by window with the reference's report (tools/tp2/ppl_paired.py): PASS if not
 #            worse at p 0.05 and |change| < 0.5 %, WARN otherwise
-#   greedy   ninfer-serve with the production flags (MTP3, --lm-head-draft, C=1), the reference's
-#            60 prompts at T=0 / 128 tokens; texts must equal the reference's; ms/round (median of
-#            decode seconds / MTP rounds) is reported against it (PASS within +-1 %, else WARN)
+#   greedy   ninfer-serve with the shipped profile (--profile 27b: MTP3, C=1, 2048-token prefill
+#            chunks; without --lm-head-draft), the reference's 60 prompts at T=0 / 128 tokens; texts
+#            must equal the reference's; ms/round (median of decode seconds / MTP rounds) is
+#            reported against it (PASS within +-1 %, else WARN)
 #   dflash2  a short DFlash2 K=7 --lm-head-draft run on the _df2nv artifact (10 prompts), same checks
 #
 # The gate does not reserve the GPUs; run it on idle GPUs or wrap it in your own GPU scheduler.
@@ -42,7 +43,7 @@ PROMPTS=${GATE_PROMPTS:-}           # --record only: JSONL of {"id","text"}; cop
 DEVICES=${GATE_DEVICES:-0,1}
 PORT=${GATE_PORT:-8090}
 CORPUS=${GATE_CORPUS:-$src/eval/corpora/perplexity-1m/manifest.json}
-SERVE_FLAGS=${GATE_SERVE_FLAGS:---tp 2 --devices $DEVICES --kv-dtype int8 --max-context 196608 --kv-capacity 196608 --device-state-slots 4 --max-concurrency 1 --spec mtp --draft-tokens 3 --lm-head-draft --vision --vision-device 0 --max-vision-tokens 4096}
+SERVE_FLAGS=${GATE_SERVE_FLAGS:---profile 27b --devices $DEVICES}
 DF2_FLAGS=${GATE_DF2_FLAGS:---tp 2 --devices $DEVICES --kv-dtype int8 --max-context 32768 --kv-capacity 32768 --max-concurrency 1 --spec dflash2 --draft-tokens 7 --lm-head-draft}
 DF2_PROMPTS=${GATE_DF2_PROMPTS:-10}
 EXTRA_FLAGS=${GATE_EXTRA_FLAGS:-}

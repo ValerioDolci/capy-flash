@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of argmax. Our file: ninfer/ops/argmax.h is upstream's and carries no
-// hook.
+// Two-device (tp 2) forms of argmax.
 
 #include "ninfer/ops/argmax.h"
 #include <array>

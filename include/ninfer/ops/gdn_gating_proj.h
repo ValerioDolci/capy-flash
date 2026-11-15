@@ -50,10 +50,8 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
                      Tensor& beta, DeviceExecutionView execution);
 
 /**
- * Registered contiguous-parent storage forms of gdn_gating_proj:
- *
- * - hidden 5120: BF16 `ab_weight [96,5120]`, with A in rows [0,48) and B in [48,96);
- * - hidden 2048: BF16 `ab_weight [64,2048]`, with A in rows [0,32) and B in [32,64).
+ * Registered contiguous-parent storage form of gdn_gating_proj: BF16 `ab_weight [96,5120]`, with A
+ * in rows [0,48) and B in [48,96).
  *
  * The complete immutable parent is the public weight. Its halves are consumed as zero-copy views
  * and produce FP32 g/beta `[heads,T]` under the same logical formula and oracle. All other effects
@@ -88,7 +86,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, DeviceExecutionView execution);
 
-/** The hidden-5120 and hidden-2048 contiguous-parent storage forms described above. */
+/** The contiguous-parent storage form described above. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,

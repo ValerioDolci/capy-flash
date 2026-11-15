@@ -13,18 +13,14 @@ namespace ninfer::ops {
 
 inline constexpr int kPackedAttentionHeadDim = 72;
 inline constexpr int kPackedAttentionHeads   = 16;
-inline constexpr int kPackedAttentionBr      = 64;
-inline constexpr int kPackedAttentionBc      = 64;
 inline constexpr int kPackedAttentionPaddedD = 128;
 
-struct alignas(16) PackedAttentionTile {
+// One query tile: rows [q0, q0 + Br) of the segment [begin, end).
+struct PackedAttentionTile {
     std::int32_t q0;
     std::int32_t begin;
     std::int32_t end;
-    std::int32_t reserved;
 };
-
-static_assert(sizeof(PackedAttentionTile) == 16);
 
 __device__ __forceinline__ const __nv_bfloat16*
 packed_attention_ptr(const __nv_bfloat16* data, std::int64_t stride_d, std::int64_t stride_h,
@@ -40,28 +36,6 @@ __device__ __forceinline__ int packed_attention_swz(int row, int col) {
 __device__ __forceinline__ unsigned packed_attention_swz_addr(unsigned lane_base, unsigned ck,
                                                               unsigned as, unsigned r) {
     return lane_base + ((ck | as) ^ r);
-}
-
-__global__ void packed_attention_prepare_tiles_kernel(const std::int32_t* cu_seqlens,
-                                                      std::int32_t segments,
-                                                      PackedAttentionTile* tiles,
-                                                      std::int32_t max_tiles, std::int32_t tokens) {
-    for (int tile = static_cast<int>(threadIdx.x); tile < max_tiles;
-         tile += static_cast<int>(blockDim.x)) {
-        tiles[tile] = {-1, 0, 0, 0};
-    }
-    __syncthreads();
-    if (threadIdx.x != 0) { return; }
-
-    int next = 0;
-    for (int segment = 0; segment < segments; ++segment) {
-        const int begin = cu_seqlens[segment];
-        const int end   = cu_seqlens[segment + 1];
-        if (begin < 0 || end <= begin || end > tokens) { continue; }
-        for (int q0 = begin; q0 < end && next < max_tiles; q0 += kPackedAttentionBr) {
-            tiles[next++] = {q0, begin, end, 0};
-        }
-    }
 }
 
 template <int Br, int Threads>
@@ -100,13 +74,16 @@ packed_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0
 }
 
 template <int Br, int Bc>
-__launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v, const PackedAttentionTile* __restrict__ tiles,
-    std::int32_t tokens, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
-    std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
-    std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
-    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+__launch_bounds__(Br * 2, 128 / Br) __global__
+    void packed_attention_flash_kernel(const __nv_bfloat16* __restrict__ q,
+                                       const __nv_bfloat16* __restrict__ k,
+                                       const __nv_bfloat16* __restrict__ v,
+                                       std::int32_t segment_length, __nv_bfloat16* __restrict__ out,
+                                       std::int64_t q_stride_d, std::int64_t q_stride_h,
+                                       std::int64_t q_stride_t, std::int64_t k_stride_d,
+                                       std::int64_t k_stride_h, std::int64_t k_stride_t,
+                                       std::int64_t v_stride_d, std::int64_t v_stride_h,
+                                       std::int64_t v_stride_t) {
     static_assert(Br == 16 || Br == 32 || Br == 64);
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
     constexpr int D             = kPackedAttentionHeadDim;
@@ -120,23 +97,15 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     constexpr float ScaleLog2E  = 0.11785113019775792073f * 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
-    PackedAttentionTile tile;
-    if (tiles != nullptr) {
-        tile = tiles[blockIdx.x];
-    } else if (uniform_segment_length > 0) {
-        const int tiles_per_segment = (uniform_segment_length + Br - 1) / Br;
-        const int segment           = static_cast<int>(blockIdx.x) / tiles_per_segment;
-        const int tile_in_segment   = static_cast<int>(blockIdx.x) - segment * tiles_per_segment;
-        const int begin             = segment * uniform_segment_length;
-        tile = {begin + tile_in_segment * Br, begin, begin + uniform_segment_length, 0};
-    } else {
-        tile = {static_cast<std::int32_t>(blockIdx.x) * Br, 0, tokens, 0};
-    }
-    if (tile.q0 < 0) { return; }
-    const int head = static_cast<int>(blockIdx.y);
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
+    const int tiles_per_segment    = (segment_length + Br - 1) / Br;
+    const int segment              = static_cast<int>(blockIdx.x) / tiles_per_segment;
+    const int tile_in_segment      = static_cast<int>(blockIdx.x) - segment * tiles_per_segment;
+    const int begin                = segment * segment_length;
+    const PackedAttentionTile tile = {begin + tile_in_segment * Br, begin, begin + segment_length};
+    const int head                 = static_cast<int>(blockIdx.y);
+    const int tid                  = static_cast<int>(threadIdx.x);
+    const int warp                 = tid >> 5;
+    const int lane                 = tid & 31;
 
     extern __shared__ __align__(16) __nv_bfloat16 shared[];
     __nv_bfloat16* q_s = shared;

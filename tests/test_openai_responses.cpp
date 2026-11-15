@@ -1291,8 +1291,7 @@ int test_codex_cli_compatibility() {
     return failures;
 }
 
-// Structured output, ported from Neroued/ninfer 08902f73, eb6696ae, 8ffa3131 and 2734a56e
-// (test_openai_responses.cpp), adapted to Tappa A (no JSON output with active tools yet).
+// Structured output; JSON output with active tools is rejected (there is no tool-call grammar).
 int test_constrained_decoding() {
     int failures = 0;
     OpenAIResponsesStore store(8, 1024 * 1024);

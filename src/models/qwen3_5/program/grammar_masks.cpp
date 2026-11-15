@@ -1,7 +1,7 @@
-// Structured output (P5/P6): host-side token masks of the constrained rows, uploaded before the
-// round's launch (decision D2: no graph split; the masks are operands at fixed addresses read by
-// the sampler through SamplingConfig::mask). capy-flash file; the fill/bind shape follows upstream
-// 08902f73 (program/grammar_masks.cpp), with per-lane slots and a pinned staging area.
+// Structured output: host-side token masks of the constrained rows, uploaded before the round's
+// launch. The masks are operands at fixed addresses read by the sampler through
+// SamplingConfig::mask, so the graph is not split. The fill/bind shape is ported from ninfer
+// (program/grammar_masks.cpp), with per-lane slots and a pinned staging area.
 
 #include "models/qwen3_5/program/program_impl.h"
 #include "core/device.h"

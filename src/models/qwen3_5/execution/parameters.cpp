@@ -487,7 +487,7 @@ public:
         }
         // moe_slots_nvfp4 quantizes each input once per call with one activation divisor per
         // layer and projection input. ModelOpt calibrates the same input_scale for every expert of
-        // a layer in the real checkpoint (T15), so this is exact there; where experts differ (the
+        // a layer in the real checkpoint, so this is exact there; where experts differ (the
         // synthetic checkpoints) the smallest divisor, i.e. the largest calibrated range, is used
         // so no activation saturates its E4M3 block scale.
         const auto smallest = [&](auto projections, const char* label) {
@@ -568,9 +568,7 @@ public:
         for (const auto& segment : table.mapped) {
             out.table.segments.push_back({.object_offset = segment.object_offset,
                                           .bytes         = segment.bytes,
-                                          .data          = segment.data,
-                                          .file          = segment.file,
-                                          .file_offset   = segment.file_offset});
+                                          .data          = segment.data});
         }
         out.table.rows      = geo.shape[0];
         out.table.row_width = static_cast<std::uint32_t>(geo.shape[1]);
@@ -759,7 +757,7 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
     const Prepare prepare(model, device);
     const auto& w = model.weights();
     if (model.config().text.qwen4()) {
-        // Qwen4Exp Text at one device or at tp 2 (this rank's shards), its MTP layer (T24) and the
+        // Qwen4Exp Text at one device or at tp 2 (this rank's shards), its MTP layer and the
         // Vision tower on the rank that holds it (the Qwen3.5 tower; its merger widens to H).
         // Draft and proposal heads have no Qwen4Exp execution; loading and the Program refuse
         // them.

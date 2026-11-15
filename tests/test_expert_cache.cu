@@ -14,13 +14,13 @@
 //   - mid-window fills (submit_fills_unfenced) after the window left the layer: intact reads,
 //     the copy lands during the window, publication at the next window; the same fill submitted
 //     before the window left the layer is caught by the same reader;
-//   - elastic columns (T64): resized between windows, moved experts read intact, no table names a
+//   - elastic columns: resized between windows, moved experts read intact, no table names a
 //     released column;
 //   - lending (prefill streaming ring): fills in flight into lent slots complete before the
 //     lend event, queued ones are dropped, lent layers insert nothing and are unpublished, the
 //     caller's writes into lent slots are overwritten by the reclaim refill, and the final state
 //     (tables == policy, exact slot bytes) holds;
-//   - T69 lending of the base slots only (keep_elastic): the lent layers' elastic residents stay
+//   - lending of the base slots only (keep_elastic): the lent layers' elastic residents stay
 //     published and intact, prompts fill those slots only, a shrink while lent respects the lent
 //     base slots, the reclaim tops up in rank order; final state holds.
 // Exit 77 when no GPU is usable.
@@ -113,8 +113,8 @@ void check(bool ok, const std::string& what) {
 }
 
 // Fake banks: layers x planes x experts, stride = plane bytes + pad. Pinned (one cudaHostAlloc),
-// unless `pageable_layers` lists layers whose banks are plain malloc memory (v0.7 pinned
-// fallback: those fill through the cache's pinned staging ring).
+// unless `pageable_layers` lists layers whose banks are plain malloc memory (pinned fallback:
+// those fill through the cache's pinned staging ring).
 struct Banks {
     std::byte* host     = nullptr;
     std::int32_t layers = 0, experts = 0;
@@ -130,7 +130,9 @@ struct Banks {
         }
         bytes = layer_bytes * static_cast<std::size_t>(L);
         pageable.assign(static_cast<std::size_t>(L), 0);
-        for (const std::int32_t l : pageable_layers) { pageable.at(static_cast<std::size_t>(l)) = 1; }
+        for (const std::int32_t l : pageable_layers) {
+            pageable.at(static_cast<std::size_t>(l)) = 1;
+        }
         CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocPortable));
         for (std::int32_t l = 0; l < L; ++l) {
             std::byte* p = host + static_cast<std::size_t>(l) * layer_bytes;
@@ -229,7 +231,7 @@ struct GpuPool {
         }
         CUDA_CHECK(cudaMalloc(&table, static_cast<std::size_t>(table_entries) * 4));
         binding.table = table;
-        // T158: the guard memsets above run on the legacy default stream, which the cache's
+        // The guard memsets above run on the legacy default stream, which the cache's
         // non-blocking fill and window streams do not wait for. Under GPU time-slicing with another
         // process they landed after the first fills and overwrote loaded experts: finish them here.
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -369,7 +371,7 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
         CUDA_CHECK(cudaMalloc(&d.ids, idbytes));
         CUDA_CHECK(cudaMalloc(&d.slot_ids, idbytes));
         CUDA_CHECK(cudaMalloc(&d.counters, 16));
-        CUDA_CHECK(cudaMemsetAsync(d.counters, 0, 16, d.stream)); // T158: ordered before the reader
+        CUDA_CHECK(cudaMemsetAsync(d.counters, 0, 16, d.stream)); // ordered before the reader
         CUDA_CHECK(cudaHostAlloc(&d.host_ids, idbytes, cudaHostAllocPortable));
         CUDA_CHECK(cudaHostAlloc(&d.host_slots, idbytes, cudaHostAllocPortable));
         // The window graph: per layer, map ids -> slots through the table, then read the slots.
@@ -455,7 +457,7 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
                 }
             }
         }
-        // T64 elastic columns: resize between windows (device idle); the next windows' verify
+        // Elastic columns: resize between windows (device idle); the next windows' verify
         // kernel checks every slot it reads (moved experts included); no table names a released
         // column afterwards.
         if (pc.elastic_columns > 0 && w % 6 == 5) {
@@ -569,7 +571,7 @@ void fence_scenario(int device, const Banks& banks) {
         CUDA_CHECK(cudaMalloc(&ids, 4));
         CUDA_CHECK(cudaMalloc(&slots, 4));
         CUDA_CHECK(cudaMalloc(&counters, 16));
-        // T158: counters and ids on the reader's stream (the legacy stream does not order them
+        // Counters and ids on the reader's stream (the legacy stream does not order them
         // against the non-blocking reader; under GPU time-slicing they landed after it).
         CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, s));
         const std::int32_t a = 3;
@@ -651,7 +653,7 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
     CUDA_CHECK(cudaMalloc(&ids, 8));
     CUDA_CHECK(cudaMalloc(&slots, 8));
     CUDA_CHECK(cudaMalloc(&counters, 16));
-    CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, s)); // T158: on the reader's stream
+    CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, s)); // on the reader's stream
     CUDA_CHECK(cudaHostAlloc(&flag, 64, cudaHostAllocMapped));
     const std::int32_t routed_ids[2] = {3, 5};
     CUDA_CHECK(cudaMemcpyAsync(ids, routed_ids, 8, cudaMemcpyHostToDevice, s));
@@ -713,7 +715,7 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
           "unfenced: window 1 read A and layer 1 intact (bad words " + std::to_string(k[0]) + ")");
     // Next window: B is published in A's slot and reads intact.
     const std::int32_t next_ids[2] = {7, 5};
-    CUDA_CHECK(cudaMemcpyAsync(ids, next_ids, 8, cudaMemcpyHostToDevice, s)); // T158
+    CUDA_CHECK(cudaMemcpyAsync(ids, next_ids, 8, cudaMemcpyHostToDevice, s)); // reader's stream
     CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, s));
     cache.begin_window(streams);
     check(cache.published_slot(0, 7) == 0 && cache.published_slot(0, 3) == -1,
@@ -832,7 +834,7 @@ void lend_scenario(int device, const Banks& banks4) {
     (void)cudaStreamDestroy(ring);
 }
 
-// T69 lending of the base slots only (lend_layers keep_elastic): 4 layers x 64 experts, base 8
+// Lending of the base slots only (lend_layers keep_elastic): 4 layers x 64 experts, base 8
 // slots per layer + 2 elastic columns (per GPU), on 1 or 2 GPUs. Layers 2..3 are lent while a
 // backlog is pending; the ring user overwrites every lent BASE slot; the lent layers' elastic
 // residents stay published and intact (a graph reads them through the table), a prompt window
@@ -952,7 +954,7 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
         CUDA_CHECK(cudaMalloc(&slots, 64 * 4));
         CUDA_CHECK(cudaMalloc(&counters, 16));
         const cudaStream_t reader = streams[static_cast<std::size_t>(p)];
-        CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, reader)); // T158: on the reader's stream
+        CUDA_CHECK(cudaMemsetAsync(counters, 0, 16, reader)); // on the reader's stream
         std::vector<std::int32_t> all(64);
         std::iota(all.begin(), all.end(), 0);
         CUDA_CHECK(cudaMemcpyAsync(ids, all.data(), 64 * 4, cudaMemcpyHostToDevice, reader));
@@ -1209,7 +1211,7 @@ int main(int argc, char** argv) {
                 (void)run_windows({0, 1}, ela2, false, banks, 90, 4, 6, 100'000, 16,
                                   ExpertCache::kDefaultInFlightBytes);
             }
-            // v0.7 pinned fallback: layer 1 pageable, a 2-slot staging ring (backpressure).
+            // Pinned fallback: layer 1 pageable, a 2-slot staging ring (backpressure).
             setenv("NINFER_HOST_STAGING_MIB", "6", 1);
             {
                 Banks mixed(3, 64, {1});

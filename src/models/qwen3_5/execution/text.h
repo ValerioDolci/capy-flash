@@ -124,22 +124,14 @@ public:
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   bool finalize_at_end, DFlashFeatureSink& sink);
+    // `sink` (the DFlash2 drafter's) captures the chunk's target features.
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                  bool finalize_at_end, DFlashFeatureSink* sink = nullptr);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_5::PreparedPromptData& input,
-                                                   std::uint32_t begin,
-                                                   std::uint32_t nominal_length,
-                                                   VisionPrefillSession& vision,
-                                                   bool finalize_at_end, DFlashFeatureSink& sink);
+                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end,
+                  DFlashFeatureSink* sink = nullptr);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
@@ -150,19 +142,15 @@ public:
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens);
-    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
-                             const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
-                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
-                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
+                             Tensor& logits, Tensor& target_tokens,
+                             DFlashFeatureSink* sink = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
     // `draft_logprobs` (FP32 [B], optional): each proposal's softmax log-probability over the
-    // proposal vocabulary (T41's adaptive window; the draft shortlist's rows under T43).
+    // proposal vocabulary (the shortlist's rows with a draft head).
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
                            Tensor* draft_logprobs = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
@@ -292,7 +280,7 @@ private:
     // Rank 1's copy (its transient arena) of rank 0's device ids, ordered after rank 0's stream.
     [[nodiscard]] Tensor qwen4_ids_on_rank1(const Tensor& ids);
     // The speculative calls take each rank's operands (rank 1's only at tp 2); the one-device
-    // overloads validate single tensors and run as rank 0. MTP (T33 at tp 2): the verification,
+    // overloads validate single tensors and run as rank 0. MTP at tp 2: the verification,
     // the MTP layer per rank (each rank embeds its own copy of the ids), the proposal through the
     // replicated MTP output mixer and the output head, and the prompt's MTP KV and drafts.
     void qwen4_target_verify(const Tensor& ids, const Tensor& cache_positions,
@@ -324,7 +312,7 @@ private:
                                  int logits_column, Tensor* logits, Tensor* draft_token,
                                  const Tensor* explicit_rope_positions,
                                  const Tensor* input_embeddings);
-    // T66b at tp 2: the prefix-reuse bridge column and its proposal steps over both ranks.
+    // At tp 2: the prefix-reuse bridge column and its proposal steps over both ranks.
     void qwen4_mtp_forward_batch(const Tensor& ids, const RankTensors& hidden,
                                  const RankTensors& positions, const RankTensors& rope_positions,
                                  ops::CausalAttentionExecutionEnvelope envelope,

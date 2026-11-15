@@ -56,7 +56,7 @@ int run_nvfp4_a16() {
     for (auto [n, k, seed] : {std::tuple{13312, 2560, 721U}, std::tuple{16384, 2560, 723U},
                               std::tuple{1280, 2560, 727U}, std::tuple{248320, 2560, 729U},
                               std::tuple{2560, 6144, 731U}, std::tuple{2560, 640, 733U},
-                              // tp 2 shards of the GDN input and the QSA/GDN output (T49).
+                              // tp 2 shards of the GDN input and the QSA/GDN output.
                               std::tuple{8192, 2560, 737U}, std::tuple{2560, 3072, 739U}}) {
         failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                               {n, k, seed, Comparison::Sampled, true, invocations});

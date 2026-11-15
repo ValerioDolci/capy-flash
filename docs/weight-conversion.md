@@ -59,22 +59,15 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_gsq3` | ISTA-DASLab 3-bit GSQ weights for one 16 GB GPU (the `27b-16gb` profile; published as `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`) | `quantized` |
 
 Qwen3.8-Flash-Next recipes. All keep the routed experts NVFP4 (imported from NVIDIA's checkpoint) and differ in the
-dense part; the published NVFP4 artifact uses `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8`. The others are the
-candidates measured on the way (tags in the [development log](capy-flash/development-log.md)).
+dense part; the published NVFP4 artifact uses `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8`.
 
 | Recipe | Dense part |
 |---|---|
 | `qwen3_8_flash_next_nvfp4` | Q8 dense projections, Q6 head (ninfer-ext's choices) |
 | `qwen3_8_flash_next_nvfp4_dense` | NVFP4 attention, GDN and shared-expert projections and head |
-| `qwen3_8_flash_next_nvfp4_mix` | NVFP4 attention/GDN projections and head, Q8 shared expert (T26b) |
-| `qwen3_8_flash_next_nvfp4_gdn` | NVFP4 GDN projections (q/k/v/z/out), the rest as `qwen3_8_flash_next_nvfp4` (T26c) |
-| `qwen3_8_flash_next_nvfp4_gdn_idxbf16` | as `_gdn`, indexer BF16 |
-| `qwen3_8_flash_next_nvfp4_gdn_hcbf16` | as `_gdn`, hyper-connections BF16 |
-| `qwen3_8_flash_next_nvfp4_gdn_idxhcbf16` | as `_gdn`, indexer and hyper-connections BF16 |
-| `qwen3_8_flash_next_nvfp4_gdnbf16` | GDN projections BF16 instead of NVFP4 |
-| `qwen3_8_flash_next_nvfp4_allbf16` | indexer, hyper-connections and GDN BF16 |
-| `qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8` | indexer and hyper-connections BF16, GDN Q8 (T103) |
-| `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8` | indexer BF16, GDN Q8, hyper-connections Q8 (T104; **the published artifact**) |
+| `qwen3_8_flash_next_nvfp4_mix` | NVFP4 attention/GDN projections and head, Q8 shared expert |
+| `qwen3_8_flash_next_nvfp4_gdn` | NVFP4 GDN projections (q/k/v/z/out), the rest as `qwen3_8_flash_next_nvfp4` |
+| `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8` | indexer BF16, GDN Q8, hyper-connections Q8 (**the published artifact**) |
 | `qwen3_8_flash_next_fp4_local` | `nvidia/Qwen3.8-Flash-Next-FP4-Local` in the checkpoint's own formats (MXFP8 and row NVFP4 copied verbatim) |
 
 **The 64 GB edition of Flash-Next** (GSQ-RCO, `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash`) is not a recipe: it

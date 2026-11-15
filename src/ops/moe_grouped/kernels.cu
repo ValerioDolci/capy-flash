@@ -22,6 +22,7 @@
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/common/math.cuh"
+#include "ops/common/moe_grouping.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
@@ -520,7 +521,7 @@ struct PackedTokens {
     }
 };
 
-// T56 wide calls: down reads the call's grouped h through the piece's row map.
+// Wide calls: down reads the call's grouped h through the piece's row map.
 struct GatherMiddle {
     const std::int32_t* __restrict__ middle_row;
     const std::int32_t* __restrict__ offsets;
@@ -667,24 +668,7 @@ __global__ void count_kernel(const std::int32_t* __restrict__ ids,
     rank[a] = present ? atomicAdd(&counts[e], 1) : -1;
 }
 
-__global__ void place_kernel(const std::int32_t* __restrict__ ids,
-                             const std::int32_t* __restrict__ rank, std::int32_t assignments,
-                             const std::int32_t* __restrict__ offsets,
-                             std::int32_t* __restrict__ packed_token,
-                             std::int32_t* __restrict__ packed_index) {
-    const int a = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (a >= assignments) { return; }
-    const int r = rank[a];
-    if (r < 0) {
-        packed_index[a] = -1;
-        return;
-    }
-    const int position     = offsets[ids[a]] + r;
-    packed_token[position] = a / K;
-    packed_index[a]        = position;
-}
-
-// T56: a piece's grouping of a wide call: its position per assignment, and per position the row of
+// A piece's grouping of a wide call: its position per assignment, and per position the row of
 // the call's grouped h (the same assignment's global position).
 __global__ void place_piece_kernel(const std::int32_t* __restrict__ ids,
                                    const std::int32_t* __restrict__ rank, std::int32_t assignments,
@@ -716,30 +700,6 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x,
     scales[task] = q.scale;
 }
 
-// One CTA per column; thread i owns features [8i, 8i+8). Routes without a slot add nothing.
-__global__ void __launch_bounds__(H / 8)
-    merge_kernel(const float* __restrict__ grouped, const std::int32_t* __restrict__ packed_index,
-                 const float* __restrict__ weights, float* __restrict__ out) {
-    const int column  = static_cast<int>(blockIdx.x);
-    const int feature = static_cast<int>(threadIdx.x) * 8;
-    float sum[8]      = {};
-#pragma unroll
-    for (int k = 0; k < K; ++k) {
-        const int row = packed_index[column * K + k];
-        if (row < 0) { continue; }
-        const float weight  = weights[column * K + k];
-        const float* source = grouped + static_cast<std::int64_t>(row) * H + feature;
-        const float4 a      = load_vec<float4>(source);
-        const float4 b      = load_vec<float4>(source + 4);
-        const float v[8]    = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-#pragma unroll
-        for (int i = 0; i < 8; ++i) { sum[i] = fmaf(weight, v[i], sum[i]); }
-    }
-    float* destination = out + static_cast<std::int64_t>(column) * H + feature;
-    store_vec(destination, make_float4(sum[0], sum[1], sum[2], sum[3]));
-    store_vec(destination + 4, make_float4(sum[4], sum[5], sum[6], sum[7]));
-}
-
 } // namespace
 
 namespace {
@@ -761,8 +721,8 @@ void group_launch(const std::int32_t* ids, std::int32_t columns, const std::int3
         const_cast<std::int32_t*>(jobs.count));
     CUDA_CHECK(cudaGetLastError());
     if (packed_token != nullptr) {
-        place_kernel<<<blocks, 256, 0, stream>>>(ids, rank, assignments, offsets, packed_token,
-                                                 packed_index);
+        moe_grouping_place_kernel<K><<<blocks, 256, 0, stream>>>(ids, rank, assignments, offsets,
+                                                                 packed_token, packed_index);
         CUDA_CHECK(cudaGetLastError());
     }
 }
@@ -805,7 +765,8 @@ void moe_grouped_launch(const MoeGroupedPiece& c, cudaStream_t stream) {
             IdentityRows{}, PackedTokens{c.offsets, jobs}, DownRaster{jobs});
         CUDA_CHECK(cudaGetLastError());
     }
-    merge_kernel<<<c.columns, H / 8, 0, stream>>>(c.grouped, c.packed_index, c.weights, c.out);
+    moe_grouping_merge_kernel<H, K>
+        <<<c.columns, H / 8, 0, stream>>>(c.grouped, c.packed_index, c.weights, c.out);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -837,8 +798,8 @@ void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
             IdentityRows{}, GatherMiddle{w.piece_middle_row, w.piece_offsets, piece_jobs},
             DownRaster{piece_jobs});
         CUDA_CHECK(cudaGetLastError());
-        merge_kernel<<<columns, H / 8, 0, stream>>>(c.grouped, w.piece_index, c.weights + k0,
-                                                    c.out + static_cast<std::int64_t>(begin) * H);
+        moe_grouping_merge_kernel<H, K><<<columns, H / 8, 0, stream>>>(
+            c.grouped, w.piece_index, c.weights + k0, c.out + static_cast<std::int64_t>(begin) * H);
         CUDA_CHECK(cudaGetLastError());
     }
 }

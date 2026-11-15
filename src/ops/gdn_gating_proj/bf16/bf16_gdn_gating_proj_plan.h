@@ -16,10 +16,6 @@ namespace ninfer::ops::detail {
 enum class Bf16GdnGatingScheduleId {
     GemvPairedRows,
     SmallTSplit10,
-    SimtWarpRowC4,
-    SimtWarpRowC8,
-    MmaCooperativeSplit32,
-    MmaCooperativeSplit16,
     MmaCooperativeSplit8,
     MmaCooperativeSplit4,
     MmaCooperativeSplit2,
@@ -41,7 +37,6 @@ struct Bf16GdnGatingPlan {
 enum class Bf16GdnNormGatingScheduleId {
     FusedSimt27,
     Composed,
-    MmaCooperativeSplit32,
 };
 
 struct Bf16GdnNormGatingPlan {
@@ -50,8 +45,6 @@ struct Bf16GdnNormGatingPlan {
     std::size_t workspace_bytes;
 };
 
-const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept;
-
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -59,7 +52,6 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_cols, std::int32_t max_cols);
-const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept;
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
@@ -70,11 +62,6 @@ void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                   Tensor& g, Tensor& beta, DeviceExecutionView execution);
-void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const Tensor& x,
-                                       const Weight& a_weight, const Weight& b_weight,
-                                       const Tensor& A_log, const Tensor& dt_bias,
-                                       WorkspaceArena& ws, Tensor& g, Tensor& beta,
-                                       DeviceExecutionView execution);
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                               Tensor& g, Tensor& beta, DeviceExecutionView execution);

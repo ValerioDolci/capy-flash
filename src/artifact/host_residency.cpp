@@ -3,7 +3,10 @@
 #include "artifact/schema.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include <set>
+#include <sstream>
 
 namespace ninfer::artifact {
 namespace {
@@ -79,6 +82,30 @@ std::uint64_t cma_pinned_limit(std::uint64_t total_bytes, std::uint64_t availabl
     const std::uint64_t keep = std::max<std::uint64_t>(2ULL << 30, total_bytes / 20) + engine_bytes;
     const std::uint64_t limit = outside > keep ? outside - keep : 1;
     return limit >= host_mapped_bytes + reserved_bytes ? 0 : limit;
+}
+
+HostMemInfo read_host_meminfo() {
+    HostMemInfo out;
+#if defined(__linux__)
+    std::ifstream meminfo("/proc/meminfo");
+    for (std::string line; std::getline(meminfo, line);) {
+        std::istringstream fields(line);
+        std::string key;
+        std::uint64_t value = 0;
+        fields >> key >> value;
+        if (key == "MemTotal:") { out.total = value * 1024; }
+        if (key == "MemAvailable:") { out.available = value * 1024; }
+        if (key == "CmaFree:") { out.cma_free = value * 1024; }
+    }
+#endif
+    return out;
+}
+
+std::string gib_text(std::uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof text, "%.1f GiB",
+                  static_cast<double>(bytes) / static_cast<double>(1ULL << 30));
+    return text;
 }
 
 } // namespace ninfer::artifact

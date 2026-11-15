@@ -21,11 +21,7 @@ constexpr ShapeEntry shape(ShapeSelector select) {
 }
 
 constexpr std::array kShapes{
-    shape<Q8N1024K2048>(select_q8_n1024_k2048),
     shape<Q8N1024K5120>(select_q8_n1024_k5120),
-    shape<Q8N2048K4096>(select_q8_n2048_k4096),
-    shape<Q8N2048K4608>(select_q8_n2048_k4608),
-    shape<Q8N2048K16384>(select_q8_n2048_k16384),
     shape<Q8N4608K4608>(select_q8_n4608_k4608),
     shape<Q8N5120K4608>(select_q8_n5120_k4608),
     shape<Q8N5120K6144>(select_q8_n5120_k6144),
@@ -33,8 +29,6 @@ constexpr std::array kShapes{
     shape<Q8N5120K17408>(select_q8_n5120_k17408),
     shape<Q8N5120K25600>(select_q8_n5120_k25600),
     shape<Q8N6144K5120>(select_q8_n6144_k5120),
-    shape<Q8N9216K2048>(select_q8_n9216_k2048),
-    shape<Q8N12288K2048>(select_q8_n12288_k2048),
     shape<Q8N14336K5120>(select_q8_n14336_k5120),
     shape<Q8N34816K5120>(select_q8_n34816_k5120),
     shape<Q8N248320K5120>(select_q8_n248320_k5120),
@@ -62,15 +56,11 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 640, select_q8_qwen4_n2560_k640},
     // Qwen4Exp at tp 2 (models/qwen3_5/load/sharding.h), one rank's shard: the Q8 recipe's
     // attention q|k|gate|v (12 query + 1 KV heads), GDN q|k|v|z (8 key + 24 value heads) and a|b
-    // (24 + 24 rows), the row-parallel attention and GDN outputs, and the stream-split
-    // hyper-connection Down(+inject) and Up.
+    // (24 + 24 rows) and the row-parallel attention and GDN outputs.
     ShapeEntry{6656, 2560, select_q8_qwen4_n6656_k2560},
     ShapeEntry{8192, 2560, select_q8_qwen4_rows_k2560},
     ShapeEntry{48, 2560, select_q8_qwen4_n48_k2560},
     ShapeEntry{2560, 3072, select_q8_qwen4_n2560_k3072},
-    ShapeEntry{324, 5120, select_q8_few_rows_wide_k},
-    ShapeEntry{320, 5120, select_q8_few_rows_wide_k},
-    ShapeEntry{5120, 320, select_q8_generic},
     // Hyper-connection Down(+inject) [R + I, 4*5120] and Up [4*5120, R] at H = 5120, on the same
     // generic routes as H = 2560.
     ShapeEntry{324, 20480, select_q8_few_rows_wide_k},

@@ -1,7 +1,6 @@
 #pragma once
 
 // Two-device (tp 2) workspace recipes, next to the single-device ones of execution/workspace.h.
-// Our file: the upstream header carries no hook.
 
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/argmax.h"

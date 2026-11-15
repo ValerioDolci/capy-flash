@@ -474,52 +474,6 @@ int run_fp8_target() {
     return failures;
 }
 
-int run_q8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kHidden      = 2048;
-    constexpr std::int32_t kQRows       = 4096;
-    constexpr std::int32_t kKvRows      = 512;
-    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 201U + tokens);
-    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
-    DeviceBuffer device_activation                   = to_device(activation_bits);
-
-    GuardedBf16Tensor query(kQRows, tokens);
-    GuardedBf16Tensor gate(kQRows, tokens);
-    GuardedBf16Tensor key(kKvRows, tokens);
-    GuardedBf16Tensor value(kKvRows, tokens);
-    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
-    Tensor q = query.tensor();
-    Tensor g = gate.tensor();
-    Tensor k = key.tensor();
-    Tensor v = value.tensor();
-    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
-    cuda_synchronize();
-
-    const std::string suffix = " Q8 target A16 T=" + std::to_string(tokens);
-    int failures             = 0;
-    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
-                              tokens);
-    failures += verify_output("attn k" + suffix, key, parent.host, kQRows, kKvRows, activation,
-                              kHidden, tokens);
-    failures += verify_output("attn gate" + suffix, gate, parent.host, kQRows + kKvRows, kQRows,
-                              activation, kHidden, tokens);
-    failures += verify_output("attn value" + suffix, value, parent.host, 2 * kQRows + kKvRows,
-                              kKvRows, activation, kHidden, tokens);
-    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
-    failures += parent.verify_preserved("attn parent weight" + suffix);
-    return failures;
-}
-
-int run_q8_target() {
-    constexpr std::int32_t kHidden = 2048;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 9216, kHidden, 211U));
-    int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 129}) {
-        failures += run_q8_target_case(parent, tokens);
-    }
-    return failures;
-}
-
 int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char* profile,
                     std::int32_t tokens, bool graph_replay = false, int sample_rows = 7) {
     constexpr int kQRows = 4096, kKvRows = 1024;
@@ -578,18 +532,6 @@ int run_q8_qkv_case(DevicePackedWeight& parent, std::int32_t hidden, const char*
         failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     }
     failures += parent.verify_preserved("attn parent weight");
-    return failures;
-}
-
-int run_q8_companion() {
-    constexpr std::int32_t kHidden = 2048;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 6144, kHidden, 307U));
-    int failures = 0;
-    // One public numerical case from every registered companion A16 T region.
-    for (const std::int32_t tokens : {1, 2, 97, 193, 289, 321, 385, 449}) {
-        failures += run_q8_qkv_case(parent, kHidden, "companion", tokens);
-    }
     return failures;
 }
 
@@ -653,8 +595,6 @@ int main(int argc, char** argv) {
         failures += run_bf16_target();
         failures += run_nvfp4_target();
         failures += run_fp8_target();
-        failures += run_q8_target();
-        failures += run_q8_companion();
     }
     failures += run_q8_dflash2();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

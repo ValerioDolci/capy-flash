@@ -1,13 +1,11 @@
-// T18 probe: the GPU share of a layer's missing experts read over PCIe, against the CPU executor,
+// Probe: the GPU share of a layer's missing experts read over PCIe, against the CPU executor,
 // alone and concurrently, on a synthetic pinned host bank in the Qwen4Exp layout (the engine's
 // bank, read in place).
 //
 // GPU share modes (one call = n distinct experts, T columns):
-//   zc      moe_slots_nvfp4 over the host-mapped bank (identity table): W4A4 straight from host
-//   memory (T22) staged  a streaming SM copy kernel moves the n experts' four planes into VRAM
-//   scratch slots, then
-//           moe_slots_nvfp4 over the scratch slots (the copy reads each byte once, many loads in
-//           flight)
+//   staged  a streaming SM copy kernel moves the n experts' four planes into VRAM scratch slots,
+//           then moe_slots_nvfp4 over the scratch slots (the copy reads each byte once, many loads
+//           in flight)
 //   dma     cudaMemcpyAsync of the four planes per expert into the scratch slots (host-issued;
 //   reference only)
 // Conditions: idle | cpu (the CPU executor runs continuously on other experts, 6 threads, as the
@@ -62,7 +60,7 @@ double now_us() {
 struct Args {
     std::string arm = "gpu";
     std::vector<int> ns{1, 2, 3, 4, 6, 8, 12};
-    std::vector<std::string> modes{"zc", "staged"};
+    std::vector<std::string> modes{"staged"};
     std::vector<std::string> conds{"idle", "cpu", "fill8", "cpu+fill8"};
     int tokens = 4, reps = 60, threads = 6, stage_blocks = 64;
     double p2 = 0.47;
@@ -213,7 +211,7 @@ struct Call {
     std::vector<int> experts;     // n distinct ids
     std::vector<int> ids;         // [T][K], only the n experts, -1 elsewhere
     std::vector<int> cols;        // columns per expert
-    int* d_ids_zc      = nullptr; // device copy of ids
+    int* d_ids         = nullptr; // device copy of ids
     int* d_picks       = nullptr; // device [kMaxN]
     int* d_count       = nullptr; // device n
     int* d_stage_table = nullptr; // device [E]: expert -> scratch slot k, else -1
@@ -242,8 +240,8 @@ Call make_call(int n, int T, double p2, std::mt19937_64& rng, std::vector<int>& 
         }
         c.cols.push_back(placed);
     }
-    CUDA_CHECK(cudaMalloc(&c.d_ids_zc, sizeof(int) * T * K));
-    CUDA_CHECK(cudaMemcpy(c.d_ids_zc, c.ids.data(), sizeof(int) * T * K, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&c.d_ids, sizeof(int) * T * K));
+    CUDA_CHECK(cudaMemcpy(c.d_ids, c.ids.data(), sizeof(int) * T * K, cudaMemcpyHostToDevice));
     std::vector<int> picks(kMaxN, 0);
     for (int i = 0; i < n; ++i) picks[i] = c.experts[i];
     CUDA_CHECK(cudaMalloc(&c.d_picks, sizeof(int) * kMaxN));
@@ -258,7 +256,7 @@ Call make_call(int n, int T, double p2, std::mt19937_64& rng, std::vector<int>& 
 }
 
 void free_call(Call& c) {
-    for (int* p : {c.d_ids_zc, c.d_picks, c.d_count, c.d_stage_table}) cudaFree(p);
+    for (int* p : {c.d_ids, c.d_picks, c.d_count, c.d_stage_table}) cudaFree(p);
 }
 
 // ------------------------------------------------------------------ GPU share
@@ -266,7 +264,6 @@ struct Gpu {
     Bank* bank = nullptr;
     std::byte* scratch[4]{};
     ops::MoeSlotPool scratch_pool;
-    int* d_identity      = nullptr;
     __nv_bfloat16* d_x   = nullptr;
     float* d_w           = nullptr;
     float* d_out         = nullptr;
@@ -282,10 +279,6 @@ struct Gpu {
         scratch_pool.down_codes     = {scratch[2], kPlaneBytes[2]};
         scratch_pool.down_scales    = {scratch[3], kPlaneBytes[3]};
         scratch_pool.slots          = kMaxN;
-        std::vector<int> id(E);
-        std::iota(id.begin(), id.end(), 0);
-        CUDA_CHECK(cudaMalloc(&d_identity, sizeof(int) * E));
-        CUDA_CHECK(cudaMemcpy(d_identity, id.data(), sizeof(int) * E, cudaMemcpyHostToDevice));
         std::vector<std::uint16_t> x(static_cast<std::size_t>(8) * H);
         std::mt19937 rng(3);
         std::normal_distribution<float> nd(0.0F, 1.0F);
@@ -304,26 +297,24 @@ struct Gpu {
         work = new WorkspaceArena(ops::moe_slots_nvfp4_workspace_bytes(8));
     }
 
-    void compute(const Call& c, int T, bool staged, cudaStream_t s) {
+    void compute(const Call& c, int T, cudaStream_t s) {
         ops::MoeSlotsLayer layer;
-        layer.slot_table       = Tensor(staged ? c.d_stage_table : d_identity, DType::I32, {E});
-        layer.gate_up_divisors = Tensor(bank->d_div13, DType::FP32, {2 * E});
-        layer.down_divisors    = Tensor(bank->d_div2, DType::FP32, {E});
+        layer.slot_table            = Tensor(c.d_stage_table, DType::I32, {E});
+        layer.gate_up_divisors      = Tensor(bank->d_div13, DType::FP32, {2 * E});
+        layer.down_divisors         = Tensor(bank->d_div2, DType::FP32, {E});
         layer.gate_up_input_divisor = 600.0F;
         layer.down_input_divisor    = 2000.0F;
         Tensor tx(d_x, DType::BF16, {H, T});
-        Tensor ti(c.d_ids_zc, DType::I32, {K, T});
+        Tensor ti(c.d_ids, DType::I32, {K, T});
         Tensor tw(d_w, DType::FP32, {K, T});
         Tensor to(d_out, DType::FP32, {H, T});
-        ops::moe_slots_nvfp4(tx, ti, tw, layer, staged ? scratch_pool : bank->pool,
-                             ops::MoeSlotsOutput::Store, to, *work, s);
+        ops::moe_slots_nvfp4(tx, ti, tw, layer, scratch_pool, ops::MoeSlotsOutput::Store, to, *work,
+                             s);
     }
 
     // Enqueue one call's GPU share on s.
     void enqueue(const std::string& mode, const Call& c, int T, cudaStream_t s) {
-        if (mode == "zc") {
-            compute(c, T, false, s);
-        } else if (mode == "staged") {
+        if (mode == "staged") {
             StageArgs a;
             const void* src[4] = {bank->pool.gate_up_codes.base, bank->pool.gate_up_scales.base,
                                   bank->pool.down_codes.base, bank->pool.down_scales.base};
@@ -335,7 +326,7 @@ struct Gpu {
             a.count = c.d_count;
             stage_kernel<<<stage_blocks, 256, 0, s>>>(a);
             CUDA_CHECK(cudaGetLastError());
-            compute(c, T, true, s);
+            compute(c, T, s);
         } else if (mode == "dma") {
             const std::byte* src[4] = {
                 static_cast<const std::byte*>(bank->pool.gate_up_codes.base),
@@ -347,7 +338,7 @@ struct Gpu {
                     CUDA_CHECK(cudaMemcpyAsync(scratch[q] + k * kPlaneBytes[q],
                                                src[q] + c.experts[k] * kPlaneBytes[q],
                                                kPlaneBytes[q], cudaMemcpyHostToDevice, s));
-            compute(c, T, true, s);
+            compute(c, T, s);
         } else {
             std::fprintf(stderr, "bad mode %s\n", mode.c_str());
             std::exit(2);
@@ -589,7 +580,7 @@ int main(int argc, char** argv) {
     };
 
     if (a.arm == "cpu") {
-        // conds: idle | fill8 | zc | staged | staged+fill8 | zc+fill8
+        // conds: idle | fill8 | staged | staged+fill8
         for (const auto& cond : a.conds) {
             for (int n : a.ns) {
                 std::vector<Call> calls, bgcalls;
@@ -600,7 +591,6 @@ int main(int argc, char** argv) {
                 Background bg;
                 const double fg = cond_fill(cond);
                 if (fg >= 0) bg.fill(bank, fg);
-                if (cond.rfind("zc", 0) == 0) bg.gpu(gpu, "zc", bgcalls, T);
                 if (cond.rfind("staged", 0) == 0) bg.gpu(gpu, "staged", bgcalls, T);
                 bg.start();
                 for (int w = 0; w < 3; ++w) cpu_run(calls[w].ids);
@@ -650,8 +640,8 @@ int main(int argc, char** argv) {
                             Call c;
                             c.ids = gpu_ids;
                             c.experts.assign(all.experts.begin(), all.experts.begin() + g);
-                            CUDA_CHECK(cudaMalloc(&c.d_ids_zc, sizeof(int) * T * K));
-                            CUDA_CHECK(cudaMemcpy(c.d_ids_zc, gpu_ids.data(), sizeof(int) * T * K,
+                            CUDA_CHECK(cudaMalloc(&c.d_ids, sizeof(int) * T * K));
+                            CUDA_CHECK(cudaMemcpy(c.d_ids, gpu_ids.data(), sizeof(int) * T * K,
                                                   cudaMemcpyHostToDevice));
                             std::vector<int> picks(kMaxN, 0);
                             for (int i = 0; i < g; ++i) picks[i] = c.experts[i];

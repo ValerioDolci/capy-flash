@@ -13,13 +13,21 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace ninfer::serve {
+
+class SseTransport;
+
+// The 500 for an unexpected exception: type server_error, which Anthropic bodies render as
+// api_error.
+[[nodiscard]] ApiError internal_error(std::string message);
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
@@ -47,6 +55,53 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 //                           An empty Origin counts as local; "null" counts as non-local.
 [[nodiscard]] bool host_header_is_local(std::string_view host_header) noexcept;
 [[nodiscard]] bool origin_header_is_local(std::string_view origin_header) noexcept;
+
+// The wire format of one generation API (Chat Completions, Messages, Responses). The request
+// lifecycle around it (prepare, generate, stream, log, report errors) is HttpServer's.
+class GenerationEndpoint {
+public:
+    virtual ~GenerationEndpoint() = default;
+
+    // The error reported for an ApiException raised after parsing.
+    [[nodiscard]] virtual ApiError api_error(const ApiError& error) const { return error; }
+
+    [[nodiscard]] virtual ApiError internal_error(const std::exception& exception) const {
+        return serve::internal_error(exception.what());
+    }
+
+    virtual void write_error(httplib::Response& response, const ApiError& error) const {
+        write_openai_error(response, error);
+    }
+
+    // False when a generation the client cancelled has nothing to render.
+    [[nodiscard]] virtual bool renders_cancelled() const { return true; }
+
+    // Assigns the response identity once the request is prepared, before it is logged as started.
+    virtual void identify(const PreparedRequest&) {}
+
+    // Aggregate response: render, store (Responses only), then the body.
+    virtual void render(const PreparedRequest& prepared, const GenerationOutcome& outcome) = 0;
+
+    virtual void store(const PreparedRequest&) {}
+
+    [[nodiscard]] virtual std::string body() = 0;
+
+    // Event stream: start, generation deltas, closing events, store, then a terminal event
+    // (Responses only).
+    virtual void open_stream(const PreparedRequest& prepared) = 0;
+
+    virtual void write_start(SseTransport&) {}
+
+    // Writes the generation deltas as they arrive.
+    virtual void attach(StreamSink& output, SseTransport& transport) = 0;
+
+    // The events that close a finished generation.
+    [[nodiscard]] virtual std::vector<std::string> finish(const GenerationOutcome& outcome) = 0;
+
+    [[nodiscard]] virtual std::vector<std::string> terminal() { return {}; }
+
+    virtual void write_stream_error(SseTransport& transport, const ApiError& error) = 0;
+};
 
 class HttpServer {
 public:
@@ -91,6 +146,13 @@ private:
     };
 
     [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
+    // Serves a parsed generation request. `generation` is read only until the request is logged as
+    // started; its messages are then released.
+    void serve_generation(const httplib::Request& req, httplib::Response& res,
+                          std::shared_ptr<GenerationEndpoint> endpoint, std::string protocol,
+                          GenerationRequest& generation, const RequestLogMetadata& metadata,
+                          ninfer::GenerationObservationOptions observation = {},
+                          ContextCacheHints cache_hints                    = {});
 
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
@@ -119,6 +181,7 @@ private:
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    RequestLimits request_limits_;
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;

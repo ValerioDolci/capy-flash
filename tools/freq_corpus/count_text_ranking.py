@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token-frequency ranking of an Italian corpus for the MTP draft shortlist (T186; tools/qwen4_draft_shortlist.py --extra-ranking).
+"""Token-frequency ranking of an Italian corpus for the MTP draft shortlist (tools/qwen4_draft_shortlist.py --extra-ranking).
 Counts the Flash-Next tokenizer's tokens over Wikipedia (it) parquet shards and Italian instruction sets (JSON
 lists of {instruction,input,output} or conversations), holding out every 20th document. Writes
 <out>.train.counts.i64 / <out>.heldout.counts.i64 in the format of tools/freq_corpus ([1, 248320] little-endian i64)."""

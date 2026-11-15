@@ -7,11 +7,8 @@ namespace ninfer::ops::detail::q6_instances {
 using SimtR8T4 = Q6A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
 using GemvR4W2G16 = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
-// T43: T = 1 candidates for the Qwen4Exp draft proposal head (K = 2560 = 40 groups per row).
-using GemvR4W2G20Cg    = Q6A16GemvSchedule<4, 2, 20, 2, Cache::cg, 1>;
+// T = 1 route of the Qwen4Exp draft proposal head (K = 2560 = 40 groups per row).
 using GemvR8W1G8S4Cg   = Q6A16GemvSchedule<8, 1, 8, 4, Cache::cg, 1>;
-using GemvR4W2G12S3Cg  = Q6A16GemvSchedule<4, 2, 12, 3, Cache::cg, 1>;
-using GemvR2W4G12Cg    = Q6A16GemvSchedule<2, 4, 12, 2, Cache::cg, 1>;
 using SlicedR16T8W4S2  = Q6A16SlicedKMmaSchedule<16, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T16W4S2 = Q6A16SlicedKMmaSchedule<32, 16, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S1 = Q6A16SlicedKMmaSchedule<32, 32, 4, 1, Cache::cg, Cache::ca, 2>;

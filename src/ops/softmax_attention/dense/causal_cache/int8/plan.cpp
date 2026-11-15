@@ -43,15 +43,14 @@ GroupedShape grouped_shape(int tokens) {
 
 GroupedShape grouped_shape(int heads, int tokens) {
     if (heads == 24) return grouped_shape<CausalD256H24Kv4>(tokens);
-    if (heads == 12) return grouped_shape<CausalD256H12Kv2>(tokens);
-    return grouped_shape<CausalD256H16Kv2>(tokens);
+    return grouped_shape<CausalD256H12Kv2>(tokens);
 }
 } // namespace
 
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope, int sms) {
-    if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
-        sms < 1 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+    if ((heads != 24 && heads != 12) || width < 1 || batch < 1 || batch > 8 || sms < 1 ||
+        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("INT8 attention: invalid plan inputs");
@@ -96,9 +95,8 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
 }
 
 namespace {
-// int8_kv_pv_routes_for_test; -1 = default.
-int test_pv_half_acc  = -1;
-int test_pv_ping_pong = -1;
+// int8_kv_pv_half_acc_for_test; -1 = default.
+int test_pv_half_acc = -1;
 } // namespace
 
 bool int8_kv_pv_half_acc_enabled() {
@@ -109,15 +107,6 @@ bool int8_kv_pv_half_acc_enabled() {
     return test_pv_half_acc >= 0 ? test_pv_half_acc != 0 : env;
 }
 
-bool int8_kv_pv_ping_pong_enabled() { return test_pv_ping_pong != 0; }
+void int8_kv_pv_half_acc_for_test(int pv_half_acc) noexcept { test_pv_half_acc = pv_half_acc; }
 
 } // namespace ninfer::ops::detail
-
-namespace ninfer::ops {
-
-void int8_kv_pv_routes_for_test(int pv_half_acc, int pv_ping_pong) noexcept {
-    detail::test_pv_half_acc  = pv_half_acc;
-    detail::test_pv_ping_pong = pv_ping_pong;
-}
-
-} // namespace ninfer::ops

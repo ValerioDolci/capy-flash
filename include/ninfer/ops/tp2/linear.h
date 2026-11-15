@@ -1,9 +1,8 @@
 #pragma once
 
-// Two-device (tp 2) forms of linear. Our file: ninfer/ops/linear.h is upstream's and carries no
-// hook.
+// Two-device (tp 2) forms of linear.
 //
-// Shapes registered for the two-device forms (the upstream header documents the single-device
+// Shapes registered for the two-device forms (ninfer/ops/linear.h documents the single-device
 // problems; each half resolves to the routes of the problem it halves): FP8 registers the halves
 // [7168,5120], [8192,5120], [17408,5120], [124160,5120], [5120,3072] and [5120,8704]; NVFP4
 // [17408,5120], [5120,3072] and [5120,8704]; BF16 [7168,5120] and [5120,3072]; Q8 the MTP halves

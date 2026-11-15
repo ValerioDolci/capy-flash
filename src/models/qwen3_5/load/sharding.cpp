@@ -349,29 +349,6 @@ std::uint32_t qwen4_block_index(std::string_view name, const TextConfig& text) {
     reject(name, "is not a decoder block parameter");
 }
 
-// One hyper-connection mixer parameter ({norm, down, inject, up}) of a block, of the output mixer
-// (text/hc_head, mtp/hc_head), or a parameter laid out over the wide residual (PLE norms and
-// convolution, MTP hidden norm). Replicated unless options.hc_split_streams; split, rank r keeps
-// the residual streams [r*S/tp, (r+1)*S/tp): rows of the per-stream vectors and of Up, columns of
-// Down|inject and of the depthwise convolution.
-LogicalShard qwen4_stream_shard(std::string_view name, std::string_view leaf,
-                                const artifact::Shape& shape, const TextConfig& text,
-                                const LoadOptions& options) {
-    if (!options.hc_split_streams) { return whole(ShardAxis::Replicated); }
-    const auto streams = text.hyper_connection.value().hc_count;
-    const auto wide    = text.residual_width();
-    if (leaf == "norm" || leaf == "key_norm" || leaf == "query_norm" || leaf == "conv_norm" ||
-        leaf == "hidden_norm" || leaf == "up") {
-        if (leading(name, shape) != wide) { reject(name, "requires a wide-residual row axis"); }
-        return even(name, ShardAxis::Rows, wide, streams, options.tp);
-    }
-    if (leaf == "down" || leaf == "inject" || leaf == "convolution") {
-        if (trailing(name, shape) != wide) { reject(name, "requires a wide-residual column axis"); }
-        return even(name, ShardAxis::Columns, wide, streams, options.tp);
-    }
-    reject(name, "has no hyper-connection stream placement");
-}
-
 // The rank that holds and runs a block's shared expert, whole: SingleDevice(block index % tp).
 // The shared expert's 640-wide intermediate has no tile-aligned half for the stored formats (NVFP4
 // rows split in 128-row tiles: 320 is not one; Q8 row-split columns in 128s: the Down half of 320
@@ -384,10 +361,9 @@ int qwen4_shared_expert_rank(std::string_view name, const TextConfig& text, int 
 LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
                                const artifact::Shape& shape, const TextConfig& text,
                                const LoadOptions& options) {
-    for (const std::string_view mixer : {"attn_hc/", "ffn_hc/"}) {
-        if (leaf.starts_with(mixer)) {
-            return qwen4_stream_shard(name, leaf.substr(mixer.size()), shape, text, options);
-        }
+    // Every hyper-connection mixer is replicated: each rank keeps the whole wide residual.
+    if (leaf.starts_with("attn_hc/") || leaf.starts_with("ffn_hc/")) {
+        return whole(ShardAxis::Replicated);
     }
     // The QSA indexer is replicated: its input is the same on both ranks and its selection is
     // deterministic, so both ranks select the same blocks without an exchange.
@@ -401,17 +377,11 @@ LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
     if (moe && leaf.starts_with("moe/shared/")) {
         return whole(ShardAxis::SingleDevice, qwen4_shared_expert_rank(name, text, options.tp));
     }
-    if (leaf.starts_with("ple/")) {
-        const auto ple_leaf = leaf.substr(4);
-        // key|value share one parent, and every rank needs all value rows: replicated in both
-        // modes. The table is a HostFile object read by host code, never placed on a device; the
-        // FP32 multiplier of a row-scaled NVFP4 table is one value every rank's gather uses.
-        if (ple_leaf == "key" || ple_leaf == "value" || ple_leaf == "table" ||
-            ple_leaf == "table_global_scale") {
-            return whole(ShardAxis::Replicated);
-        }
-        return qwen4_stream_shard(name, ple_leaf, shape, text, options);
-    }
+    // The PLE is replicated: key|value share one parent and every rank needs all value rows; the
+    // per-lane norms and convolution follow the replicated residual. The table is a HostFile
+    // object read by host code, never placed on a device; the FP32 multiplier of a row-scaled
+    // NVFP4 table is one value every rank's gather uses.
+    if (leaf.starts_with("ple/")) { return whole(ShardAxis::Replicated); }
     // Gated attention (12 query and 1 KV heads per rank), GDN (8 key and 24 value heads per
     // rank) and a dense FFN (gate/up rows and down columns halved): the dense Qwen3.5 rules.
     if (leaf.starts_with("attention/") || leaf.starts_with("gdn/") ||
@@ -432,13 +402,9 @@ LogicalShard qwen4_shard(std::string_view name, const artifact::Shape& shape, co
         const auto rows = leading(name, shape);
         return even(name, ShardAxis::Rows, rows, rows, options.tp);
     }
-    if (name == "mtp/hidden_norm") {
-        return qwen4_stream_shard(name, "hidden_norm", shape, text, options);
-    }
-    for (const std::string_view head : {"text/hc_head/", "mtp/hc_head/"}) {
-        if (name.starts_with(head)) {
-            return qwen4_stream_shard(name, name.substr(head.size()), shape, text, options);
-        }
+    if (name == "mtp/hidden_norm" || name.starts_with("text/hc_head/") ||
+        name.starts_with("mtp/hc_head/")) {
+        return whole(ShardAxis::Replicated);
     }
     if (const auto leaf = block_leaf(name); !leaf.empty()) {
         return qwen4_block_shard(name, leaf, shape, text, options);

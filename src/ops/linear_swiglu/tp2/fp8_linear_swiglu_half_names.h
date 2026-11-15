@@ -1,6 +1,6 @@
-// Renames that turn upstream's FP8 linear_swiglu sources into the [17408,5120] half's when a
+// Renames that turn the parent's FP8 linear_swiglu sources into the [17408,5120] half's when a
 // translation unit of this directory includes them. Include it once, after the family's headers
-// and right before the upstream source. The A8 launcher and its partial reservation read the rows
+// and right before the parent's source. The A8 launcher and its partial reservation read the rows
 // from the weight and are shared, not renamed.
 
 #define Fp8N34816K5120                             Fp8N17408K5120

@@ -203,7 +203,7 @@ int test_attribution_system_block() {
     const ninfer::PromptInput first       = prompt(first_request);
     const ninfer::PromptInput second      = prompt(parse(attributed(".8f7")).generation);
     const ninfer::PromptInput counted =
-        prompt(parse_anthropic_count_tokens_request(first_body).generation);
+        prompt(parse_anthropic_count_tokens_request(first_body, limits()).generation);
 
     const auto has_real_system = [](const ninfer::PromptInput& input) {
         return input.messages.size() == 2 &&
@@ -358,8 +358,9 @@ int test_tool_history() {
          Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_same", "result")})}}});
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
                       "duplicate tool_use ID was accepted");
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
-                          "invalid_tool_history",
+    failures += check(api_code([&] {
+                          (void)parse_anthropic_count_tokens_request(body, limits());
+                      }) == "invalid_tool_history",
                       "Count Tokens did not share Messages tool-history validation");
 
     body["messages"] = Json::array(
@@ -438,8 +439,9 @@ int test_tools() {
     const GenerationRequest loaded = parse(body).generation;
     failures += check(prompt(loaded).options.tool_jsons.size() == 1,
                       "a tool_reference did not bring its deferred tool into the prompt");
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }).empty(),
-                      "Count Tokens rejected a request carrying tool_reference history");
+    failures +=
+        check(api_code([&] { (void)parse_anthropic_count_tokens_request(body, limits()); }).empty(),
+              "Count Tokens rejected a request carrying tool_reference history");
 
     // A loaded deferred tool renders exactly like the same tool declared up front.
     Json eager_body                         = body;
@@ -452,8 +454,9 @@ int test_tools() {
     reference["tool_name"] = "mcp__unknown";
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
                       "a tool_reference to an undeclared tool was accepted");
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
-                          "invalid_tool_reference",
+    failures += check(api_code([&] {
+                          (void)parse_anthropic_count_tokens_request(body, limits());
+                      }) == "invalid_tool_reference",
                       "Count Tokens accepted a tool_reference to an undeclared tool");
     reference["tool_name"] = 7;
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_reference",
@@ -581,10 +584,11 @@ int test_thinking_and_count_tokens() {
                       "display was accepted with disabled Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
 
-    body["max_tokens"]                        = 0;
-    body["temperature"]                       = "ignored for counting";
-    body["output_config"]                     = Json{{"format", Json{{"type", "json_schema"}}}};
-    const AnthropicCountTokensRequest counted = parse_anthropic_count_tokens_request(body);
+    body["max_tokens"]    = 0;
+    body["temperature"]   = "ignored for counting";
+    body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    const AnthropicCountTokensRequest counted =
+        parse_anthropic_count_tokens_request(body, limits());
     failures += check(counted.generation.enable_thinking == true,
                       "Count Tokens did not share prompt-affecting Thinking parsing");
 
@@ -641,7 +645,7 @@ int test_thinking_history_transport_metadata() {
                       "visible Thinking text did not own prompt semantics");
 
     const AnthropicCountTokensRequest counted =
-        parse_anthropic_count_tokens_request(missing_signature);
+        parse_anthropic_count_tokens_request(missing_signature, limits());
     failures += check(counted.generation.messages[1].reasoning_content == "thought",
                       "Count Tokens assigned semantics to Thinking signature metadata");
     return failures;
@@ -1023,8 +1027,7 @@ int test_hidden_reasoning_round_trip() {
     return failures;
 }
 
-// Structured output, ported from Neroued/ninfer 08902f73, eb6696ae, 8ffa3131 and 2734a56e
-// (test_anthropic_schema.cpp), adapted to Tappa A (no JSON output with active tools yet).
+// Structured output; JSON output with active tools is rejected (there is no tool-call grammar).
 int test_constrained_decoding() {
     int failures = 0;
     auto options = [](const GenerationRequest& request) {
@@ -1077,7 +1080,7 @@ int test_constrained_decoding() {
                   schema_request.generation.reasoning_effort == RequestedReasoningEffort::Low &&
                   options(schema_request.generation).execution.sampling.presence_penalty ==
                       std::optional<float>(0.0F),
-              "Anthropic JSON schema source, effort or D6 default lost");
+              "Anthropic JSON schema source, effort or presence penalty default lost");
     auto bad                               = body;
     bad["output_config"]["format"]["type"] = "json_object";
     failures += check(api_param([&] { (void)parse(bad); }) == "output_config.format.type",
@@ -1098,9 +1101,9 @@ int test_constrained_decoding() {
     bad["tool_choice"] = Json{{"type", "any"}};
     bad["tools"]       = Json::array({ordinary_tool()});
     failures += check(api_code([&] { (void)parse(bad); }) == "tool_choice_not_supported",
-                      "forced tool_choice is still rejected in Tappa A");
+                      "forced tool_choice was accepted");
 
-    // D7: assistant prefill with a constraint is rejected before the Engine.
+    // Assistant prefill with a constraint is rejected before the Engine.
     bad             = body;
     bad["thinking"] = Json{{"type", "disabled"}};
     bad["messages"].push_back(Json{{"role", "assistant"}, {"content", "{\"z\":"}});
@@ -1108,7 +1111,7 @@ int test_constrained_decoding() {
                       "assistant prefill admitted an output constraint");
 
     // Count Tokens ignores the format.
-    failures += check(!parse_anthropic_count_tokens_request(body).generation.constraint,
+    failures += check(!parse_anthropic_count_tokens_request(body, limits()).generation.constraint,
                       "Count Tokens parsed an output format");
 
     // The error object has no param: structured-output errors keep their location in the message.

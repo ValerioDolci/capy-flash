@@ -134,7 +134,7 @@ void Qwen4Forward<Arena>::hc_block(std::size_t layer, const RankTensors* ple_emb
     st.pending = st.next;
     st.next ^= 1;
     hc_mix(st, &Qwen4BlockParameters::ffn_hc, layer); // commits the mixer output in the same pass
-    ffn(layer, st.wide, st.mixed, st.y[at(st.next)], st.staging_bf16, st.staging_fp32);
+    ffn(layer, st.mixed, st.y[at(st.next)], st.staging_bf16, st.staging_fp32);
     st.pending = st.next;
     st.next ^= 1;
     if constexpr (kExecute) {

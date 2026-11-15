@@ -15,6 +15,15 @@ namespace ninfer::product {
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
+// `--spec`. off also drops a draft window and proposal head set before it (by a profile).
+inline void set_speculative_backend(SpeculativeOptions& options, std::string_view value) {
+    options.backend = parse_speculative_backend(value);
+    if (options.backend == SpeculativeBackend::None) {
+        options.draft_tokens  = 0;
+        options.proposal_head = ProposalHead::Full;
+    }
+}
+
 [[nodiscard]] inline const char* speculative_backend_name(SpeculativeBackend backend) noexcept {
     switch (backend) {
     case SpeculativeBackend::None:

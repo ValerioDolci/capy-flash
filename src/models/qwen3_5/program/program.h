@@ -66,7 +66,7 @@ struct DeviceKVPages {
     std::uint32_t backend = 0;
 };
 
-// Program::disk_cache_save_one (v0.7.2, disk tier of the context cache).
+// Program::disk_cache_save_one (disk tier of the context cache).
 enum class DiskCacheSave : std::uint8_t {
     NothingToSave,
     Saved,
@@ -74,7 +74,7 @@ enum class DiskCacheSave : std::uint8_t {
     Failed,
 };
 
-// Program::compact_device_kv (v0.6, idle KV to the Host).
+// Program::compact_device_kv (idle KV to the Host).
 struct DeviceKVCompaction {
     bool ran                    = false;
     std::uint32_t moved_pages   = 0; // Device replicas packed into lower physical pages
@@ -211,7 +211,7 @@ public:
     // Bytes of the curve's per-rank reservation that `rank` does not allocate, whatever the page
     // count: at tp 2 with Vision, the encode workspace of the rank without the tower.
     [[nodiscard]] std::size_t unallocated_reservation_bytes(int rank) const noexcept;
-    // T64: one rank's KV page-pool device bytes (Text + MTP pools) at `main_page_groups` Text
+    // One rank's KV page-pool device bytes (Text + MTP pools) at `main_page_groups` Text
     // pages (the MTP pool has its lanes' draft pages more), the curve's minimum page count, and
     // the number of KV planes (each elastic plane may cost one granule more).
     [[nodiscard]] std::size_t kv_pool_bytes(std::uint32_t main_page_groups) const noexcept;
@@ -893,11 +893,8 @@ struct TpTransportStatus {
     std::string transport;
     double probe_ms = 0.0; // startup probe round trip; 0 when no probe ran
     std::string fallback;  // why the mailbox was dropped or narrowed; empty otherwise
-    // The mailbox's exchange kernel, "pipelined" or "legacy" (NINFER_TP_MAILBOX_LEGACY=1); empty
+    // The mailbox's slot, the widest captured all-reduce it carries (hidden x (K+1) x C BF16); 0
     // when the captured all-reduces run on the copies.
-    std::string exchange_kernel;
-    // The mailbox's slot, the widest captured all-reduce it carries (hidden x (K+1) x C BF16 with
-    // the pipelined kernel); 0 when the captured all-reduces run on the copies.
     std::size_t slot_bytes = 0;
     // Under MTP or DFlash2 with the optimized proposal head: "split by vocabulary" or "rank 0"
     // (NINFER_TP_DRAFT_HEAD=primary; for DFlash2 also NINFER_TP_DRAFTER=primary); empty otherwise.
@@ -1024,13 +1021,12 @@ public:
     // abort when the Program cannot retain it.
     [[nodiscard]] FinishResult finish_cancelled(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
-    // Device KV lease (capy-flash, after ninfer-custom 9f108db7): an active sequence holds its
-    // prompt plus a bounded window of its output, extended at a decode-round boundary up to its
-    // own output ceiling. When the pools cannot extend it the lease settles: the sequence then
-    // finishes at the frontier the lease covers with its generation limit reason, instead of
-    // failing a launch on coverage. This reports how many further model tokens that finish
-    // licenses (`forced_span_tokens`: the largest forced control span the caller may still
-    // apply); absent while the lease can grow.
+    // Device KV lease: an active sequence holds its prompt plus a bounded window of its output,
+    // extended at a decode-round boundary up to its own output ceiling. When the pools cannot
+    // extend it the lease settles: the sequence then finishes at the frontier the lease covers with
+    // its generation limit reason, instead of failing a launch on coverage. This reports how many
+    // further model tokens that finish licenses (`forced_span_tokens`: the largest forced control
+    // span the caller may still apply); absent while the lease can grow.
     [[nodiscard]] std::optional<std::uint32_t>
     device_kv_lease_settlement_tokens(SequenceHandle sequence,
                                       std::uint32_t forced_span_tokens) const noexcept;
@@ -1074,7 +1070,7 @@ public:
     [[nodiscard]] std::optional<SharedPrefixSummary>
     demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
                                         DeviceKVPages needed) noexcept;
-    // v0.6 (idle KV to the Host): with elastic KV and a Host KV tier the Device keeps only the
+    // Idle KV to the Host: with elastic KV and a Host KV tier the Device keeps only the
     // KV of active requests. The Engine moves the Device KV of idle retained owners to the Host
     // (demote_retained_*_for_lease with every page) and then calls compact_device_kv(), which
     // packs the remaining Device pages into the lowest physical pages and gives the KV backing no
@@ -1088,13 +1084,11 @@ public:
     idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
     DeviceKVCompaction compact_device_kv();
-    // Disk tier of the context cache (v0.7.2; ContextCacheOptions::disk_directory). Off: every
+    // Disk tier of the context cache (ContextCacheOptions::disk_directory). Off: every
     // call is a no-op. Between execution units only, with no context transaction.
     [[nodiscard]] bool disk_cache_enabled() const noexcept;
     // ContextCacheOptions::disk_idle_ms (0: no idle export).
     [[nodiscard]] std::uint32_t disk_cache_idle_ms() const noexcept;
-    // Whether some retained conversation is not on disk yet.
-    [[nodiscard]] bool disk_cache_has_unsaved() const noexcept;
     // Writes one retained conversation that is not on disk yet (most tokens first): Saved when
     // it was handed to the writer thread, NothingToSave, Aborted when `abort` returned true (the
     // partial record is dropped; tried again later) or Failed (not tried again).
@@ -1300,14 +1294,11 @@ struct RuntimeContractAccess {
 
 // Device bytes one more offloaded-expert slot per layer costs (every layer's slot), or 0 when the
 // model's routed experts are not offloaded (EngineOptions::routed_experts does not apply).
-// True when the Qwen4Exp routed experts are ggml block banks (capy-flash v0.7).
+// True when the Qwen4Exp routed experts are ggml block banks.
 [[nodiscard]] bool gguf_routed_experts(const execution::Parameters& parameters);
 [[nodiscard]] std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                                        const EngineOptions& options);
-// Device bytes of the offload backend's prefetch staging slots (T25; 0 when prefetch is off).
-[[nodiscard]] std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,
-                                                          const EngineOptions& options);
-// Device bytes of the staged miss split's scratch slots (T18), or 0 when not used.
+// Device bytes of the staged miss split's scratch slots, or 0 when not used.
 [[nodiscard]] std::int64_t offloaded_expert_split_bytes(const execution::Parameters& parameters,
                                                         const EngineOptions& options);
 

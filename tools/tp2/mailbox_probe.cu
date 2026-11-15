@@ -15,28 +15,26 @@
 // The exchange kernels are the production ones: this file includes
 // src/ops/kernel/peer_exchange.cuh (CUDA headers only), so build it from a checkout. The mailbox
 // is allocated as PeerMailbox does (pinned, mapped, portable) and, like the engine, alternates two
-// slots. The default kernel is the pipelined one; --legacy selects the original kernel (the
-// engine's NINFER_TP_MAILBOX_LEGACY=1). No engine library: nvcc and the CUDA runtime only.
+// slots. No engine library: nvcc and the CUDA runtime only.
 //
 // Build (from the repository root):
 //   Linux    nvcc -O2 -std=c++20 -arch=sm_120a -o build/mailbox_probe tools/tp2/mailbox_probe.cu
 //   Windows  nvcc -O2 -std=c++20 -arch=sm_120a -o mailbox_probe.exe tools\tp2\mailbox_probe.cu
 //   (-arch=native also works on CUDA 12.8+; the exchange needs no sm_120-specific feature.)
 // Run:
-//   mailbox_probe [dev_a dev_b] [--payload BYTES] [--chain N] [--spin-limit N] [--legacy]
+//   mailbox_probe [dev_a dev_b] [--payload BYTES] [--chain N] [--spin-limit N]
 //                 [--simulate-hang] [--sweep] [--timed] [--work US] [--replays N]
 //     dev_a dev_b     CUDA device ids (default 0 1)
 //     --payload       exchange payload in bytes, multiple of 16 (default 10240, the decode
 //     activation)
 //     --chain         exchanges per chain (default 128, one decode step's worth)
 //     --spin-limit    pipelined poller probes before an exchange reports a hang (default 1000000,
-//                     ~0.8 s; the original kernel's limit is the compiled kPeerSpinLimit)
-//     --legacy        the original exchange kernel instead of the pipelined one
+//                     ~0.8 s)
 //     --simulate-hang rank 1 skips the startup exchange, to exercise the hang report path
 //     --sweep         maintainer: µs per exchange for every kernel variant (1/2/4/8 vectors per
 //     lane,
 //                     64/128/256 threads, both poll flavours, sleeps) at 4, 10 and 40 KiB
-//     --timed         maintainer: per-phase anatomy of one exchange (clock64 stamps), both kernels
+//     --timed         maintainer: per-phase anatomy of one exchange (clock64 stamps)
 //     --work US       maintainer: a US-microsecond spin kernel on both ranks before every exchange
 //                     (a stand-in for the layer between two all-reduces); reported costs exclude it
 //     --replays N     graph replays per measurement (default 20)
@@ -73,99 +71,6 @@ namespace pd = ninfer::ops::detail;
 using pd::PeerVec;
 using pd::PeerVecBf16;
 
-// ---- the original kernel with phase stamps (maintainer anatomy only) ---------------------------
-// peer_exchange_sum_kernel line for line, plus clock64 stamps by thread 0 of block 0: globaltimer
-// and clock at entry, after the publish loop, after __threadfence_system, after the arrival (and
-// release), when the peer's flag was seen, after the acquire fence, after the second barrier, at
-// the end, globaltimer at the end; word kLegacyStamps counts the polls that missed. The stamps
-// only read clocks; the protocol and the memory operations are the production ones.
-constexpr int kLegacyStamps = 10;
-
-__global__ __launch_bounds__(256) void legacy_timed_kernel(
-    PeerVecBf16* partial, PeerVecBf16* mine_payload, std::uint32_t* mine_flag,
-    const PeerVecBf16* peer_payload, std::uint32_t* peer_flag, std::uint32_t* epoch,
-    std::uint32_t* arrival, std::uint32_t* hang, int vecs, unsigned long long* stamps) {
-    using DeviceWord = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_device>;
-    using SystemWord = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>;
-    __shared__ int combine;
-    const bool timed                     = blockIdx.x == 0 && threadIdx.x == 0;
-    unsigned long long st[kLegacyStamps] = {};
-    if (timed) {
-        st[0] = pd::peer_globaltimer();
-        st[1] = clock64();
-    }
-    const int tid        = blockIdx.x * blockDim.x + threadIdx.x;
-    const int group_span = gridDim.x * blockDim.x * pd::kPeerGroup;
-    std::uint32_t target = 0;
-    if (threadIdx.x == 0) { target = DeviceWord(*epoch).load(cuda::memory_order_relaxed) + 1u; }
-    for (int g = tid * pd::kPeerGroup; g < vecs; g += group_span) {
-#pragma unroll
-        for (int j = 0; j < pd::kPeerGroup; ++j) {
-            if (g + j < vecs) { mine_payload[g + j].raw = partial[g + j].raw; }
-        }
-    }
-    if (timed) { st[2] = clock64(); }
-    __threadfence_system();
-    if (timed) { st[3] = clock64(); }
-    __syncthreads();
-    std::uint32_t spins = 0;
-    if (threadIdx.x == 0) {
-        const std::uint32_t arrived =
-            DeviceWord(*arrival).fetch_add(1u, cuda::memory_order_acq_rel);
-        if (arrived == gridDim.x - 1u) {
-            DeviceWord(*arrival).store(0u, cuda::memory_order_relaxed);
-            DeviceWord(*epoch).store(target, cuda::memory_order_relaxed);
-            SystemWord(*mine_flag).store(target, cuda::memory_order_release);
-        }
-        if (timed) { st[4] = clock64(); }
-        const SystemWord peer(*peer_flag);
-        const SystemWord fault(*hang);
-        bool published = true;
-        while (static_cast<std::int32_t>(peer.load(cuda::memory_order_relaxed) - target) < 0) {
-            __nanosleep(100);
-            ++spins;
-            if (spins % pd::kPeerHangProbe == 0u &&
-                (spins > pd::kPeerSpinLimit || fault.load(cuda::memory_order_relaxed) != 0u)) {
-                fault.store(1u, cuda::memory_order_relaxed);
-                published = false;
-                break;
-            }
-        }
-        if (timed) { st[5] = clock64(); }
-        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
-        if (timed) { st[6] = clock64(); }
-        combine = published ? 1 : 0;
-    }
-    __syncthreads();
-    if (timed) { st[7] = clock64(); }
-    if (combine == 0) { return; }
-    for (int g = tid * pd::kPeerGroup; g < vecs; g += group_span) {
-#pragma unroll
-        for (int j = 0; j < pd::kPeerGroup; ++j) {
-            if (g + j >= vecs) { break; }
-            PeerVecBf16 mine;
-            PeerVecBf16 peer;
-            mine.raw = partial[g + j].raw;
-            peer.raw = __ldcv(&peer_payload[g + j].raw);
-#pragma unroll
-            for (int pair = 0; pair < 4; ++pair) {
-                const float a0  = __low2float(mine.pair[pair]);
-                const float b0  = __high2float(mine.pair[pair]);
-                const float a1  = __low2float(peer.pair[pair]);
-                const float b1  = __high2float(peer.pair[pair]);
-                mine.pair[pair] = __floats2bfloat162_rn(a0 + a1, b0 + b1);
-            }
-            partial[g + j].raw = mine.raw;
-        }
-    }
-    if (timed) {
-        st[8] = clock64();
-        for (int i = 0; i < 9; ++i) { stamps[i] = st[i]; }
-        stamps[9]             = pd::peer_globaltimer();
-        stamps[kLegacyStamps] = spins;
-    }
-}
-
 // A spin of `ns` nanoseconds on one thread: the layer between two all-reduces, as far as the
 // exchange can tell.
 __global__ void spin_kernel(unsigned long long ns) {
@@ -192,10 +97,7 @@ __global__ void add_bf16_kernel(PeerVecBf16* partial, const PeerVecBf16* staged,
 }
 
 // ---- kernel variants ---------------------------------------------------------------------------
-enum class Kind { Legacy, LegacyTimed, Pipelined };
-
 struct Variant {
-    Kind kind           = Kind::Pipelined;
     int vecs_per_lane   = pd::kPeerPipelinedVecsPerLane;
     int threads         = pd::kPeerPipelinedThreads;
     int poll            = pd::kPeerPollAcquire;
@@ -203,7 +105,6 @@ struct Variant {
     bool timed          = false;
 
     std::string name() const {
-        if (kind != Kind::Pipelined) { return kind == Kind::Legacy ? "legacy" : "legacy-timed"; }
         char buffer[96];
         std::snprintf(buffer, sizeof buffer, "pipelined g%d t%d %s sleep%u%s", vecs_per_lane,
                       threads, poll == pd::kPeerPollAcquire ? "acquire" : "early+fence", sleep,
@@ -212,7 +113,6 @@ struct Variant {
     }
 
     int blocks(std::size_t vecs) const {
-        if (kind != Kind::Pipelined) { return pd::peer_exchange_blocks(vecs * sizeof(PeerVec)); }
         return pd::peer_pipelined_blocks(vecs, vecs_per_lane, threads);
     }
 };
@@ -260,7 +160,6 @@ struct Options {
     std::size_t payload      = 10240;
     int chain                = 128;
     std::uint32_t spin_limit = pd::kPeerSpinLimit;
-    bool legacy              = false;
     bool simulate_hang       = false;
     bool sweep               = false;
     bool timed               = false;
@@ -286,8 +185,6 @@ Options parse(int argc, char** argv) {
             o.chain = std::atoi(value());
         } else if (arg == "--spin-limit") {
             o.spin_limit = static_cast<std::uint32_t>(std::strtoul(value(), nullptr, 10));
-        } else if (arg == "--legacy") {
-            o.legacy = true;
         } else if (arg == "--simulate-hang") {
             o.simulate_hang = true;
         } else if (arg == "--sweep") {
@@ -376,7 +273,7 @@ struct Rank {
     cudaStream_t stream        = nullptr;
     PeerVecBf16* partial       = nullptr; // [chain][vecs]
     PeerVecBf16* staged        = nullptr; // copies path scratch, [chain][vecs]
-    std::uint32_t* words       = nullptr; // epochs (and the original kernel's arrival counters)
+    std::uint32_t* words       = nullptr; // epochs
     std::size_t word_count     = 0;
     unsigned long long* stamps = nullptr; // [chain][stamp stride]
     std::vector<std::uint16_t> host;      // host copy of partial for init / verification
@@ -391,14 +288,13 @@ struct Probe {
     int stamp_stride = 0;
 
     void setup(const Options& opts, std::size_t payload, int chain) {
-        o         = opts;
-        o.payload = payload;
-        o.chain   = chain;
-        vecs      = static_cast<int>(payload / sizeof(PeerVec));
-        elems     = vecs * 8;
-        slab      = alloc_slab(o, payload);
-        stamp_stride =
-            std::max<int>(kLegacyStamps + 1, static_cast<int>(slab.lanes) * pd::kPeerStampCount);
+        o            = opts;
+        o.payload    = payload;
+        o.chain      = chain;
+        vecs         = static_cast<int>(payload / sizeof(PeerVec));
+        elems        = vecs * 8;
+        slab         = alloc_slab(o, payload);
+        stamp_stride = static_cast<int>(slab.lanes) * pd::kPeerStampCount;
         for (int r = 0; r < 2; ++r) {
             Rank& rk  = rank[r];
             rk.device = o.device[r];
@@ -407,7 +303,7 @@ struct Probe {
             const std::size_t bytes = static_cast<std::size_t>(chain) * payload;
             CK(cudaMalloc(&rk.partial, bytes));
             CK(cudaMalloc(&rk.staged, bytes));
-            rk.word_count = std::max<std::size_t>(2 * kSlots, kSlots * slab.lanes);
+            rk.word_count = kSlots * slab.lanes;
             CK(cudaMalloc(&rk.words, rk.word_count * sizeof(std::uint32_t)));
             CK(cudaMalloc(&rk.stamps, static_cast<std::size_t>(chain) * stamp_stride *
                                           sizeof(unsigned long long)));
@@ -445,41 +341,31 @@ struct Probe {
         std::uint32_t* peer_flags  = slab.flags(r, 1 - r, slot);
         unsigned long long* stamps = rank[r].stamps + static_cast<std::size_t>(k) * stamp_stride;
         const int blocks           = v.blocks(static_cast<std::size_t>(vecs));
-        if (v.kind == Kind::Legacy) {
-            pd::peer_exchange_sum_kernel<<<blocks, 256, 0, rank[r].stream>>>(
-                partial, mine, mine_flags, peer, peer_flags, rank[r].words + kSlots + slot,
-                rank[r].words + slot, slab.hang_dev[r], vecs);
-        } else if (v.kind == Kind::LegacyTimed) {
-            legacy_timed_kernel<<<blocks, 256, 0, rank[r].stream>>>(
-                partial, mine, mine_flags, peer, peer_flags, rank[r].words + kSlots + slot,
-                rank[r].words + slot, slab.hang_dev[r], vecs, stamps);
-        } else {
-            pd::PeerPipelinedTuning tuning;
-            tuning.spin_limit     = o.spin_limit;
-            tuning.sleep_ns       = v.sleep;
-            tuning.stamps         = v.timed ? stamps : nullptr;
-            std::uint32_t* epochs = rank[r].words + static_cast<std::size_t>(slot) * slab.lanes;
-            switch (v.vecs_per_lane) {
-            case 1:
-                launch_pipelined_g<1>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
-                                      peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
-                break;
-            case 2:
-                launch_pipelined_g<2>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
-                                      peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
-                break;
-            case 4:
-                launch_pipelined_g<4>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
-                                      peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
-                break;
-            case 8:
-                launch_pipelined_g<8>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
-                                      peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
-                break;
-            default:
-                std::fprintf(stderr, "unsupported vecs per lane %d\n", v.vecs_per_lane);
-                std::exit(1);
-            }
+        pd::PeerPipelinedTuning tuning;
+        tuning.spin_limit     = o.spin_limit;
+        tuning.sleep_ns       = v.sleep;
+        tuning.stamps         = v.timed ? stamps : nullptr;
+        std::uint32_t* epochs = rank[r].words + static_cast<std::size_t>(slot) * slab.lanes;
+        switch (v.vecs_per_lane) {
+        case 1:
+            launch_pipelined_g<1>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
+                                  peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
+            break;
+        case 2:
+            launch_pipelined_g<2>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
+                                  peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
+            break;
+        case 4:
+            launch_pipelined_g<4>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
+                                  peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
+            break;
+        case 8:
+            launch_pipelined_g<8>(v, blocks, rank[r].stream, partial, mine, mine_flags, peer,
+                                  peer_flags, epochs, slab.hang_dev[r], vecs, tuning);
+            break;
+        default:
+            std::fprintf(stderr, "unsupported vecs per lane %d\n", v.vecs_per_lane);
+            std::exit(1);
         }
         CK(cudaGetLastError());
     }
@@ -714,18 +600,16 @@ int run_sweep(const Options& o) {
         payloads.push_back(o.payload);
     }
     std::vector<Variant> variants;
-    variants.push_back(Variant{Kind::Legacy});
     for (int g : {1, 2, 4, 8}) {
         for (int t : {64, 128, 256}) {
             for (int poll : {pd::kPeerPollAcquire, pd::kPeerPollEarlyFence}) {
-                variants.push_back(
-                    Variant{Kind::Pipelined, g, t, poll, pd::kPeerPollSleepNs, false});
+                variants.push_back(Variant{g, t, poll, pd::kPeerPollSleepNs, false});
             }
         }
     }
     for (std::uint32_t sleep : {0u, 32u}) {
-        variants.push_back(Variant{Kind::Pipelined, pd::kPeerPipelinedVecsPerLane,
-                                   pd::kPeerPipelinedThreads, pd::kPeerPollAcquire, sleep, false});
+        variants.push_back(Variant{pd::kPeerPipelinedVecsPerLane, pd::kPeerPipelinedThreads,
+                                   pd::kPeerPollAcquire, sleep, false});
     }
     int wrong = 0;
     std::printf(
@@ -750,8 +634,8 @@ int run_sweep(const Options& o) {
     return 0;
 }
 
-// --timed: per-phase anatomy of both kernels at --payload. Stamps are clock64 on the SM that ran
-// warp 0 / block 0, converted with that SM's clock measured against globaltimer over the chain.
+// --timed: per-phase anatomy of the exchange kernel at --payload. Stamps are clock64 on the SM that
+// ran warp 0, converted with that SM's clock measured against globaltimer over the chain.
 int run_timed(const Options& o) {
     Probe p;
     p.setup(o, o.payload, o.chain);
@@ -759,105 +643,62 @@ int run_timed(const Options& o) {
     std::printf("\n[timed] anatomy at %zu bytes, chain x%d%s: medians over exchanges, us\n",
                 o.payload, o.chain, o.work_us > 0 ? " with spin work between exchanges" : "");
 
-    struct Row {
-        const char* label;
-        double early;
-        double late;
-    };
-
-    for (int which = 0; which < 2; ++which) {
-        Variant v = which == 0 ? Variant{Kind::LegacyTimed}
-                               : Variant{Kind::Pipelined,           pd::kPeerPipelinedVecsPerLane,
-                                         pd::kPeerPipelinedThreads, pd::kPeerPollAcquire,
-                                         pd::kPeerPollSleepNs,      true};
-        p.init_partials();
-        cudaGraphExec_t exec = p.capture_mailbox_chain(v, o.chain, false);
-        p.launch_graph(exec);
-        if (p.hang()) {
-            std::printf("  HANG\n");
-            return 1;
+    const Variant v{pd::kPeerPipelinedVecsPerLane, pd::kPeerPipelinedThreads, pd::kPeerPollAcquire,
+                    pd::kPeerPollSleepNs, true};
+    p.init_partials();
+    cudaGraphExec_t exec = p.capture_mailbox_chain(v, o.chain, false);
+    p.launch_graph(exec);
+    if (p.hang()) {
+        std::printf("  HANG\n");
+        return 1;
+    }
+    wrong += p.verify(v.name().c_str(), o.chain);
+    CK(cudaGraphExecDestroy(exec));
+    const int warps =
+        pd::peer_pipelined_warps(static_cast<std::size_t>(p.vecs), pd::kPeerPipelinedVecsPerLane);
+    std::printf("  %s (%d blocks, warp 0 and the slowest of %d warps)\n", v.name().c_str(),
+                v.blocks(static_cast<std::size_t>(p.vecs)), warps);
+    for (int r = 0; r < 2; ++r) {
+        const auto st = p.stamps(r);
+        double cycles = 0, ns = 0;
+        std::vector<double> ph[4];
+        std::vector<double> total, slowest_end, slowest_seen;
+        int immediate = 0;
+        for (int k = 0; k < o.chain; ++k) {
+            const unsigned long long* s = st.data() + static_cast<std::size_t>(k) * p.stamp_stride;
+            cycles += static_cast<double>(s[5] - s[1]);
+            ns += static_cast<double>(s[6] - s[0]);
         }
-        wrong += p.verify(v.name().c_str(), o.chain);
-        CK(cudaGraphExecDestroy(exec));
-        const int warps = pd::peer_pipelined_warps(static_cast<std::size_t>(p.vecs),
-                                                   pd::kPeerPipelinedVecsPerLane);
-        std::printf(
-            "  %s (%d blocks%s)\n", v.name().c_str(), v.blocks(static_cast<std::size_t>(p.vecs)),
-            which == 0
-                ? ", thread 0 of block 0"
-                : (", warp 0 and the slowest of " + std::to_string(warps) + " warps").c_str());
-        for (int r = 0; r < 2; ++r) {
-            const auto st = p.stamps(r);
-            double cycles = 0, ns = 0;
-            std::vector<double> ph[8];
-            std::vector<double> total, slowest_end, slowest_seen;
-            int immediate = 0;
-            for (int k = 0; k < o.chain; ++k) {
-                const unsigned long long* s =
-                    st.data() + static_cast<std::size_t>(k) * p.stamp_stride;
-                if (which == 0) {
-                    cycles += static_cast<double>(s[8] - s[1]);
-                    ns += static_cast<double>(s[9] - s[0]);
-                } else {
-                    cycles += static_cast<double>(s[5] - s[1]);
-                    ns += static_cast<double>(s[6] - s[0]);
-                }
+        const double ghz = cycles / ns; // cycles per ns
+        for (int k = 0; k < o.chain; ++k) {
+            const unsigned long long* s = st.data() + static_cast<std::size_t>(k) * p.stamp_stride;
+            auto us                     = [&](unsigned long long a, unsigned long long b) {
+                return static_cast<double>(b - a) / ghz / 1000.0;
+            };
+            ph[0].push_back(us(s[1], s[2])); // loads + stores issued
+            ph[1].push_back(us(s[2], s[3])); // release (system fence + flag store)
+            ph[2].push_back(us(s[3], s[4])); // poll until the peer's flag (acquire)
+            ph[3].push_back(us(s[4], s[5])); // peer loads + combine
+            total.push_back(us(s[1], s[5]));
+            if (s[7] == 0) { ++immediate; }
+            double worst_end = 0, worst_seen = 0;
+            for (int w = 0; w < warps; ++w) {
+                const unsigned long long* sw =
+                    s + static_cast<std::size_t>(w) * pd::kPeerStampCount;
+                // globaltimer is shared by the device's SMs: warp w's end against warp 0's entry
+                worst_end  = std::max(worst_end, static_cast<double>(sw[6] - s[0]) / 1000.0);
+                worst_seen = std::max(worst_seen, us(sw[1], sw[4]));
             }
-            const double ghz = cycles / ns; // cycles per ns
-            for (int k = 0; k < o.chain; ++k) {
-                const unsigned long long* s =
-                    st.data() + static_cast<std::size_t>(k) * p.stamp_stride;
-                auto us = [&](unsigned long long a, unsigned long long b) {
-                    return static_cast<double>(b - a) / ghz / 1000.0;
-                };
-                if (which == 0) {
-                    ph[0].push_back(us(s[1], s[2])); // publish loop (4 dependent load->store pairs)
-                    ph[1].push_back(us(s[2], s[3])); // __threadfence_system
-                    ph[2].push_back(us(s[3], s[4])); // __syncthreads + arrival atomic (+ release)
-                    ph[3].push_back(us(s[4], s[5])); // poll until the peer's flag
-                    ph[4].push_back(us(s[5], s[6])); // acquire fence
-                    ph[5].push_back(us(s[6], s[7])); // __syncthreads
-                    ph[6].push_back(
-                        us(s[7], s[8])); // read loop + combine (4 dependent round trips)
-                    total.push_back(us(s[1], s[8]));
-                    if (s[kLegacyStamps] == 0) { ++immediate; }
-                } else {
-                    ph[0].push_back(us(s[1], s[2])); // loads + stores issued
-                    ph[1].push_back(us(s[2], s[3])); // release (system fence + flag store)
-                    ph[2].push_back(us(s[3], s[4])); // poll until the peer's flag (acquire)
-                    ph[3].push_back(us(s[4], s[5])); // peer loads + combine
-                    total.push_back(us(s[1], s[5]));
-                    if (s[7] == 0) { ++immediate; }
-                    double worst_end = 0, worst_seen = 0;
-                    for (int w = 0; w < warps; ++w) {
-                        const unsigned long long* sw =
-                            s + static_cast<std::size_t>(w) * pd::kPeerStampCount;
-                        // globaltimer is shared by the device's SMs: warp w's end against warp 0's
-                        // entry
-                        worst_end = std::max(worst_end, static_cast<double>(sw[6] - s[0]) / 1000.0);
-                        worst_seen = std::max(worst_seen, us(sw[1], sw[4]));
-                    }
-                    slowest_end.push_back(worst_end);
-                    slowest_seen.push_back(worst_seen);
-                }
-            }
-            std::printf("    rank %d (SM clock %.2f GHz, peer flag already there at the first poll "
-                        "in %d/%d):\n",
-                        r, ghz, immediate, o.chain);
-            if (which == 0) {
-                std::printf(
-                    "      publish %.2f | fence.sc.sys %.2f | bar+arrival+release %.2f | poll %.2f "
-                    "| acquire fence %.2f | bar %.2f | read+combine %.2f | total %.2f\n",
-                    median(ph[0]), median(ph[1]), median(ph[2]), median(ph[3]), median(ph[4]),
-                    median(ph[5]), median(ph[6]), median(total));
-            } else {
-                std::printf(
-                    "      loads+stores %.2f | release %.2f | poll %.2f | read+combine %.2f | "
+            slowest_end.push_back(worst_end);
+            slowest_seen.push_back(worst_seen);
+        }
+        std::printf("    rank %d (SM clock %.2f GHz, peer flag already there at the first poll "
+                    "in %d/%d):\n",
+                    r, ghz, immediate, o.chain);
+        std::printf("      loads+stores %.2f | release %.2f | poll %.2f | read+combine %.2f | "
                     "total %.2f | slowest warp: flag seen %.2f, end %.2f (globaltimer)\n",
                     median(ph[0]), median(ph[1]), median(ph[2]), median(ph[3]), median(total),
                     median(slowest_seen), median(slowest_end));
-            }
-        }
     }
     if (wrong != 0) {
         std::printf("timed: WRONG SUMS in %d elements\n", wrong);
@@ -880,11 +721,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "device ids must be two distinct ids below %d\n", devices);
         return 1;
     }
-    const Variant chosen = o.legacy ? Variant{Kind::Legacy} : Variant{};
-    std::printf(
-        "NInfer TP2 mailbox probe: payload %zu bytes, chain %d, %s kernel, spin limit %u%s\n",
-        o.payload, o.chain, o.legacy ? "legacy" : "pipelined", o.spin_limit,
-        o.simulate_hang ? ", SIMULATED HANG" : "");
+    const Variant chosen{};
+    std::printf("NInfer TP2 mailbox probe: payload %zu bytes, chain %d, spin limit %u%s\n",
+                o.payload, o.chain, o.spin_limit, o.simulate_hang ? ", SIMULATED HANG" : "");
     print_environment(o);
     int wrong = 0;
 
@@ -920,16 +759,13 @@ int main(int argc, char** argv) {
         // ---- 2. mailbox timings at the decode payload ------------------------------------------
         std::printf("\n[2] mailbox at %zu bytes, graph chain x%d, 2 alternating slots\n", o.payload,
                     o.chain);
-        const Variant other = o.legacy ? Variant{} : Variant{Kind::Legacy};
-        for (const Variant& v : {chosen, other}) {
-            const double us = p.measure(v, wrong);
-            if (us < 0) {
-                std::printf("  HANG in the captured chain (%s kernel)\n", v.name().c_str());
-                mailbox_ok = false;
-                break;
-            }
+        const double us = p.measure(chosen, wrong);
+        if (us < 0) {
+            std::printf("  HANG in the captured chain (%s kernel)\n", chosen.name().c_str());
+            mailbox_ok = false;
+        } else {
             std::printf("  %s kernel: %.1f us per exchange (mean of %d replays)\n",
-                        v.name().c_str(), us, o.replays);
+                        chosen.name().c_str(), us, o.replays);
         }
     } else {
         std::printf("\n[2] mailbox timings skipped (mailbox unusable)\n");

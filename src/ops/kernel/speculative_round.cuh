@@ -32,9 +32,7 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
         const int off = row * T + j;
         verify_ids[off] =
             j == 0 ? anchors[row] : (j <= extent ? drafts[row * k + j - 1] : anchors[row]);
-        if (positions != nullptr) {
-            positions[off] = base_positions[row] + (j <= extent ? j : extent);
-        }
+        positions[off] = base_positions[row] + (j <= extent ? j : extent);
     }
 }
 
@@ -167,8 +165,8 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             const float u  = sampling_uniform(cfg.seed, old_length + lane + 1,
                                               kSamplePurposeSpeculativeAccept, 0);
             // A proposal lookup miss (qd == 0) would otherwise accept the draft unconditionally
-            // and leave the position target-unmatched (upstream issue #349). Rejecting it keeps
-            // the residual resample on the unmodified target distribution.
+            // and leave the position target-unmatched. Rejecting it keeps the residual resample on
+            // the unmodified target distribution.
             reject = qd <= 0.0f || !(pd >= qd || u * qd < pd);
         }
     }

@@ -1,4 +1,4 @@
-"""v0.7 27b-16gb: q3_g128_fp16 registry/codec and the GSQ pack-quantized integer source."""
+"""27b-16gb: q3_g128_fp16 registry/codec and the GSQ pack-quantized integer source."""
 
 from __future__ import annotations
 

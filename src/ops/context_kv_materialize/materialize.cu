@@ -5,6 +5,7 @@
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/common/dflash_rope.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -310,9 +311,11 @@ void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, 
                 DeviceLayers layers, ContextKVMaterializeExecutionEnvelope envelope,
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
-    if constexpr (bytes > 48 * 1024)
-        CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    if constexpr (bytes > 48 * 1024) {
+        static FuncAttrPerDevice attribute;
+        attribute.ensure(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    }
     context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>
         <<<dim3(kRows / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(

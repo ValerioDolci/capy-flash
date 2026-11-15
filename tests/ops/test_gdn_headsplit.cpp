@@ -12,12 +12,12 @@
 // the generated data depends on the global head index, and the reference heads are checked to be
 // pairwise distinct, so a wrong window or a permutation inside it cannot pass.
 //
-// Shard and single-device runs are expected to be bitwise equal. Since upstream 0784e76f the
-// chunked route is two kernels: prepare works per key head (Q/K packets) and per value head
-// (control matrices), and recurrence picks its value tile from H_v and the SM count
-// (chunked::value_tile: on a 70-SM RTX 5070 Ti, 32 columns at 48 heads, 64 at 24). The tile only
-// partitions a head's value columns across CTAs and warps; each column's key reductions run the
-// same MMA sequence in the same order, so each head is evaluated with the same arithmetic.
+// Shard and single-device runs are expected to be bitwise equal. The chunked route is two kernels:
+// prepare works per key head (Q/K packets) and per value head (control matrices), and recurrence
+// picks its value tile from H_v and the SM count (chunked::value_tile: on a 70-SM RTX 5070 Ti, 32
+// columns at 48 heads, 64 at 24). The tile only partitions a head's value columns across CTAs and
+// warps; each column's key reductions run the same MMA sequence in the same order, so each head is
+// evaluated with the same arithmetic.
 // Leg A also qualifies the shard geometry against the Op's registered FP64 criteria.
 //
 // Leg B runs a 4141-token prefill (259 16-token chunks, the last one padded) followed by five
@@ -315,7 +315,7 @@ struct Runner {
     int qk_heads    = 0;
     int value_heads = 0;
     int max_tokens  = 0;
-    // The chunked route sizes its value tiles from the device's SM count (upstream 0784e76f).
+    // The chunked route sizes its value tiles from the device's SM count.
     int multiprocessor_count = 0;
 
     DeviceBuffer q, k, v, g, beta, state, out;
@@ -542,7 +542,7 @@ void oracle_case(int tokens, bool normalize_qk, std::uint64_t salt) {
         "gdn oracle T=" + std::to_string(tokens) + (normalize_qk ? " normalized" : " raw");
     const Global world = make_global(tokens, salt, normalize_qk);
     // The registered criteria of the route this T takes: recurrent below 16 tokens, the chunked
-    // profile from 16 on (gdn_criteria.h, upstream 0784e76f).
+    // profile from 16 on (gdn_criteria.h).
     const Criteria& criteria = gated_delta_net_prefill_criteria(tokens, normalize_qk);
 
     // Control: the tp1 geometry against the same oracle, on the same data.
@@ -730,17 +730,35 @@ void conv_case(int tokens, std::uint64_t salt) {
         const auto xb = bf16_bits(x_in);
         const auto wb = bf16_bits(w_in);
         const auto sb = bf16_bits(s_in);
-        DeviceBuffer dx(xb.size() * 2), dw(wb.size() * 2), ds(sb.size() * 2), dout(xb.size() * 2);
+        // The split entry writes the q, k and v channel blocks to three destinations.
+        const int key_rows            = channels == kConvChans ? kKeyDim : kKeyDim / kRanks;
+        const std::array<int, 3> rows = {key_rows, key_rows, channels - 2 * key_rows};
+        DeviceBuffer dx(xb.size() * 2), dw(wb.size() * 2), ds(sb.size() * 2);
+        std::array<DeviceBuffer, 3> dout{DeviceBuffer(std::size_t(rows[0]) * tokens * 2),
+                                         DeviceBuffer(std::size_t(rows[1]) * tokens * 2),
+                                         DeviceBuffer(std::size_t(rows[2]) * tokens * 2)};
         dx.copy_from_host(xb.data(), xb.size() * 2);
         dw.copy_from_host(wb.data(), wb.size() * 2);
         ds.copy_from_host(sb.data(), sb.size() * 2);
         Tensor xt(dx.p, DType::BF16, {channels, tokens});
         Tensor wt(dw.p, DType::BF16, {channels, kConvWidth});
         Tensor st(ds.p, DType::BF16, {channels, kConvState});
-        Tensor ot(dout.p, DType::BF16, {channels, tokens});
-        ops::causal_conv1d_silu(xt, wt, st, ot, nullptr);
+        Tensor qt(dout[0].p, DType::BF16, {rows[0], tokens});
+        Tensor kt(dout[1].p, DType::BF16, {rows[1], tokens});
+        Tensor vt(dout[2].p, DType::BF16, {rows[2], tokens});
+        ops::causal_conv1d_silu_split(xt, wt, st, st, qt, kt, vt, nullptr);
         cuda_synchronize();
-        out_bits   = from_device<std::uint16_t>(dout.p, xb.size());
+        out_bits.assign(xb.size(), 0);
+        for (int part = 0, first = 0; part < 3; first += rows[part], ++part) {
+            const auto bits = from_device<std::uint16_t>(
+                dout[part].p, static_cast<std::size_t>(rows[part]) * tokens);
+            for (int t = 0; t < tokens; ++t) {
+                for (int r = 0; r < rows[part]; ++r) {
+                    out_bits[static_cast<std::size_t>(t) * channels + first + r] =
+                        bits[static_cast<std::size_t>(t) * rows[part] + r];
+                }
+            }
+        }
         state_bits = from_device<std::uint16_t>(ds.p, sb.size());
     };
 
@@ -933,8 +951,8 @@ int main() {
     // exact oracle and BF16 error accumulates with the recurrence length, so applying them at
     // T = 4141 would measure the length, not the split -- verified: the tp1 geometry misses them
     // there too, on the same data). T = 1 is the pure recurrent route; 65 (five 16-token chunks,
-    // the last padded), 128 and 64 take the chunked route since upstream 0784e76f and are judged
-    // by its profile. The oracle is a full O(T * H_v * 128^2) FP64 recurrence.
+    // the last padded), 128 and 64 take the chunked route and are judged by its profile. The
+    // oracle is a full O(T * H_v * 128^2) FP64 recurrence.
     oracle_case(1, /*normalize_qk=*/true, 31001u);
     oracle_case(65, /*normalize_qk=*/true, 31002u);
     oracle_case(128, /*normalize_qk=*/true, 31003u);

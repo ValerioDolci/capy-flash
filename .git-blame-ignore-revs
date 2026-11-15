@@ -4,3 +4,5 @@
 29de06f2e1629d395aabcc7c33ea89f3cf058cec
 # style: ruff format every Python file (line length 120) and lint statements and imports
 9d0c1175006fcef3effe510b2b8fed2900e83f46
+# style: clang-format 21.1.2 on every C/C++/CUDA file changed since v0.12.0
+0328573a89b343384a66a3fc7c54fbd320c98fd1

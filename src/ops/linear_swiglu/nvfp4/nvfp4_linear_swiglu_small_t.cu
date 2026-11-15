@@ -46,9 +46,9 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 
 constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 
-// Sliced-K over 8 K warps with 2 stages, the reduction of the upstream <8,8,2> and <16,8,2>
+// Sliced-K over 8 K warps with 2 stages, the reduction of the generic <8,8,2> and <16,8,2>
 // instances, so every T keeps their results bit for bit. What changes is how many CTAs an SM
-// holds; the upstream instances hold 3 (T<=8) and 2 (T<=16) of 8 warps, and on the 70-SM
+// holds; the generic instances hold 3 (T<=8) and 2 (T<=16) of 8 warps, and on the 70-SM
 // RTX 5070 Ti that leaves the shared-memory pipe throttled and DRAM at ~64 %:
 // - T<=4 stages 4 activation rows instead of 8 and caps registers at 64: 4 CTAs per SM,
 //   [17408,5120] 85.0 -> 78.2 us at T=4 (A4 route 78.9), [34816,5120] 166.2 -> 149.7 (A4 151.4);
@@ -67,7 +67,7 @@ void launch_sliced_k(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
         Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
 }
 
-// Above 16 tokens A16 has no measured 5070 Ti schedule; these are the upstream-shaped routes of
+// Above 16 tokens A16 has no measured 5070 Ti schedule; these are the routes of
 // Wallawalla47/ninfer-custom 1f2f5e97, which serve the DFlash2 drafter's NVFP4 gate/up (A16Only)
 // at batched widths: one sliced-K tile through 32 tokens, then 64-token Tensor Core tiles whose
 // m16 fragments pair 8 gate rows over their 8 up rows (Nvfp4SwiGluMmaRows). The target's gate/up

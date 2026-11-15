@@ -40,8 +40,8 @@ ExpertCachePolicy::ExpertCachePolicy(const PolicyConfig& config) : config_(confi
     if (c.rule == Rule::kF0KSinglePass && (c.admission || c.insert_cap != 0)) {
         throw std::invalid_argument("expert cache policy: kF0KSinglePass has no admission or cap");
     }
-    if (c.elastic_columns < 0 || c.elastic_gap < 0) {
-        throw std::invalid_argument("expert cache policy: elastic columns and gap must be >= 0");
+    if (c.elastic_columns < 0) {
+        throw std::invalid_argument("expert cache policy: elastic columns must be >= 0");
     }
     const std::int32_t P = c.partitions;
     if (!c.layer_slots.empty()) {
@@ -106,8 +106,7 @@ std::int32_t ExpertCachePolicy::pool_slot(std::int32_t partition, std::int32_t l
                                           std::int32_t local) const noexcept {
     const std::int32_t base = base_slots(partition, layer);
     if (local < base) { return base_offset(partition, layer) + local; }
-    return base_offset(partition, config_.layers) + config_.elastic_gap +
-           (local - base) * config_.layers + layer;
+    return base_offset(partition, config_.layers) + (local - base) * config_.layers + layer;
 }
 
 void ExpertCachePolicy::locate(std::int32_t partition, std::int32_t slot, std::int32_t& layer,
@@ -122,7 +121,7 @@ void ExpertCachePolicy::locate(std::int32_t partition, std::int32_t slot, std::i
         local = slot - offsets[layer];
         return;
     }
-    const std::int32_t e = slot - offsets[L] - config_.elastic_gap;
+    const std::int32_t e = slot - offsets[L];
     layer                = e % L;
     local                = base_slots(partition, layer) + e / L;
 }
@@ -357,8 +356,24 @@ void ExpertCachePolicy::decide(std::int32_t layer, std::span<const Routed> route
     for (const std::int32_t e : candidates_) {
         if (cap > 0 && inserted >= cap) { break; }
         if (config_.rule == Rule::kEngine && !admissible(e, true)) { continue; }
-        // T69: a lane whose base slots are blocked with no active column holds nothing.
+        // A lane whose base slots are blocked with no active column holds nothing.
         if (capacity(layer, partition_of(e)) == 0) { continue; }
+        if (config_.hysteresis_ratio > 0.0 && config_.rule == Rule::kEngine) {
+            const std::int32_t p = partition_of(e);
+            if (full(layer, p)) {
+                const std::int32_t local = victim_local(layer, p, /*scored=*/true);
+                const std::size_t i      = lane_base(layer, p) + static_cast<std::size_t>(local);
+                const double age =
+                    static_cast<double>(window_[static_cast<std::size_t>(layer)] - last_use_[i]);
+                const double recency = config_.evict_tau_windows > 0.0
+                                           ? std::exp2(-age / config_.evict_tau_windows)
+                                           : 1.0;
+                const double victim  = f[expert_of_[i]] * recency;
+                if (f[e] < config_.hysteresis_ratio * victim + config_.hysteresis_gain) {
+                    continue;
+                }
+            }
+        }
         out.inserts.push_back(insert(layer, e, /*scored=*/true));
         ++inserted;
     }
@@ -598,7 +613,7 @@ void ExpertCachePolicy::set_active_columns(std::int32_t columns, std::vector<Slo
             const std::int32_t cap = base_slots(p, layer) + columns;
             if (ln.used <= cap) { continue; }
             const std::size_t base = lane_base(layer, p);
-            // T69: a lane may have free slots below `used` and, while its base slots are blocked,
+            // A lane may have free slots below `used` and, while its base slots are blocked,
             // keeps only local slots [lo, cap).
             const std::int32_t lo = ln.blocked ? base_slots(p, layer) : 0;
             // Coldest first: the LRU order, stably re-ranked by decayed frequency with admission.

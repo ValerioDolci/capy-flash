@@ -14,10 +14,10 @@ ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
-# v07/p2p-overlap: the tp 2 eager transport decision table, host only (header-only, no CUDA).
+# The tp 2 eager transport decision table, host only (header-only, no CUDA).
 ninfer_add_test(ninfer_tp2_eager_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tp2_eager_transport.cpp")
 
-# v07/prefill-slices: the sliced tp 2 prefill's column-slice plan, host only (header-only, no CUDA).
+# The sliced tp 2 prefill's column-slice plan, host only (header-only, no CUDA).
 ninfer_add_test(ninfer_tp2_prefill_slices_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tp2_prefill_slices.cpp")

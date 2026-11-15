@@ -8,10 +8,7 @@ template <class G, int Tokens>
 struct K8V4KvGroupedInstance {
     static_assert(Tokens > 0 && Tokens * G::GroupSize <= 64);
     static constexpr int kRowTiles = (Tokens * G::GroupSize + 15) / 16;
-    using Schedule                 = K8V4KvGroupedMmaSchedule<Tokens,
-                                              kRowTiles == 4   ? 16
-                                                              : kRowTiles == 3 ? 12
-                                                                               : 8,
+    using Schedule                 = K8V4KvGroupedMmaSchedule<Tokens, kRowTiles == 3 ? 12 : 8,
                                               Tokens == 1 ? 32 : 64, Tokens == 1 ? 2 : 1>;
     using Merge                    = K8V4KvMergeSchedule;
 };

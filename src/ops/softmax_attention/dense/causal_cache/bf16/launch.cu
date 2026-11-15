@@ -46,24 +46,16 @@ void grouped_instance(const CausalAttentionOperands& p, Bf16KvCacheView<Writable
     }
 }
 
-void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvCausalPlan& plan,
-           cudaStream_t stream) {
+void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, cudaStream_t stream) {
     const auto invoke = [&]<class G>() {
-        if (plan.instance == Bf16KvInstance::Tiled128)
-            launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled128>::Schedule>(p, cache,
-                                                                                      stream);
-        else
-            launch_bf16_kv_tiled_mma<
-                G, typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(p, cache,
-                                                                                     stream);
+        launch_bf16_kv_tiled_mma<G,
+                                 typename Bf16KvInstanceTraits<Bf16KvInstance::Tiled64>::Schedule>(
+            p, cache, stream);
     };
     if (p.query_heads == 24)
         invoke.template operator()<CausalD256H24Kv4>();
     else if (p.query_heads == 12)
         invoke.template operator()<CausalD256H12Kv2>();
-    else if (p.query_heads == 16)
-        invoke.template operator()<CausalD256H16Kv2>();
     else
         throw std::invalid_argument("BF16 attention: unsupported head geometry");
 }
@@ -83,8 +75,6 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan, partial, stream);
     else if (p.query_heads == 12)
         grouped_instance<CausalD256H12Kv2>(p, view, input, plan, partial, stream);
-    else if (p.query_heads == 16)
-        grouped_instance<CausalD256H16Kv2>(p, view, input, plan, partial, stream);
     else
         throw std::invalid_argument("BF16 attention: unsupported head geometry");
 }
@@ -99,7 +89,7 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (!plan.grouped()) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-              bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), plan, stream);
+              bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), stream);
     } else {
         execute_grouped(q,
                         CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
@@ -117,7 +107,7 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     const auto view = single_row_paged_kv_batch_view(cache);
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-              bf16_kv_cache_view<false>(view), plan, stream);
+              bf16_kv_cache_view<false>(view), stream);
     } else {
         execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, plan,
                         workspace, out, stream);

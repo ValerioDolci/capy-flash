@@ -1,9 +1,9 @@
 #pragma once
 
 // The two-device [3072,5120] shard of the DFlash2 drafter's Q8 query|key|value projection
-// [6144,5120]: a rank's 16 query and 4 KV heads of D128. Its launchers are upstream's
+// [6144,5120]: a rank's 16 query and 4 KV heads of D128. Its launchers are the parent's
 // q8/q8_dflash2_attn_input.cu compiled with the shard's section output
-// (q8_dflash2_attn_input_shard.cu); the dispatch takes the parent's DFlash2 routes. Our file.
+// (q8_dflash2_attn_input_shard.cu); the dispatch takes the parent's DFlash2 routes.
 
 #include "core/tensor.h"
 #include "core/weight.h"

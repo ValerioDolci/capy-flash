@@ -21,7 +21,7 @@ ConstraintCompiler::~ConstraintCompiler() = default;
 
 text::GrammarCompiler& ConstraintCompiler::grammars() const {
     std::call_once(once_, [&] {
-        // Upstream 08902f73 Frontend::Impl::grammars(): the decoded bytes of every ordinary
+        // As ninfer's Frontend::Impl::grammars(): the decoded bytes of every ordinary
         // token; special and invalid IDs stay empty (forbidden), EOS is passed separately and is
         // licensed only where the language is complete. The tags <think>, </think>,
         // <tool_call>... are ordinary tokens in every Qwen3.8 artifact (special=false), so the

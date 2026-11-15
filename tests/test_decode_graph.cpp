@@ -140,8 +140,8 @@ int exercise_dual_device_capture() {
                        "failed dual-device capture left a stream capturing");
 
     // A memcpy whose source moves from the origin device to the peer keeps the topology but not
-    // the node's context: the driver refuses the update; since T132 the executable is
-    // re-instantiated, so the copy now reads the peer's word (0x99999999).
+    // the node's context: the driver refuses the update and the executable is re-instantiated,
+    // so the copy reads the peer's word (0x99999999).
     ninfer::DeviceArena origin_source(sizeof(std::uint32_t));
     ninfer::DecodeGraphDefinition from_origin;
     from_origin.capture(origin.stream, [&] {
@@ -162,7 +162,7 @@ int exercise_dual_device_capture() {
         std::cerr << "rejected memcpy update threw: " << error.what() << '\n';
         copy_recovered = false;
     }
-    failures += expect(copy_recovered, "a rejected memcpy update was not re-instantiated (T132)");
+    failures += expect(copy_recovered, "a rejected memcpy update was not re-instantiated");
     origin.bind_to_current_thread();
     copies.launch(origin.stream);
     origin.synchronize();
@@ -226,9 +226,9 @@ int main() {
         device.synchronize();
         failures += expect_value(storage.base(), 0x22222222U, "updated graph launch");
 
-        // A definition the executable cannot take in place (two nodes against one): since T132
-        // (145c0186) a rejected update re-instantiates the executable from the new definition
-        // instead of throwing, so the next launch runs the new work (last memset: 0x55).
+        // A definition the executable cannot take in place (two nodes against one): a rejected
+        // update re-instantiates the executable from the new definition instead of throwing, so
+        // the next launch runs the new work (last memset: 0x55).
         ninfer::DecodeGraphDefinition reshaped;
         reshaped.capture(device.stream, [&] {
             CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x44, sizeof(std::uint32_t), device.stream));
@@ -241,7 +241,7 @@ int main() {
             std::cerr << "rejected update threw: " << error.what() << '\n';
             recovered = false;
         }
-        failures += expect(recovered, "a rejected graph update was not re-instantiated (T132)");
+        failures += expect(recovered, "a rejected graph update was not re-instantiated");
         executable.launch(device.stream);
         device.synchronize();
         failures += expect_value(storage.base(), 0x55555555U,

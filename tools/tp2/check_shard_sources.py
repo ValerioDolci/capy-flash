@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""check_shard_sources.py [SRC_ROOT] — guards the shards compiled from upstream's own sources.
+"""check_shard_sources.py [SRC_ROOT] — guards the shards compiled from their parent Ops' sources.
 
-src/ops/*/tp2/*_{shard,half}_*.{cu,cpp} include an upstream launcher or plan source after a names
-header of #defines (docs/maintainer/upstream-merge.md §2.4). Two things would turn that into a
-silent bug after an upstream change, and this script fails on both:
+src/ops/*/tp2/*_{shard,half}_*.{cu,cpp} include a parent launcher or plan source after a names
+header of #defines (docs/maintainer/two-gpu-layer.md §2.4). Two things would turn that into a
+silent bug after a change to the parent source, and this script fails on both:
 
 1. A template, inline, constexpr, static or kernel definition OUTSIDE an anonymous namespace in an
-   included upstream source: it would be compiled with different bodies in the parent's and the
+   included parent source: it would be compiled with different bodies in the parent's and the
    shard's translation units under the same name, and the linker would keep only one.
 2. A renamed identifier appearing in a header that the prelude does not include first: that header
    would be processed with the renames in the shard's translation unit and differ from the parent's.
@@ -60,10 +60,10 @@ for dirpath, _, files in os.walk(src):
 
 for unit in sorted(units):
     incs = included(unit)
-    upstream = [resolve(i) for i in incs if re.search(r"\.(cu|cpp)$", i)]
+    parents = [resolve(i) for i in incs if re.search(r"\.(cu|cpp)$", i)]
     names_hdr = [resolve(i) for i in incs if i.endswith("_names.h")]
-    if not upstream or not names_hdr:
-        problems.append(f"{unit}: no upstream source or names header included")
+    if not parents or not names_hdr:
+        problems.append(f"{unit}: no parent source or names header included")
         continue
     renamed = set()
     for h in names_hdr:
@@ -84,8 +84,8 @@ for unit in sorted(units):
         if p:
             pre.add(p)
             transitive(p, pre)
-    for up in upstream:
-        lines = open(up, encoding="utf-8").read().split("\n")
+    for parent in parents:
+        lines = open(parent, encoding="utf-8").read().split("\n")
         anon = 0
         for n, line in enumerate(lines, 1):
             s = line.strip()
@@ -94,8 +94,8 @@ for unit in sorted(units):
             elif s == "} // namespace" and anon:
                 anon -= 1
             elif anon == 0 and re.match(r"^(template\s*<|inline\b|constexpr\b|static\b|__global__|__device__)", line):
-                problems.append(f"{up}:{n}: definition outside an anonymous namespace: {s[:90]}")
-        for hdr in sorted(transitive(up, set()) - pre):
+                problems.append(f"{parent}:{n}: definition outside an anonymous namespace: {s[:90]}")
+        for hdr in sorted(transitive(parent, set()) - pre):
             text = open(hdr, encoding="utf-8").read()
             text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)  # comments are not renamed
             text = re.sub(r"//[^\n]*", "", text)

@@ -1,6 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of the DFlash2 drafter (execution/draft.cpp). Our file.
+// Two-device (tp 2) forms of the DFlash2 drafter (execution/draft.cpp).
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -64,7 +64,7 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
 // features and appends rank 1's context.
 void dflash_append_context_peer(DFlashPeerDrafter& peer, const qwen3_5::DFlashDecodeIngress& host,
                                 std::int32_t batch, std::uint32_t draft_window,
-                                ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+                                ops::ContextKVMaterializeExecutionEnvelope envelope);
 
 // Rank 1's DFlash feature sinks of the split drafter: target verification scatters into its pending
 // features, and a prefill chunk into its prefill features, whose consumer appends rank 1's context

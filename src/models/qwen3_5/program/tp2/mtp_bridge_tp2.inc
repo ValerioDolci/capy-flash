@@ -1,7 +1,6 @@
 // Translation-unit fragment of src/models/qwen3_5/program/speculative/mtp.cpp, included once at
 // its end (after its closing namespace): the two-device (tp 2) MTP bridge, sharing mtp.cpp's
-// private helpers. mtp.cpp declares it in its anonymous namespace. Not a header. Our file; see
-// docs/maintainer/upstream-merge.md.
+// private helpers. mtp.cpp declares it in its anonymous namespace. Not a header.
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {

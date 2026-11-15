@@ -11,9 +11,8 @@ constexpr int kGroupedPrefillMaxWidth = 80;
 
 K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope) {
-    if ((heads != 24 && heads != 16) || width < 1 || batch < 1 || batch > 8 ||
-        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
-        envelope.min_visible_keys > envelope.max_visible_keys ||
+    if (heads != 24 || width < 1 || batch < 1 || batch > 8 || (batch > 1 && width > 16) ||
+        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("K8V4 attention: invalid plan inputs");
     constexpr int grouped_limit = K8V4KvCausalPlan::kTokenTile;
@@ -33,7 +32,7 @@ K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
     const int query_tile        = family == K8V4KvFamily::ParallelGrouped && width <= 16
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
-    const int independent_tiles = batch * (heads == 24 ? 4 : 2) * tiles;
+    const int independent_tiles = batch * 4 * tiles;
     // Decode permits two resident CTAs per SM. Spec uses one; add a wave when
     // rounding to complete query tiles would leave over 10% of the 170 SMs idle.
     constexpr int sms   = kCausalAttentionSmCount;
@@ -42,7 +41,7 @@ K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
     CausalKvPartition partition{
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.key_shift = width == 1 ? 7 : 8;
     partition.capacity  = partition.active(envelope.max_visible_keys);
     return {family, heads, width, batch, query_tile, envelope, partition};
 }

@@ -1,16 +1,14 @@
 #pragma once
 
 // The two-device output-row half [17408,5120] of the FP8 and NVFP4 [34816,5120] gate/up problem:
-// one device's block of the gate rows over its matching block of the up rows, out [8704,T]. Our
-// file.
+// one device's block of the gate rows over its matching block of the up rows, out [8704,T].
 //
-// The half runs upstream's own linear_swiglu launchers and plans, compiled a second time by the
+// The half runs the parent's own linear_swiglu launchers and plans, compiled a second time by the
 // *_linear_swiglu_half_*.cu/.cpp translation units of this directory with the problem geometry
 // and the entry points renamed (*_linear_swiglu_half_names.h). Both share K, so every route,
-// schedule and token cutoff is the parent's, by construction and after every upstream change.
-// Upstream's A8/A4 GEMM, TMA and decode launchers take the row count from the weight and serve the
-// half unchanged; the wrapper (src/ops/wrapper/linear_swiglu.cpp) sends the half to the dispatchers
-// below.
+// schedule and token cutoff is the parent's by construction. The parent's A8/A4 GEMM, TMA and
+// decode launchers take the row count from the weight and serve the half unchanged; the wrapper
+// (src/ops/wrapper/linear_swiglu.cpp) sends the half to the dispatchers below.
 
 #include "core/weight.h"
 #include "core/arena.h"

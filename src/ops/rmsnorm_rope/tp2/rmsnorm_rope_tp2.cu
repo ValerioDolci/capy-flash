@@ -1,13 +1,14 @@
-// Implements: include/ninfer/ops/tp2/rmsnorm_rope.h (rmsnorm_rope_head_block). Our file.
+// Implements: include/ninfer/ops/tp2/rmsnorm_rope.h (rmsnorm_rope_head_block).
 // Match: q BF16 [128,16,W,B], k BF16 [128,4,W,B], W=2..16, B=1..8.
-// Algorithm assumptions: upstream's per-head device code (rmsnorm_rope/d128.cuh) and coefficient
-// table (common/dflash_rope.cuh); only the head counts per token differ from the 32/8 kernel
-// (rmsnorm_rope/kernel.cuh): two Q CTAs of eight heads and one K CTA of four per token.
+// Algorithm assumptions: the 32/8 kernel's per-head device code (rmsnorm_rope/d128.cuh) and
+// coefficient table (common/dflash_rope.cuh); only the head counts per token differ from the 32/8
+// kernel (rmsnorm_rope/kernel.cuh): two Q CTAs of eight heads and one K CTA of four per token.
 #include "ninfer/ops/tp2/rmsnorm_rope.h"
 
 #include "core/device.h"
 #include "ops/common/dflash_rope.cuh"
 #include "ops/rmsnorm_rope/d128.cuh"
+#include "ops/common/validate.h"
 
 #include <cuda_bf16.h>
 
@@ -54,12 +55,6 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_head_block_kernel(
     data[base + lane + 32] = out.second;
 }
 
-bool overlaps(const Tensor& a, const Tensor& b) {
-    const auto a0 = reinterpret_cast<std::uintptr_t>(a.data);
-    const auto b0 = reinterpret_cast<std::uintptr_t>(b.data);
-    return a0 < b0 + b.bytes() && b0 < a0 + a.bytes();
-}
-
 void require(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t n1, std::int32_t n2,
              std::int32_t n3, const char* label) {
     if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != n2 || t.ne[3] != n3 ||
@@ -84,9 +79,10 @@ void rmsnorm_rope_head_block(const Tensor& positions, const Tensor& q_norm_weigh
     require(q_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, "q norm weight");
     require(k_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, "k norm weight");
     require(positions, DType::I32, width, batch, 1, 1, "positions");
-    if (overlaps(q, k) || overlaps(q, positions) || overlaps(k, positions) ||
-        overlaps(q, q_norm_weight) || overlaps(q, k_norm_weight) || overlaps(k, q_norm_weight) ||
-        overlaps(k, k_norm_weight)) {
+    if (detail::overlaps(q, k) || detail::overlaps(q, positions) ||
+        detail::overlaps(k, positions) || detail::overlaps(q, q_norm_weight) ||
+        detail::overlaps(q, k_norm_weight) || detail::overlaps(k, q_norm_weight) ||
+        detail::overlaps(k, k_norm_weight)) {
         throw std::invalid_argument("rmsnorm_rope_head_block: mutable tensors overlap");
     }
     const dim3 grid(static_cast<unsigned>(width * batch), kQueryCtas + 1);

@@ -1,6 +1,6 @@
 #pragma once
 
-// v0.7 q3-prefill: the A8 prefill route's activation scratch, taken from a caller workspace.
+// The A8 prefill route's activation scratch, taken from a caller workspace.
 
 #include "core/arena.h"
 #include "ops/linear/q3/q3_linear.h"
@@ -29,6 +29,7 @@ public:
         const DeviceSpan span = arena->alloc_bytes(bytes, 256);
         ws_                   = {span.data, bytes};
     }
+
     Q3ArenaWorkspace(const Q3ArenaWorkspace&)            = delete;
     Q3ArenaWorkspace& operator=(const Q3ArenaWorkspace&) = delete;
 

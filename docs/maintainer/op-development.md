@@ -167,10 +167,9 @@ direction is a core or host transfer.
 Two-device tensor parallelism adds entries beside a family's single-device Op; it does not add new
 mathematics.
 
-- `ninfer/ops/allreduce.h` owns the cross-device collectives: `allreduce_sum` (row-parallel
-  partial sums) and `allgather_rows` (a symmetric row gather that only the tests call; the Model
-  assembles vocabulary-split logits on rank 0 alone), ordered by `PeerEvents` on each device's own
-  stream. Captured single-request all-reduces may exchange through an attached
+- `ninfer/ops/allreduce.h` owns the cross-device collectives: `allreduce_sum` and
+  `allreduce_sum_f32` (row-parallel partial sums; the Model assembles vocabulary-split logits on
+  rank 0 alone), ordered by `PeerEvents` on each device's own stream. Captured single-request all-reduces may exchange through an attached
   `PeerMailbox` (`ninfer/ops/peer_mailbox.h`) with bit-identical results.
 - `<op>_column_parallel` splits the output rows: each rank reads the replicated activation and its
   weight-row shard and writes its own output block, with no communication.

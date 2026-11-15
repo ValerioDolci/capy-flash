@@ -5,37 +5,30 @@
 // descriptions, so the loader can describe the table without this file depending on it.
 //
 // The table never resides in RAM as a whole (FP8 320,001,536 x 160 = 47.7 GiB): every call reads
-// the hash rows of its columns either through a read-only file mapping (Mapped: rows come from
-// the page cache; misses are first prefetched together with MADV_WILLNEED so a window pays about
-// one storage latency instead of one per row) or with batched direct reads (Stream: O_DIRECT,
-// nothing enters the page cache). The decoded BF16 embedding `[embed_dim, count]` is written to a
-// caller buffer (pinned for one H2D upload per call).
+// the hash rows of its columns through a read-only file mapping (rows come from the page cache;
+// misses are first prefetched together with MADV_WILLNEED so a window pays about one storage
+// latency instead of one per row). The decoded BF16 embedding `[embed_dim, count]` is written to
+// a caller buffer (pinned for one H2D upload per call).
 //
-// For the FP8 table, Mapped keeps the BF16 row multipliers (the scale plane, 2 bytes per row =
-// 640 MB) in RAM, read once sequentially at construction (T171): otherwise every cold row costs
+// For the FP8 table, the gather keeps the BF16 row multipliers (the scale plane, 2 bytes per row =
+// 640 MB) in RAM, read once sequentially at construction: otherwise every cold row costs
 // two random page reads, its codes and its multiplier, and the storage's random-read rate bounds
-// the first prefill chunk. NINFER_QWEN4_PLE_RESIDENT_SCALES=0 reads the multipliers through the
-// mapping instead. An NVFP4 row carries its own scales (one 90-byte read per row), so nothing of
-// that table is resident.
+// the first prefill chunk. An NVFP4 row carries its own scales (one 90-byte read per row), so
+// nothing of that table is resident.
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <memory>
 #include <span>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 
-// One contiguous span of the table object. `data` addresses it in a read-only mapping (Mapped);
-// `file` and `file_offset` locate it for direct reads (Stream).
+// One contiguous span of the table object; `data` addresses it in a read-only mapping.
 struct PleTableSegment {
     std::uint64_t object_offset = 0;
     std::uint64_t bytes         = 0;
     const std::byte* data       = nullptr;
-    std::filesystem::path file;
-    std::uint64_t file_offset = 0;
 };
 
 enum class PleRowFormat : std::uint8_t {
@@ -79,23 +72,21 @@ struct PleHashConfig {
     }
 };
 
-enum class PleResidency : std::uint8_t { Mapped, Stream };
-
-class PleRowReader;
-
 class PleGather {
 public:
-    // `prefetch` (Mapped only) issues MADV_WILLNEED for every row page before decoding.
-    PleGather(PleTableView table, PleHashConfig hash, PleResidency residency, bool prefetch = true);
+    // `prefetch` issues MADV_WILLNEED for every row page before decoding.
+    PleGather(PleTableView table, PleHashConfig hash, bool prefetch = true);
     ~PleGather();
 
     PleGather(const PleGather&)            = delete;
     PleGather& operator=(const PleGather&) = delete;
 
-    [[nodiscard]] PleResidency residency() const noexcept { return residency_; }
-
     // Embedding width: heads * row_width.
     [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
+
+    // Bytes of the FP8 row multipliers kept in RAM: the plane, 2 when every row has the same
+    // multiplier, 0 when they are read through the mapping.
+    [[nodiscard]] std::size_t resident_scale_bytes() const noexcept { return scales_.size(); }
 
     // BF16 `[width, count]` embedding columns of `tokens[first, first + count)`. Tokens before
     // `first` (and EOS before the sequence start) form each n-gram context, and an EOS closes
@@ -104,7 +95,7 @@ public:
                 std::span<std::uint16_t> out);
 
     // Starts the page reads (MADV_WILLNEED) of the rows a later gather() of the same columns
-    // will decode, and returns (Mapped with prefetch only; otherwise nothing). A hint: the
+    // will decode, and returns (with prefetch only; otherwise nothing). A hint: the
     // gather's values never depend on it.
     void prefetch(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count);
 
@@ -125,7 +116,7 @@ private:
     }
     // Calls `piece(segment, within, bytes)` for each segment `[object_offset, +bytes)` touches, in
     // order. A row can straddle two segments: an artifact's part files end at payload boundaries
-    // that need not fall on a row boundary (T155: "PLE table row crosses a mapped segment").
+    // that need not fall on a row boundary.
     template <class Piece>
     void for_each_piece(std::uint64_t object_offset, std::uint64_t bytes, Piece&& piece) const;
     // Mapped bytes `[object_offset, +bytes)`: a pointer into the mapping, or `bounce` filled from
@@ -138,17 +129,17 @@ private:
 
     PleTableView table_;
     PleHashConfig hash_;
-    PleResidency residency_;
     bool prefetch_       = true;
     std::uint32_t width_ = 0;
     std::array<float, 256> e4m3_{};
     // NVFP4: BF16 value of (E4M3 scale code, E2M1 code) at [scale * 16 + code], global scale
     // applied: bf16_rn((e2m1 * e4m3) * global_scale).
     std::vector<std::uint16_t> nvfp4_values_;
-    std::unique_ptr<PleRowReader> reader_;
     std::vector<std::uint64_t> row_scratch_;
-    std::vector<std::byte>
-        scales_; // resident scale plane (Mapped); empty: read through the mapping
+    std::vector<std::byte> scales_; // resident scale plane; empty: read through the mapping
+    // Bytes between two rows' multipliers in scales_: 2, or 0 when it holds the one multiplier
+    // every row repeats.
+    std::uint64_t scale_stride_ = 2;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

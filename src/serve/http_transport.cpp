@@ -29,18 +29,18 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 
 } // namespace
 
-RequestJson parse_json_body(const httplib::Request& request) {
-    // Before the parser: the prompt path reads client JSON recursively (capy-flash).
-    check_request_json_nesting(request.body, {});
+RequestJson parse_json_body(const httplib::Request& request, const RequestLimits& limits) {
+    // Before the parser: the prompt path reads client JSON recursively.
+    check_request_json_nesting(request.body, {}, limits);
     RequestJson body;
     try {
         body = RequestJson::parse(request.body);
     } catch (const std::exception&) { bad_request("request body is not valid JSON"); }
-    // A body with an output-format schema is read a second time keeping the numeric spellings
-    // (Neroued/ninfer 81c8ce09): a bound such as 1e400 would otherwise reach the grammar compiler
-    // as a different number. Every other body is parsed once, exactly as before.
+    // A body with an output-format schema is read a second time keeping the numeric spellings: a
+    // bound such as 1e400 would otherwise reach the grammar compiler as a different number. Every
+    // other body is parsed once.
     if (has_output_format_schema(body)) {
-        validate_schema_number_input(text::parse_json_numbers(request.body));
+        validate_schema_number_input(text::parse_json_numbers(request.body), limits);
     }
     return body;
 }
@@ -111,8 +111,8 @@ bool SseTransport::poll(Clock::time_point now) {
 void configure_http_server_socket(socket_t socket) noexcept {
 #if defined(__linux__)
     const int enabled = 1;
-    // Issue #24: SO_REUSEADDR instead of httplib's default SO_REUSEPORT. SO_REUSEPORT let a second
-    // server bind the same port and silently share the connections with the first, and binds over
+    // SO_REUSEADDR instead of httplib's default SO_REUSEPORT. SO_REUSEPORT lets a second server
+    // bind the same port and silently share the connections with the first, and binds over
     // TIME-WAIT only when the sockets that left it had SO_REUSEPORT too. With SO_REUSEADDR a second
     // server is refused and a restart binds over the TIME-WAIT its predecessor left.
     set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);

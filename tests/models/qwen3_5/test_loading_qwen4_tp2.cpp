@@ -3,9 +3,9 @@
 //
 // Plan (host only, also the real 125B artifact with --plan-only): every parameter's parent carries
 // the placement an independent name table of this test expects (heads split, indexer / router /
-// HC / PLE replicated or stream-split with --hc-split, shared expert on rank block % 2, routed
-// experts host-mapped, the n-gram table file-mapped), every rank shard of a split parameter has
-// the per-rank shape the split Ops consume, and the per-rank device bytes are printed by class.
+// HC / PLE replicated, shared expert on rank block % 2, routed experts host-mapped, the n-gram
+// table file-mapped), every rank shard of a split parameter has the per-rank shape the split Ops
+// consume, and the per-rank device bytes are printed by class.
 // Materialize (two CUDA devices): every device parent is byte-identical to the slices of the
 // artifact parent the host applies itself (reader bytes + PlaneCopy list), the host-mapped expert
 // banks are one copy both ranks address, and each rank's views have the narrowed logical shapes.
@@ -85,9 +85,9 @@ std::uint32_t block_index(const std::string& name, std::uint32_t layers) {
 }
 
 // The placement this test expects for one Qwen4Exp logical parameter (independent of
-// load/sharding.cpp: a table over the names T30 documents).
+// load/sharding.cpp: its own table over the parameter names).
 std::optional<Expectation> expected_placement(const std::string& name, std::uint32_t layers,
-                                              bool split, bool embedding_host) {
+                                              bool embedding_host) {
     if (contains(name, "/moe/experts/")) {
         return Expectation{ShardAxis::HostMapped, 0, "experts"};
     }
@@ -103,11 +103,7 @@ std::optional<Expectation> expected_placement(const std::string& name, std::uint
     if (name == "text/output_head") { return Expectation{ShardAxis::Rows, 0, "output head"}; }
     const bool hc = contains(name, "attn_hc/") || contains(name, "ffn_hc/") ||
                     contains(name, "hc_head/") || name == "mtp/hidden_norm";
-    if (hc) {
-        if (!split) { return Expectation{ShardAxis::Replicated, 0, "hc"}; }
-        const bool columns = ends_with(name, "/down") || ends_with(name, "/inject");
-        return Expectation{columns ? ShardAxis::Columns : ShardAxis::Rows, 0, "hc"};
-    }
+    if (hc) { return Expectation{ShardAxis::Replicated, 0, "hc"}; }
     if (name.rfind("mtp/", 0) == 0 && !contains(name, "/layers/")) {
         return Expectation{ShardAxis::Replicated, 0, "mtp stem"};
     }
@@ -133,13 +129,7 @@ std::optional<Expectation> expected_placement(const std::string& name, std::uint
         return Expectation{ShardAxis::SingleDevice, static_cast<int>(block_index(name, layers) % 2),
                            "shared expert"};
     }
-    if (contains(name, "/ple/")) {
-        if (!split || ends_with(name, "/key") || ends_with(name, "/value")) {
-            return Expectation{ShardAxis::Replicated, 0, "ple"};
-        }
-        return Expectation{ends_with(name, "/convolution") ? ShardAxis::Columns : ShardAxis::Rows,
-                           0, "ple"};
-    }
+    if (contains(name, "/ple/")) { return Expectation{ShardAxis::Replicated, 0, "ple"}; }
     throw std::runtime_error(name + ": the test has no expectation for this parameter");
 }
 
@@ -182,8 +172,7 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
         const auto& reference = plan.parameter(qwen::WeightId{index});
         const auto& name      = reference.name;
         if (reference.residency != artifact::Residency::Device) { continue; }
-        const auto expect =
-            expected_placement(name, layers, options.hc_split_streams, options.embedding_host);
+        const auto expect = expected_placement(name, layers, options.embedding_host);
         if (!expect) { continue; }
         for (const auto& part : reference.binding.parts) {
             const auto object = part.object.index;
@@ -228,8 +217,7 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
             shapes[name] = rank_shape(name, reference.shape, expect->axis);
         }
     }
-    std::printf("%s: tp 2%s%s, %zu parameters\n", path.filename().c_str(),
-                options.hc_split_streams ? ", HC split by streams" : ", HC replicated",
+    std::printf("%s: tp 2, HC replicated%s, %zu parameters\n", path.filename().c_str(),
                 options.embedding_host ? ", embedding host-mapped" : "", plan.parameter_count());
     for (const auto& [kind, bytes] : totals.by_kind) {
         std::printf("  %-14s rank0 %13llu B  rank1 %13llu B\n", kind.c_str(),
@@ -367,15 +355,12 @@ int main(int argc, char** argv) {
                 path = argv[++i];
             } else if (arg == "--mtp") {
                 options.speculative = SpeculativeBackend::Mtp;
-            } else if (arg == "--hc-split") {
-                options.hc_split_streams = true;
             } else if (arg == "--embedding-host") {
                 options.embedding_host = true;
             } else if (arg == "--plan-only") {
                 plan_only = true;
             } else {
-                std::cerr << "usage: --artifact PATH [--mtp] [--hc-split] [--embedding-host] "
-                             "[--plan-only]\n";
+                std::cerr << "usage: --artifact PATH [--mtp] [--embedding-host] [--plan-only]\n";
                 return 2;
             }
         }

@@ -18,12 +18,14 @@ launcher command. The launchers ship in the release tarball (`tools/release/` in
 profile, the model id and the chat template, and append any extra flag you give them, which then wins over
 the profile:
 
-| `install.sh --model` | artifact repository | launcher | profile | GPUs | free RAM checked by install.sh |
-|---|---|---|---|---|---|
-| `flash-next` (default) | `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` | `serve-flash-next.sh` | `flash-next` | 2 | 70 GiB |
-| `flash-next-64gb` | `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` | `serve-flash-next.sh` (install.sh adds `--host-kv-mib 1024 --host-state-slots 2`); `NINFER_DEVICES=0` for one GPU | `flash-next`; one GPU: `flash-next-1gpu` | 1 or 2 | 56 GiB |
-| `27b` | `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` | `serve-tp2.sh` | `27b` | 2 | 8 GiB |
-| `27b-16gb` | `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` | `serve-27b-16gb.sh` | `27b-16gb` | 1 | 8 GiB |
+| `install.sh --model` | artifact repository | launcher | profile | GPUs |
+|---|---|---|---|---|
+| `flash-next` (default) | `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` | `serve-flash-next.sh` | `flash-next` | 2 |
+| `flash-next-64gb` | `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` | `serve-flash-next.sh` (install.sh adds `--host-kv-mib 1024 --host-state-slots 2`); `NINFER_DEVICES=0` for one GPU | `flash-next`; one GPU: `flash-next-1gpu` | 1 or 2 |
+| `27b` | `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` | `serve-tp2.sh` | `27b` | 2 |
+| `27b-16gb` | `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` | `serve-27b-16gb.sh` | `27b-16gb` | 1 |
+
+RAM, disk and download size of each model: [Pick a model](../README.md#pick-a-model).
 
 Launcher environment (defaults in brackets): `NINFER_HOST` (`127.0.0.1`), `NINFER_PORT` (`8080`),
 `NINFER_MAX_CONTEXT` (the profile's), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b` for the 27B),
@@ -69,7 +71,7 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   host weights plus max(2 GiB, 5 % of MemTotal) and otherwise refuses to start with the numbers (`NINFER_RAM_GUARD=0`
   skips the check); the Host tiers below are checked after that, with the experts already pinned. With
   `--profile flash-next` on a 96 GB machine the two checks add up to about 75 GiB free at startup; `install.sh` fails
-  below 70 GiB in total and warns below 70 GiB free (56 GiB for the 64 GB edition). The 27B needs no RAM beyond its
+  below 75 GiB in total and warns below 75 GiB free (56 GiB for the 64 GB edition). The 27B needs no RAM beyond its
   context cache.
 - **CMA memory (Ubuntu 26.04, Linux 7.0).** The kernel may hold part of the RAM as CMA (`CmaTotal` / `CmaFree` in
   `/proc/meminfo`; the kexec-handover scratch takes about 9 GiB on a 64 GiB machine). Free CMA counts in MemAvailable
@@ -218,30 +220,12 @@ Environment variables (production settings, A/B switches, dumps): [docs/capy-fla
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 
-**Upstream NInfer example (one RTX 5090).** The command below comes from upstream NInfer and targets a single large
-board: the 27B NVFP4 artifact does not fit one 16 GB board, and `fp8` KV is rejected at `--tp 2`. On 16 GB boards
-use the [launchers and profiles](#launchers-and-profiles) above.
+Start the server with a launcher or a `--profile` ([Launchers and profiles](#launchers-and-profiles)); this section
+explains the options they set.
 
-```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --max-context 240000 \
-  --kv-capacity 240000 \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
-  --preserve-thinking
-```
-
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
-240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
-when running alone, and two requests run concurrently when their complete reservations fit.
-In capy-flash a request's Device KV reservation is a lease: its prompt plus a window of up to
+`--max-context` is each request's logical ceiling. `--kv-capacity` sizes the shared Main Text KV pool that serves
+admitted requests; a request may use the full capacity when running alone, and requests run concurrently when their
+complete reservations fit. A request's Device KV reservation is a lease: its prompt plus a window of up to
 4,096 output tokens (or the prefill chunk, if larger), extended at a decode-round boundary as the
 answer grows, up to the request's own `max_tokens`. A client that asks for 64k output tokens and
 uses 300 therefore no longer keeps 64k tokens of KV away from retained conversations. When the pool
@@ -259,12 +243,7 @@ The Host tiers are pinned RAM that the kernel cannot page out. The server refuse
 `--host-kv-mib` plus the Host state slots would leave less than max(4 GiB, 5 % of RAM) available,
 and says how many MiB fit (`NINFER_HOST_TIER_RAM_GUARD=0` skips the check).
 
-With `C=2` and two extra Device checkpoint slots, the process owns two active StateImage guarantees
-plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
-pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
-
-Other artifacts use the same command shape with their own path. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
+Qwen3.8-27B artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
 `--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
 `--vision`.
@@ -312,6 +291,9 @@ systemd, or llama-swap, which reloads the model on the next request — instead 
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
+
+An unexpected server failure is HTTP 500 with error type `server_error` on the OpenAI endpoints
+(Chat Completions, Responses, models) and `api_error` on the Anthropic endpoints.
 
 All three generation SSE endpoints emit the standard `: keep-alive` comment after five seconds
 without a protocol event. The comment is transport-only: SSE clients ignore it, and it does not
@@ -1291,8 +1273,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--spec mtp\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
-| `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144). `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
-| `--rope-original-max-position N` | the native window YaRN scales from, used only when `--rope-yarn-factor` > 1 | `262144` |
+| `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144) and rotates as Hugging Face's `rope_type: "yarn"` does (the same inverse frequencies, cos and sin multiplied by 0.1 ln F + 1). It covers every text RoPE on every GPU: attention at one and two GPUs, text after an image (MRoPE), the Flash-Next QSA indexer and the MTP layer; the Vision tower and the DFlash2 drafter keep their RoPE. `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental: its quality past the native window is not measured. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
+| `--rope-original-max-position N` | the native window YaRN scales from (Hugging Face `original_max_position_embeddings`), used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
@@ -1470,7 +1452,7 @@ then. When the Host KV tier has no room for a conversation, idle conversations a
 dropped, least valuable first; one that still does not fit stays on the GPUs. The flash-next default
 of 4 GiB holds about two idle conversations of 80k tokens (22.5 KB of KV per token over both
 GPUs, Main and MTP); each GiB is pinned and comes out of the page cache the CPU experts' PLE rows
-are read from (measured on the T71 agentic replay: 4 GiB cost +0.8 GB of disk reads and +0.6 s of
+are read from (measured on the agentic replay of `bench/capy_flash`: 4 GiB cost +0.8 GB of disk reads and +0.6 s of
 PLE gathers over 53 turns, against about 5 s of decode saved; 8 GiB added the same again with no
 further gain). Without them, every
 checkpoint lives in a Device StateImage, and the defaults raise the Device checkpoint pool
@@ -1611,8 +1593,7 @@ carry it. It lets a measurement separate benchmark, smoke and gate traffic from 
 sharing one log; the label never affects generation. The header carries one value of 1 to 64
 characters from `A-Z a-z 0-9 . _ : / @ + -`; a repeated or malformed header is rejected before
 preparation with HTTP 400 `invalid_client_label` (param `X-Ninfer-Client`). The repository's own
-clients send `<kind>/<tool>` labels: `gate/tp2` (`tools/tp2/gate_client.py`),
-`bench/serve-corpus`, `bench/serve-concurrency`, `bench/serve-ttft`, `bench/agentic-ab`,
+clients send `<kind>/<tool>` labels: `gate/tp2` (`tools/tp2/gate_client.py`), `bench/agentic-ab`,
 `smoke/serve-contract` and `smoke/thinking-preservation`. With `--cors` the header is listed in
 `Access-Control-Allow-Headers`.
 

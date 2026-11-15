@@ -1,6 +1,6 @@
 #pragma once
 
-// Disk tier of the context cache (capy-flash v0.7.2, opt-in with --disk-cache-dir).
+// Disk tier of the context cache (opt-in with --disk-cache-dir).
 //
 // Content-addressed storage (format 2), after LMCache / SGLang HiCache:
 //   DIR/.lock            exclusive flock for the life of the server (one directory = one server)
@@ -112,11 +112,11 @@ struct DiskKVSectionInfo {
 // order the producer submits them (a manifest's BlobRefs section is written by the cache).
 struct DiskKVRecordSpec {
     DiskKVRecordKind kind = DiskKVRecordKind::Manifest;
-    DiskKVBlobId blob;                    // Blob: its id
-    std::uint64_t session = 0;            // the save it belongs to (DiskKVCache::begin_session)
-    std::vector<std::int32_t> tokens;     // Manifest: the conversation; Blob: free use
+    DiskKVBlobId blob;                // Blob: its id
+    std::uint64_t session = 0;        // the save it belongs to (DiskKVCache::begin_session)
+    std::vector<std::int32_t> tokens; // Manifest: the conversation; Blob: free use
     std::vector<DiskKVCheckpoint> checkpoints;
-    std::vector<DiskKVBlobId> blob_refs;  // Manifest: every blob it uses
+    std::vector<DiskKVBlobId> blob_refs; // Manifest: every blob it uses
     std::vector<DiskKVSectionInfo> sections;
     std::array<std::uint64_t, kDiskKVMetaWords> meta{};
 };
@@ -140,30 +140,30 @@ struct DiskKVRecordHeader {
 };
 
 struct DiskKVCacheStats {
-    std::uint64_t records          = 0; // manifests with this key
-    std::uint64_t foreign_records  = 0; // manifests with another key: ignored, evictable
-    std::uint64_t blobs            = 0;
-    std::uint64_t orphan_blobs     = 0; // no reference (interrupted save)
-    std::uint64_t bytes            = 0; // every manifest and blob
-    std::uint64_t blob_bytes       = 0;
-    std::uint64_t capacity_bytes   = 0;
-    std::uint64_t min_free_bytes   = 0; // free-space margin of the file system
-    std::uint64_t fs_free_bytes    = 0; // at the last check
-    std::uint64_t removed_broken   = 0; // at start and on read
-    std::uint64_t removed_temp     = 0; // temporaries of dead processes at start
-    std::uint64_t removed_orphans  = 0; // at start
-    std::uint64_t evicted          = 0; // manifests, LRU under the cap or the margin
-    std::uint64_t evicted_blobs    = 0;
-    std::uint64_t superseded       = 0; // earlier saves of the same conversation
-    std::uint64_t written          = 0; // records (manifests and blobs)
-    std::uint64_t written_bytes    = 0;
-    std::uint64_t written_blobs    = 0;
-    std::uint64_t reused_blobs     = 0; // already on disk when a save asked for them
-    std::uint64_t aborted          = 0;
-    std::uint64_t write_failures   = 0;
-    std::uint64_t space_refusals   = 0; // a record skipped for lack of cap or free space
-    std::uint64_t hits             = 0;
-    std::uint64_t read_failures    = 0;
+    std::uint64_t records         = 0; // manifests with this key
+    std::uint64_t foreign_records = 0; // manifests with another key: ignored, evictable
+    std::uint64_t blobs           = 0;
+    std::uint64_t orphan_blobs    = 0; // no reference (interrupted save)
+    std::uint64_t bytes           = 0; // every manifest and blob
+    std::uint64_t blob_bytes      = 0;
+    std::uint64_t capacity_bytes  = 0;
+    std::uint64_t min_free_bytes  = 0; // free-space margin of the file system
+    std::uint64_t fs_free_bytes   = 0; // at the last check
+    std::uint64_t removed_broken  = 0; // at start and on read
+    std::uint64_t removed_temp    = 0; // temporaries of dead processes at start
+    std::uint64_t removed_orphans = 0; // at start
+    std::uint64_t evicted         = 0; // manifests, LRU under the cap or the margin
+    std::uint64_t evicted_blobs   = 0;
+    std::uint64_t superseded      = 0; // earlier saves of the same conversation
+    std::uint64_t written         = 0; // records (manifests and blobs)
+    std::uint64_t written_bytes   = 0;
+    std::uint64_t written_blobs   = 0;
+    std::uint64_t reused_blobs    = 0; // already on disk when a save asked for them
+    std::uint64_t aborted         = 0;
+    std::uint64_t write_failures  = 0;
+    std::uint64_t space_refusals  = 0; // a record skipped for lack of cap or free space
+    std::uint64_t hits            = 0;
+    std::uint64_t read_failures   = 0;
 };
 
 class DiskKVCache;
@@ -187,7 +187,9 @@ public:
     DiskKVRecordFile& operator=(const DiskKVRecordFile&) = delete;
 
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
     [[nodiscard]] const DiskKVRecordHeader& header() const noexcept { return header_; }
+
     // Index of the first section of `kind`, or sections.size().
     [[nodiscard]] std::uint32_t section_of(DiskKVSectionKind kind) const noexcept;
 
@@ -197,21 +199,11 @@ public:
     bool read_prefix(std::uint32_t section, std::uint64_t bytes, std::span<std::byte> chunk,
                      const std::function<void(std::span<const std::byte>, std::uint64_t)>& sink);
 
-    // The same, pipelined: a thread reads chunk k+1 (O_DIRECT when the file system allows it)
-    // into the other buffer while the caller consumes chunk k. Per chunk: `issue(data, offset)`
-    // starts the consumer's work, the blocks are verified on the calling thread meanwhile, then
-    // `wait()` must finish every use of `data`. Both buffers are the same multiple of
-    // kDiskKVBlockBytes and 4 KiB aligned.
-    bool read_prefix_pipelined(
-        std::uint32_t section, std::uint64_t bytes, std::span<std::byte> first,
-        std::span<std::byte> second,
-        const std::function<void(std::span<const std::byte>, std::uint64_t)>& issue,
-        const std::function<void()>& wait);
-
     // Reads sections [first_section, end) whole and contiguous (from the first one's offset)
     // into `into` (4 KiB aligned), verifying them. Returns the region's start offset in the file,
     // or nullopt (I/O error, checksum mismatch, region larger than `into`).
-    std::optional<std::uint64_t> read_region(std::uint32_t first_section, std::span<std::byte> into);
+    std::optional<std::uint64_t> read_region(std::uint32_t first_section,
+                                             std::span<std::byte> into);
 
 private:
     friend class DiskKVCache;
@@ -224,7 +216,8 @@ class DiskKVCache {
 public:
     // Whether another process holds `directory`'s lock: its PID (or "unknown") if so. Lets a
     // server fail before loading its weights (DiskKVCache takes the lock itself later).
-    [[nodiscard]] static std::optional<std::string> directory_holder(const std::filesystem::path& directory);
+    [[nodiscard]] static std::optional<std::string>
+    directory_holder(const std::filesystem::path& directory);
 
     struct Options {
         std::filesystem::path directory;
@@ -257,8 +250,7 @@ public:
 
         // Waits for a free staging buffer while `abort` returns false; nullopt when it returned
         // true or the cache is stopping.
-        [[nodiscard]] std::optional<DiskKVBuffer>
-        acquire(const std::function<bool()>& abort = {});
+        [[nodiscard]] std::optional<DiskKVBuffer> acquire(const std::function<bool()>& abort = {});
         // Appends `bytes` of `buffer` to the record (sections are contiguous in submission
         // order, the padding between sections is written by the cache).
         void submit(DiskKVBuffer buffer, std::size_t bytes);
@@ -270,6 +262,7 @@ public:
         void abort() noexcept;
 
         [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
+
         [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return expected_; }
 
     private:
@@ -294,7 +287,9 @@ public:
     DiskKVCache& operator=(const DiskKVCache&) = delete;
 
     [[nodiscard]] const Options& options() const noexcept { return options_; }
+
     [[nodiscard]] DiskKVCacheStats stats() const;
+
     [[nodiscard]] std::uint64_t key_hash() const noexcept { return key_hash_; }
 
     // Size of the file a spec makes (header + aligned sections).
@@ -321,7 +316,7 @@ public:
                                             std::uint32_t max_frontier);
     // The frontier find() would try first: the longest F <= max_frontier whose digest matches
     // prompt[0, F), from the in-memory index alone (no file opened, last use untouched); 0 when
-    // none. Admission compares it with the in-memory matches (issue #6).
+    // none. Admission compares it with the in-memory matches.
     [[nodiscard]] std::uint32_t longest_indexed_frontier(std::span<const std::int32_t> prompt,
                                                          std::uint32_t max_frontier);
 
@@ -348,6 +343,7 @@ private:
         std::vector<DiskKVCheckpoint> checkpoints;
         std::vector<DiskKVBlobId> refs;
     };
+
     struct Blob {
         std::uint64_t bytes      = 0;
         std::uint32_t refs       = 0;
@@ -361,7 +357,7 @@ private:
     // Caller holds mutex_. Frees room for `bytes` more under the cap and the free-space margin.
     bool make_room(std::uint64_t bytes);
     void remove_manifest(std::vector<Entry>::iterator it); // caller holds mutex_
-    void release_blob(DiskKVBlobId id);                     // caller holds mutex_
+    void release_blob(DiskKVBlobId id);                    // caller holds mutex_
     [[nodiscard]] std::uint64_t free_bytes() const;
     void finish_job(Job& job);
     void abort_job(Job& job) noexcept;
@@ -396,11 +392,12 @@ private:
         DiskKVBuffer buffer;
         std::size_t bytes = 0;
     };
+
     std::deque<Item> queue_;
     std::vector<std::unique_ptr<Job>> jobs_;
-    std::uint64_t in_flight_ = 0;
-    bool stopping_           = false;
-    std::uint64_t next_id_   = 0;
+    std::uint64_t in_flight_    = 0;
+    bool stopping_              = false;
+    std::uint64_t next_id_      = 0;
     std::uint64_t next_session_ = 0;
     std::thread thread_;
 };

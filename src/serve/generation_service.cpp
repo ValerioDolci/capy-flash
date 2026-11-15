@@ -1,5 +1,3 @@
-#include "ops/kernel/yarn.h"
-#include "ops/launcher/rope.h"
 #include "serve/generation_service.h"
 #include "serve/prompt_overlap.h"
 #include "serve/turn_anchors.h"
@@ -10,7 +8,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cstdlib>
 #include <cstdio>
 #include <iterator>
 #include <mutex>
@@ -48,7 +45,7 @@ struct RequestLifetime {
 namespace {
 // The grammar vendor prefixes its errors with a timestamp and the server's source path
 // ("[21:04:30] /home/.../regex_converter.cc:85: Regex parsing error..."): clients get the message
-// without them (capy-flash, second audit N6).
+// without them.
 std::string client_message(std::string_view text) {
     std::string result;
     result.reserve(text.size());
@@ -86,8 +83,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
     error.param   = "messages";
     error.message = client_message(exception.what());
     switch (exception.kind()) {
-    // Structured output (Neroued/ninfer 08902f73, eb6696ae, 8ffa3131, 2734a56e). The param is the
-    // wire field of the constraint; JSON Schema errors append their JSON Pointer to it.
+    // Structured output. The param is the wire field of the constraint; JSON Schema errors append
+    // their JSON Pointer to it.
     case ninfer::RequestErrorKind::UnsupportedOutputCombination:
         error.status = 400;
         error.code   = "unsupported_output_combination";
@@ -117,8 +114,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception,
             : exception.kind() == ninfer::RequestErrorKind::InvalidRegex  ? "invalid_regex"
                                                                           : "constraint_dead_end";
         break;
-    // capy-flash limits (OutputConstraintLimits): an input or compilation over a limit, or a
-    // generating request whose matcher exceeded its time budget (only that request fails).
+    // OutputConstraintLimits: an input or compilation over a limit, or a generating request whose
+    // matcher exceeded its time budget (only that request fails).
     case ninfer::RequestErrorKind::ConstraintLimitExceeded:
         error.status = 400;
         error.code   = "constraint_limit_exceeded";
@@ -387,44 +384,31 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         engine_options.routed_experts.stream_min_tokens     = *options_.stream_min_tokens;
         engine_options.routed_experts.stream_min_tokens_set = true;
     }
-    engine_options.rope_yarn_factor         = options_.rope_yarn_factor;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.vision_device            = options_.vision_device;
-    engine_options.max_vision_tokens        = options_.max_vision_tokens;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
-    engine_options.tp_mailbox               = options_.tp_mailbox;
-    engine_options.embedding_host           = options_.embedding_host;
-    engine_options.host_pinned_max_bytes    = options_.host_pinned_max_bytes;
-    engine_options.speculative              = options_.speculative;
-    engine_options.context_cache            = options_.context_cache;
-    engine_options.context_cost.preset_path = options_.context_cost_presets;
-    engine_options.media_cache_bytes        = options_.media_cache_bytes;
-    engine_options.media_live_bytes         = options_.media_live_bytes;
-    engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.constraint_limits        = options_.constraint_limits;
-    engine_options.startup_observer         = std::move(startup_observer);
+    engine_options.rope_yarn_factor           = options_.rope_yarn_factor;
+    engine_options.rope_original_max_position = options_.rope_original_max_position;
+    engine_options.enable_vision              = options_.enable_vision;
+    engine_options.vision_device              = options_.vision_device;
+    engine_options.max_vision_tokens          = options_.max_vision_tokens;
+    engine_options.use_cuda_graph             = options_.use_cuda_graph;
+    engine_options.tp_mailbox                 = options_.tp_mailbox;
+    engine_options.embedding_host             = options_.embedding_host;
+    engine_options.host_pinned_max_bytes      = options_.host_pinned_max_bytes;
+    engine_options.speculative                = options_.speculative;
+    engine_options.context_cache              = options_.context_cache;
+    engine_options.context_cost.preset_path   = options_.context_cost_presets;
+    engine_options.media_cache_bytes          = options_.media_cache_bytes;
+    engine_options.media_live_bytes           = options_.media_live_bytes;
+    engine_options.media_preprocess_threads   = options_.media_preprocess_threads;
+    engine_options.constraint_limits          = options_.constraint_limits;
+    engine_options.startup_observer           = std::move(startup_observer);
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
-    // YaRN tables go in BEFORE the first forward pass: the rope kernel reads the __constant__
-    // table at launch, so installing after construction is correct and factor 1 never calls this.
-    if (options_.rope_yarn_factor > 1.0F) {
-        ninfer::rope::YarnParams yarn;
-        yarn.factor                = options_.rope_yarn_factor;
-        yarn.original_max_position = static_cast<int>(options_.rope_original_max_position);
-        // rotary_dim 64 and rope_theta 1e7 are this family's geometry: the 27B and Flash-Next both
-        // declare partial_rotary_factor 0.25 on head_dim 256, i.e. 32 frequency pairs.
-        const auto freqs = ninfer::rope::yarn_inv_freq(yarn, yarn.rotary_dim);
-        ninfer::ops::detail::rope_install_text_inv_frequency(freqs.data(),
-                                                             static_cast<int>(freqs.size()));
-        ninfer::ops::detail::rope_install_text_attention_scale(
-            ninfer::rope::yarn_attention_scale(yarn));
-    }
     turn_anchors_ =
         resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
     if (options_.reasoning_close_retry) {
         reasoning_guard_tokens_ = engine_->reasoning_guard_tokens();
     }
-    // On by default since v0.7: a model whose stop configuration the guard cannot handle (no or
-    // more than two terminal ids, no thinking opener) serves without it instead of not starting.
+    // On by default: a model whose stop configuration the guard cannot handle (no or more than two
+    // terminal ids, no thinking opener) serves without it instead of not starting.
     try {
         engine_->configure_reasoning_eos_guard(options_.reasoning_eos_guard);
     } catch (const std::invalid_argument& error) {
@@ -792,11 +776,10 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
-    // Deterministic expert publication (NINFER_QWEN4_FILL_PUBLISH_LAG >= 1): greedy, because with
-    // sampling the drafts accepted, hence the decode rounds run, vary from start to start, and the
-    // Qwen4 expert cache learns its first residency from them.
-    if (const char* lag = std::getenv("NINFER_QWEN4_FILL_PUBLISH_LAG");
-        lag != nullptr && std::atoi(lag) > 0) {
+    // Deterministic expert publication: greedy, because with sampling the drafts accepted, hence
+    // the decode rounds run, vary from start to start, and the Qwen4 expert cache learns its first
+    // residency from them.
+    if (engine_->memory_summary().routed_expert_publish_lag >= 1) {
         request.sampling.temperature = 0.0;
     }
     PreparedRequest prepared =

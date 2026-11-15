@@ -4,10 +4,6 @@
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,9 +13,72 @@
 namespace ninfer::serve {
 namespace {
 
-std::string sse_error_event(const ApiError& error) {
-    return "data: " + make_error_body(error) + "\n\n";
-}
+class ChatEndpoint final : public GenerationEndpoint {
+public:
+    explicit ChatEndpoint(const OpenAIChatRequest& request)
+        : model_(request.model), include_usage_(request.include_usage),
+          timings_(request.timings_per_token), progress_(request.return_progress) {}
+
+    void identify(const PreparedRequest&) override {
+        identity_ = make_openai_chat_response_identity(model_);
+    }
+
+    void render(const PreparedRequest&, const GenerationOutcome& outcome) override {
+        body_ = make_chat_completion_response(identity_, outcome);
+    }
+
+    std::string body() override { return std::move(body_); }
+
+    void open_stream(const PreparedRequest&) override {
+        encoder_.emplace(identity_, include_usage_, timings_, progress_);
+    }
+
+    void write_start(SseTransport& transport) override {
+        render_and_write(transport, [&] { return encoder_->start(); });
+    }
+
+    void attach(StreamSink& output, SseTransport& transport) override {
+        output.on_start = [this, &transport](const ninfer::GenerationStart& start) {
+            encoder_->note_start(start);
+            if (progress_) {
+                render_and_write(transport, [&] { return encoder_->initial_prompt_progress(); });
+            }
+        };
+        if (progress_) {
+            output.on_progress = [this, &transport](const ninfer::PromptProgress& progress) {
+                render_and_write(transport, [&] { return encoder_->prompt_progress(progress); });
+            };
+        }
+        if (timings_) {
+            output.on_timing = [this](const ninfer::GenerationTimingObservation& timing) {
+                encoder_->note_timing(timing);
+            };
+        }
+        output.on_content = [this, &transport](const std::string& text) {
+            render_and_write(transport, [&] { return encoder_->content_delta(text); });
+        };
+        output.on_reasoning = [this, &transport](const std::string& text) {
+            render_and_write(transport, [&] { return encoder_->reasoning_delta(text); });
+        };
+    }
+
+    std::vector<std::string> finish(const GenerationOutcome& outcome) override {
+        return encoder_->finish(outcome);
+    }
+
+    void write_stream_error(SseTransport& transport, const ApiError& error) override {
+        render_and_write(transport, [&] { return "data: " + make_error_body(error) + "\n\n"; });
+    }
+
+private:
+    std::string model_;
+    bool include_usage_;
+    bool timings_;
+    bool progress_;
+    OpenAIChatResponseIdentity identity_;
+    std::string body_;
+    std::optional<OpenAIChatStream> encoder_;
+};
 
 } // namespace
 
@@ -27,9 +86,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     OpenAIChatRequest request;
     std::optional<std::string> client;
     try {
-        RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(parse_json_body(req), limits);
+        request =
+            parse_chat_completion_request(parse_json_body(req, request_limits_), request_limits_);
         validate_openai_model(request.model, public_model_id_);
         client = parse_client_label(req);
     } catch (const ApiException& exception) {
@@ -37,219 +95,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .client                 = std::move(client),
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
-    PreparedRequest prepared;
-    try {
-        const ninfer::GenerationObservationOptions observation{
-            .phase_timings   = true,
-            .live_timings    = request.stream && request.timings_per_token,
-            .prompt_progress = request.stream && request.return_progress,
-        };
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     observation, [&req] { return client_disconnected(req); });
-    } catch (const ApiException& exception) {
-        record_request_rejected(make_request_rejection_log_context(
-            req_id, "openai_chat_completions", request.generation, metadata, exception.error()));
-        write_openai_error(res, exception.error());
-        return;
-    } catch (const std::exception& exception) {
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        record_request_rejected(make_request_rejection_log_context(
-            req_id, "openai_chat_completions", request.generation, metadata, error));
-        write_openai_error(res, error);
-        return;
-    }
-
-    const OpenAIChatResponseIdentity identity = make_openai_chat_response_identity(request.model);
-    auto lifecycle                            = begin_request(make_request_log_context(
-        req_id, "openai_chat_completions", request.generation, metadata, prepared));
-
-    if (!request.stream) {
-        GenerationOutcome outcome;
-        try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
-        } catch (const ApiException& exception) {
-            lifecycle->failure(make_generation_request_failure(exception.error()));
-            write_openai_error(res, exception.error());
-            return;
-        } catch (const std::exception& exception) {
-            const RequestFailure failure =
-                make_internal_request_failure(RequestFailurePhase::Generation, exception.what());
-            lifecycle->failure(failure);
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
-            return;
-        }
-        lifecycle->done(outcome);
-        try {
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
-                                   prepared.lifetime);
-        } catch (const std::exception& exception) {
-            lifecycle->response_failure(make_internal_request_failure(
-                RequestFailurePhase::ResponseRender, exception.what()));
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = exception.what();
-            write_openai_error(res, error);
-        }
-        return;
-    }
-
-    try {
-        const bool return_progress   = request.return_progress;
-        const bool timings_per_token = request.timings_per_token;
-        auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
-                                                          timings_per_token, return_progress);
-
-        prepare_sse_response(res);
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, stream, encoder, lifecycle, return_progress,
-             timings_per_token](std::size_t, httplib::DataSink& sink) -> bool {
-                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
-                    sink.done();
-                    return true;
-                }
-                SseTransport transport(sink, stream->cancelled);
-                const auto send_error = [&](const ApiError& error) {
-                    try {
-                        render_and_write(transport, [&] { return sse_error_event(error); });
-                        sink.done();
-                        return true;
-                    } catch (const ClientDisconnected&) {
-                        lifecycle->response_failure(
-                            make_client_disconnected_failure(RequestFailurePhase::Transport));
-                        return false;
-                    } catch (const ResponseRenderFailure& exception) {
-                        lifecycle->response_failure(make_internal_request_failure(
-                            RequestFailurePhase::ResponseRender, exception.what()));
-                        return false;
-                    }
-                };
-                try {
-                    render_and_write(transport, [&] { return encoder->start(); });
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-
-                GenerationOutcome outcome;
-                try {
-                    StreamSink output;
-                    output.on_start = [&](const ninfer::GenerationStart& start) {
-                        encoder->note_start(start);
-                        if (return_progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->initial_prompt_progress(); });
-                        }
-                    };
-                    if (return_progress) {
-                        output.on_progress = [&](const ninfer::PromptProgress& progress) {
-                            render_and_write(transport,
-                                             [&] { return encoder->prompt_progress(progress); });
-                        };
-                    }
-                    if (timings_per_token) {
-                        output.on_timing = [&](const ninfer::GenerationTimingObservation& timing) {
-                            encoder->note_timing(timing);
-                        };
-                    }
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
-                    };
-                    output.on_reasoning = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
-                    };
-                    output.is_cancelled = [&] { return transport.poll(); };
-
-                    outcome = service_->run(stream->prepared, &output);
-                } catch (const ClientDisconnected&) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                } catch (const ResponseRenderFailure& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                } catch (const ApiException& exception) {
-                    lifecycle->failure(make_generation_request_failure(exception.error()));
-                    return send_error(exception.error());
-                } catch (const std::exception& exception) {
-                    lifecycle->failure(make_internal_request_failure(
-                        RequestFailurePhase::Generation, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-
-                lifecycle->done(outcome);
-                std::vector<std::string> terminal;
-                try {
-                    terminal = encoder->finish(outcome);
-                } catch (const std::exception& exception) {
-                    lifecycle->response_failure(make_internal_request_failure(
-                        RequestFailurePhase::ResponseRender, exception.what()));
-                    ApiError error;
-                    error.status  = 500;
-                    error.type    = "internal_error";
-                    error.message = exception.what();
-                    return send_error(error);
-                }
-                try {
-                    transport.write(terminal);
-                    sink.done();
-                    return true;
-                } catch (const ClientDisconnected&) {
-                    lifecycle->response_failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                    return false;
-                }
-            },
-            [stream, lifecycle](bool successful) {
-                stream->cancelled.store(true, std::memory_order_release);
-                if (!successful || !stream->started.load(std::memory_order_acquire)) {
-                    lifecycle->failure(
-                        make_client_disconnected_failure(RequestFailurePhase::Transport));
-                }
-            });
-    } catch (const std::exception& exception) {
-        lifecycle->failure(
-            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
-        ApiError error;
-        error.status  = 500;
-        error.type    = "internal_error";
-        error.message = exception.what();
-        write_openai_error(res, error);
-    }
+    const ninfer::GenerationObservationOptions observation{
+        .phase_timings   = true,
+        .live_timings    = request.stream && request.timings_per_token,
+        .prompt_progress = request.stream && request.return_progress,
+    };
+    serve_generation(req, res, std::make_shared<ChatEndpoint>(request), "openai_chat_completions",
+                     request.generation, metadata, observation);
 }
 
 } // namespace ninfer::serve

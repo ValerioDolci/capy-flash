@@ -182,6 +182,23 @@ int main() {
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");
 
+    // An unexpected exception is one 500 per protocol: server_error for OpenAI, api_error for
+    // Anthropic.
+    const ninfer::serve::ApiError internal = ninfer::serve::internal_error("boom");
+    httplib::Response internal_openai;
+    ninfer::serve::write_openai_error(internal_openai, internal);
+    const Json internal_openai_body = Json::parse(internal_openai.body);
+    failures += check(internal_openai.status == 500 &&
+                          internal_openai_body.at("error").at("type") == "server_error" &&
+                          internal_openai_body.at("error").at("message") == "boom",
+                      "OpenAI 500 did not use type server_error");
+    httplib::Response internal_anthropic;
+    ninfer::serve::write_anthropic_error(internal_anthropic, internal, "req_internal");
+    const Json internal_anthropic_body = Json::parse(internal_anthropic.body);
+    failures += check(internal_anthropic.status == 500 &&
+                          internal_anthropic_body.at("error").at("type") == "api_error",
+                      "Anthropic 500 did not use type api_error");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

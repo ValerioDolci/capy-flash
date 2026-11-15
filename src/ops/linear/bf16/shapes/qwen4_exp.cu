@@ -18,8 +18,8 @@ using TmaR48T128K64S2 = Bf16A16TmaMmaSchedule<48, 128, 64, 48, 32, 2, 1, Bf16Mma
 using TmaR64T128K64S2 = Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2, 1, Bf16MmaRaster::RowFast>;
 } // namespace
 
-// [320|324, 10240] and the stream-split [320|324, 5120]: few rows over a wide K. K-sliced warps
-// fill the GPU until T ~ 512; beyond, 48-row tiles (7 of them for 324 rows instead of 6 x 64).
+// [320|324, 10240]: few rows over a wide K. K-sliced warps fill the GPU until T ~ 512; beyond,
+// 48-row tiles (7 of them for 324 rows instead of 6 x 64).
 Bf16Launch select_bf16_qwen4_hc_down(std::int32_t tokens) {
     if (tokens <= 8) return launch_bf16_generic;
     if (tokens <= 64) return launch_bf16_sliced_k_mma<SlicedR16T32W8>;
@@ -28,7 +28,7 @@ Bf16Launch select_bf16_qwen4_hc_down(std::int32_t tokens) {
     return launch_bf16_tma_mma<TmaR48T128K64S2>;
 }
 
-// [10240, 320] and [5120, 320]: K = 320 is five 64-wide stages. The generic tiled kernel is
+// [10240, 320]: K = 320 is five 64-wide stages. The generic tiled kernel is
 // still faster for 17 <= T <= 64.
 Bf16Launch select_bf16_qwen4_hc_up(std::int32_t tokens) {
     if (tokens <= 8 || (tokens > 16 && tokens <= 64)) return launch_bf16_generic;

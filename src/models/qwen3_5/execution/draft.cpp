@@ -91,7 +91,7 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
 template <class Context>
 void append_context_impl(Context& state, const Tensor& features, const Tensor& positions,
                          const Tensor& commit_counts, const Tensor& lanes,
-                         ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+                         ops::ContextKVMaterializeExecutionEnvelope envelope) {
     {
         const auto& target         = state.execution.parameters.model.config().text;
         const auto& config         = *state.execution.parameters.model.config().draft;
@@ -117,7 +117,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const int local_offset =
             replace_local_window ? width - dimension(config.sliding_window) : 0;
         const int local_width = replace_local_window ? dimension(config.sliding_window) : width;
-        const ops::KVCacheAppendPrefixExecutionEnvelope local_envelope{
+        const ops::ContextKVMaterializeExecutionEnvelope local_envelope{
             replace_local_window ? static_cast<std::uint32_t>(dimension(config.sliding_window))
                                  : envelope.min_count,
             replace_local_window ? static_cast<std::uint32_t>(dimension(config.sliding_window))
@@ -407,9 +407,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         // The draft phase's own collectives stay on the staged copies while the pinned-host mailbox
         // carries the target forward below: this phase interleaves cross-device copies with its
-        // layer sums, and under WSL2 such a copy stalls behind the peer's spinning exchange kernel
-        // (issue #1). A full DFlash2 round hung the mailbox; see
-        // ProgramImpl::degrade_peer_mailbox().
+        // layer sums, and under WSL2 such a copy stalls behind the peer's spinning exchange kernel.
+        // A full DFlash2 round hung the mailbox; see ProgramImpl::degrade_peer_mailbox().
         std::optional<ops::PeerEvents::StagedScope> staged_draft;
         if (tp != nullptr && tp->staged_draft_collectives) { staged_draft.emplace(*tp->events); }
         if (tp != nullptr && tp->dflash != nullptr) {
@@ -489,13 +488,13 @@ DFlashFeatureSink dflash_feature_sink(PrefillContext& state,
 void dflash_append_context(DFlashAppendContext& state, const Tensor& features,
                            const Tensor& positions, const Tensor& commit_counts,
                            const Tensor& lanes,
-                           ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+                           ops::ContextKVMaterializeExecutionEnvelope envelope) {
     append_context_impl(state, features, positions, commit_counts, lanes, envelope);
 }
 
 void dflash_append_context(PrefillContext& state, const Tensor& features, const Tensor& positions,
                            const Tensor& commit_counts, const Tensor& lanes,
-                           ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+                           ops::ContextKVMaterializeExecutionEnvelope envelope) {
     append_context_impl(state, features, positions, commit_counts, lanes, envelope);
 }
 

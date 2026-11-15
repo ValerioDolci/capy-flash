@@ -13,7 +13,7 @@
 
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "ops/hyper_connection/launch.h" // T56: the prefill-width forms against the scalar kernels
+#include "ops/hyper_connection/launch.h" // the prefill-width forms against the scalar kernels
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -268,7 +268,7 @@ int combine_expand_case(std::int32_t tokens, std::uint32_t seed) {
     return failures;
 }
 
-// T56: the prefill-width (>= 64 columns) vectorized collapse and combine give the bits of the
+// The prefill-width (>= 64 columns) vectorized collapse and combine give the bits of the
 // scalar kernels (which run below 64 columns): the whole call against the same data in slices
 // of 7 columns.
 int wide_exact_case(std::int32_t tokens, std::uint32_t seed) {

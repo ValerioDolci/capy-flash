@@ -6,7 +6,7 @@
 #   docker run --gpus all -p 8080:8080 -v ~/capy-flash/models:/models capy-flash \
 #     /models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --host 0.0.0.0
 #
-# Flash-Next needs about 70 GiB of free host RAM (page-locked experts); the container gets it unless you limit it.
+# Flash-Next needs about 75 GiB of free host RAM (page-locked experts); the container gets it unless you limit it.
 # The Dockerfile at the repository root builds the same server from source instead.
 FROM docker.io/library/ubuntu:26.04
 

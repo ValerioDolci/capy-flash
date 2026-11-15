@@ -19,19 +19,19 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.12.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.13.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
 
 **16 GB of VRAM per GPU is the minimum.** RAM matters for Flash-Next only.
 
-| what you want to run | GPUs (RTX 50 series, sm_120) | RAM | `install.sh` |
-|---|---|---|---|
-| Qwen3.8-27B, 3-bit | **one** with 16 GB of VRAM (the minimum) | nothing special | `--model 27b-16gb` |
-| Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | `--model 27b` |
-| Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | `--model flash-next-64gb` |
-| Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | (default) |
+| what you want to run | GPUs (RTX 50 series, sm_120) | RAM | download / free disk | `install.sh` |
+|---|---|---|---|---|
+| Qwen3.8-27B, 3-bit | **one** with 16 GB of VRAM (the minimum) | nothing special | 12.5 GB / 15 GB | `--model 27b-16gb` |
+| Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | 17.4 GB / 20 GB | `--model 27b` |
+| Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | 108.9 GB / 118 GB | `--model flash-next-64gb` |
+| Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | 126.6 GB / 135 GB | (default) |
 
 - **One GPU, little RAM:** the 3-bit 27B. It costs quality: GSM8K on par with the NVFP4 27B, MMLU-Pro about 0.72
   against 0.78 ([benchmarks](#benchmarks)).
@@ -52,8 +52,9 @@ users report other setups. Not affiliated with Qwen or NVIDIA.
   64 GB edition), and `--profile flash-next` also keeps the token embedding and up to 4 GiB of idle conversations in
   RAM. The server checks this at startup and refuses with the numbers when it does not fit (`NINFER_RAM_GUARD=0`
   starts anyway). On Windows/WSL2, which limit page-locked memory to about half the RAM, the layers that do not fit
-  stay in pageable RAM (same tokens, slower).
-- Disk: about 135 GB (Flash-Next NVFP4), 110 GB (64 GB edition), 20 GB (27B NVFP4), 15 GB (27B 3-bit).
+  stay in pageable RAM (same tokens, slower). With the 64 GB edition on a 64 GB machine that also runs a desktop,
+  `NINFER_QWEN4_EXCLUSIVE_LAYERS=20` keeps no RAM copy of the experts the GPUs already hold in the first 20 layers
+  (7.7 GiB less on two GPUs; the tokens change, and decode is about 2-3 % slower).
 
 ## Quick start
 
@@ -85,10 +86,10 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 ## Connect a client
 
-The server listens on `http://127.0.0.1:8080` (`NINFER_HOST` / `NINFER_PORT` change it): OpenAI Chat Completions and
-Responses under `/v1`, Anthropic Messages at `/v1/messages`. `--api-key KEY` makes it require
-`Authorization: Bearer KEY` or `x-api-key: KEY`; `--api-key-file FILE` or the `NINFER_API_KEY` environment variable
-set the key without putting it on the command line.
+The server listens on `http://127.0.0.1:8080` (`--host` / `--port`; with the launchers, `NINFER_HOST` / `NINFER_PORT`):
+OpenAI Chat Completions and Responses under `/v1`, Anthropic Messages at `/v1/messages`. `--api-key KEY` makes it
+require `Authorization: Bearer KEY` or `x-api-key: KEY`; `--api-key-file FILE` or the `NINFER_API_KEY` environment
+variable set the key without putting it on the command line.
 
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` (any model name is accepted on Messages).
 - **Codex CLI:** a custom provider with base URL `http://127.0.0.1:8080/v1`, the `responses` wire API and the server's
@@ -113,6 +114,25 @@ Schemas and grammars come from the client, so they are bounded: size, nesting an
 compilation timeout, and a time and memory budget while generating (`--constraint-*` flags). A request over a limit
 fails alone with a 400 that names the flag; the other requests keep their speed. Fields, errors, limits and cost:
 [docs/serving.md](docs/serving.md#structured-output).
+
+## The capy-flash app (alpha)
+
+[`app/`](app) is a local window for the engine, **in alpha**: it can change from one release to the next and has been
+used on few machines. On Linux with suitable GPUs it checks the machine as `install.sh` does, downloads and verifies
+the release and a model that fits, starts and stops the engine with the release's launchers, tunes the settings that
+leave the answers unchanged, and chats with it (streaming, reasoning, speed of every answer). On a Mac, or anywhere
+the engine cannot run, it is a chat window for a capy-flash (or other OpenAI-compatible) server elsewhere. Python 3.9+,
+standard library only.
+
+```bash
+git clone https://github.com/ValerioDolci/capy-flash && cd capy-flash
+app/launch/capy-app             # opens the window
+app/launch/capy-app --install   # adds an icon (macOS: ~/Applications, Linux: the applications menu)
+```
+
+It is not in the release tarball yet; network access from other machines, unloading when idle and starting at login
+are not there yet. Problems: [open an issue](https://github.com/ValerioDolci/capy-flash/issues) with what the app
+showed and its engine log. Everything else: [app/README.md](app/README.md).
 
 ## Run it other ways
 
@@ -149,6 +169,11 @@ goes to expert slots. Same tokens; within a few per cent of the default speed
 `--max-concurrency N --kv-capacity T` (T tokens for all of them together; the RAM follows what they use). Prompts are
 prefilled one at a time: a request waits at most `--pending-timeout-ms` (default 10 minutes) for the others.
 
+Past the native 262,144 tokens, `--rope-yarn-factor F` (1 to 4) raises the accepted `--max-context` to 262,144 × F
+and applies YaRN as Hugging Face does (`rope_type: "yarn"`) to every text RoPE on every GPU, the Flash-Next QSA
+indexer and MTP layer included. Off by default; experimental: it costs perplexity, and its quality past the native
+window is not measured ([docs/serving.md](docs/serving.md)).
+
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
 [Dockerfile](Dockerfile) compiles from source instead). It needs the NVIDIA Container Toolkit:
@@ -165,15 +190,17 @@ without extra limits).
 Ready to serve on Hugging Face (`install.sh --model` downloads one of these; each has its `SHA256SUMS`):
 - [`Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash)
   (126.6 GB, the default; NVIDIA Open Model License together with the Qwen Community License of Qwen3.8-Flash-Next).
-  Or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself in one command, same result:
+  Or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself in one command:
   `python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir>`. It runs `python -m tools.convert --recipe
   qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 --components text,mtp` (experts NVFP4 as published, indexer BF16, GDN Q8,
-  about 5 minutes on a GPU, 118 GB) and `tools/qwen4_draft_shortlist.py`. The previous text artifact, with NVIDIA's
-  MTP head, stays available as revision `v0.5.4` (`hf download ... --revision v0.5.4`).
+  about 5 minutes on a GPU, about 127 GB) and `tools/qwen4_draft_shortlist.py`. The conversion keeps NVIDIA's MTP
+  head; the published artifact has one retrained on this engine's output, which gives the same greedy output with more
+  drafts accepted, so a faster decode. The previous text artifact, with NVIDIA's MTP head, stays available as revision
+  `v0.5.4` (`hf download ... --revision v0.5.4`).
 - [`Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)
   (the same plus the Q8 vision tower; download by hand, serve with `--vision`; or `convert.py ... --vision`).
 - [`Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash)
-  (102 GB, the 64 GB edition: ISTA-DASLab's GSQ-RCO experts, the rest as above).
+  (108.9 GB, the 64 GB edition: ISTA-DASLab's GSQ-RCO experts, the rest as above).
 - [`Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash) (12.5 GB,
   ISTA-DASLab's 3-bit GSQ 27B plus the official MTP layer; recipe `qwen3_8_27b_gsq3`).
 - [`Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer`](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer)
@@ -187,12 +214,10 @@ How the engine runs these models, every server flag, the RAM tiers, the chat tem
 
 Three environment variables make prefill faster at the price of a small change in the numbers: two for Flash-Next,
 one for the 27B on long prompts. All three are **off by default**. Set them in the server's environment, e.g.
-`NINFER_ATTN_PV_F16ACC=1 ninfer-serve ...`. A fourth one, lossless, is on by default since v0.11.1 on pairs without
-P2P (`NINFER_TP_XIN_KERNEL=0` turns it off).
+`NINFER_ATTN_PV_F16ACC=1 ninfer-serve ...`.
 
 | Variable | Applies to | What it changes | Prefill gain (2x RTX 5070 Ti, fresh prompts) | Loss, our measurements |
 |---|---|---|---|---|
-| `NINFER_TP_XIN_KERNEL` (on by default without P2P since v0.11.1) | tp 2 without P2P | nothing in the numbers: the exchange between the GPUs is received by a kernel instead of queueing on the copy engine | 0 to +3 % on our setup; +6-7 % with `--kv-ram-active` | none, same tokens |
 | `NINFER_TP_AR_PAYLOAD=int8` | Flash-Next (no effect on the 27B) | the prefill exchange between the GPUs carries int8 codes with an FP16 scale per 32 rows instead of FP16 | +7-8 % | perplexity −0.22 % (NVFP4), −0.26 % (GSQ-RCO): within noise |
 | `NINFER_Q8_A8=128` (or `32`) | Flash-Next | the dense Q8 projections of the prefill run with int8 activations on the int8 tensor cores | +7-8 % | perplexity +0.21 % (NVFP4), +0.004 % (GSQ-RCO): within noise |
 | `NINFER_ATTN_PV_F16ACC=1` | the 27B (Flash-Next unchanged) | the INT8-KV prefill attention sums P x V of each 64-key tile in FP16 before adding it to the FP32 accumulator (GeForce Blackwell runs FP16 accumulation at twice the rate) | +6 % at 16k, +18 % at 64k, +25 % at 128k | perplexity +1.1 % on the full 64k corpus (p 0.29, all of it from one English domain); GSM8K (1,319) 0.9629 vs 0.9666 (p 0.23); MMLU-Pro (504) 0.8095 = 0.8095; long-context retrieval at 64k and 126k unchanged |
@@ -323,171 +348,25 @@ Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). `ctest -j4` is s
 large for one 16 GB board skip with the sizes. For the 27B, `tools/tp2/gate.sh` is the reference run: it sets the
 artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then checks golden ids, perplexity and
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
+The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
 
-**v0.12.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.12.0))
-- Opt-in faster 27B prefill on long prompts: `NINFER_ATTN_PV_F16ACC=1` accumulates the INT8-KV prefill attention's
-  P x V in FP16 per 64-key tile ([PR #72](https://github.com/ValerioDolci/capy-flash/pull/72) by @Mici81): +18 % at 64k,
-  +25 % at 128k; loss in [Optional speed switches](#optional-speed-switches-off-by-default).
-- Opt-in repeatable Flash-Next runs: `NINFER_QWEN4_FILL_PUBLISH_LAG=1` publishes expert copies at points fixed by the
-  call sequence instead of when the copy happens to finish, so greedy texts repeat across starts even with slowed
-  copies ([PR #75](https://github.com/ValerioDolci/capy-flash/pull/75) by @Mici81). A testing aid: decode is a few
-  percent slower.
-- Fixed: a Chat Completions history whose tool-call arguments are not a JSON object (truncated by another backend)
-  is a 400 that names the tool call, not a 500; a client cancel on `/v1/messages` is logged as a disconnect, not as
-  an internal error.
-- Default: same tokens as v0.11.2 (27B gate and Flash-Next perplexity and frozen greedy identical).
+**v0.13.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.0))
+- A cleanup release: at every default and profile the same tokens at the same speed as v0.12.0, with about 42,000
+  fewer lines outside the new app (superseded A/B switches, code no route reached, duplicated helpers). 44
+  diagnostic environment switches whose default was already served are gone; the list is in the release notes.
+- `--rope-yarn-factor` now applies YaRN to every text RoPE path on every GPU, Flash-Next's QSA indexer and MTP layer
+  included, as Hugging Face does; before, only the 27B on one GPU got it.
+- Opt-in `NINFER_QWEN4_EXCLUSIVE_LAYERS=N` for the 64 GB edition next to a desktop on 64 GB of RAM
+  ([PR #77](https://github.com/ValerioDolci/capy-flash/pull/77) by @Mici81); `--help` grouped by topic
+  ([PR #76](https://github.com/ValerioDolci/capy-flash/pull/76) by @fantasyz).
+- Corrected requirements: Flash-Next NVFP4 needs ~75 GiB of free RAM, the 64 GB edition 118 GB of disk.
+- Internal server errors of the OpenAI-compatible routes always carry `"type": "server_error"`.
+- **The capy-flash app, in alpha** ([app/](app)): installs, starts, tunes and chats with the engine on Linux; a chat
+  window for a remote server on a Mac.
 
-**v0.11.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.2))
-- Shorter time to first token on short and medium Flash-Next prompts. 64 GB edition on one GPU: prompt chunks of
-  256-2,047 tokens leave part of each layer's missing experts to the CPU while the GPU copies the others (625 tokens:
-  1.65 -> 0.82 s; `NINFER_GGUF_HYBRID=0` restores v0.11.1). Two GPUs: the 64 GB edition copies its missing experts from
-  600 tokens (was 256; 355 tokens: 0.84 -> 0.66 s). NVFP4 on one GPU: fixed the CPU share of a new prompt (1,151 tokens:
-  5.6 -> 2.0 s). Two GPUs give the same tokens as v0.11.1; long prompts and decode speed are unchanged.
-
-**v0.11.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.1))
-- The lossless receive of the tp-2 exchange by kernel ([PR #66](https://github.com/ValerioDolci/capy-flash/pull/66)) is on
-  by default on pairs without P2P; `NINFER_TP_XIN_KERNEL=0` restores the copy engine. Same tokens as v0.11.0.
-
-**v0.11.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.11.0))
-- Faster prefill, same bits at the default: Flash-Next +13 % at 30k-100k (QSA attention at two CTAs per SM, fused
-  hyper-connection Up, wider GDN tiles), 27B +2-5 % prefill and −1 % per decode round. Eleven PRs by @Mici81.
-- Opt-in: `NINFER_TP_XIN_KERNEL=1` (same bits, tp-2 exchange without P2P off the copy engine),
-  `NINFER_TP_AR_PAYLOAD=int8` and `NINFER_Q8_A8=128` (Flash-Next, change numerics): all three together +28 % on
-  Flash-Next prefill, GSM8K and MMLU-Pro at the level of v0.10.0. See
-  [Optional speed switches](#optional-speed-switches-off-by-default).
-- Fixed: tool-call arguments that quote the tool-call markup no longer fall back to text
-  ([#59](https://github.com/ValerioDolci/capy-flash/issues/59)).
-
-**v0.10.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.10.0))
-- Structured output ([#17](https://github.com/ValerioDolci/capy-flash/issues/17)): JSON mode, JSON Schema, GBNF
-  grammars, regex and choice lists on Chat Completions (`response_format`, `structured_outputs`), Responses
-  (`text.format`) and Anthropic Messages (`output_config.format`), streaming included, with MTP and next to other
-  requests. Objects are strict by default as in vLLM (`--constraint-json-strict off` for literal JSON Schema); every
-  client input is bounded (`--constraint-*`). Cost on the 27B: +0.3 % per round. See
-  [docs/serving.md](docs/serving.md#structured-output). Unconstrained requests are served as in v0.9.0.
-- `--pending-timeout-ms` defaults to 10 minutes (was 30 s): queued requests behind long prompts are no longer refused.
-- Fixed: a request body nested very deeply (for example a tool schema) crashed the server; beyond
-  `--max-request-json-depth` (default 1000) it now gets a 400.
-- Grouped MoE metadata in one scan ([PR #52](https://github.com/ValerioDolci/capy-flash/pull/52) by @lupodevelop).
-
-**v0.9.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.9.0))
-- Opt-in, nothing changed at the default (greedy output identical to v0.8.2).
-- `--kv-ram-active` (Flash-Next) now serves several requests at once, with or without `--elastic`; its RAM grows
-  with the conversations and is given back when they end; the MTP layer's KV is in RAM too; beyond 262k tokens the
-  VRAM region no longer grows. Three coding agents at once: 171 s with it against 274 s with the KV in VRAM
-  (`--max-concurrency 3 --draft-tokens 1`) and 180 s one at a time, first token after 1.8 s instead of 8.1 s.
-- `--decode-share F`: the requests already decoding keep a share of the time while a new prompt runs.
-- Fixed: `--elastic` with a `--kv-capacity` above `--max-context` could run out of device memory; a failed elastic
-  growth no longer leaves unzeroed memory mapped, and host-memory copies work inside CUDA Graph capture
-  ([PR #49](https://github.com/ValerioDolci/capy-flash/pull/49), [PR #50](https://github.com/ValerioDolci/capy-flash/pull/50)
-  by @lupodevelop).
-
-**v0.8.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.2))
-- Two opt-in community contributions, nothing changed at the default (greedy output identical to v0.8.1).
-- Long context with YaRN: `--rope-yarn-factor F` (1-4) raises the accepted `--max-context` to native × F,
-  up to 1,048,576 tokens on Flash-Next (`--kv-dtype nvfp4` on two 16 GB cards). Experimental; 4× costs
-  perplexity. @splickz's work, ported and measured by @Hazelhof
-  ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)).
-- A portable benchmark, `bench/capy_flash/ladder.py`: one command, a fixed prefill/decode ladder with the
-  machine and the server's P2P state recorded, so rows compare across setups
-  ([#30](https://github.com/ValerioDolci/capy-flash/issues/30), by @Zeppe79).
-
-**v0.8.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.1))
-- Fixes and hardening, same tokens and speed as v0.8.0. Recommended for everyone.
-- Flash-Next no longer hangs at «loading weights» on kernels that keep part of the RAM as CMA (Ubuntu 26.04):
-  the page-locked experts stay outside it and the rest goes to pageable RAM
-  ([#40](https://github.com/ValerioDolci/capy-flash/issues/40)). Two GPUs that advertise peer access but cannot
-  map it (a VM with a 256 MiB BAR1) now start with `p2p off` instead of aborting
-  ([#41](https://github.com/ValerioDolci/capy-flash/issues/41)).
-- `--host-pinned-max-gib` is validated and always enforced, and `install.sh` stops on a failed checksum
-  ([PR #44](https://github.com/ValerioDolci/capy-flash/pull/44), [PR #45](https://github.com/ValerioDolci/capy-flash/pull/45),
-  [PR #46](https://github.com/ValerioDolci/capy-flash/pull/46) by @lupodevelop).
-- Security: on a loopback address the server refuses cross-site and DNS-rebinding requests from web pages (`--cors`
-  turns that off); the disk tier is private to the server's user; the API key is compared in constant time; response
-  IDs are no longer predictable.
-
-**v0.8.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0))
-- Before updating: Qwen3.5 MoE (Qwen3.6-35B-A3B) and DFlash v1 (`--spec dflash`) are no longer supported; stay on
-  v0.7.7 for them. Qwen3.8-27B (the dense Qwen3.5 architecture) and DFlash2 are not affected. As after every update,
-  conversations saved by the disk tier start cold; the request log is schema 28.
-- Tool calls the model gets almost right (undeclared or catalog-spelled names, missing closing tags, prose after the
-  calls) come back as calls instead of plain text ([PR #35](https://github.com/ValerioDolci/capy-flash/pull/35),
-  [PR #39](https://github.com/ValerioDolci/capy-flash/pull/39) by @omni326); correct output is unchanged.
-- `--kv-ram-active` for Flash-Next: the KV cache in RAM, its VRAM to expert slots, for long contexts
-  ([Profiles](#profiles)).
-- Preparation for Qwen4: a dense variant of Flash-Next's architecture runs, checked on synthetic checkpoints. The
-  released Qwen4 architecture is not known yet.
-- Fixed: a probable fix for replies cut with `output_limit`
-  ([#27](https://github.com/ValerioDolci/capy-flash/issues/27)); a two-GPU exchange that hangs while serving no
-  longer stops the server ([#20](https://github.com/ValerioDolci/capy-flash/issues/20)); Flash-Next MTP drafts no
-  longer depend on a race; a request near the maximum context no longer takes Flash-Next down.
-- The 27B now runs the same Text forward as Flash-Next, with the same tokens and speed as v0.7.7.
-
-**v0.7.7**
-- Two engine-wide failures fixed. Both could follow a reasoning-close retry (`--reasoning-close-retry`, on by default) when a later request repeated the prompt or restored from its turn anchor. The fixes are a continuation that no longer registers the chat prompt's capture points ([PR #36](https://github.com/ValerioDolci/capy-flash/pull/36) by @omni326), and a state fork closed before a shared prefix is promoted at the reuse point. Recommended for everyone.
-
-**v0.7.6**
-- `/v1/messages` with four `cache_control` breakpoints (the Anthropic maximum, which OpenCode sends) no longer
-  returns HTTP 400: the server's own turn anchor gives way when the request already uses every marker slot
-  ([PR #34](https://github.com/ValerioDolci/capy-flash/pull/34) by @omni326).
-- `--spec off` (or `none`) after a `--profile` runs the profile without speculative decoding, dropping its
-  `--draft-tokens` and `--lm-head-draft` ([issue #33](https://github.com/ValerioDolci/capy-flash/issues/33)).
-- Builds with GCC 16 ([issue #31](https://github.com/ValerioDolci/capy-flash/issues/31)); an out-of-range write in
-  the context cache's KV lease bookkeeping is fixed.
-
-**v0.7.5**
-- `--miss-split calibrate` (Flash-Next NVFP4, opt-in; asked for in
-  [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11)): the decode miss split with costs measured on
-  your machine instead of the fixed ones fitted on our Ryzen 9 9900X. It times the GPU's copy of an expert over PCIe at
-  startup and the CPU's time per expert over the first 4,096 decode calls, logs both, then splits with them. On our
-  box it lands where the fixed costs already were, and splitting does not beat `off` there (agentic replay, two runs:
-  one GPU 74.8 / 73.5 tok/s against 72.9 / 73.0 with `off`; two GPUs 155.5 / 152.5 against 157.6 / 154.1), so the
-  default stays `off`. It is there to check whether the split pays on other CPUs and links
-  ([docs/serving.md](docs/serving.md#capy-flash-serving)).
-
-**v0.7.4**
-- Disk tier: a long conversation saved on disk now resumes even when a shorter match (a system prompt another
-  conversation left) is in memory, and resumes work on one GPU (27B: 7.63 → 0.46 s on two GPUs, 15.18 → 0.60 s on
-  one; [issue #6](https://github.com/ValerioDolci/capy-flash/issues/6)).
-- `NINFER_HOST_MOE_CPUS` takes ranges (`0-15,32-47`); `--api-key-file FILE` and `NINFER_API_KEY` keep the key off
-  the command line; a second server on the same port is refused.
-
-**v0.7.3**
-- CPU expert threads: when the allowed CPUs have no free SMT sibling (for example `taskset -c 0-15` on a 16-core /
-  32-thread CPU, or SMT off) and the automatic count would take every core, one core is left to the main thread, which
-  spin-waits on the GPU. Reported in [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11): on an EPYC 7F52,
-  16 threads on `taskset -c 0-15` dropped decode to 80-90 tok/s, against about 144 with 15. `--expert-cpu-threads N`
-  still overrides ([details](docs/serving.md#cpu-expert-threads)).
-- 64 GB edition: the startup line `Qwen4Exp offload experts: 49 of 49 expert layers in pageable host memory` was a
-  false alarm (the check read the NVFP4 bank pointers, which ggml block banks do not use); fixed, no speed change
-  ([issue #22](https://github.com/ValerioDolci/capy-flash/issues/22)).
-- Documentation: every server flag and the four profiles in [docs/serving.md](docs/serving.md#capy-flash-serving),
-  client setup, the chat template, the vision opt-out.
-
-**v0.7.2: pick up where you left off.**
-- Disk tier of the context cache (opt-in, `--disk-cache-dir DIR --disk-cache-gib N`; idea by @KouShuo): conversations
-  survive a restart and resume without a new prefill (27B, two GPUs: 140k tokens in 1.08 s instead of 48 s); see
-  [docs/serving.md](docs/serving.md#disk-tier-of-the-context-cache).
-- Faster long prompts on the 64 GB edition of Flash-Next: prefill 64k +19 % on two GPUs (3,994 tok/s) and +35 % on
-  one (2,921 tok/s), same tokens.
-- CPU expert threads chosen from the machine (physical cores, affinity, L3 domains) instead of fixed counts;
-  `--expert-cpu-threads N` sets them by hand.
-
-**v0.7.1:** `--profile flash-next-1gpu` keeps 8 conversation states in RAM (+0.66 GiB): on the agentic replay with one
-GPU 83 % of the prompt tokens come from the cache, 1.9 s to the first token (median) and 276 s for the whole replay
-(v0.7.0: 34 %, 13.3 s, 858 s).
-
-**v0.7.0: start small, grow later, same engine.**
-- Flash-Next on 64 GB of RAM, with one or two GPUs (`--model flash-next-64gb`, GGUF i-quant experts).
-- Qwen3.8-27B on one 16 GB card (`--model 27b-16gb`, 3-bit GSQ weights, 64k context, vision).
-- AVX2 CPUs (Zen 2/3, Intel client) and Windows/WSL2 with its page-locked memory limit start Flash-Next too.
-- Empty-reply guards on by default for every model; boards with P2P overlap the prefill exchanges on the direct copy
-  (+29-45 % measured by @tzolkincz); a context-cache accounting error fails one request instead of the server.
-
-Older releases: [GitHub releases](https://github.com/ValerioDolci/capy-flash/releases) and the
-[development log](docs/capy-flash/development-log.md), which records the work behind the `Tnn` tags in the sources.
+Older releases: [GitHub releases](https://github.com/ValerioDolci/capy-flash/releases).
 
 ## License
 Apache License 2.0 ([LICENSE](LICENSE)); attribution in [NOTICE](NOTICE). The original ninfer-tp2 README is the one of

@@ -32,7 +32,7 @@ namespace {
 constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 constexpr double kRtx5090DramGBs  = 1792.0;
 
-enum class Format : std::uint8_t { Q4Q5, Q8, Nvfp4, Fp8, All };
+enum class Format : std::uint8_t { Q4Q5, Nvfp4, Fp8, All };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 
@@ -70,7 +70,7 @@ struct Measurement {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_gdn_input_proj_bench "
-                 "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
+                 "[--format q4q5|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
                  "[--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] "
@@ -119,8 +119,6 @@ Options parse_options(int argc, char** argv) {
             const std::string_view value(next("--format requires a value"));
             if (value == "q4q5")
                 options.format = Format::Q4Q5;
-            else if (value == "q8")
-                options.format = Format::Q8;
             else if (value == "nvfp4")
                 options.format = Format::Nvfp4;
             else if (value == "fp8")
@@ -128,7 +126,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.format = Format::All;
             else
-                usage("--format expects q4q5, q8, nvfp4, fp8, or all");
+                usage("--format expects q4q5, nvfp4, fp8, or all");
         } else if (argument == "--nvfp4-policy") {
             const std::string_view value(next("--nvfp4-policy requires a value"));
             if (value == "a16")
@@ -333,34 +331,6 @@ void run_q4q5(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t 
         [](std::int32_t) { return std::size_t{0}; }, make_launch, flush, stream, results);
 }
 
-void run_q8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
-            std::vector<Result>& results) {
-    constexpr std::int32_t kHidden     = 2048;
-    constexpr std::int32_t kQkvRows    = 8192;
-    constexpr std::int32_t kZRows      = 4096;
-    constexpr std::int32_t kOutputRows = kQkvRows + kZRows;
-    const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight parent =
-        bench::make_row_split_weight(QType::Q8_G32_FP16, kOutputRows, kHidden, kHidden, 505U);
-    DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens, 103U);
-    DeviceBuffer qkv(static_cast<std::size_t>(kQkvRows) * max_tokens * 2);
-    DeviceBuffer z(static_cast<std::size_t>(kZRows) * max_tokens * 2);
-    const auto make_launch = [&](std::int32_t tokens) {
-        return [&, tokens](cudaStream_t launch_stream) {
-            Tensor x(input.p, DType::BF16, {kHidden, tokens});
-            Tensor tqkv(qkv.p, DType::BF16, {kQkvRows, tokens});
-            Tensor tz(z.p, DType::BF16, {kZRows, tokens});
-            ops::gdn_input_proj(x, parent.weight, tqkv, tz, launch_stream);
-        };
-    };
-    const auto workspace_capacity = [](std::int32_t tokens) {
-        return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::Q8_G32_FP16, kOutputRows, kHidden, ops::LinearPolicy::A16Only, tokens, tokens);
-    };
-    measure_points(options, "q8", "a16", kHidden, kOutputRows, parent.model_weight_bytes(),
-                   workspace_capacity, make_launch, flush, stream, results);
-}
-
 void run_nvfp4(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
                std::vector<Result>& results) {
     constexpr std::int32_t kHidden     = 5120;
@@ -463,7 +433,6 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
 
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
-        if (selected(options.format, Format::Q8)) { run_q8(options, flush, stream, results); }
         if (selected(options.format, Format::Nvfp4)) { run_nvfp4(options, flush, stream, results); }
         if (selected(options.format, Format::Fp8)) { run_fp8(options, flush, stream, results); }
 

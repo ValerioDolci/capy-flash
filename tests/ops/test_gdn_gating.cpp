@@ -153,7 +153,7 @@ int main() {
     failures += run_case(1, 0x606u, false, 24);
     failures += run_case(8, 0x707u, false, 24);
     failures += run_case(4096, 0x808u, false, 24);
-    // a|b as row slices of one projection output (T49).
+    // a|b as row slices of one projection output.
     failures += run_case(4, 0x909u, false, 48, true);
     failures += run_case(17, 0xa0au, true, 48, true);
     failures += run_case(8, 0xb0bu, false, 24, true);

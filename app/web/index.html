@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>capy-flash</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24"><path d="M8 12.5l6.2-6.2a3 3 0 114.2 4.2l-8 8a5 5 0 11-7.1-7.1l7.4-7.4"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 012-2h9"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0113.7-5.7L20 8.5M20 4v4.5h-4.5M20 12a8 8 0 01-13.7 5.7L4 15.5M4 20v-4.5h4.5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9 15.5H3L12 4zM12 10v4.5M12 17.2v.3"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-tools" viewBox="0 0 24 24"><path d="M8 7l-4 5 4 5M16 7l4 5-4 5M13.5 5l-3 14"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.6 5.6l1.8 1.8M16.6 16.6l1.8 1.8M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6L13 3z"/></symbol>
+  </svg>
+
+  <div class="shell" id="shell" hidden>
+    <aside class="rail" id="rail" aria-label="capy-flash">
+      <div class="brand">
+        <img src="/icon.svg" alt="" class="brand-mark" width="30" height="30">
+        <span class="brand-name">capy-flash</span>
+      </div>
+      <button class="row-btn" id="new-chat" type="button">
+        <svg class="ico"><use href="#i-plus"/></svg><span data-i18n="new_chat">New chat</span>
+      </button>
+      <nav class="conv-list" id="conv-list" data-i18n-aria="conversations" aria-label="Conversations"></nav>
+      <div class="rail-foot">
+        <button class="status" id="status" type="button">
+          <span class="dot" id="status-dot"></span>
+          <span class="status-text"><span class="status-title" id="status-title"></span><span class="status-sub" id="status-sub"></span></span>
+          <span class="status-bar" id="status-bar" hidden><span id="status-bar-fill"></span></span>
+        </button>
+        <div class="rail-links">
+          <button class="link-btn" id="open-tools" type="button"><svg class="ico"><use href="#i-tools"/></svg><span data-i18n="tools">Tools</span></button>
+          <button class="link-btn" id="open-settings" type="button"><svg class="ico"><use href="#i-gear"/></svg><span data-i18n="settings">Settings</span></button>
+        </div>
+      </div>
+    </aside>
+    <div class="rail-scrim" id="rail-scrim" hidden></div>
+
+    <main class="stage">
+      <header class="bar">
+        <button class="icon-btn only-narrow" id="open-rail" type="button" data-i18n-aria="menu" aria-label="Menu"><svg class="ico"><use href="#i-menu"/></svg></button>
+        <label class="model-pick">
+          <span class="sr" data-i18n="model">Model</span>
+          <select id="model"></select>
+        </label>
+        <span class="bar-space"></span>
+        <button class="btn btn-quiet btn-small" id="toggle-system" type="button" aria-expanded="false" aria-controls="system-box">
+          <span data-i18n="system_prompt">System prompt</span><span class="mark" id="system-mark" hidden></span>
+        </button>
+      </header>
+
+      <div class="system-box" id="system-box" hidden>
+        <label class="sr" for="system" data-i18n="system_prompt">System prompt</label>
+        <textarea id="system" rows="3" data-i18n-placeholder="system_placeholder"></textarea>
+      </div>
+
+      <section class="log" id="log" tabindex="-1">
+        <div class="empty" id="empty">
+          <img src="/icon.svg" alt="" width="56" height="56">
+          <h1 id="empty-title"></h1>
+          <p id="empty-sub"></p>
+          <div class="empty-progress" id="empty-progress" hidden><span id="empty-progress-fill"></span></div>
+          <div class="empty-actions" id="empty-actions"></div>
+        </div>
+      </section>
+      <div class="sr" id="live" aria-live="polite"></div>
+
+      <footer class="composer">
+        <div class="composer-box" id="composer-box">
+          <div class="attachments" id="attachments"></div>
+          <label class="sr" for="input" data-i18n="message">Message</label>
+          <textarea id="input" rows="1" data-i18n-placeholder="input_placeholder"></textarea>
+          <div class="composer-row">
+            <button class="icon-btn" id="attach" type="button" data-i18n-aria="attach" data-i18n-title="attach" aria-label="Attach an image"><svg class="ico"><use href="#i-clip"/></svg></button>
+            <input type="file" id="file" accept="image/*" multiple hidden>
+            <label class="switch" id="thinking-wrap">
+              <input type="checkbox" id="thinking"><span class="switch-track"></span><span data-i18n="thinking">Thinking</span>
+            </label>
+            <span class="bar-space"></span>
+            <button class="btn btn-primary send" id="send" type="button" data-i18n-title="send_hint"><span data-i18n="send">Send</span><svg class="ico"><use href="#i-send"/></svg></button>
+            <button class="btn send" id="stop" type="button" hidden><svg class="ico solid"><use href="#i-stop"/></svg><span data-i18n="stop">Stop</span></button>
+          </div>
+          <p class="composer-note" id="composer-note" role="status" hidden></p>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- the panel: engine / connection, models, tuning, tools, settings -->
+  <dialog class="panel" id="panel" aria-labelledby="panel-title">
+    <nav class="panel-nav" id="panel-nav" data-i18n-aria="sections" aria-label="Sections"></nav>
+    <div class="panel-main">
+      <header class="panel-head">
+        <h2 id="panel-title"></h2>
+        <button class="icon-btn" id="close-panel" type="button" data-i18n-aria="close" aria-label="Close"><svg class="ico"><use href="#i-close"/></svg></button>
+      </header>
+      <div class="panel-body" id="panel-body"></div>
+    </div>
+  </dialog>
+
+  <!-- first run -->
+  <div class="setup" id="setup" hidden>
+    <div class="setup-card" role="main">
+      <div class="setup-brand"><img src="/icon.svg" alt="" width="34" height="34"><span>capy-flash</span></div>
+      <div class="setup-body" id="setup-body" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div class="gate" id="gate" hidden>
+    <img src="/icon.svg" alt="" width="64" height="64">
+    <h1 id="gate-title"></h1>
+    <p id="gate-text"></p>
+  </div>
+  <noscript><div class="gate"><h1>capy-flash</h1><p>This app needs JavaScript.</p></div></noscript>
+</body>
+</html>

@@ -1,4 +1,4 @@
-// Disk tier of the context cache (v0.7.2, format 2): content-addressed blobs shared between saves,
+// Disk tier of the context cache (format 2): content-addressed blobs shared between saves,
 // manifests, reference counts, LRU under the cap, free-space margin, directory lock, atomicity.
 #include "core/disk_kv_cache.h"
 
@@ -101,7 +101,9 @@ bool write_payload(DiskKVCache::Writer& writer, std::uint64_t seed,
     return true;
 }
 
-DiskKVBlobId blob_id(std::uint64_t n) { return DiskKVBlobId{n * 0x1234567ULL + 1, n ^ 0xabcdefULL}; }
+DiskKVBlobId blob_id(std::uint64_t n) {
+    return DiskKVBlobId{n * 0x1234567ULL + 1, n ^ 0xabcdefULL};
+}
 
 bool write_blob(DiskKVCache& cache, std::uint64_t session, DiskKVBlobId id, std::uint64_t seed,
                 std::uint64_t bytes) {
@@ -110,7 +112,8 @@ bool write_blob(DiskKVCache& cache, std::uint64_t session, DiskKVBlobId id, std:
     spec.blob    = id;
     spec.session = session;
     spec.tokens  = tokens(5, static_cast<std::int32_t>(seed));
-    spec.sections.push_back({.kind = static_cast<std::uint32_t>(DiskKVSectionKind::TextKV), .bytes = bytes});
+    spec.sections.push_back(
+        {.kind = static_cast<std::uint32_t>(DiskKVSectionKind::TextKV), .bytes = bytes});
     auto writer = cache.begin_record(std::move(spec));
     return writer && write_payload(*writer, seed, {bytes}) && writer->commit();
 }
@@ -120,7 +123,7 @@ bool write_blob(DiskKVCache& cache, std::uint64_t session, DiskKVBlobId id, std:
 struct Conversation {
     std::vector<std::int32_t> toks;
     std::vector<std::uint64_t> blocks; // blob numbers
-    std::uint64_t state = 0;
+    std::uint64_t state      = 0;
     std::uint64_t tail_bytes = 0;
 };
 
@@ -134,7 +137,8 @@ bool save(DiskKVCache& cache, const Conversation& conv, std::uint64_t block_byte
     for (std::size_t i = 0; i < ids.size(); ++i) {
         if (present[i]) { continue; }
         const std::uint64_t n = i < conv.blocks.size() ? conv.blocks[i] : conv.state;
-        if (!write_blob(cache, session, ids[i], n, i < conv.blocks.size() ? block_bytes : state_bytes)) {
+        if (!write_blob(cache, session, ids[i], n,
+                        i < conv.blocks.size() ? block_bytes : state_bytes)) {
             cache.abort_session(session);
             return false;
         }
@@ -155,7 +159,8 @@ bool save(DiskKVCache& cache, const Conversation& conv, std::uint64_t block_byte
         {.kind = static_cast<std::uint32_t>(DiskKVSectionKind::TextKV), .bytes = conv.tail_bytes});
     spec.meta[0] = 42;
     auto writer  = cache.begin_record(std::move(spec));
-    if (!writer || !write_payload(*writer, conv.state + 1000, {conv.tail_bytes}) || !writer->commit()) {
+    if (!writer || !write_payload(*writer, conv.state + 1000, {conv.tail_bytes}) ||
+        !writer->commit()) {
         cache.abort_session(session);
         return false;
     }
@@ -171,35 +176,12 @@ bool check_blob(DiskKVCache& cache, std::uint64_t n, std::uint64_t bytes) {
     const bool ok = file->read_prefix(1, bytes, chunk,
                                       [&](std::span<const std::byte> data, std::uint64_t offset) {
                                           for (std::size_t i = 0; i < data.size(); ++i) {
-                                              if (data[i] != pattern(n, 1, offset + i)) { same = false; }
+                                              if (data[i] != pattern(n, 1, offset + i)) {
+                                                  same = false;
+                                              }
                                           }
                                       });
     return ok && same;
-}
-
-bool check_blob_pipelined(DiskKVCache& cache, std::uint64_t n, std::uint64_t bytes) {
-    auto file = cache.open_blob(blob_id(n));
-    if (!file) { return false; }
-    auto* a = static_cast<std::byte*>(std::aligned_alloc(4096, 4 * kMiB));
-    auto* b = static_cast<std::byte*>(std::aligned_alloc(4096, 4 * kMiB));
-    std::vector<std::byte> copy;
-    std::uint64_t copy_offset = 0, seen = 0;
-    bool same     = true;
-    const bool ok = file->read_prefix_pipelined(
-        1, bytes, std::span<std::byte>(a, 4 * kMiB), std::span<std::byte>(b, 4 * kMiB),
-        [&](std::span<const std::byte> data, std::uint64_t offset) {
-            copy.assign(data.begin(), data.end());
-            copy_offset = offset;
-        },
-        [&] {
-            for (std::size_t i = 0; i < copy.size(); ++i) {
-                if (copy[i] != pattern(n, 1, copy_offset + i)) { same = false; }
-            }
-            seen += copy.size();
-        });
-    std::free(a);
-    std::free(b);
-    return ok && same && seen == bytes;
 }
 
 std::size_t count_files(const fs::path& dir, const std::string& needle) {
@@ -273,7 +255,7 @@ void test_roundtrip_and_sharing(const fs::path& dir) {
     std::vector<std::int32_t> prompt = tokens(1501, 5);
     expect(cache.longest_indexed_frontier(prompt, 1500) == 1500, "restart: index probe frontier");
     expect(cache.longest_indexed_frontier(prompt, 1499) < 1500, "restart: index probe bound");
-    auto match                       = cache.find(prompt, 1500);
+    auto match = cache.find(prompt, 1500);
     expect(match.has_value(), "restart: found");
     if (match) {
         expect(match->checkpoint.frontier == 1500, "restart: frontier");
@@ -282,16 +264,15 @@ void test_roundtrip_and_sharing(const fs::path& dir) {
         expect(match->blob_refs[match->checkpoint.state_section] == blob_id(102),
                "restart: checkpoint state reference");
         auto* region = static_cast<std::byte*>(std::aligned_alloc(4096, 4 * kMiB));
-        const auto start = match->manifest.read_region(
-            match->manifest.section_of(DiskKVSectionKind::TextKV), std::span<std::byte>(region, 4 * kMiB));
+        const auto start =
+            match->manifest.read_region(match->manifest.section_of(DiskKVSectionKind::TextKV),
+                                        std::span<std::byte>(region, 4 * kMiB));
         bool same = start.has_value();
         for (std::size_t i = 0; same && i < kMiB; ++i) { same = region[i] == pattern(1102, 1, i); }
         expect(same, "restart: tail region");
         std::free(region);
     }
     expect(check_blob(cache, 1, block) && check_blob(cache, 102, state), "restart: blob bytes");
-    expect(check_blob_pipelined(cache, 5, block) && check_blob_pipelined(cache, 102, state),
-           "restart: pipelined blob reads");
     std::vector<std::int32_t> miss = tokens(1501, 6);
     expect(!cache.find(miss, 1500).has_value(), "restart: other prompt misses");
     expect(cache.longest_indexed_frontier(miss, 1500) == 0, "restart: index probe misses");
@@ -305,7 +286,8 @@ void test_key(const fs::path& dir) {
            "key: manifests of another key ignored, their blobs kept");
     std::vector<std::int32_t> prompt = tokens(1501, 5);
     expect(!cache.find(prompt, 1500).has_value(), "key: no hit across keys");
-    expect(cache.longest_indexed_frontier(prompt, 1500) == 0, "key: index probe misses across keys");
+    expect(cache.longest_indexed_frontier(prompt, 1500) == 0,
+           "key: index probe misses across keys");
 }
 
 void test_lock(const fs::path& dir) {
@@ -338,9 +320,11 @@ void test_cap_and_orphans(const fs::path& dir) {
     DiskKVCache cache(options(dir / "c", 3 * one + one / 2, "k"));
     for (int i = 0; i < 6; ++i) {
         const auto base = static_cast<std::uint64_t>(100 * (i + 1));
-        expect(save(cache, {tokens(300, static_cast<std::int32_t>(base)), {base, base + 1}, base + 2, kMiB},
-                    block, state),
-               "cap: save " + std::to_string(i));
+        expect(
+            save(cache,
+                 {tokens(300, static_cast<std::int32_t>(base)), {base, base + 1}, base + 2, kMiB},
+                 block, state),
+            "cap: save " + std::to_string(i));
         expect(directory_bytes(dir / "c") <= cache.options().capacity_bytes,
                "cap: files under the cap after save " + std::to_string(i));
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -358,8 +342,8 @@ void test_cap_and_orphans(const fs::path& dir) {
     expect(cache.stats().reused_blobs >= 3 && cache.stats().orphan_blobs == 0, "orphans: reused");
     // A record larger than the cap is refused.
     DiskKVRecordSpec big;
-    big.kind = DiskKVRecordKind::Blob;
-    big.blob = blob_id(77777);
+    big.kind   = DiskKVRecordKind::Blob;
+    big.blob   = blob_id(77777);
     big.tokens = tokens(5, 0);
     big.sections.push_back({.kind = 3, .bytes = 10 * one});
     expect(!cache.begin_record(std::move(big)).has_value(), "cap: record above the cap refused");
@@ -390,8 +374,8 @@ void test_free(const fs::path& dir) {
     DiskKVCache cache(opts);
     for (int i = 0; i < 5; ++i) {
         const auto base = static_cast<std::uint64_t>(100 * (i + 1));
-        save(cache, {tokens(300, static_cast<std::int32_t>(base)), {base}, base + 1, kMiB}, 4 * kMiB,
-             4 * kMiB);
+        save(cache, {tokens(300, static_cast<std::int32_t>(base)), {base}, base + 1, kMiB},
+             4 * kMiB, 4 * kMiB);
         expect(directory_bytes(dir) <= 30 * kMiB + 64 * 1024,
                "free: margin kept after save " + std::to_string(i));
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
@@ -424,13 +408,13 @@ void test_corruption(const fs::path& dir) {
     {
         DiskKVCache cache(options(dir, 1024 * kMiB));
         expect(!check_blob(cache, 1, 6 * kMiB), "corruption: flipped byte detected");
-        expect(!check_blob_pipelined(cache, 1, 6 * kMiB), "corruption: pipelined reader detects it");
         expect(check_blob(cache, 2, 6 * kMiB), "corruption: intact blob reads");
         auto match = cache.find(tokens(301, 1), 300);
         expect(match.has_value(), "corruption: manifest still found");
         if (match) { cache.discard(match->manifest.header().id, blob_id(1)); }
-        expect(cache.stats().records == 0 && cache.stats().blobs == 0,
-               "corruption: discard drops the manifest, the broken blob and the blobs only it used");
+        expect(
+            cache.stats().records == 0 && cache.stats().blobs == 0,
+            "corruption: discard drops the manifest, the broken blob and the blobs only it used");
     }
     // A manifest whose blob is missing is deleted at start; a broken manifest header too.
     fs::remove_all(dir);

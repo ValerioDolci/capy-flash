@@ -7,13 +7,15 @@
 //      values' rounding envelope. tp 2 changes summation orders (two BF16 partial roundings of the
 //      mixer output, the FP32 MoE partials summed across ranks) and, through them, the NVFP4
 //      activation quantization of the W4A4 experts; on fn4 that measured mean |d| 0.011 and max
-//      0.039 nats (0.0145 / 0.078 with QSA selection active), both PASS against the FP64 reference
-//      (T31, docs/capy-flash/development-log.md). The bounds (mean 0.05, max 0.4) leave 3-5x margin
+//      0.039 nats (0.0145 / 0.078 with QSA selection active), both PASS against the FP64 reference.
+//      The bounds (mean 0.05, max 0.4) leave 3-5x margin
 //      and still catch a lost expert partition, a wrong head shard or an unsynchronized rank, which
 //      move the near-uniform fn4 log-probabilities by far more.
 //   2. Greedy generation at tp 2 with CUDA Graphs (captured all-reduces through the pinned-host
 //      mailbox) and eager (staged copies): identical tokens. Both transports and both execution
 //      forms give identical bits, so any difference is a capture or ordering bug.
+//   3. YaRN x4 (rope_yarn_factor 4, the table installed by the Engine on each rank), mapped
+//      experts: tp 2 scores within the same tp 1 envelope, and different from the plain RoPE ones.
 #include "ninfer/engine.h"
 
 #include <cuda_runtime.h>
@@ -49,7 +51,7 @@ ninfer::EngineOptions base_options(const char* artifact, int tp,
                                    ninfer::RoutedExpertBackend experts) {
     ninfer::EngineOptions options;
     options.routed_experts.backend = experts;
-    // Offload (T33): a fixed small cache, so most routes of the synthetic checkpoint (near-uniform
+    // Offload: a fixed small cache, so most routes of the synthetic checkpoint (near-uniform
     // routing) run on the CPU and the device/host split is exercised on both ranks.
     if (experts == ninfer::RoutedExpertBackend::Offload) {
         options.routed_experts.slots_per_layer = 24;
@@ -63,9 +65,10 @@ ninfer::EngineOptions base_options(const char* artifact, int tp,
 }
 
 std::vector<float> score(const char* artifact, int tp, const std::vector<ninfer::TokenId>& ids,
-                         ninfer::RoutedExpertBackend experts) {
+                         ninfer::RoutedExpertBackend experts, float rope_yarn_factor = 1.0F) {
     ninfer::EngineOptions options = base_options(artifact, tp, experts);
     options.purpose               = ninfer::EnginePurpose::CausalScoring;
+    options.rope_yarn_factor      = rope_yarn_factor;
     options.max_context           = 256;
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(256);
     ninfer::Engine engine(options);
@@ -91,6 +94,32 @@ std::vector<ninfer::TokenId> generate(const char* artifact, bool graph,
     return engine.generate(engine.prepare_tokens(prompt, false), request).generated_token_ids;
 }
 
+// tp 2 log-probabilities within the tp 1 values' envelope (mean |d| <= 0.05, max <= 0.4).
+int compare_scores(const std::string& label, const std::vector<float>& tp1,
+                   const std::vector<float>& tp2, std::size_t expected) {
+    if (tp1.size() != tp2.size() || tp1.size() != expected) {
+        std::cerr << label << " score: " << tp1.size() << " / " << tp2.size() << " log-probs\n";
+        return 1;
+    }
+    double mean = 0.0, worst = 0.0;
+    for (std::size_t i = 0; i < tp1.size(); ++i) {
+        const double d = std::fabs(static_cast<double>(tp1[i]) - tp2[i]);
+        if (!std::isfinite(d)) { worst = INFINITY; }
+        mean += d;
+        worst = std::max(worst, d);
+    }
+    mean /= static_cast<double>(tp1.size());
+    std::cout << label << " score tp2 vs tp1: mean |d logprob| " << mean << ", max " << worst
+              << '\n';
+    if (!(mean <= 0.05) || !(worst <= 0.4)) {
+        std::cerr << "FAIL: " << label
+                  << " tp 2 log-probabilities outside the tp 1 envelope (mean <= 0.05, "
+                     "max <= 0.4)\n";
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -109,7 +138,7 @@ int main() {
         const std::vector<ninfer::TokenId>& ids = kIds;
         // The offload backend's decode depends on fill timing (which experts are resident when):
         // freeze the residency after the prompt so graph and eager runs compute alike.
-        // A token-changing validation knob: it needs the opt-in since T37.
+        // A token-changing validation knob: it needs the NINFER_QWEN4_VALIDATION opt-in.
         setenv("NINFER_QWEN4_VALIDATION", "1", 1);
         setenv("NINFER_QWEN4_EXPERT_FREEZE", "1", 1);
         for (const auto [experts, label] :
@@ -117,26 +146,18 @@ int main() {
               std::pair{ninfer::RoutedExpertBackend::Offload, "offload"}}) {
             const std::vector<float> tp1 = score(artifact, 1, ids, experts);
             const std::vector<float> tp2 = score(artifact, 2, ids, experts);
-            if (tp1.size() != tp2.size() || tp1.size() != ids.size() - 1) {
-                std::cerr << label << " score: " << tp1.size() << " / " << tp2.size()
-                          << " log-probs\n";
-                return 1;
-            }
-            double mean = 0.0, worst = 0.0;
-            for (std::size_t i = 0; i < tp1.size(); ++i) {
-                const double d = std::fabs(static_cast<double>(tp1[i]) - tp2[i]);
-                if (!std::isfinite(d)) { worst = INFINITY; }
-                mean += d;
-                worst = std::max(worst, d);
-            }
-            mean /= static_cast<double>(tp1.size());
-            std::cout << label << " score tp2 vs tp1: mean |d logprob| " << mean << ", max "
-                      << worst << '\n';
-            if (!(mean <= 0.05) || !(worst <= 0.4)) {
-                std::cerr << "FAIL: " << label
-                          << " tp 2 log-probabilities outside the tp 1 envelope (mean <= 0.05, "
-                             "max <= 0.4)\n";
-                ++failures;
+            failures += compare_scores(label, tp1, tp2, ids.size() - 1);
+            if (experts == ninfer::RoutedExpertBackend::Mapped) {
+                const std::vector<float> yarn1 = score(artifact, 1, ids, experts, 4.0F);
+                const std::vector<float> yarn2 = score(artifact, 2, ids, experts, 4.0F);
+                failures += compare_scores("yarn x4 mapped", yarn1, yarn2, ids.size() - 1);
+                const bool changed = yarn1 != tp1 && yarn2 != tp2;
+                std::cout << "yarn x4 scores differ from plain RoPE at tp 1 and tp 2: "
+                          << (changed ? "yes" : "no") << '\n';
+                if (!changed) {
+                    std::cerr << "FAIL: rope_yarn_factor 4 left the scores unchanged\n";
+                    ++failures;
+                }
             }
 
             const std::vector<ninfer::TokenId> prompt(ids.begin(), ids.begin() + 32);

@@ -158,7 +158,7 @@ int test_prompt_json_member_order() {
     request.body =
         R"({"model":"claude-local","tools":[{"name":"probe","input_schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}}}}],"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"probe","input":{"zeta":"last","alpha":{"yankee":2,"bravo":true}}}]}],"max_tokens":32})";
 
-    const auto parsed = ninfer::serve::parse_json_body(request);
+    const auto parsed = ninfer::serve::parse_json_body(request, {});
     return check(
         parsed.at("tools").at(0).at("input_schema").at("properties").dump() ==
                 R"({"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}})" &&
@@ -168,16 +168,16 @@ int test_prompt_json_member_order() {
 }
 
 // Structured output: a schema number whose spelling the double cannot keep is rejected at the
-// body boundary with its location (Neroued/ninfer 81c8ce09); the same number outside a schema, or
-// a schema without such numbers, parses as before.
-// capy-flash: a body nested deeper than --max-request-json-depth is a 400 before parsing (a tool
-// schema nested 100 000 levels used to overflow the stack of the template renderer).
+// body boundary with its location; the same number outside a schema, or a schema without such
+// numbers, parses.
+// A body nested deeper than --max-request-json-depth is a 400 before parsing (a tool schema nested
+// 100 000 levels overflows the stack of the template renderer).
 int test_request_json_depth() {
-    const auto error_of = [](std::string body) {
+    const auto error_of = [](std::string body, ninfer::serve::RequestLimits limits = {}) {
         httplib::Request request;
         request.body = std::move(body);
         try {
-            (void)ninfer::serve::parse_json_body(request);
+            (void)ninfer::serve::parse_json_body(request, limits);
         } catch (const ninfer::serve::ApiException& exception) { return exception.error(); }
         return ninfer::serve::ApiError{.status = 0};
     };
@@ -196,10 +196,10 @@ int test_request_json_depth() {
     }
     failures += check(error_of(R"({"s":")" + std::string(5000, '[') + R"("})").status == 0,
                       "brackets inside a string counted as nesting");
-    ninfer::serve::configure_max_request_json_depth(4);
-    failures += check(error_of(body(4)).status == 400 && error_of(body(3)).status == 0,
-                      "the configured depth was not applied");
-    ninfer::serve::configure_max_request_json_depth(1000);
+    const ninfer::serve::RequestLimits shallow{.max_json_depth = 4};
+    failures +=
+        check(error_of(body(4), shallow).status == 400 && error_of(body(3), shallow).status == 0,
+              "the configured depth was not applied");
     return failures;
 }
 
@@ -208,7 +208,7 @@ int test_schema_number_spelling() {
         httplib::Request request;
         request.body = std::move(body);
         try {
-            (void)ninfer::serve::parse_json_body(request);
+            (void)ninfer::serve::parse_json_body(request, {});
         } catch (const ninfer::serve::ApiException& exception) { return exception.error(); }
         return ninfer::serve::ApiError{.status = 0};
     };

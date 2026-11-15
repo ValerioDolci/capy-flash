@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) form of rmsnorm_rope. Our file: ninfer/ops/rmsnorm_rope.h is upstream's and
-// carries no hook.
+// Two-device (tp 2) form of rmsnorm_rope.
 
 #include "ninfer/ops/rmsnorm_rope.h"
 
@@ -33,9 +32,11 @@ void rmsnorm_rope_head_block(const Tensor& positions, const Tensor& q_norm_weigh
  * Unlike rmsnorm_rope, the BF16 rounding of n is part of the contract: the outputs equal
  * ops::rmsnorm(q, q_norm_weight, eps, true, q_out) and the same for k followed by
  * ops::rope(positions, 64, theta, q_out, k_out), bit for bit, on every input (the Op runs the
- * same arithmetic in the same order; the test compares the two exactly). q_out and k_out are
- * completely overwritten, must not overlap each other or any input; inputs are unchanged. All
- * tensors are contiguous and 4-byte aligned. No workspace or persistent state.
+ * same arithmetic in the same order; the test compares the two exactly), also with the YaRN table
+ * of rope_install_text_yarn, whose angle and cos/sin factor replace the ones above as in ops::rope.
+ * q_out and k_out are completely overwritten, must not overlap each other or any input; inputs are
+ * unchanged. All tensors are contiguous and 4-byte aligned. No workspace; the YaRN table is the
+ * only persistent state.
  */
 void rmsnorm_rope_text_shard(const Tensor& positions, int rotary_dim, float theta,
                              const Tensor& q_norm_weight, const Tensor& k_norm_weight, float eps,

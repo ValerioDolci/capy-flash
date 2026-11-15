@@ -8,10 +8,10 @@
 #include "ninfer/types.h"
 
 #include <array>
-#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::artifact {
@@ -45,11 +45,35 @@ struct HostMappedPlacement {
     std::uint64_t offset    = 0;
     std::uint64_t bytes     = 0;
     std::uint64_t alignment = 256;
-    // v0.7 pinned fallback (artifact/host_residency.h): 0 = must stay in the mapped page-locked
+    // Pinned fallback (artifact/host_residency.h): 0 = must stay in the mapped page-locked
     // allocation (a kernel reads it in place); k > 0 = may move to pageable host memory when the
     // page-locked allocation cannot hold every parent, lower k kept pinned first. Set by the
     // model's load plan; the binder leaves 0.
     std::uint32_t pageable_rank = 0;
+    // Exclusive tier: the last `tail_bytes` of the parent are read into a temporary buffer
+    // (MaterializedArtifact::host_tails) and never take page-locked memory; `spare_bytes` of
+    // page-locked room follow the rest of the parent.
+    std::uint64_t tail_bytes  = 0;
+    std::uint64_t spare_bytes = 0;
+};
+
+// Exclusive tier: the tails of the host-mapped parents (HostMappedPlacement::tail_bytes), in one
+// pageable buffer until the expert cache has placed their experts.
+struct HostTails {
+    std::unique_ptr<PageableHostBuffer> buffer;
+    // Every address of a parent (host, or each device's mapping) -> its tail in `buffer`.
+    std::unordered_map<const std::byte*, const std::byte*> parent_tail;
+
+    // The tail of the parent at `parent`, or null.
+    [[nodiscard]] const std::byte* tail_of(const std::byte* parent) const {
+        const auto found = parent_tail.find(parent);
+        return found == parent_tail.end() ? nullptr : found->second;
+    }
+
+    void release() noexcept {
+        parent_tail.clear();
+        buffer.reset();
+    }
 };
 
 struct MaterializationPlan {
@@ -103,7 +127,7 @@ struct MaterializationStats {
     // the bytes of those parents each device reads in place from it.
     std::uint64_t host_mapped_bytes = 0;
     std::array<std::uint64_t, kMaximumDevices> per_device_host_mapped_bytes{};
-    // v0.7 pinned fallback: the HostMapped parents placed in pageable host memory instead (their
+    // Pinned fallback: the HostMapped parents placed in pageable host memory instead (their
     // allocation with alignment, and how many); 0 when the pinned allocation holds them all.
     std::uint64_t host_pageable_bytes = 0;
     std::size_t host_pageable_objects = 0;
@@ -117,13 +141,11 @@ struct MaterializationStats {
 };
 
 // One read-only mapped piece of a HostFile object, addressed by its object-relative offset. The
-// page cache owns residency; `file`/`file_offset` locate the same bytes for direct reads.
+// page cache owns residency.
 struct MappedObjectSegment {
     std::uint64_t object_offset = 0;
     std::uint64_t bytes         = 0;
     const std::byte* data       = nullptr;
-    std::filesystem::path file;
-    std::uint64_t file_offset = 0;
 };
 
 class FileMapping;
@@ -160,6 +182,10 @@ public:
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
 
+    // Exclusive tier: the parents' tails, null without any. The model backend that places their
+    // experts releases them.
+    [[nodiscard]] HostTails* host_tails() const noexcept { return host_tails_.get(); }
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&,
                                             std::span<DeviceContext* const>,
@@ -181,8 +207,9 @@ private:
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> arenas_;
     // The HostMapped parents' bytes; every device's parent of such an object points into it.
     std::unique_ptr<PinnedHostBuffer> host_mapped_;
-    // v0.7 pinned fallback: the HostMapped parents that did not fit the page-locked allocation.
+    // Pinned fallback: the HostMapped parents that did not fit the page-locked allocation.
     std::unique_ptr<PageableHostBuffer> host_pageable_;
+    std::unique_ptr<HostTails> host_tails_;
     std::vector<std::unique_ptr<FileMapping>> mappings_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;

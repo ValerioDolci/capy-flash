@@ -1,6 +1,6 @@
 // NVFP4 W4A8 host dots and activation codecs in AVX2 + FMA (HostIsa::Avx2): the kernels of
-// host_nvfp4.cpp (FreeToken's per-token dot, the T03 multi-token dot, the int8 and A4 codecs) for
-// CPUs without AVX-512 (Zen 2/3, Intel client cores). Same results bit for bit:
+// host_nvfp4.cpp (the multi-token dot, the int8 and A4 codecs) for CPUs without AVX-512 (Zen 2/3,
+// Intel client cores). Same results bit for bit:
 //  - integer block sums: vpmaddubsw + vpmaddwd instead of vpdpbusd; exact, the int16 pair sums
 //    cannot saturate (|w| <= 12 or w + 12 <= 24 against |q| <= 127, q + 128 <= 255: at most
 //    255 * 12 * 2 = 6120);
@@ -101,61 +101,12 @@ NINFER_HOST_AVX2 inline void even_odd_ps(__m256 lo, __m256 hi, __m256& even, __m
 }
 
 // ---------------------------------------------------------------- dots
-// One row, one token (FreeToken's dot_nvfp4_i8_avx512vnni): four accumulators over 16-block
-// steps, then single 4-block steps into the first; k % 64 == 0.
-NINFER_HOST_AVX2 inline void grp4(__m256& lo, __m256& hi, const std::uint8_t* packed,
-                                  const std::uint8_t* scale_quad, const std::int8_t* asi8,
-                                  const float* asb, int b, const float* e4m3, __m256i lut) {
-    __m256i wl, wh;
-    decode64(packed + static_cast<std::size_t>(b) * 8, lut, wl, wh);
-    const auto* a    = reinterpret_cast<const __m256i*>(asi8 + static_cast<std::size_t>(b) * 16);
-    const __m256i dl = dot4(_mm256_sign_epi8(wl, wl), _mm256_sign_epi8(_mm256_loadu_si256(a), wl));
-    const __m256i dh =
-        dot4(_mm256_sign_epi8(wh, wh), _mm256_sign_epi8(_mm256_loadu_si256(a + 1), wh));
-    const __m256 sl = halves_ps(e4m3[scale_quad[0]] * asb[b], e4m3[scale_quad[1]] * asb[b + 1]);
-    const __m256 sh = halves_ps(e4m3[scale_quad[2]] * asb[b + 2], e4m3[scale_quad[3]] * asb[b + 3]);
-    lo              = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dl), sl, lo);
-    hi              = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dh), sh, hi);
-}
-
-NINFER_HOST_AVX2 float dot_per_token(const std::uint8_t* packed, const std::uint8_t* sc, int k,
-                                     const std::int8_t* asi8, const float* asb, const float* e4m3) {
-    const __m256i lut =
-        _mm256_broadcastsi128_si256(_mm_load_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
-    __m256 l0 = _mm256_setzero_ps(), h0 = _mm256_setzero_ps();
-    __m256 l1 = _mm256_setzero_ps(), h1 = _mm256_setzero_ps();
-    __m256 l2 = _mm256_setzero_ps(), h2 = _mm256_setzero_ps();
-    __m256 l3 = _mm256_setzero_ps(), h3 = _mm256_setzero_ps();
-    const int nb = k / kNvfp4Group;
-    const int pf = nb < 256 ? 2 * nb : 512;
-    int b        = 0;
-    for (; b + 16 <= nb; b += 16) {
-        _mm_prefetch(reinterpret_cast<const char*>(packed + static_cast<std::size_t>(b + pf) * 8),
-                     _MM_HINT_T0);
-        _mm_prefetch(
-            reinterpret_cast<const char*>(packed + static_cast<std::size_t>(b + pf) * 8 + 64),
-            _MM_HINT_T0);
-        const std::uint8_t* s = sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride;
-        grp4(l0, h0, packed, s, asi8, asb, b, e4m3, lut);
-        grp4(l1, h1, packed, s + kScaleQuadStride, asi8, asb, b + 4, e4m3, lut);
-        grp4(l2, h2, packed, s + 2 * kScaleQuadStride, asi8, asb, b + 8, e4m3, lut);
-        grp4(l3, h3, packed, s + 3 * kScaleQuadStride, asi8, asb, b + 12, e4m3, lut);
-    }
-    for (; b + 4 <= nb; b += 4) {
-        grp4(l0, h0, packed, sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride, asi8, asb, b,
-             e4m3, lut);
-    }
-    return reduce_add16(_mm256_add_ps(_mm256_add_ps(l0, l1), _mm256_add_ps(l2, l3)),
-                        _mm256_add_ps(_mm256_add_ps(h0, h1), _mm256_add_ps(h2, h3)));
-}
-
-// T03 multi-token dot (V1: (w + 12) u8 x q s8 from corr; V4: (q + 128) u8 x w s8 - 128 sum(w));
+// Multi-token dot (V1: (w + 12) u8 x q s8 from corr; V4: (q + 128) u8 x w s8 - 128 sum(w));
 // the two give the same integers, V as in host_nvfp4.cpp.
 template <int T, int V>
 NINFER_HOST_AVX2 inline void dot_multi_token(const std::uint8_t* packed, const std::uint8_t* sc,
                                              int k, const W4A8Activation* act, float* s,
-                                             const float* e4m3,
-                                             const std::uint8_t* prefetch = nullptr) {
+                                             const float* e4m3) {
     static_assert(T >= 1 && T <= kHostMaxTokens && (V == 1 || V == 4));
     const __m256i lut = _mm256_broadcastsi128_si256(
         _mm_load_si128(V == 1 ? reinterpret_cast<const __m128i*>(kE2M1x2u)
@@ -166,10 +117,6 @@ NINFER_HOST_AVX2 inline void dot_multi_token(const std::uint8_t* packed, const s
     for (int t = 0; t < T; ++t) lo[t] = hi[t] = _mm256_setzero_ps();
     const int nb = k / kNvfp4Group;
     for (int b = 0; b < nb; b += 4) {
-        if (prefetch != nullptr && (b & 7) == 0) {
-            _mm_prefetch(reinterpret_cast<const char*>(prefetch + static_cast<std::size_t>(b) * 8),
-                         _MM_HINT_T0);
-        }
         __m256i wl, wh;
         decode64(packed + static_cast<std::size_t>(b) * 8, lut, wl, wh);
         const std::uint8_t* q4 = sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride;
@@ -208,17 +155,13 @@ NINFER_HOST_AVX2 inline void dot_multi_token(const std::uint8_t* packed, const s
 
 template <int T>
 NINFER_HOST_AVX2 void rows_multi_token(const Nvfp4Plane& p, std::int64_t r0, int n,
-                                       const W4A8Activation* act, float* out, std::size_t ldo,
-                                       int prefetch_rows) {
+                                       const W4A8Activation* act, float* out, std::size_t ldo) {
     constexpr int V   = T <= 5 ? 1 : 4;
     const float* e4m3 = e4m3_table();
-    const std::size_t pf =
-        static_cast<std::size_t>(prefetch_rows) * static_cast<std::size_t>(p.k / 2);
     for (int i = 0; i < n; ++i) {
         const std::int64_t r = r0 + i;
         float s[T];
-        dot_multi_token<T, V>(p.row_codes(r), p.row_scales(r), p.k, act, s, e4m3,
-                              prefetch_rows > 0 ? p.row_codes(r) + pf : nullptr);
+        dot_multi_token<T, V>(p.row_codes(r), p.row_scales(r), p.k, act, s, e4m3);
         const float d = p.divisor(r);
 #pragma GCC unroll 8
         for (int t = 0; t < T; ++t) out[static_cast<std::size_t>(t) * ldo + i] = s[t] * 0.5F / d;
@@ -226,7 +169,7 @@ NINFER_HOST_AVX2 void rows_multi_token(const Nvfp4Plane& p, std::int64_t r0, int
 }
 
 using RowsFn = void (*)(const Nvfp4Plane&, std::int64_t, int, const W4A8Activation*, float*,
-                        std::size_t, int);
+                        std::size_t);
 constexpr RowsFn kRowsMultiToken[kHostMaxTokens + 1] = {nullptr,
                                                         rows_multi_token<1>,
                                                         rows_multi_token<2>,
@@ -236,21 +179,6 @@ constexpr RowsFn kRowsMultiToken[kHostMaxTokens + 1] = {nullptr,
                                                         rows_multi_token<6>,
                                                         rows_multi_token<7>,
                                                         rows_multi_token<8>};
-
-NINFER_HOST_AVX2 void rows_per_token(const Nvfp4Plane& p, std::int64_t r0, int n,
-                                     const W4A8Activation* act, int tokens, float* out,
-                                     std::size_t ldo) {
-    const float* e4m3 = e4m3_table();
-    for (int i = 0; i < n; ++i) {
-        const std::int64_t r = r0 + i;
-        const float d        = p.divisor(r);
-        for (int t = 0; t < tokens; ++t) {
-            out[static_cast<std::size_t>(t) * ldo + i] =
-                dot_per_token(p.row_codes(r), p.row_scales(r), p.k, act[t].q, act[t].asb, e4m3) *
-                0.5F / d;
-        }
-    }
-}
 
 // ---------------------------------------------------------------- activation codecs
 // Stores q (stored order, int32 lanes of even and odd elements), qu = q + 128, corr and the scale.
@@ -364,13 +292,8 @@ void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Acti
 }
 
 void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
-              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
-              std::int32_t prefetch_rows) {
-    if (kernel == DotKernel::MultiToken) {
-        kRowsMultiToken[tokens](plane, r0, n, acts, out, ldo, prefetch_rows);
-    } else {
-        rows_per_token(plane, r0, n, acts, tokens, out, ldo);
-    }
+              std::int32_t tokens, float* out, std::size_t ldo) {
+    kRowsMultiToken[tokens](plane, r0, n, acts, out, ldo);
 }
 
 } // namespace ninfer::ops::host::detail::avx2

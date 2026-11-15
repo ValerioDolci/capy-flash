@@ -1,6 +1,6 @@
 #pragma once
 
-// v0.7 27b-16gb: q3_g128_fp16 row-split storage (docs/maintainer/storage-layouts.md §3).
+// q3_g128_fp16 row-split storage (docs/maintainer/storage-layouts.md §3).
 //
 // One group = 128 signed codes in [-4, 3] and one binary16 multiplier. The base plane stores each
 // group as one little-endian bit stream: lane i occupies bits 3i..3i+2, so bytes 3j..3j+2 hold the
@@ -14,9 +14,9 @@
 #include <cstdint>
 
 #if defined(__CUDACC__)
-#define NINFER_Q3_HD __host__ __device__ __forceinline__
+#    define NINFER_Q3_HD __host__ __device__ __forceinline__
 #else
-#define NINFER_Q3_HD inline
+#    define NINFER_Q3_HD inline
 #endif
 
 namespace ninfer::ops::detail {
@@ -67,7 +67,7 @@ NINFER_Q3_HD void q3_decode_unit(std::uint32_t w0, std::uint32_t w1, std::uint32
 // Host/device scalar reference: code of logical column `k` of a row whose base plane starts at
 // `row_codes`.
 NINFER_Q3_HD int q3_row_code(const std::uint8_t* row_codes, int k) {
-    const int byte = (k / 8) * 3;
+    const int byte             = (k / 8) * 3;
     const std::uint32_t word24 = static_cast<std::uint32_t>(row_codes[byte]) |
                                  (static_cast<std::uint32_t>(row_codes[byte + 1]) << 8) |
                                  (static_cast<std::uint32_t>(row_codes[byte + 2]) << 16);

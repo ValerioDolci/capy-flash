@@ -42,7 +42,8 @@ struct AnthropicCountTokensRequest {
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const RequestJson& body,
                                                           const RequestLimits& limits);
-AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const RequestJson& body);
+AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const RequestJson& body,
+                                                                 const RequestLimits& limits);
 
 struct AnthropicResponseIdentity {
     std::string request_id;

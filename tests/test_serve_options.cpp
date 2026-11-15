@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,6 +34,36 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+
+    {
+        // Every flag the parser accepts (an `arg == "--flag"` branch of serve_options.cpp) has an
+        // entry in the help's option list (a line "  --flag ..." or "  --a <X>, --b").
+        std::ifstream source(NINFER_SOURCE_DIR "/src/serve/serve_options.cpp");
+        const std::string code((std::istreambuf_iterator<char>(source)),
+                               std::istreambuf_iterator<char>());
+        const std::string branch = "arg == \"--";
+        std::set<std::string> parsed;
+        for (std::size_t at = 0; (at = code.find(branch, at)) != std::string::npos;) {
+            at += branch.size() - 2; // the flag's "--"
+            parsed.insert(code.substr(at, code.find('"', at) - at));
+        }
+        std::set<std::string> listed;
+        std::istringstream help(serve_usage_text("ninfer-serve"));
+        for (std::string line; std::getline(help, line);) {
+            if (!line.starts_with("  --")) { continue; }
+            std::istringstream words(line);
+            for (std::string word; words >> word;) {
+                if (word.starts_with("--")) { listed.insert(word.substr(0, word.find(','))); }
+            }
+        }
+        failures += check(parsed.size() >= 90, "the parser's flags were not found in its source");
+        for (const std::string& flag : parsed) {
+            if (!listed.contains(flag)) {
+                std::cerr << "serve help has no entry for " << flag << '\n';
+                ++failures;
+            }
+        }
+    }
 
     failures += check(parse({"ninfer-serve", "model.ninfer", "--host-pinned-max-gib", "0.5"})
                               .host_pinned_max_bytes == (1ULL << 29),
@@ -66,6 +99,17 @@ int main() {
                           parse({"ninfer-serve", "model.ninfer", "--max-request-json-depth", "64"})
                                   .max_request_json_depth == 64,
                       "request JSON depth default or flag mismatch");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--rope-original-max-position", "131072"})
+                      .rope_original_max_position == 131072,
+              "--rope-original-max-position was not kept");
+    for (const char* value : {"0", "-1", "4294967297", "262144x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--rope-original-max-position", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--rope-original-max-position accepted a bad value");
+    }
     for (const char* value : {"0", "5001"}) {
         bool rejected = false;
         try {
@@ -73,7 +117,7 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "invalid request JSON depth was accepted");
     }
-    // Structured output limits (capy-flash): prudent defaults, every flag reaches the options.
+    // Structured output limits: prudent defaults, every flag reaches the options.
     failures += check(defaults.constraint_limits == ninfer::OutputConstraintLimits{} &&
                           defaults.constraint_limits.max_bytes == 256U * 1024U &&
                           defaults.constraint_limits.max_depth == 256 &&
@@ -430,14 +474,14 @@ int main() {
                           resolve_turn_anchors(std::nullopt, "Qwen3_5ForCausalLM") == 1 &&
                           resolve_turn_anchors(2U, "Qwen4ExpForCausalLM") == 2 &&
                           resolve_turn_anchors(0U, "Qwen3_5ForCausalLM") == 0,
-                      "turn anchors model default (Qwen4Exp 0 T152, others 1 T161) not resolved");
+                      "turn anchors model default (Qwen4Exp 0, others 1) not resolved");
     failures +=
         check(parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "0"}).turn_anchors == 0 &&
                   parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "3"}).turn_anchors == 3,
               "--turn-anchors did not reach serving options");
     failures += check(serve_usage_text("ninfer-serve").find("--turn-anchors") != std::string::npos,
                       "serve help omits --turn-anchors");
-    // T66c: Qwen4Exp product options.
+    // Qwen4Exp product options.
     failures += check(!defaults.elastic_kv.enabled && !defaults.miss_split.has_value(),
                       "elastic KV or miss split on by default");
     {
@@ -481,7 +525,7 @@ int main() {
                 serve_usage_text("ninfer-serve").find("--kv-ram-active") != std::string::npos,
             "serve help omits the Qwen4Exp product options");
     }
-    // T211: prompt streaming threshold.
+    // Prompt streaming threshold.
     failures += check(!defaults.stream_min_tokens.has_value(),
                       "--stream-min-tokens set by default (the engine default applies)");
     failures += check(
@@ -499,9 +543,13 @@ int main() {
     }
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
-                          std::string::npos,
-                      "serve help omits context-cache defaults");
+    {
+        const std::string help  = serve_usage_text("ninfer-serve");
+        const std::size_t slots = help.find("--device-state-slots");
+        failures += check(slots != std::string::npos &&
+                              help.find("default: max-concurrency", slots) != std::string::npos,
+                          "serve help omits context-cache defaults");
+    }
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
@@ -634,9 +682,8 @@ int main() {
     failures += check(profile_flash.context_cache.host_state_slots == 8 &&
                           profile_flash.context_cache.host_kv_capacity_bytes == 4096ULL << 20U,
                       "--profile flash-next does not set 4 GiB of Host KV and 8 Host states");
-    failures +=
-        check(profile_flash.embedding_host,
-              "--profile flash-next does not keep the token embedding in host memory (T200)");
+    failures += check(profile_flash.embedding_host,
+                      "--profile flash-next does not keep the token embedding in host memory");
     // A queued request waits up to 10 minutes by default (long prompts are prefilled one at a
     // time); every profile keeps that default, and the Engine default is the same.
     const std::uint32_t engine_timeout = ninfer::EngineOptions{}.pending_timeout_ms;
@@ -644,7 +691,7 @@ int main() {
                           profile_flash.pending_timeout_ms == 600000 &&
                           profile_27b.pending_timeout_ms == 600000,
                       "--pending-timeout-ms is not 600000 by default or a profile changes it");
-    // v0.7: both reasoning guards are on by default for every model and every profile.
+    // Both reasoning guards are on by default for every model and every profile.
     failures += check(defaults.reasoning_close_retry && profile_flash.reasoning_close_retry &&
                           profile_27b.reasoning_close_retry &&
                           !parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next",
@@ -666,7 +713,7 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("--reasoning-close-retry") != std::string::npos,
               "serve help omits --reasoning-close-retry");
     failures += check(profile_27b.prefill_chunk == 2048,
-                      "--profile 27b does not use 2048-token prefill chunks (T205b, T205c)");
+                      "--profile 27b does not use 2048-token prefill chunks");
     failures += check(
         rejects({"ninfer-serve", "model.ninfer", "--device", "1", "--tp", "2", "--devices", "0,1"}),
         "--device disagreeing with the rank 0 device was accepted");
@@ -753,7 +800,7 @@ int main() {
         check(serve_usage_text("ninfer-serve").find("flash-next: --tp 2") != std::string::npos,
               "the usage text does not list the profiles");
 
-    { // issue #25: --api-key-file and NINFER_API_KEY
+    { // --api-key-file and NINFER_API_KEY
         const std::string key_path = "test_serve_options.api_key";
         const auto write_key       = [&](const char* text) {
             std::ofstream(key_path, std::ios::binary | std::ios::trunc) << text;

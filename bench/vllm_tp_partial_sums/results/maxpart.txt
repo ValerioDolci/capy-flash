@@ -1,3 +1,0 @@
-{"model": "models/qwen3-4b", "max_abs_partial": {"o_proj": 293.02642822265625, "down_proj": 7986.07177734375}, "at": {"o_proj": "model.layers.35.self_attn.o_proj", "down_proj": "model.layers.16.mlp.down_proj"}}
-{"model": "models/qwen3-14b", "max_abs_partial": {"o_proj": 6934.40087890625, "down_proj": 14664.4208984375}, "at": {"o_proj": "model.layers.39.self_attn.o_proj", "down_proj": "model.layers.6.mlp.down_proj"}}
-DONE

@@ -6,6 +6,7 @@
 // rotary coefficients across heads.
 
 #include "ops/common/dflash_rope.cuh"
+#include "ops/kernel/text_rope_yarn.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,10 +23,6 @@ enum class RopeKernelMode : std::int32_t {
 };
 
 inline constexpr int kRopeMaxHalf = 128;
-
-// YaRN attention scaling (HF: attention_factor = 0.1*ln(factor)+1). 1.0F means disabled;
-// multiplying by 1.0F is exact in IEEE-754, so the disabled path is bit-identical.
-static __device__ __constant__ float kTextRopeAttentionScale = 1.0F;
 
 static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
@@ -50,16 +47,22 @@ __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float*
         *axis      = pair / 18;
         *frequency = kVisionRopeInvFrequency[pair % 18];
     } else {
-        *axis      = Mode == RopeKernelMode::TextMrope ? pair % 3 : 0;
+        *axis      = text_rope_axis(Mode == RopeKernelMode::TextMrope ? 3 : 1, pair);
         *frequency = kTextRopeInvFrequency[pair];
     }
 }
 
-template <RopeKernelMode Mode>
+// Yarn selects the YaRN table installed on the device (text modes only).
+template <RopeKernelMode Mode, bool Yarn = false>
 __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int tokens, int token,
                                              int pair, float* sine, float* cosine) {
+    static_assert(!Yarn || Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope);
     if constexpr (Mode == RopeKernelMode::DflashText1D) {
         dflash_rope_sincos(positions, token, pair, sine, cosine);
+    } else if constexpr (Yarn) {
+        const int axis = text_rope_axis(Mode == RopeKernelMode::TextMrope ? 3 : 1, pair);
+        text_yarn_sincos(positions[static_cast<std::int64_t>(axis) * tokens + token], pair, sine,
+                         cosine);
     } else {
         int axis = 0;
         float frequency;
@@ -68,10 +71,6 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
             frequency;
         sincosf(angle, sine, cosine);
-        // YaRN attention scaling, HF-style: applied to cos/sin rather than to the softmax
-        // scale. Exactly 1.0F unless a YaRN table was installed.
-        *sine *= kTextRopeAttentionScale;
-        *cosine *= kTextRopeAttentionScale;
     }
 }
 
@@ -91,7 +90,7 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads>
+template <RopeKernelMode Mode, int QHeads, int KHeads, bool Yarn = false>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
@@ -108,7 +107,8 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
-        fixed_sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        fixed_sincos<Mode, Yarn>(positions, tokens, token, pair, &sin_cache[pair],
+                                 &cos_cache[pair]);
     }
     __syncthreads();
 
@@ -180,17 +180,18 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
         const int local = pair % 18;
         *exponent       = -2.0F * static_cast<float>(local) / 36.0F;
     } else {
-        *axis     = axes == 3 ? pair % 3 : 0;
+        *axis     = text_rope_axis(axes, pair);
         *exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
     }
 }
 
-static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
-                                           __nv_bfloat16* q, __nv_bfloat16* k,
-                                           std::int32_t head_dim, std::int32_t rotary_dim,
-                                           float theta, std::int32_t q_heads, std::int32_t k_heads,
-                                           std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride) {
+// Yarn: Text head with the YaRN table installed on the device (rotary_dim 64).
+template <bool Yarn>
+static __global__ void
+rope_generic_kernel(const std::int32_t* positions, std::int32_t axes, __nv_bfloat16* q,
+                    __nv_bfloat16* k, std::int32_t head_dim, std::int32_t rotary_dim, float theta,
+                    std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens,
+                    std::int64_t q_token_stride, std::int64_t k_token_stride) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -198,7 +199,11 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
     __shared__ float sin_cache[kRopeMaxHalf];
     if (threadIdx.x < static_cast<unsigned>(half)) {
         const int pair = static_cast<int>(threadIdx.x);
-        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
+        if constexpr (Yarn) {
+            const int axis = text_rope_axis(axes, pair);
+            text_yarn_sincos(positions[static_cast<std::int64_t>(axis) * tokens + token], pair,
+                             &sin_cache[pair], &cos_cache[pair]);
+        } else if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
         } else {

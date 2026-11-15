@@ -135,24 +135,18 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{1024, 5120} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 5120} && k == q &&
                         third == std::vector<std::uint64_t>{6144, 5120} && fourth == third;
-    const bool moe =
-        attention ? q == std::vector<std::uint64_t>{4096, 2048} &&
-                        k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
-                  : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
-                        third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
     // Two-device shard: one rank's heads of every section, stored as one contiguous parent.
     const bool shard =
         attention ? q == std::vector<std::uint64_t>{3072, 5120} &&
                         k == std::vector<std::uint64_t>{512, 5120} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{1024, 5120} && k == q &&
                         third == std::vector<std::uint64_t>{3072, 5120} && fourth == third;
-    require(dense || moe || shard, "input projection: unsupported logical projection geometry");
+    require(dense || shard, "input projection: unsupported logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);
         const auto format = result.weight.qtype;
         const bool supported =
-            (moe && format == QType::Q8_G32_FP16) ||
             (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
                        format == QType::Q3_G128_FP16 || (attention && format == QType::BF16))) ||
             (shard && (format == QType::FP8_E4M3FN_ROW_BF16 || format == QType::NVFP4));
@@ -184,9 +178,8 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
     // Two-device shard of the DFlash2 drafter: one rank's 16 query and 4 KV heads.
     const bool shard = q == std::vector<std::uint64_t>{2048, 5120} &&
                        matrix(key) == std::vector<std::uint64_t>{512, 5120};
-    require(((q == std::vector<std::uint64_t>{4096, 2048} ||
-              q == std::vector<std::uint64_t>{4096, 5120}) &&
-                 matrix(key) == std::vector<std::uint64_t>{1024, q[1]} ||
+    require((q == std::vector<std::uint64_t>{4096, 5120} &&
+                 matrix(key) == std::vector<std::uint64_t>{1024, 5120} ||
              shard) &&
                 matrix(value) == matrix(key),
             "QKV input projection: unsupported logical geometry");

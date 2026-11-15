@@ -157,33 +157,28 @@ void test_dots(std::mt19937_64& rng) {
         const double bound = 2.0 * (k / 16 + 8) * kU;
         std::vector<float> got(static_cast<std::size_t>(n) * kHostMaxTokens),
             single(static_cast<std::size_t>(n));
-        for (const DotKernel kernel : {DotKernel::PerToken, DotKernel::MultiToken}) {
-            const char* name = kernel == DotKernel::PerToken ? "per-token" : "multi-token";
-            for (int T = 1; T <= kHostMaxTokens; ++T) {
-                double worst = 0;
-                int variance = 0;
-                rows_dot(plane, r0, n, view.data(), T, got.data(), n, kernel);
-                for (int t = 0; t < T; ++t) {
-                    for (int i = 0; i < n; ++i) {
-                        const std::size_t idx = static_cast<std::size_t>(t) * n + i;
-                        worst                 = std::max(worst,
-                                                         std::abs(got[idx] - ref[idx]) / (bound * l1[idx] + 1e-30));
-                    }
-                    if (kernel == DotKernel::MultiToken) {
-                        rows_dot(plane, r0, n, &view[t], 1, single.data(), n, kernel);
-                        for (int i = 0; i < n; ++i)
-                            variance += single[i] != got[static_cast<std::size_t>(t) * n + i];
-                    }
+        for (int T = 1; T <= kHostMaxTokens; ++T) {
+            double worst = 0;
+            int variance = 0;
+            rows_dot(plane, r0, n, view.data(), T, got.data(), n);
+            for (int t = 0; t < T; ++t) {
+                for (int i = 0; i < n; ++i) {
+                    const std::size_t idx = static_cast<std::size_t>(t) * n + i;
+                    worst =
+                        std::max(worst, std::abs(got[idx] - ref[idx]) / (bound * l1[idx] + 1e-30));
                 }
-                expect(worst <= 1.0, std::string(name) + " dot k=" + std::to_string(k) + " T=" +
-                                         std::to_string(T) + " err/tol " + std::to_string(worst));
-                expect(variance == 0, std::string(name) + " batch variance k=" + std::to_string(k) +
-                                          " T=" + std::to_string(T));
-                if (T == 1 || T == 4 || T == 8) {
-                    std::printf("dot %-11s k=%4d T=%d max err/tol %.3f (tol %.2e of sum|w*a|)%s\n",
-                                name, k, T, worst, bound,
-                                kernel == DotKernel::MultiToken ? ", bit-identical to T=1" : "");
-                }
+                rows_dot(plane, r0, n, &view[t], 1, single.data(), n);
+                for (int i = 0; i < n; ++i)
+                    variance += single[i] != got[static_cast<std::size_t>(t) * n + i];
+            }
+            expect(worst <= 1.0, "dot k=" + std::to_string(k) + " T=" + std::to_string(T) +
+                                     " err/tol " + std::to_string(worst));
+            expect(variance == 0,
+                   "dot batch variance k=" + std::to_string(k) + " T=" + std::to_string(T));
+            if (T == 1 || T == 4 || T == 8) {
+                std::printf("dot k=%4d T=%d max err/tol %.3f (tol %.2e of sum|w*a|), bit-identical "
+                            "to T=1\n",
+                            k, T, worst, bound);
             }
         }
     }
@@ -421,7 +416,7 @@ void test_layer(std::mt19937_64& rng, int E, int H, int I, bool statistics) {
     LayerData L(E, H, I, rng);
     const HostExpertLayer layer = L.layer();
     std::vector<Case> cases;
-    // Decode-window pattern of F0-M at TP2: 3-5 missing experts per layer, 1-2 tokens each.
+    // Decode-window pattern at TP2: 3-5 missing experts per layer, 1-2 tokens each.
     cases.push_back(make_case("T4 real (4 experts, 1-2 tokens)", 4, top_k, E, rng,
                               {{3, 9}, {9, 1}, {5}, {1}}, H));
     // Every token routes 10 experts of a small bank: experts shared by up to 8 tokens (multi-token
@@ -468,90 +463,46 @@ void test_layer(std::mt19937_64& rng, int E, int H, int I, bool statistics) {
     for (const auto& c : cases) {
         const CaseRef ref   = build_ref(L, c, top_k);
         const std::size_t n = static_cast<std::size_t>(c.tokens) * H;
-        std::vector<float> first, first_mt1;
-
-        // (min_mt, slices, schedule, member_quantize, prefetch_rows); the first is the T16/T22
-        // executor.
-        struct Variant {
-            int min_mt, slices;
-            Schedule schedule;
-            bool member_quantize;
-            int prefetch;
-            bool steal = true;
-        };
-
-        const Variant options[] = {
-            {3, 4, Schedule::Dynamic, false, 0},      {1, 4, Schedule::Dynamic, false, 0},
-            {9, 4, Schedule::Dynamic, false, 0},      {3, 1, Schedule::Dynamic, false, 0},
-            {3, 2, Schedule::Dynamic, false, 0},      {3, 4, Schedule::Static, true, 0},
-            {3, 4, Schedule::Static, false, 0},       {3, 4, Schedule::Static, true, 4},
-            {3, 4, Schedule::Static, true, 0, false}, {1, 4, Schedule::Static, true, 0},
-            {1, 4, Schedule::Static, false, 2}};
-        for (const Variant& v : options) {
-            const int min_mt = v.min_mt, slices = v.slices;
-            for (const int threads : {1, 4, 6, 7}) {
-                const auto cpus = spread_cpus(threads);
-                HostCpuPool pool(cpus);
-                HostMoeExecutor::Options opt;
-                opt.min_multi_token = min_mt;
-                opt.slices_per_item = slices;
-                opt.schedule        = v.schedule;
-                opt.member_quantize = v.member_quantize;
-                opt.prefetch_rows   = v.prefetch;
-                opt.steal           = v.steal;
-                opt.record_members  = threads == 7;
-                opt.a4 = false; // this test qualifies the W4A8 path against its oracle (A4 is the
-                                // default since v0.2.1)
-                HostMoeExecutor ex(pool, H, I, std::max(kHostMaxTokens, c.tokens), top_k, opt);
-                std::vector<float> out(n, 1e30F), again(n, -1e30F);
-                const HostMoeJob job2{c.tokens,     top_k,          c.x.data(),
-                                      c.ids.data(), c.alpha.data(), again.data()};
-                ex.run(layer, job2);
-                const HostMoeJob job{c.tokens,     top_k,          c.x.data(),
-                                     c.ids.data(), c.alpha.data(), out.data()};
-                ex.run(layer, job);
-                expect(out == again, c.name + ": repeated call differs");
-                const std::string sched =
-                    v.schedule == Schedule::Static
-                        ? std::string(" static") + (v.member_quantize ? "+mq" : "") +
-                              (v.prefetch ? " pf" + std::to_string(v.prefetch) : "") +
-                              (v.steal ? "" : " nosteal")
-                        : " dynamic";
-                if (min_mt == 3 ||
-                    min_mt ==
-                        1) { // same kernels: schedule, item size and thread count must not matter
-                    auto& ref_out = min_mt == 3 ? first : first_mt1;
-                    if (ref_out.empty()) ref_out = out;
-                    expect(out == ref_out, c.name + ": result depends on the thread count (" +
-                                               std::to_string(threads) + "), slices (" +
-                                               std::to_string(slices) + ") or schedule (" + sched +
-                                               ")");
-                }
-                if (threads != 6) continue;
-                const RunCheck rc     = check_run(ref, ex, out, c.tokens, H, I);
-                const std::string tag = c.name + " min_mt " + std::to_string(min_mt) + " slices " +
-                                        std::to_string(slices) + sched;
-                expect(rc.missing == 0, tag + ": intermediates do not match the routed pairs");
-                expect(rc.bad_q == 0, tag + ": " + std::to_string(rc.bad_q) +
-                                          " int8 intermediates differ outside the bound");
-                expect(rc.bad_scale == 0, tag + ": " + std::to_string(rc.bad_scale) +
-                                              " block scales outside the bound");
-                expect(rc.stage_b <= 1.0,
-                       tag + ": down stage err/tol " + std::to_string(rc.stage_b));
-                double d8 = 0, n8 = 0;
-                for (std::size_t i = 0; i < n; ++i)
-                    d8 += (out[i] - ref.w4a8[i]) * (out[i] - ref.w4a8[i]),
-                        n8 += ref.w4a8[i] * ref.w4a8[i];
-                std::printf("layer H%d I%d %-48s min_mt %d slices %d%s: int8 h flips %d (of %d "
-                            "within the bound, %zu pairs), "
-                            "down stage err/tol %.4f, rel L2 vs pure-W4A8 oracle %.2e\n",
-                            H, I, c.name.c_str(), min_mt, slices, sched.c_str(), rc.flips,
-                            ref.ambiguous, ref.pairs.size(), rc.stage_b,
-                            n8 > 0 ? std::sqrt(d8 / n8) : 0.0);
-            }
+        std::vector<float> first;
+        for (const int threads : {1, 4, 6, 7}) {
+            const auto cpus = spread_cpus(threads);
+            HostCpuPool pool(cpus);
+            HostMoeExecutor::Options opt;
+            opt.record_members = threads == 7;
+            // This test qualifies the W4A8 path against its oracle (A4 is the default).
+            opt.a4 = false;
+            HostMoeExecutor ex(pool, H, I, std::max(kHostMaxTokens, c.tokens), top_k, opt);
+            std::vector<float> out(n, 1e30F), again(n, -1e30F);
+            const HostMoeJob job2{c.tokens,     top_k,          c.x.data(),
+                                  c.ids.data(), c.alpha.data(), again.data()};
+            ex.run(layer, job2);
+            const HostMoeJob job{c.tokens,     top_k,          c.x.data(),
+                                 c.ids.data(), c.alpha.data(), out.data()};
+            ex.run(layer, job);
+            expect(out == again, c.name + ": repeated call differs");
+            if (first.empty()) first = out;
+            expect(out == first, c.name + ": result depends on the thread count (" +
+                                     std::to_string(threads) + ")");
+            if (threads != 6) continue;
+            const RunCheck rc = check_run(ref, ex, out, c.tokens, H, I);
+            expect(rc.missing == 0, c.name + ": intermediates do not match the routed pairs");
+            expect(rc.bad_q == 0, c.name + ": " + std::to_string(rc.bad_q) +
+                                      " int8 intermediates differ outside the bound");
+            expect(rc.bad_scale == 0, c.name + ": " + std::to_string(rc.bad_scale) +
+                                          " block scales outside the bound");
+            expect(rc.stage_b <= 1.0,
+                   c.name + ": down stage err/tol " + std::to_string(rc.stage_b));
+            double d8 = 0, n8 = 0;
+            for (std::size_t i = 0; i < n; ++i)
+                d8 += (out[i] - ref.w4a8[i]) * (out[i] - ref.w4a8[i]),
+                    n8 += ref.w4a8[i] * ref.w4a8[i];
+            std::printf("layer H%d I%d %-48s: int8 h flips %d (of %d within the bound, %zu pairs), "
+                        "down stage err/tol %.4f, rel L2 vs pure-W4A8 oracle %.2e\n",
+                        H, I, c.name.c_str(), rc.flips, ref.ambiguous, ref.pairs.size(), rc.stage_b,
+                        n8 > 0 ? std::sqrt(d8 / n8) : 0.0);
         }
         if (!statistics) continue;
-        // Informative numerics (min_mt 3, as served).
+        // Informative numerics of the served executor.
         double n16 = 0, d8 = 0, d4 = 0, d84 = 0;
         for (std::size_t i = 0; i < n; ++i) {
             n16 += ref.w4a16[i] * ref.w4a16[i];
@@ -570,9 +521,8 @@ void test_layer(std::mt19937_64& rng, int E, int H, int I, bool statistics) {
     }
 }
 
-
-// v0.7.3 (issue #11): the automatic thread count leaves one core to the main thread when no SMT
-// sibling is free, and is otherwise unchanged.
+// Issue #11: the automatic thread count leaves one core to the main thread when no SMT sibling is
+// free, and is otherwise unchanged.
 void test_auto_threads() {
     using ninfer::ops::host::auto_expert_cpu_threads;
     using ninfer::ops::host::HostCpuTopology;

@@ -6,6 +6,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>
@@ -264,8 +265,9 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
                  const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(Fp8M64ReusableStorage<TileColumns, kBlockK>);
     if constexpr (shared_bytes > 48 * 1024) {
-        CUDA_CHECK(cudaFuncSetAttribute(fp8_m64_linear_topk_kernel<TileColumns, kBlockK>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+        static FuncAttrPerDevice attribute;
+        attribute.ensure(fp8_m64_linear_topk_kernel<TileColumns, kBlockK>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
     }
     fp8_m64_linear_topk_kernel<TileColumns, kBlockK>
         <<<dim3(workspace.producer_groups, div_up(hidden.ne[1], TileColumns)),

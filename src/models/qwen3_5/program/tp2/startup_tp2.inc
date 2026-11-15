@@ -1,7 +1,6 @@
 // Translation-unit fragment of src/models/qwen3_5/program/planning/startup.cpp, included once at
 // its end (after its closing namespace): the two-device (tp 2) workspace plan and the tp 2 option
-// checks, sharing startup.cpp's private reserve_* helpers. Not a header. Our file; see
-// docs/maintainer/upstream-merge.md.
+// checks, sharing startup.cpp's private reserve_* helpers. Not a header.
 
 #include "models/qwen3_5/execution/tp2/draft_split.h"
 #include "ninfer/ops/tp2/sliding_window_attention.h"

@@ -20,8 +20,6 @@ void fp8_kv_tiled_attention(const CausalAttentionOperands& p, Fp8KvReadView cach
     };
     if (p.query_heads == 24)
         invoke.template operator()<CausalD256H24Kv4>();
-    else if (p.query_heads == 16)
-        invoke.template operator()<CausalD256H16Kv2>();
     else
         throw std::invalid_argument("FP8 attention: unsupported head geometry");
 }

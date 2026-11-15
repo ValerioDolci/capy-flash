@@ -9,8 +9,7 @@ approach.
 ## Project scope and decisions
 
 capy-flash is an intentionally focused inference engine (one or two 16 GB GPUs, Qwen3.8-Flash-Next and
-Qwen3.8-27B); changes that belong to the single-GPU engine it builds on are better proposed to
-[NInfer](https://github.com/Neroued/ninfer). Contributions are evaluated against the
+Qwen3.8-27B). Contributions are evaluated against the
 supported product described in [`README.md`](README.md), the public documentation map in
 [`docs/README.md`](docs/README.md), and the applicable architecture documents. Broader
 compatibility or generality is not a benefit by itself when it adds a product contract or

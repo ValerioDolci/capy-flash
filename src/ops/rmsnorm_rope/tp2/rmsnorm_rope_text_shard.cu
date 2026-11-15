@@ -11,6 +11,8 @@
 #include "core/device.h"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/rmsnorm.cuh"
+#include "ops/kernel/text_rope_yarn.cuh"
+#include "ops/launcher/rope.h"
 
 #include <cuda_bf16.h>
 
@@ -35,6 +37,8 @@ static_assert(kPairsPerLane == 4 && kHalf == kWarpSize,
               "the rotary span is exactly the first BF16x2 pair of every lane");
 static_assert(kCombined % kHeadsPerCta == 0, "every warp owns a head");
 
+// Yarn: the coefficients of the YaRN table installed on the device, as rope_generic_kernel<true>.
+template <bool Yarn>
 __global__ __launch_bounds__(kHeadsPerCta* kWarpSize) void rmsnorm_rope_text_shard_kernel(
     const std::int32_t* __restrict__ positions, std::int32_t axes, float theta,
     const __nv_bfloat162* __restrict__ q, const __nv_bfloat162* __restrict__ k,
@@ -49,15 +53,21 @@ __global__ __launch_bounds__(kHeadsPerCta* kWarpSize) void rmsnorm_rope_text_sha
     __shared__ float cos_cache[kHalf];
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
-        // rope_generic_kernel's coefficients for a Text head (generic_axis_frequency).
-        const int pair        = static_cast<int>(threadIdx.x);
-        const int axis        = axes == 3 ? pair % 3 : 0;
-        const float exponent  = -2.0F * static_cast<float>(pair) / static_cast<float>(kRotaryDim);
-        const float frequency = powf(theta, exponent);
-        const float angle =
-            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-            frequency;
-        sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+        // The coefficients of rope_generic_kernel<Yarn> for a Text head.
+        const int pair = static_cast<int>(threadIdx.x);
+        const int axis = text_rope_axis(axes, pair);
+        if constexpr (Yarn) {
+            text_yarn_sincos(positions[static_cast<std::int64_t>(axis) * tokens + token], pair,
+                             &sin_cache[pair], &cos_cache[pair]);
+        } else {
+            const float exponent =
+                -2.0F * static_cast<float>(pair) / static_cast<float>(kRotaryDim);
+            const float frequency = powf(theta, exponent);
+            const float angle =
+                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+                frequency;
+            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+        }
     }
 
     const bool query = head < kQueryHeads;
@@ -180,7 +190,10 @@ void rmsnorm_rope_text_shard(const Tensor& positions, int rotary_dim, float thet
         throw std::invalid_argument("rmsnorm_rope_text_shard: q_out and k_out overlap");
     }
     const dim3 grid(static_cast<unsigned>(tokens), kCtasPerToken);
-    rmsnorm_rope_text_shard_kernel<<<grid, kHeadsPerCta * kWarpSize, 0, stream>>>(
+    auto* kernel = detail::text_rope_yarn(rotary_dim, theta) != nullptr
+                       ? rmsnorm_rope_text_shard_kernel<true>
+                       : rmsnorm_rope_text_shard_kernel<false>;
+    kernel<<<grid, kHeadsPerCta * kWarpSize, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data), axes, theta,
         static_cast<const __nv_bfloat162*>(q.data), static_cast<const __nv_bfloat162*>(k.data),
         static_cast<const __nv_bfloat162*>(q_norm_weight.data),

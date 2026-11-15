@@ -209,7 +209,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, std::int32_t column) {
-    // T42: a Qwen4Exp chunk wider than prefill_hidden ran on lent workspace and left its last
+    // A Qwen4Exp chunk wider than prefill_hidden ran on lent workspace and left its last
     // column in prefill_hidden's last column (qwen4_text.cpp keep_last_column).
     if (qwen4_prompt_base_chunk > 0 && column >= prefill_hidden.ne[1] &&
         column < static_cast<std::int32_t>(prefill_chunk)) {
@@ -438,7 +438,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             if (ple_staging) { qwen4_ple_stager->finish(); }
         }
         timing.end_wait();
-        // T53 (eager rounds): the next round's n-gram rows (the sampled token's) start their page
+        // Eager rounds: the next round's n-gram rows (the sampled token's) start their page
         // reads now; a graph round gathers them after its launch instead.
         if (executable == nullptr) { prefetch_qwen4_ple_next_round(lanes, false); }
         qwen4_end_window();
@@ -449,7 +449,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             }
         }
         if (qwen4_replay) {
-            // T59 replay: the reference token (teacher forcing through the ordinary route).
+            // Replay: the reference token (teacher forcing through the ordinary route).
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 const SequenceState& sequence = active_sequence(lanes[row]);
                 if (const execution::Qwen4ReplaySequence* ref =
@@ -609,7 +609,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
-            // T59 replay: the recorded window of this frontier (extent, drafts) and the reference.
+            // Replay: the recorded window of this frontier (extent, drafts) and the reference.
             const execution::Qwen4ReplaySequence* replay_ref =
                 qwen4_replay ? qwen4_replay->match(sequence.ledger) : nullptr;
             const execution::Qwen4ReplayWindow* replay_window = nullptr;
@@ -621,7 +621,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             } else if (qwen4_replay) {
                 ++qwen4_replay->rounds_unmatched;
             }
-            // T121c: NINFER_QWEN4_REPLAY_MODEL_DRAFTS=1 keeps the model's own drafts (and extent)
+            // NINFER_QWEN4_REPLAY_MODEL_DRAFTS=1 keeps the model's own drafts (and extent)
             // where the replay has no recorded window: forced targets with realistic rejections.
             static const bool replay_model_drafts = [] {
                 const char* v = std::getenv("NINFER_QWEN4_REPLAY_MODEL_DRAFTS");
@@ -677,13 +677,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 }
             }
             if (replay_ref != nullptr) {
-                // T59 replay: recorded drafts (or the reference itself where no window was
+                // Replay: recorded drafts (or the reference itself where no window was
                 // recorded), and the reference continuation as every column's target, so the
                 // device accepts the recorded count and commits the reference tokens.
                 const auto& ids = replay_ref->ids;
                 for (std::uint32_t j = 0; j < extent; ++j) {
                     const std::size_t at = frontier + 1U + j;
-                    if (replay_window == nullptr && replay_model_drafts) { continue; } // T121c
+                    if (replay_window == nullptr && replay_model_drafts) { continue; }
                     mtp_host_ingress->current_drafts[row * draft_window + j] =
                         replay_window != nullptr && j < replay_window->drafts.size()
                             ? replay_window->drafts[j]
@@ -727,7 +727,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             state_images->continuation_hidden_store(),
             peer ? &*peer->io.mtp_decode : nullptr,
             peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-            mtp_min_p > 0.0F || qwen4_mtp_calib != nullptr};
+            qwen4_mtp_calib != nullptr};
 
         // An eager round gathers its n-gram rows before the body; a graph round after the launch
         // (on the stager thread).
@@ -756,7 +756,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             if (ple_staging) { qwen4_ple_stager->finish(); }
         }
         timing.end_wait();
-        // T53 (eager rounds): the next round's n-gram rows are known now; their page reads
+        // Eager rounds: the next round's n-gram rows are known now; their page reads
         // overlap the window end, the commit and the next round's preparation. A graph round
         // gathers them after its launch, off the host's critical path, so it skips this.
         if (executable == nullptr) { prefetch_qwen4_ple_next_round(lanes, true); }
@@ -831,7 +831,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
-            if (peer && execution::tp_rank_probe_enabled()) { // T123 rank-consistency probe
+            if (peer && execution::tp_rank_probe_enabled()) {
                 execution::tp_rank_probe_check(base_E, static_cast<std::int32_t>(row), count_i,
                                                row_tokens.data());
             }

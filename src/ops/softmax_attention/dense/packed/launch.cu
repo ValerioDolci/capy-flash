@@ -14,8 +14,7 @@ std::int64_t stride_elements(const Tensor& tensor, int dim) {
 }
 
 template <int Br, int Bc>
-void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
-                  const PackedAttentionTile* tiles, std::int32_t uniform_segment_length,
+void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t segment_length,
                   std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
     constexpr int kThreads = Br * 2;
     constexpr int kSmemBytes =
@@ -24,7 +23,7 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
                     static_cast<unsigned>(kPackedAttentionHeads), 1u);
     packed_attention_flash_kernel<Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
+        static_cast<const __nv_bfloat16*>(v.data), segment_length,
         static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
         stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1), stride_elements(k, 2),
         stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
@@ -32,24 +31,6 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
 }
 
 } // namespace
-
-void packed_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                             const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
-                             cudaStream_t stream) {
-    const bool packed_segments = tiles != nullptr;
-    const int max_tiles =
-        packed_segments ? tiles->ne[1] : (q.ne[2] + kPackedAttentionBr - 1) / kPackedAttentionBr;
-    if (packed_segments) {
-        packed_attention_prepare_tiles_kernel<<<1, 256, 0, stream>>>(
-            static_cast<const std::int32_t*>(cu_seqlens.data), cu_seqlens.ne[0] - 1,
-            static_cast<PackedAttentionTile*>(tiles->data), max_tiles, q.ne[2]);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    launch_flash<kPackedAttentionBr, kPackedAttentionBc>(
-        q, k, v, packed_segments ? static_cast<const PackedAttentionTile*>(tiles->data) : nullptr,
-        0, max_tiles, out, stream);
-}
 
 std::int32_t packed_attention_uniform_tile(std::int32_t segment_length) {
     // Measured issued-MMA rates are approximately 3:6:8 for the 16/32/64
@@ -79,13 +60,13 @@ void packed_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
     switch (tile_size) {
     case 16:
-        launch_flash<16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<16, 16>(q, k, v, segment_length, query_tiles, out, stream);
         return;
     case 32:
-        launch_flash<32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<32, 32>(q, k, v, segment_length, query_tiles, out, stream);
         return;
     case 64:
-        launch_flash<64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<64, 64>(q, k, v, segment_length, query_tiles, out, stream);
         return;
     default:
         throw std::invalid_argument("packed_softmax_attention: invalid uniform tile size");

@@ -129,10 +129,9 @@ struct ProposalParameters {
 };
 
 // ---- Qwen4Exp (Qwen3.8-Flash-Next) -------------------------------------------------------------
-// Names follow ninfer-ext's execution (giveen/ninfer-ext @9c933f01, Apache-2.0) and T12's
-// bindings (weights.h `Qwen4*Weights`).
+// Names follow ninfer-ext's execution and the bindings (weights.h `Qwen4*Weights`).
 
-// One hyper-connection mixer: the T10 Op operands (down = [low rank (+ S inject rows), S*H]).
+// One hyper-connection mixer: the Op operands (down = [low rank (+ S inject rows), S*H]).
 struct HyperConnectionParameters {
     ops::HyperConnectionWeights weights;
     bool inject = false;
@@ -162,7 +161,7 @@ struct Qwen4FusedRoutes {
 // base + e * stride; the stacked weight divisors (gate of e at 2e, up at 2e+1; down at e), also
 // host-mapped; and the layer's two activation divisors.
 //
-// GGUF banks (gguf = true; artifact layout gguf_blocks_v1, capy-flash v0.7): the same two parents
+// GGUF banks (gguf = true; artifact layout gguf_blocks_v1): the same two parents
 // as ggml block rows, expert e = gate|up rows [e*1280, (e+1)*1280) and down rows [e*2560,
 // (e+1)*2560); no divisors, `bank` and the divisor fields stay empty.
 struct Qwen4ExpertBank {
@@ -246,7 +245,7 @@ struct Qwen4Parameters {
 // dense FFN), and its own output mixer in front of the Text output head.
 //
 // Its routed experts reach the W4A4 expert Op like the Text banks, with two differences the
-// preparation resolves (T24):
+// preparation resolves:
 //   * weight divisors: one per matrix (this tree's recipes) or one for the whole bank (ninfer-ext's
 //     artifact); `uniform_*_divisor` holds the latter, which the Program expands into per-expert
 //     planes (moe_slots indexes divisors by expert id);
@@ -257,8 +256,7 @@ struct Qwen4Parameters {
 //     the largest activation and ~64x it (E4M3 block scales keep three mantissa bits over that
 //     span); on the real model the MTP inputs reach 24.5 (x) and 826 (h) against Text ranges of
 //     13.9 and 57.8, and margins 16-64 give the minimum error with no saturated block, 4 saturates
-//     h blocks (T24, docs/capy-flash/development-log.md). 32 centres both inputs in the flat
-//     region.
+//     h blocks. 32 centres both inputs in the flat region.
 inline constexpr float kQwen4MtpActivationRangeMargin = 32.0F;
 
 struct Qwen4MtpParameters {

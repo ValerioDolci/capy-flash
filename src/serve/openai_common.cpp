@@ -15,13 +15,6 @@ namespace ninfer::serve {
 
 namespace {
 
-std::string chat_identifier(std::string_view prefix) {
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx",
-                  static_cast<unsigned long long>(random_id_bits()));
-    return std::string(prefix) + buffer.data();
-}
-
 std::string responses_identifier(std::string_view prefix) {
     std::array<char, 48> buffer{};
     std::snprintf(buffer.data(), buffer.size(), "%016llx%016llx",
@@ -221,9 +214,9 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
     throw ApiException(std::move(error));
 }
 
-std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"); }
+std::string new_openai_chat_completion_id() { return random_identifier("chatcmpl-"); }
 
-std::string new_openai_chat_tool_call_id() { return chat_identifier("call_"); }
+std::string new_openai_chat_tool_call_id() { return random_identifier("call_"); }
 
 std::string new_openai_request_id() { return responses_identifier("req"); }
 

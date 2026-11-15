@@ -85,7 +85,7 @@ std::int32_t qwen4_expert_layer(std::string_view name, std::uint32_t text_layers
     return -1;
 }
 
-// v0.7 pinned fallback: ranks the routed-expert banks (models/qwen3_5/qwen4_layer_profile.h) so the
+// Pinned fallback: ranks the routed-expert banks (models/qwen3_5/qwen4_layer_profile.h) so the
 // materializer may move the least important layers' banks to pageable memory when the page-locked
 // allocation cannot hold them all; every other HostMapped parent (--embedding-host) keeps rank 0.
 void rank_host_mapped(artifact::MaterializationPlan& plan,
@@ -106,10 +106,20 @@ void rank_host_mapped(artifact::MaterializationPlan& plan,
     for (std::size_t i = 0; i < order.size(); ++i) {
         rank[static_cast<std::size_t>(order[i])] = static_cast<std::uint32_t>(i + 1);
     }
+    const std::uint64_t experts  = std::get<MoeConfig>(text.ffn).num_experts;
+    const std::int32_t exclusive = qwen4_exclusive_layers();
     for (auto& placement : plan.host_mapped_objects) {
         const auto found = layer_of.find(placement.object.index);
         if (found != layer_of.end()) {
             placement.pageable_rank = rank[static_cast<std::size_t>(found->second)];
+            // Exclusive tier: the bank keeps no page-locked copy of its highest `tail` experts.
+            const std::int32_t tail = qwen4_exclusive_tail(found->second, exclusive);
+            if (tail > 0 &&
+                plan.source->directory().tensor(placement.object).format.rfind("gguf", 0) == 0) {
+                const std::uint64_t stride = placement.bytes / experts;
+                placement.tail_bytes       = stride * static_cast<std::uint64_t>(tail);
+                placement.spare_bytes      = stride * kQwen4ExclusiveSpare;
+            }
         }
     }
 }

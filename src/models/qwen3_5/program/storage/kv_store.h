@@ -777,7 +777,7 @@ public:
         return release_reference(handle, page.writer_references != 0);
     }
 
-    // v0.6 (idle KV to the Host): packs the Device replicas into the lowest physical pages, so
+    // Idle KV to the Host: packs the Device replicas into the lowest physical pages, so
     // an elastic backing can shrink to the pages still in use. Content, epochs and references
     // are unchanged; replicas pinned by an open transfer stay where they are. The caller
     // republishes the execution rows of every active address before the next launch
@@ -943,7 +943,7 @@ public:
             throw std::logic_error("KV address space is not reservable for activation");
         }
         const std::uint32_t required_pages =
-            activation_frontier ? pages_for_tokens(*activation_frontier) : address.page_count;
+            activation_frontier ? kv_pages_for_tokens(*activation_frontier) : address.page_count;
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
         std::uint32_t missing_replicas      = 0;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
@@ -1065,7 +1065,7 @@ public:
         if (frontier == 0 || frontier > source.committed_frontier) {
             throw std::logic_error("KV retained-prefix frontier is unavailable");
         }
-        const std::uint32_t required_pages = pages_for_tokens(frontier);
+        const std::uint32_t required_pages = kv_pages_for_tokens(frontier);
         if (entitlement < required_pages || entitlement > page_capacity_) {
             throw std::invalid_argument("KV retained-prefix entitlement is invalid");
         }
@@ -1157,7 +1157,7 @@ public:
             !pages_->host_resident(logical)) {
             throw std::logic_error("KV prefix-fork retained tail was not moved to Host");
         }
-        const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+        const std::uint32_t required_pages = kv_pages_for_tokens(fork.frontier_);
         const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
         pages_->physical_pool().resize_reservation(fork.page_reservation_, growth);
     }
@@ -1166,7 +1166,7 @@ public:
         require_prefix_fork(fork);
         Address& source                    = require(fork.source_);
         Address& destination               = require(fork.destination_);
-        const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+        const std::uint32_t required_pages = kv_pages_for_tokens(fork.frontier_);
         const std::uint32_t growth         = fork.requested_entitlement_ - required_pages;
         if (!fork.row_ || destination.active || destination.row ||
             destination.reservation.valid() || destination.page_count != 0 ||
@@ -1229,7 +1229,7 @@ public:
         if (fork.owner_ != this) { return; }
         if (valid(fork.source_)) {
             Address& source                    = addresses_[fork.source_.index_];
-            const std::uint32_t required_pages = pages_for_tokens(fork.frontier_);
+            const std::uint32_t required_pages = kv_pages_for_tokens(fork.frontier_);
             for (std::uint32_t page = 0; page < required_pages; ++page) {
                 if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
                 const LogicalKVPageHandle logical = membership(source, page);
@@ -1251,7 +1251,7 @@ public:
         if (frontier == 0 || frontier != source.committed_frontier) {
             throw std::logic_error("active KV snapshot frontier is invalid");
         }
-        const std::uint32_t required_pages    = pages_for_tokens(frontier);
+        const std::uint32_t required_pages    = kv_pages_for_tokens(frontier);
         const std::uint32_t entitlement_pages = entitlement(source);
         if (source.page_count < required_pages || entitlement_pages < required_pages) {
             throw std::logic_error("active KV snapshot frontier is not fully materialized");
@@ -1309,7 +1309,7 @@ public:
             throw std::logic_error("active KV snapshot endpoints are invalid");
         }
         const KVActiveSnapshotShape shape     = active_snapshot_shape(source_handle, frontier);
-        const std::uint32_t required_pages    = pages_for_tokens(frontier);
+        const std::uint32_t required_pages    = kv_pages_for_tokens(frontier);
         const std::uint32_t entitlement_pages = entitlement(source);
         if (source.page_count != required_pages) {
             throw std::logic_error("active KV snapshot source has untrimmed suffix pages");
@@ -1364,7 +1364,7 @@ public:
         Address& destination = require(snapshot.destination_);
         const KVActiveSnapshotShape shape =
             active_snapshot_shape(snapshot.source_, snapshot.frontier_);
-        const std::uint32_t required_pages  = pages_for_tokens(snapshot.frontier_);
+        const std::uint32_t required_pages  = kv_pages_for_tokens(snapshot.frontier_);
         const std::uint32_t expected_growth = snapshot.entitlement_ - required_pages;
         if (shape != snapshot.shape_ || !source.row || !source.reservation.valid() ||
             source.page_count != required_pages ||
@@ -1433,7 +1433,7 @@ public:
         if (snapshot.owner_ != this) { return; }
         if (valid(snapshot.source_)) {
             Address& source                    = addresses_[snapshot.source_.index_];
-            const std::uint32_t required_pages = pages_for_tokens(snapshot.frontier_);
+            const std::uint32_t required_pages = kv_pages_for_tokens(snapshot.frontier_);
             for (std::uint32_t page = 0; page < required_pages && page < source.page_count;
                  ++page) {
                 const LogicalKVPageHandle logical = membership(source, page);
@@ -1469,7 +1469,7 @@ public:
     void ensure_mapped_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
                                  cudaStream_t stream) {
         Address& address           = require_active(handle);
-        const std::uint32_t target = pages_for_tokens(tokens);
+        const std::uint32_t target = kv_pages_for_tokens(tokens);
         if (target > entitlement(address)) {
             throw std::invalid_argument(
                 "KV coverage exceeds active entitlement: tokens=" + std::to_string(tokens) +
@@ -1508,7 +1508,7 @@ public:
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
         if (frontier < address.committed_frontier ||
-            pages_for_tokens(frontier) > address.page_count) {
+            kv_pages_for_tokens(frontier) > address.page_count) {
             throw std::invalid_argument("KV committed frontier is invalid");
         }
         if (frontier == address.committed_frontier) { return; }
@@ -1530,7 +1530,7 @@ public:
         if (frontier > address.committed_frontier) {
             throw std::invalid_argument("KV destructive truncate extends the frontier");
         }
-        const std::uint32_t target = pages_for_tokens(frontier);
+        const std::uint32_t target = kv_pages_for_tokens(frontier);
         if (frontier == address.committed_frontier && target == address.page_count) { return; }
         for (std::uint32_t page = target; page < address.page_count; ++page) {
             if (!pages_->can_dematerialize(membership(address, page))) {
@@ -1568,7 +1568,7 @@ public:
             frontier > address.committed_frontier) {
             return false;
         }
-        const std::uint32_t target = pages_for_tokens(frontier);
+        const std::uint32_t target = kv_pages_for_tokens(frontier);
         for (std::uint32_t page = target; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
             if (!pages_->can_release_reference(logical, false)) { return false; }
@@ -1592,7 +1592,7 @@ public:
             throw std::logic_error("inactive KV address space is not destructively truncatable");
         }
         Address& address           = require(handle);
-        const std::uint32_t target = pages_for_tokens(frontier);
+        const std::uint32_t target = kv_pages_for_tokens(frontier);
         // Full pages before the selected frontier can remain shared. Only removed suffix
         // references and a changed private partial tail need mutation; protection is rebuilt from
         // the surviving address-space requirements after publication.
@@ -1632,7 +1632,7 @@ public:
             frontier > address.committed_frontier) {
             return false;
         }
-        const std::uint32_t target = pages_for_tokens(frontier);
+        const std::uint32_t target = kv_pages_for_tokens(frontier);
         for (std::uint32_t page = target; page < address.page_count; ++page) {
             if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
         }
@@ -1644,7 +1644,7 @@ public:
             throw std::logic_error("inactive KV checkpoint prefix is not truncatable");
         }
         Address& address           = require(handle);
-        const std::uint32_t target = pages_for_tokens(frontier);
+        const std::uint32_t target = kv_pages_for_tokens(frontier);
         while (address.page_count > target) {
             const std::uint32_t index         = --address.page_count;
             const LogicalKVPageHandle logical = membership(address, index);
@@ -1830,10 +1830,6 @@ private:
         return static_cast<std::size_t>(addresses) * pages;
     }
 
-    [[nodiscard]] static std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
-        return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-    }
-
     [[nodiscard]] static std::uint32_t next_generation(std::uint32_t generation) noexcept {
         ++generation;
         return generation == 0 ? 1 : generation;
@@ -1850,11 +1846,11 @@ private:
             for (const Address& address : addresses_) {
                 if (!address.occupied || address.checkpoint_frontier == 0) { continue; }
                 if (address.checkpoint_frontier > address.committed_frontier ||
-                    pages_for_tokens(address.checkpoint_frontier) > address.page_count) {
+                    kv_pages_for_tokens(address.checkpoint_frontier) > address.page_count) {
                     std::terminate();
                 }
-                for (std::uint32_t page = 0; page < pages_for_tokens(address.checkpoint_frontier);
-                     ++page) {
+                for (std::uint32_t page = 0;
+                     page < kv_pages_for_tokens(address.checkpoint_frontier); ++page) {
                     const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
                     pages_->protect_coverage(membership(address, page),
                                              std::min(static_cast<std::uint32_t>(kPagedKVPageSize),

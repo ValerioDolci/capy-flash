@@ -1,7 +1,7 @@
 #pragma once
 
-// Elastic VRAM between the KV cache and the routed-expert slot cache of Qwen4Exp (T64,
-// EngineOptions::elastic_kv).
+// Elastic VRAM between the KV cache and the routed-expert slot cache of Qwen4Exp
+// (EngineOptions::elastic_kv).
 //
 // Every rank holds an ElasticArena (CUDA VMM) with the KV page planes and the four expert slot
 // planes (PersistentLayout::elastic_bytes; the rest of the persistent state is an ordinary
@@ -22,7 +22,7 @@
 // are backed. rebalance(), at the start of a request, shrinks each pool's backing to its live
 // extent (the pages still allocated, e.g. a reused prefix) or the new prompt's pages, whichever
 // is larger, rounded up to the grow step, and gives the freed bytes back as columns: their slots
-// are empty and the cache fills them with later insertions. With a Host KV tier (v0.6) the KV of
+// are empty and the cache fills them with later insertions. With a Host KV tier the KV of
 // idle conversations leaves the Device while a request decodes and the live pages are packed low,
 // so shrink_to_live() returns their bytes to the experts at once instead of at the next prompt.
 // A request that needs more KV than fits (or than kv_budget_bytes) fails in grow() before any
@@ -81,7 +81,7 @@ public:
 
     // Before a request's prompt: `text_tokens` / `mtp_tokens` = the KV it is about to map.
     void rebalance(std::uint32_t text_tokens, std::uint32_t mtp_tokens);
-    // v0.6 (idle KV to the Host), between execution units with the devices idle: once the idle
+    // Idle KV to the Host, between execution units with the devices idle: once the idle
     // owners' pages have left the Device and the live pages were packed low
     // (LogicalKVPageStore::compact_device_replicas), shrinks each pool's backing to its live
     // extent rounded up to the grow step and gives the freed bytes back as expert columns.

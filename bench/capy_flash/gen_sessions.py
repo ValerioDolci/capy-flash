@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic agentic sessions (T71) shaped like a real production log of a coding agent (2 201 tool-history
+"""Synthetic agentic sessions shaped like a real production log of a coding agent (2 201 tool-history
 requests): prompt p50 35k / p90 84k tokens, new tokens per turn p50 3.8k, output p50 254.
 Each session: a system prompt (~8k tokens: tool descriptions + project docs), a task, then turns of
 [fixed assistant message, tool output (source code / docs from the ninfer tree)] until ~MAX tokens.

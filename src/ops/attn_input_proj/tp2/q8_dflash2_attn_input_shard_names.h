@@ -1,6 +1,6 @@
-// Renames that turn upstream's q8/q8_dflash2_attn_input.cu into the [3072,5120] shard's when a
+// Renames that turn the parent's q8/q8_dflash2_attn_input.cu into the [3072,5120] shard's when a
 // translation unit of this directory includes it. Include it once, after the family's headers
-// (q8_dflash2_attn_input_shard_prelude.h) and right before the upstream source, so that only that
+// (q8_dflash2_attn_input_shard_prelude.h) and right before the parent's source, so that only that
 // source's code sees the substitutions. The source's Geometry only supplies K (5120, unchanged);
 // the rows come from the weight.
 

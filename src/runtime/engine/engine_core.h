@@ -1022,8 +1022,8 @@ private:
             }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             // The cancelled sequence is catalogued, not discarded: a same-session follow-up has
-            // consumed the previous turn's continuation, and discarding it made the next turn
-            // rebuild the whole conversation (issue #3). ResourceManager falls back to the
+            // consumed the previous turn's continuation, and discarding it would make the next turn
+            // rebuild the whole conversation. ResourceManager falls back to the
             // discard when the Program cannot retain the sequence.
             auto settled = resources_.finish(*instance_.program, *request->lane, *request->sequence,
                                              /*cancelled=*/true);
@@ -1991,7 +1991,7 @@ private:
         }
     }
 
-    // Idle KV to the Host (v0.6): with elastic KV and a Host KV tier, once the active requests
+    // Idle KV to the Host: with elastic KV and a Host KV tier, once the active requests
     // are decoding (no prompt in flight, no context transaction), the Device KV of every idle
     // retained owner moves to the Host and the Program packs the remaining pages and gives the
     // freed backing back to the routed-expert cache. Runs again only after the Program's
@@ -2173,7 +2173,7 @@ private:
         publish_runtime_stats();
     }
 
-    // Disk tier (v0.7.2): with no request in the Engine, writes the retained conversations that
+    // Disk tier: with no request in the Engine, writes the retained conversations that
     // are not on disk yet, one by one, until a request arrives (the one being written is then
     // dropped and written again at the next idle period).
     void save_context_to_disk_while_idle() noexcept {
@@ -2204,7 +2204,7 @@ private:
     }
 
 public:
-    // Disk tier (v0.7.2): at a clean shutdown, writes every retained conversation not on disk
+    // Disk tier: at a clean shutdown, writes every retained conversation not on disk
     // yet (most tokens first) and waits for the writer, within ContextCacheOptions::
     // disk_flush_seconds. Requests still running keep running; their conversations are not saved.
     void persist_context_cache() noexcept {
@@ -2357,7 +2357,7 @@ private:
                     if (active) { disk_idle_check_ = true; }
                     const std::uint32_t disk_idle_ms = instance_.program->disk_cache_idle_ms();
                     if (!active && disk_idle_ms != 0 && disk_idle_check_) {
-                        // Disk tier (v0.7.2): after disk_idle_ms without work, save the retained
+                        // Disk tier: after disk_idle_ms without work, save the retained
                         // conversations not on disk yet; an arriving request interrupts it.
                         const bool woke =
                             queue_cv_.wait_for(lock, std::chrono::milliseconds(disk_idle_ms),

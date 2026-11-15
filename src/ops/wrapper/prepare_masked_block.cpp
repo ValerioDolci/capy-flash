@@ -1,6 +1,7 @@
 #include "ninfer/ops/prepare_masked_block.h"
 
 #include "ops/launcher/prepare_masked_block.h"
+#include "ops/common/validate.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -28,12 +29,6 @@ void require_i32_matrix(const Tensor& tensor, std::int32_t width, std::int32_t b
     }
 }
 
-bool overlaps(const Tensor& lhs, const Tensor& rhs) {
-    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
-    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
-    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
-}
-
 } // namespace
 
 void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Tensor& valid_columns,
@@ -55,9 +50,10 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
     require_i32_vector(valid_columns, batch_size, "valid_columns");
     require_i32_matrix(ids, block_size, batch_size, "ids");
     require_i32_matrix(positions, block_size, batch_size, "positions");
-    if (overlaps(ids, positions) || overlaps(anchors, ids) || overlaps(anchors, positions) ||
-        overlaps(lengths, ids) || overlaps(lengths, positions) || overlaps(valid_columns, ids) ||
-        overlaps(valid_columns, positions)) {
+    if (detail::overlaps(ids, positions) || detail::overlaps(anchors, ids) ||
+        detail::overlaps(anchors, positions) || detail::overlaps(lengths, ids) ||
+        detail::overlaps(lengths, positions) || detail::overlaps(valid_columns, ids) ||
+        detail::overlaps(valid_columns, positions)) {
         throw std::invalid_argument("prepare_masked_block: inputs and outputs must not overlap");
     }
     detail::prepare_masked_block_launch(anchors, lengths, valid_columns, mask_id, ids, positions,

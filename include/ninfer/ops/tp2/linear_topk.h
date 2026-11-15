@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of linear_topk. Our file: ninfer/ops/linear_topk.h is upstream's and
-// carries no hook.
+// Two-device (tp 2) forms of linear_topk.
 
 #include "ninfer/ops/linear_topk.h"
 

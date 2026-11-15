@@ -95,11 +95,11 @@ private:
     std::vector<std::int32_t> forced_;
     // NINFER_QWEN4_TFDUMP_STRIDE: logits only at positions % stride == 0 (KL over long windows).
     std::int32_t stride_ = 1;
-    std::filesystem::path xdir_; // T128 exchange taps (empty = off)
+    std::filesystem::path xdir_; // exchange taps (empty = off)
     std::int32_t xstride_ = 16;
     // NINFER_QWEN4_TFDUMP_SEQUENCES=1: every write_tokens (one scored sequence) opens seqNNN/.
     bool sequences_ = false;
-    // MTP training data (T194): NINFER_QWEN4_TFDUMP_COMPACT=1 appends the hidden taps of a sequence
+    // MTP training data: NINFER_QWEN4_TFDUMP_COMPACT=1 appends the hidden taps of a sequence
     // to one file per layer, hidden_LXX.bin = records {i32 first_position, i32 columns, i32 rows,
     // bf16 [columns][rows]}; NINFER_QWEN4_TFDUMP_TOPK=k writes the k most likely tokens of every
     // scored position instead of the whole logits, topk.bin = records {i32 position, i32 ids[k],
@@ -117,12 +117,12 @@ public:
     void set_forced(std::vector<std::int32_t> ids) { forced_ = std::move(ids); }
 };
 
-// T59 fast bench: teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY=<file>,
+// Fast bench: teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY=<file>,
 // validation-gated: it changes the generated tokens). File: one "seq <ids...>" line per recorded
 // request (prompt + its reference continuation), each followed by the request's MTP rounds,
 // "win <frontier> <extent> <accepted> <draft_1> .. <draft_K>" (drafts as the round verified them;
-// written by NINFER_QWEN4_REPLAY_RECORD=<file> as "req"/"win" lines, completed by
-// tools/ws/fastbench.py). A request whose ledger is a prefix of a "seq" line then commits exactly
+// written by NINFER_QWEN4_REPLAY_RECORD=<file> as "req"/"win" lines, each "req" then completed
+// into a "seq" line). A request whose ledger is a prefix of a "seq" line then commits exactly
 // the reference: the first token after the prompt and every ordinary decode token are forced,
 // and every MTP round verifies the recorded extent with the recorded drafts while the reference
 // continuation replaces the target argmax before acceptance (MtpDecodeIngress::forced_targets),

@@ -227,7 +227,7 @@ public:
         --object.checkpoint_references;
     }
 
-    // The published Host replica's bytes (disk tier, v0.7.2); nullopt without one.
+    // The published Host replica's bytes (disk tier); nullopt without one.
     [[nodiscard]] std::optional<qwen3_5::HostStateImageConstView>
     host_view(StateImageHandle handle) const {
         const Object& object = require(handle);

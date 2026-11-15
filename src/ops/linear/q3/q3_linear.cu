@@ -1,4 +1,4 @@
-// v0.7 27b-16gb: q3_g128_fp16 A16 Linear, residual-add, SwiGLU and row-split epilogues.
+// q3_g128_fp16 Linear, residual-add, SwiGLU and row-split epilogues.
 // See q3_linear.h for the contract and q3_rowsplit_storage.cuh for the storage.
 #include "ops/linear/q3/q3_linear.h"
 
@@ -44,6 +44,7 @@ __device__ __forceinline__ float q3_scale(const Q3Operands& op, int row, int gro
 
 struct SegmentsEpilogue {
     Q3RowSegments seg;
+
     __device__ __forceinline__ void store(int row, int token, float value) const {
         int begin = 0;
 #pragma unroll
@@ -55,6 +56,7 @@ struct SegmentsEpilogue {
             if (s < seg.count) begin = seg.end[s];
         }
     }
+
     // Rows row..row+7 of one token (row % 8 == 0): one 16-byte store when they lie in one segment
     // at a 16-byte aligned place, else element by element (rows past the last segment dropped).
     __device__ __forceinline__ void store8(int row, int token, const float (&v)[8]) const {
@@ -67,7 +69,8 @@ struct SegmentsEpilogue {
                     uint4 o;
                     auto* h = reinterpret_cast<__nv_bfloat162*>(&o);
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) h[i] = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
+                    for (int i = 0; i < 4; ++i)
+                        h[i] = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
                     *reinterpret_cast<uint4*>(p) = o;
                     return;
                 }
@@ -85,10 +88,12 @@ struct SegmentsEpilogue {
 struct AddEpilogue {
     __nv_bfloat16* residual; // [N,T]
     std::int32_t rows;
+
     __device__ __forceinline__ void store(int row, int token, float value) const {
         __nv_bfloat16* p = residual + static_cast<std::int64_t>(token) * rows + row;
-        *p = __float2bfloat16_rn(__bfloat162float(*p) + value);
+        *p               = __float2bfloat16_rn(__bfloat162float(*p) + value);
     }
+
     __device__ __forceinline__ void store8(int row, int token, const float (&v)[8]) const {
         __nv_bfloat16* p = residual + static_cast<std::int64_t>(token) * rows + row;
         if (row + 8 <= rows && (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0) {
@@ -97,7 +102,7 @@ struct AddEpilogue {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const float2 r = __bfloat1622float2(h[i]);
-                h[i] = __floats2bfloat162_rn(r.x + v[2 * i], r.y + v[2 * i + 1]);
+                h[i]           = __floats2bfloat162_rn(r.x + v[2 * i], r.y + v[2 * i + 1]);
             }
             *reinterpret_cast<uint4*>(p) = o;
             return;
@@ -112,10 +117,12 @@ struct AddEpilogue {
 struct SwigluOut {
     __nv_bfloat16* out;
     std::int32_t half_rows;
+
     __device__ __forceinline__ void store(int row, int token, float gate, float up) const {
         out[static_cast<std::int64_t>(token) * half_rows + row] =
             __float2bfloat16_rn(silu(gate) * up);
     }
+
     __device__ __forceinline__ void store8(int row, int token, const float (&gate)[8],
                                            const float (&up)[8]) const {
         __nv_bfloat16* p = out + static_cast<std::int64_t>(token) * half_rows + row;
@@ -134,131 +141,6 @@ struct SwigluOut {
             if (row + i < half_rows) store(row + i, token, gate[i], up[i]);
     }
 };
-
-// ---------------------------------------------------------------------------------------------
-// GEMV, T <= 8: one warp per weight row (two rows, gate and up, for SwiGLU). Lane l of chunk c
-// owns unit 32c + l (codes [32(32c+l), +32)). The activations of a 1024-code chunk are staged in
-// shared memory as [T][32 units][40] BF16 (32 values + 8 pad: an 80-byte unit stride keeps the
-// per-lane 16-byte reads conflict-free).
-
-constexpr int kGemvWarps      = 8;
-constexpr int kGemvThreads    = kGemvWarps * 32;
-constexpr int kChunkUnits     = 32;
-constexpr int kChunkCodes     = kChunkUnits * S::kUnitCodes; // 1024
-constexpr int kUnitPitch      = 40;                          // BF16 per staged unit
-
-template <int T>
-__device__ __forceinline__ void q3_gemv_row(const Q3Operands& op, int row, int unit,
-                                            const __nv_bfloat16* xs, float (&acc)[T]) {
-    const auto* p = reinterpret_cast<const std::uint32_t*>(op.codes + row * op.code_row_bytes +
-                                                           static_cast<std::int64_t>(unit) *
-                                                               S::kUnitBytes);
-    const std::uint32_t w0 = __ldg(p), w1 = __ldg(p + 1), w2 = __ldg(p + 2);
-    const float scale      = q3_scale(op, row, unit / S::kUnitsGroup);
-    float codes[32];
-    q3_decode_unit(w0, w1, w2, codes);
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-        const uint4* xv = reinterpret_cast<const uint4*>(xs + (t * kChunkUnits) * kUnitPitch);
-        float sum       = 0.0F;
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const uint4 v = xv[q];
-            const auto* h = reinterpret_cast<const __nv_bfloat162*>(&v);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = __bfloat1622float2(h[i]);
-                sum            = fmaf(codes[8 * q + 2 * i], f.x, sum);
-                sum            = fmaf(codes[8 * q + 2 * i + 1], f.y, sum);
-            }
-        }
-        acc[t] = fmaf(scale, sum, acc[t]);
-    }
-}
-
-template <int T>
-__device__ __forceinline__ void q3_stage_chunk(const Q3Operands& op, int chunk, int units,
-                                               __nv_bfloat16* xs) {
-    // T x units x 4 vectors of 8 BF16.
-    const int vectors = T * units * 4;
-    for (int i = threadIdx.x; i < vectors; i += kGemvThreads) {
-        const int t = i / (units * 4);
-        const int r = i - t * units * 4;
-        const int u = r >> 2;
-        const int q = r & 3;
-        const auto* src = reinterpret_cast<const uint4*>(
-            op.x + static_cast<std::int64_t>(t) * op.k + chunk * kChunkCodes + u * 32 + q * 8);
-        *reinterpret_cast<uint4*>(xs + (t * kChunkUnits + u) * kUnitPitch + q * 8) = __ldg(src);
-    }
-}
-
-template <int T, class Epilogue>
-__global__ void __launch_bounds__(kGemvThreads)
-    q3_gemv_kernel(Q3Operands op, Epilogue epilogue) {
-    __shared__ __align__(16) __nv_bfloat16 xs[T * kChunkUnits * kUnitPitch];
-    const int warp  = threadIdx.x >> 5;
-    const int lane  = threadIdx.x & 31;
-    const int row   = blockIdx.x * kGemvWarps + warp;
-    const bool live = row < op.rows;
-    float acc[T];
-#pragma unroll
-    for (int t = 0; t < T; ++t) acc[t] = 0.0F;
-    const int chunks = (op.k + kChunkCodes - 1) / kChunkCodes;
-    for (int c = 0; c < chunks; ++c) {
-        const int units = min(kChunkUnits, (op.k - c * kChunkCodes) / S::kUnitCodes);
-        __syncthreads();
-        q3_stage_chunk<T>(op, c, units, xs);
-        __syncthreads();
-        if (live && lane < units) {
-            q3_gemv_row<T>(op, row, c * kChunkUnits + lane, xs + lane * kUnitPitch, acc);
-        }
-    }
-    if (!live) return;
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-        float v = acc[t];
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_xor_sync(0xffffffffu, v, offset);
-        if (lane == 0) epilogue.store(row, t, v);
-    }
-}
-
-template <int T>
-__global__ void __launch_bounds__(kGemvThreads)
-    q3_gemv_swiglu_kernel(Q3Operands op, SwigluOut out) {
-    __shared__ __align__(16) __nv_bfloat16 xs[T * kChunkUnits * kUnitPitch];
-    const int warp  = threadIdx.x >> 5;
-    const int lane  = threadIdx.x & 31;
-    const int half  = op.rows / 2;
-    const int row   = blockIdx.x * kGemvWarps + warp;
-    const bool live = row < half;
-    float gate[T], up[T];
-#pragma unroll
-    for (int t = 0; t < T; ++t) gate[t] = up[t] = 0.0F;
-    const int chunks = (op.k + kChunkCodes - 1) / kChunkCodes;
-    for (int c = 0; c < chunks; ++c) {
-        const int units = min(kChunkUnits, (op.k - c * kChunkCodes) / S::kUnitCodes);
-        __syncthreads();
-        q3_stage_chunk<T>(op, c, units, xs);
-        __syncthreads();
-        if (live && lane < units) {
-            const __nv_bfloat16* own = xs + lane * kUnitPitch;
-            q3_gemv_row<T>(op, row, c * kChunkUnits + lane, own, gate);
-            q3_gemv_row<T>(op, row + half, c * kChunkUnits + lane, own, up);
-        }
-    }
-    if (!live) return;
-#pragma unroll
-    for (int t = 0; t < T; ++t) {
-        float g = gate[t], u = up[t];
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            g += __shfl_xor_sync(0xffffffffu, g, offset);
-            u += __shfl_xor_sync(0xffffffffu, u, offset);
-        }
-        if (lane == 0) out.store(row, t, g, u);
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // GEMM, T > 8: a CTA computes 128 weight rows x 64 tokens with 8 warps (4 row x 2 token warps,
@@ -306,11 +188,10 @@ __device__ __forceinline__ bool q3_tile_row_live(const Q3Operands& op, int tile,
 }
 
 template <bool Swiglu, class Epilogue>
-__global__ void __launch_bounds__(kGemmThreads)
-    q3_gemm_kernel(Q3Operands op, Epilogue epilogue) {
+__global__ void __launch_bounds__(kGemmThreads) q3_gemm_kernel(Q3Operands op, Epilogue epilogue) {
     extern __shared__ __align__(16) unsigned char smem[];
-    auto* as = reinterpret_cast<__nv_bfloat16*>(smem);
-    auto* bs = reinterpret_cast<__nv_bfloat16*>(smem + kASmemBytes);
+    auto* as        = reinterpret_cast<__nv_bfloat16*>(smem);
+    auto* bs        = reinterpret_cast<__nv_bfloat16*>(smem + kASmemBytes);
     const int tile  = blockIdx.x;
     const int t0    = blockIdx.y * kTileTokens;
     const int warp  = threadIdx.x >> 5;
@@ -359,7 +240,8 @@ __global__ void __launch_bounds__(kGemmThreads)
             }
             auto* dst = reinterpret_cast<__nv_bfloat162*>(as + r * kTilePitch + u * 32);
 #pragma unroll
-            for (int j = 0; j < 16; ++j) dst[j] = __floats2bfloat162_rn(codes[2 * j], codes[2 * j + 1]);
+            for (int j = 0; j < 16; ++j)
+                dst[j] = __floats2bfloat162_rn(codes[2 * j], codes[2 * j + 1]);
         }
         __syncthreads();
 
@@ -376,7 +258,7 @@ __global__ void __launch_bounds__(kGemmThreads)
 #pragma unroll
             for (int mi = 0; mi < 2; ++mi) {
                 const __nv_bfloat16* base = as + (wr * 32 + mi * 16 + g) * kTilePitch + kk + 2 * tq;
-                a[mi][0] = *reinterpret_cast<const std::uint32_t*>(base);
+                a[mi][0]                  = *reinterpret_cast<const std::uint32_t*>(base);
                 a[mi][1] = *reinterpret_cast<const std::uint32_t*>(base + 8 * kTilePitch);
                 a[mi][2] = *reinterpret_cast<const std::uint32_t*>(base + 8);
                 a[mi][3] = *reinterpret_cast<const std::uint32_t*>(base + 8 * kTilePitch + 8);
@@ -384,8 +266,8 @@ __global__ void __launch_bounds__(kGemmThreads)
 #pragma unroll
             for (int ni = 0; ni < 4; ++ni) {
                 const __nv_bfloat16* base = bs + (wt * 32 + ni * 8 + g) * kTilePitch + kk + 2 * tq;
-                b[ni][0] = *reinterpret_cast<const std::uint32_t*>(base);
-                b[ni][1] = *reinterpret_cast<const std::uint32_t*>(base + 8);
+                b[ni][0]                  = *reinterpret_cast<const std::uint32_t*>(base);
+                b[ni][1]                  = *reinterpret_cast<const std::uint32_t*>(base + 8);
             }
 #pragma unroll
             for (int mi = 0; mi < 2; ++mi)
@@ -395,15 +277,13 @@ __global__ void __launch_bounds__(kGemmThreads)
         // Scale this group's partial by each row's multiplier (rows g and g + 8 of every m tile).
 #pragma unroll
         for (int mi = 0; mi < 2; ++mi) {
-            const int r0 = wr * 32 + mi * 16 + g;
-            const float s0 =
-                q3_tile_row_live<Swiglu>(op, tile, r0)
-                    ? q3_scale(op, q3_tile_row<Swiglu>(op, tile, r0), step)
-                    : 0.0F;
-            const float s1 =
-                q3_tile_row_live<Swiglu>(op, tile, r0 + 8)
-                    ? q3_scale(op, q3_tile_row<Swiglu>(op, tile, r0 + 8), step)
-                    : 0.0F;
+            const int r0   = wr * 32 + mi * 16 + g;
+            const float s0 = q3_tile_row_live<Swiglu>(op, tile, r0)
+                                 ? q3_scale(op, q3_tile_row<Swiglu>(op, tile, r0), step)
+                                 : 0.0F;
+            const float s1 = q3_tile_row_live<Swiglu>(op, tile, r0 + 8)
+                                 ? q3_scale(op, q3_tile_row<Swiglu>(op, tile, r0 + 8), step)
+                                 : 0.0F;
 #pragma unroll
             for (int ni = 0; ni < 4; ++ni) {
                 total[mi][ni][0] = fmaf(s0, part[mi][ni][0], total[mi][ni][0]);
@@ -423,8 +303,8 @@ __global__ void __launch_bounds__(kGemmThreads)
             for (int ni = 0; ni < 4; ++ni)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int r = wr * 32 + mi * 16 + g + (e >= 2 ? 8 : 0);
-                    const int t = wt * 32 + ni * 8 + 2 * tq + (e & 1);
+                    const int r         = wr * 32 + mi * 16 + g + (e >= 2 ? 8 : 0);
+                    const int t         = wt * 32 + ni * 8 + 2 * tq + (e & 1);
                     cs[r * kCPitch + t] = total[mi][ni][e];
                 }
         __syncthreads();
@@ -451,210 +331,7 @@ __global__ void __launch_bounds__(kGemmThreads)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Small-T tensor-core route, T <= 8 and K % 256 == 0 (the decode and MTP-verify widths). Design
-// after roofkid/ninfer-4080's small-T route (Apache-2.0): a CTA owns Rows weight rows x 8 token
-// columns and walks K in 256-code stages (two groups) through a three-buffer cp.async ring, so
-// every row's code stream is contiguous 16-byte DRAM traffic and two stages stay in flight while
-// one is computed. Each stage: 256 threads expand the 3-bit codes into exact BF16 integers in
-// shared memory; the 8 warps split the stage's 16 K16 slices (warp w owns slices 2w, 2w+1, i.e.
-// codes [32w, 32w+32), which lie in group w / 4), run mma.sync m16n8k16, and scale their FP32
-// partial by the row's group multiplier before adding it to their running sums; the 8 warp sums
-// meet once in shared memory at the end. Unlike roofkid (one BF16 rounding of code*scale), the
-// codes stay exact and the multiplier is applied in FP32, as in the GEMV and tile routes.
-
-constexpr int kStK       = 256;
-constexpr int kStBuffers = 3;
-constexpr int kStPitch   = kStK + 8; // BF16 per staged row (528 B: conflict-free u32 fragment reads)
-constexpr int kStTokens  = 8;
-
-template <int Rows>
-struct SmallTStage {
-    __align__(16) std::uint8_t codes[Rows][2 * S::kCodeBytesPerGroup];
-    __align__(16) std::uint16_t x[kStTokens][kStPitch]; // BF16 bits
-    __align__(16) std::uint16_t scale[Rows][2];
-};
-
-template <int Rows>
-struct SmallTSmem {
-    SmallTStage<Rows> stage[kStBuffers];
-    union {
-        __align__(16) std::uint16_t dec[Rows][kStPitch]; // BF16 bits of exact integer codes
-        float partial[8][Rows / 16][32][4];
-    };
-};
-
-// Weight row of local row i of a small-T tile; SwiGLU tiles hold Rows/2 gate rows then their up rows.
-template <int Rows, bool Swiglu>
-__device__ __forceinline__ int st_row(const Q3Operands& op, int tile, int i) {
-    if constexpr (Swiglu) {
-        constexpr int H = Rows / 2;
-        return i < H ? tile * H + i : op.rows / 2 + tile * H + (i - H);
-    } else {
-        return tile * Rows + i;
-    }
-}
-
-template <int Rows, bool Swiglu>
-__device__ __forceinline__ bool st_live(const Q3Operands& op, int tile, int i) {
-    if constexpr (Swiglu) {
-        return tile * (Rows / 2) + (i % (Rows / 2)) < op.rows / 2;
-    } else {
-        return tile * Rows + i < op.rows;
-    }
-}
-
-template <int Rows, bool Swiglu>
-__device__ __forceinline__ void st_issue(const Q3Operands& op, int tile, int step,
-                                         SmallTStage<Rows>& st) {
-    constexpr int kCodeChunks = Rows * 6; // 96 code bytes per row per stage
-    const int k0              = step * kStK;
-    for (int i = threadIdx.x; i < kCodeChunks; i += 256) {
-        const int r      = i / 6;
-        const int c      = i - r * 6;
-        const bool live  = st_live<Rows, Swiglu>(op, tile, r);
-        const int row    = live ? st_row<Rows, Swiglu>(op, tile, r) : 0;
-        const auto* src  = op.codes + row * op.code_row_bytes +
-                          static_cast<std::int64_t>(step) * 2 * S::kCodeBytesPerGroup + c * 16;
-        cp_async_zfill<16, Cache::cg>(&st.codes[r][c * 16], src, live ? 16 : 0);
-    }
-    for (int i = threadIdx.x; i < Rows; i += 256) {
-        const bool live = st_live<Rows, Swiglu>(op, tile, i);
-        const int row   = live ? st_row<Rows, Swiglu>(op, tile, i) : 0;
-        cp_async_zfill<4>(&st.scale[i][0], op.scales + row * op.scale_row_bytes + step * 4,
-                          live ? 4 : 0);
-    }
-    const int vectors = op.tokens * (kStK / 8);
-    for (int i = threadIdx.x; i < vectors; i += 256) {
-        const int t = i / (kStK / 8);
-        const int v = i - t * (kStK / 8);
-        cp_async<16, Cache::cg>(&st.x[t][v * 8], op.x + static_cast<std::int64_t>(t) * op.k + k0 + v * 8);
-    }
-}
-
-template <int Rows, bool Swiglu, class Epilogue>
-__global__ void __launch_bounds__(256) q3_small_t_kernel(Q3Operands op, Epilogue epilogue) {
-    static_assert(Rows == 16 || Rows == 32);
-    static_assert(!Swiglu || Rows == 32, "SwiGLU tiles pair a gate m16 tile with its up m16 tile");
-    constexpr int kM = Rows / 16;
-    __shared__ SmallTSmem<Rows> sm;
-    const int tile  = blockIdx.x;
-    const int warp  = threadIdx.x >> 5;
-    const int lane  = threadIdx.x & 31;
-    const int g     = lane >> 2;
-    const int tq    = lane & 3;
-    const int steps = op.k / kStK;
-
-    // Token rows >= T stay zero in every ring buffer (never written by the copies).
-    for (int i = threadIdx.x; i < kStBuffers * kStTokens * kStPitch / 2; i += 256) {
-        const int b = i / (kStTokens * kStPitch / 2);
-        const int j = i - b * (kStTokens * kStPitch / 2);
-        reinterpret_cast<std::uint32_t*>(&sm.stage[b].x[0][0])[j] = 0u;
-    }
-    __syncthreads();
-    st_issue<Rows, Swiglu>(op, tile, 0, sm.stage[0]);
-    cp_commit();
-    if (steps > 1) st_issue<Rows, Swiglu>(op, tile, 1, sm.stage[1]);
-    cp_commit();
-
-    float total[kM][4];
-#pragma unroll
-    for (int mi = 0; mi < kM; ++mi)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) total[mi][e] = 0.0F;
-
-    for (int step = 0; step < steps; ++step) {
-        cp_wait<1>();
-        __syncthreads(); // stage `step` landed; MMAs of step-1 are done with dec and their buffer
-        if (step + 2 < steps) st_issue<Rows, Swiglu>(op, tile, step + 2, sm.stage[(step + 2) % kStBuffers]);
-        cp_commit();
-        SmallTStage<Rows>& st = sm.stage[step % kStBuffers];
-        // Expand codes: Rows x 8 units of 32 codes.
-        for (int i = threadIdx.x; i < Rows * 8; i += 256) {
-            const int r  = i >> 3;
-            const int u  = i & 7;
-            const auto* p = reinterpret_cast<const std::uint32_t*>(&st.codes[r][u * S::kUnitBytes]);
-            float codes[32];
-            q3_decode_unit(p[0], p[1], p[2], codes);
-            auto* dst = reinterpret_cast<__nv_bfloat162*>(&sm.dec[r][u * 32]);
-#pragma unroll
-            for (int j = 0; j < 16; ++j) dst[j] = __floats2bfloat162_rn(codes[2 * j], codes[2 * j + 1]);
-        }
-        __syncthreads();
-        float part[kM][4];
-#pragma unroll
-        for (int mi = 0; mi < kM; ++mi)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) part[mi][e] = 0.0F;
-#pragma unroll
-        for (int sl = 0; sl < 2; ++sl) {
-            const int kk = (2 * warp + sl) * 16;
-            std::uint32_t b[2];
-            const std::uint16_t* xb = &st.x[g][kk + 2 * tq];
-            b[0] = *reinterpret_cast<const std::uint32_t*>(xb);
-            b[1] = *reinterpret_cast<const std::uint32_t*>(xb + 8);
-#pragma unroll
-            for (int mi = 0; mi < kM; ++mi) {
-                std::uint32_t a[4];
-                const std::uint16_t* ab = &sm.dec[mi * 16 + g][kk + 2 * tq];
-                a[0] = *reinterpret_cast<const std::uint32_t*>(ab);
-                a[1] = *reinterpret_cast<const std::uint32_t*>(ab + 8 * kStPitch);
-                a[2] = *reinterpret_cast<const std::uint32_t*>(ab + 8);
-                a[3] = *reinterpret_cast<const std::uint32_t*>(ab + 8 * kStPitch + 8);
-                mma_bf16_16816(part[mi], a, b);
-            }
-        }
-        const int grp = warp >> 2; // slices of warp w lie in group w / 4 of the stage
-#pragma unroll
-        for (int mi = 0; mi < kM; ++mi) {
-            const float s0 = __half2float(__ushort_as_half(st.scale[mi * 16 + g][grp]));
-            const float s1 = __half2float(__ushort_as_half(st.scale[mi * 16 + g + 8][grp]));
-            total[mi][0] = fmaf(s0, part[mi][0], total[mi][0]);
-            total[mi][1] = fmaf(s0, part[mi][1], total[mi][1]);
-            total[mi][2] = fmaf(s1, part[mi][2], total[mi][2]);
-            total[mi][3] = fmaf(s1, part[mi][3], total[mi][3]);
-        }
-    }
-    cp_wait<0>();
-    __syncthreads();
-#pragma unroll
-    for (int mi = 0; mi < kM; ++mi)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) sm.partial[warp][mi][lane][e] = total[mi][e];
-    __syncthreads();
-    if (threadIdx.x >= 32 * (Swiglu ? 1 : kM)) return;
-    const int mi0 = threadIdx.x >> 5;
-    float sum[kM][4];
-#pragma unroll
-    for (int mi = 0; mi < kM; ++mi)
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            float v = 0.0F;
-            if (Swiglu || mi == mi0) {
-#pragma unroll
-                for (int w = 0; w < 8; ++w) v += sm.partial[w][mi][lane][e];
-            }
-            sum[mi][e] = v;
-        }
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int r = g + (e >= 2 ? 8 : 0);
-        const int t = 2 * tq + (e & 1);
-        if (t >= op.tokens) continue;
-        if constexpr (Swiglu) {
-            if (st_live<Rows, Swiglu>(op, tile, r)) epilogue.store(tile * 16 + r, t, sum[0][e], sum[1][e]);
-        } else {
-#pragma unroll
-            for (int mi = 0; mi < kM; ++mi) {
-                if (mi != mi0) continue;
-                const int lr = mi * 16 + r;
-                if (st_live<Rows, Swiglu>(op, tile, lr)) epilogue.store(st_row<Rows, Swiglu>(op, tile, lr), t, sum[mi][e]);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Register-direct small-T route (default for T <= 8, K % 128 == 0). Weights are the MMA A operand
+// Register-direct small-T route (T <= 8, K % 128 == 0). Weights are the MMA A operand
 // (M = 16 rows), activations the B operand (N = 8 token columns). The K order inside each 16-wide
 // MMA slice is permuted identically on both operands (a dot product does not depend on the order
 // of its terms): thread (g, t) of a warp owns codes [32t, 32t+32) of one 128-code group for rows g
@@ -681,11 +358,11 @@ template <int M, bool Swiglu, class Epilogue>
 __global__ void __launch_bounds__(256) q3_rd_kernel(Q3Operands op, Epilogue epilogue) {
     static_assert(M == 1 || M == 2);
     __shared__ float partial[8][M][32][4];
-    const int tile = blockIdx.x;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int g    = lane >> 2;
-    const int tq   = lane & 3;
+    const int tile   = blockIdx.x;
+    const int warp   = threadIdx.x >> 5;
+    const int lane   = threadIdx.x & 31;
+    const int g      = lane >> 2;
+    const int tq     = lane & 3;
     const int groups = op.k / S::kGroupK;
     // Rows of this thread: tile m holds rows base_m + {g, g + 8}.
     int row[M][2];
@@ -701,7 +378,7 @@ __global__ void __launch_bounds__(256) q3_rd_kernel(Q3Operands op, Epilogue epil
             if (!live[m][h]) row[m][h] = 0;
         }
     }
-    const bool token_live = g < op.tokens; // B column n = g is token g
+    const bool token_live     = g < op.tokens; // B column n = g is token g
     const __nv_bfloat16* xrow = op.x + static_cast<std::int64_t>(token_live ? g : 0) * op.k;
     float total[M][4];
 #pragma unroll
@@ -726,7 +403,11 @@ __global__ void __launch_bounds__(256) q3_rd_kernel(Q3Operands op, Epilogue epil
                     op.codes + row[m][h] * op.code_row_bytes +
                     static_cast<std::int64_t>(grp) * S::kCodeBytesPerGroup + tq * S::kUnitBytes);
                 std::uint32_t w0 = 0, w1 = 0, w2 = 0;
-                if (live[m][h]) { w0 = __ldg(p); w1 = __ldg(p + 1); w2 = __ldg(p + 2); }
+                if (live[m][h]) {
+                    w0 = __ldg(p);
+                    w1 = __ldg(p + 1);
+                    w2 = __ldg(p + 2);
+                }
                 std::uint32_t w24[4];
                 q3_unit_words(w0, w1, w2, w24);
 #pragma unroll
@@ -741,8 +422,8 @@ __global__ void __launch_bounds__(256) q3_rd_kernel(Q3Operands op, Epilogue epil
 #pragma unroll
         for (int sl = 0; sl < 8; ++sl) {
             const std::uint32_t b[2] = {xw[2 * sl], xw[2 * sl + 1]};
-            const int j = sl >> 1;       // 24-bit word holding codes 4sl..4sl+3
-            const int f = (sl & 1) * 4;  // first field inside it
+            const int j              = sl >> 1;      // 24-bit word holding codes 4sl..4sl+3
+            const int f              = (sl & 1) * 4; // first field inside it
 #pragma unroll
             for (int m = 0; m < M; ++m) {
                 const std::uint32_t a[4] = {rd_sub132(rd_pair(word[m][0][j], f)),
@@ -791,7 +472,7 @@ __global__ void __launch_bounds__(256) q3_rd_kernel(Q3Operands op, Epilogue epil
 
 // ---------------------------------------------------------------------------------------------
 // A8 tile route for prefill widths (T >= 64; the fallback of the tall route below when the caller
-// has no workspace, or NINFER_Q3_A8=f): int8 tensor cores
+// has no workspace): int8 tensor cores
 // (mma.sync m16n8k32 s8). Each CTA quantizes its activation tile per (token, 128-value group) to
 // int8 with an FP32 scale (amax / 127, round to nearest) in shared memory; the 3-bit codes are
 // exact int8, decoded straight into A-fragment registers with the same K permutation trick as the
@@ -811,8 +492,8 @@ __device__ __forceinline__ void mma_s8_16832(int (&d)[4], const std::uint32_t (&
 // Four offset-form 3-bit fields of a 24-bit word starting at field f -> four signed int8 lanes.
 __device__ __forceinline__ std::uint32_t a8_quad(std::uint32_t u, int f) {
     const std::uint32_t v = u >> (3 * f);
-    const std::uint32_t packed = (v & 7u) | (((v >> 3) & 7u) << 8) | (((v >> 6) & 7u) << 16) |
-                                 (((v >> 9) & 7u) << 24);
+    const std::uint32_t packed =
+        (v & 7u) | (((v >> 3) & 7u) << 8) | (((v >> 6) & 7u) << 16) | (((v >> 9) & 7u) << 24);
     return __vsub4(packed, 0x04040404u);
 }
 
@@ -827,13 +508,13 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
     __shared__ __align__(16) std::uint16_t xs[2][Tt][kA8XPitch];
     __shared__ __align__(16) std::int8_t xq[Tt][kA8QPitch];
     __shared__ float sx[Tt];
-    const int t0   = blockIdx.x * Tt;
-    const int rt   = blockIdx.y;
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int g    = lane >> 2;
-    const int tq   = lane & 3;
-    const int groups = op.k / S::kGroupK;
+    const int t0       = blockIdx.x * Tt;
+    const int rt       = blockIdx.y;
+    const int warp     = threadIdx.x >> 5;
+    const int lane     = threadIdx.x & 31;
+    const int g        = lane >> 2;
+    const int tq       = lane & 3;
+    const int groups   = op.k / S::kGroupK;
     const int out_rows = Swiglu ? op.rows / 2 : op.rows;
     int row[M][2];
     bool live[M][2];
@@ -848,10 +529,11 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
     }
     auto issue = [&](int grp, int buf) {
         for (int i = threadIdx.x; i < Tt * 16; i += 256) {
-            const int t = i >> 4;
-            const int v = i & 15;
+            const int t   = i >> 4;
+            const int v   = i & 15;
             const bool ok = t0 + t < op.tokens;
-            const auto* src = op.x + static_cast<std::int64_t>(ok ? t0 + t : 0) * op.k + grp * S::kGroupK + v * 8;
+            const auto* src =
+                op.x + static_cast<std::int64_t>(ok ? t0 + t : 0) * op.k + grp * S::kGroupK + v * 8;
             cp_async_zfill<16, Cache::cg>(&xs[buf][t][v * 8], src, ok ? 16 : 0);
         }
         cp_commit();
@@ -876,14 +558,21 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
                     op.codes + row[m][h] * op.code_row_bytes +
                     static_cast<std::int64_t>(grp) * S::kCodeBytesPerGroup + tq * S::kUnitBytes);
                 std::uint32_t w0 = 0, w1 = 0, w2 = 0;
-                if (live[m][h]) { w0 = __ldg(p); w1 = __ldg(p + 1); w2 = __ldg(p + 2); }
+                if (live[m][h]) {
+                    w0 = __ldg(p);
+                    w1 = __ldg(p + 1);
+                    w2 = __ldg(p + 2);
+                }
                 std::uint32_t w24[4];
                 q3_unit_words(w0, w1, w2, w24);
 #pragma unroll
                 for (int j = 0; j < 4; ++j) word[m][h][j] = w24[j] ^ kQ3SignFlip24;
                 sw[m][h] = live[m][h] ? q3_scale(op, row[m][h], grp) : 0.0F;
             }
-        if (grp + 1 < groups) issue(grp + 1, (grp + 1) & 1); else cp_commit();
+        if (grp + 1 < groups)
+            issue(grp + 1, (grp + 1) & 1);
+        else
+            cp_commit();
         cp_wait<1>();
         __syncthreads(); // x tile of grp landed; previous MMAs are done with xq
         // Quantize: warp w handles tokens w, w+8, ...; lane holds 4 values.
@@ -891,12 +580,14 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
             const std::uint16_t* src = &xs[grp & 1][t][lane * 4];
             float v[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] = __uint_as_float(static_cast<std::uint32_t>(src[i]) << 16);
+            for (int i = 0; i < 4; ++i)
+                v[i] = __uint_as_float(static_cast<std::uint32_t>(src[i]) << 16);
             float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-            const float scale = amax > 0.0F ? amax / 127.0F : 0.0F;
-            const float inv   = amax > 0.0F ? 127.0F / amax : 0.0F;
+            for (int off = 16; off > 0; off >>= 1)
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+            const float scale    = amax > 0.0F ? amax / 127.0F : 0.0F;
+            const float inv      = amax > 0.0F ? 127.0F / amax : 0.0F;
             std::uint32_t packed = 0;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -926,7 +617,7 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
             }
 #pragma unroll
             for (int n = 0; n < NT; ++n) {
-                const std::int8_t* bp = &xq[n * 8 + g][32 * tq + 8 * sl];
+                const std::int8_t* bp    = &xq[n * 8 + g][32 * tq + 8 * sl];
                 const std::uint32_t b[2] = {*reinterpret_cast<const std::uint32_t*>(bp),
                                             *reinterpret_cast<const std::uint32_t*>(bp + 4)};
 #pragma unroll
@@ -939,10 +630,14 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
             const float s1 = sx[n * 8 + 2 * tq + 1];
 #pragma unroll
             for (int m = 0; m < M; ++m) {
-                total[m][n][0] = fmaf(sw[m][0] * s0, static_cast<float>(part[m][n][0]), total[m][n][0]);
-                total[m][n][1] = fmaf(sw[m][0] * s1, static_cast<float>(part[m][n][1]), total[m][n][1]);
-                total[m][n][2] = fmaf(sw[m][1] * s0, static_cast<float>(part[m][n][2]), total[m][n][2]);
-                total[m][n][3] = fmaf(sw[m][1] * s1, static_cast<float>(part[m][n][3]), total[m][n][3]);
+                total[m][n][0] =
+                    fmaf(sw[m][0] * s0, static_cast<float>(part[m][n][0]), total[m][n][0]);
+                total[m][n][1] =
+                    fmaf(sw[m][0] * s1, static_cast<float>(part[m][n][1]), total[m][n][1]);
+                total[m][n][2] =
+                    fmaf(sw[m][1] * s0, static_cast<float>(part[m][n][2]), total[m][n][2]);
+                total[m][n][3] =
+                    fmaf(sw[m][1] * s1, static_cast<float>(part[m][n][3]), total[m][n][3]);
             }
         }
     }
@@ -963,7 +658,7 @@ __global__ void __launch_bounds__(256) q3_a8_gemm_kernel(Q3Operands op, Epilogue
 }
 
 // ---------------------------------------------------------------------------------------------
-// A8 tall route (v0.7 q3-prefill): the arithmetic of q3_a8_gemm_kernel, bit for bit, without its
+// A8 tall route: the arithmetic of q3_a8_gemm_kernel, bit for bit, without its
 // per-CTA overheads.
 //  1. q3_a8_quantize_kernel quantizes the activations once per call (per token and 128-value
 //     group, the same amax / 127 rule and the same lane split) into a caller workspace:
@@ -998,18 +693,19 @@ __global__ void __launch_bounds__(256)
     const std::int64_t item =
         static_cast<std::int64_t>(blockIdx.x) * 8 + static_cast<std::int64_t>(threadIdx.x >> 5);
     if (item >= static_cast<std::int64_t>(tokens) * groups) return;
-    const int t    = static_cast<int>(item / groups);
-    const int grp  = static_cast<int>(item - static_cast<std::int64_t>(t) * groups);
-    const int lane = threadIdx.x & 31;
+    const int t           = static_cast<int>(item / groups);
+    const int grp         = static_cast<int>(item - static_cast<std::int64_t>(t) * groups);
+    const int lane        = threadIdx.x & 31;
     const std::int64_t at = static_cast<std::int64_t>(t) * k + grp * S::kGroupK + lane * 4;
-    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(x + at));
-    float v[4] = {__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
-                  __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u)};
-    float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    const uint2 raw       = __ldg(reinterpret_cast<const uint2*>(x + at));
+    float v[4]            = {__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+                             __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u)};
+    float amax            = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-    const float scale = amax > 0.0F ? amax / 127.0F : 0.0F;
-    const float inv   = amax > 0.0F ? 127.0F / amax : 0.0F;
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float scale    = amax > 0.0F ? amax / 127.0F : 0.0F;
+    const float inv      = amax > 0.0F ? 127.0F / amax : 0.0F;
     std::uint32_t packed = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -1019,7 +715,7 @@ __global__ void __launch_bounds__(256)
     *reinterpret_cast<std::uint32_t*>(xq + at) = packed;
     if (lane == 0) {
         float* row = sx + static_cast<std::int64_t>(grp) * tp;
-        row[t] = scale;
+        row[t]     = scale;
         if (t == tokens - 1) {
             for (int p = tokens; p < tp; ++p) row[p] = 0.0F;
         }
@@ -1078,8 +774,8 @@ __global__ void __launch_bounds__(256, 1)
             const int t   = i >> 3;
             const int c   = i & 7;
             const bool ok = t0 + t < op.tokens;
-            const std::int8_t* src = xq + static_cast<std::int64_t>(ok ? t0 + t : 0) * op.k +
-                                     grp * S::kGroupK + c * 16;
+            const std::int8_t* src =
+                xq + static_cast<std::int64_t>(ok ? t0 + t : 0) * op.k + grp * S::kGroupK + c * 16;
             cp_async_zfill<16, Cache::cg>(base + t * kA8tXPitch + c * 16, src, ok ? 16 : 0);
         }
         for (int i = threadIdx.x; i < kA8tRows * 3; i += 256) {
@@ -1087,14 +783,15 @@ __global__ void __launch_bounds__(256, 1)
             const int c   = i - 3 * r;
             const bool ok = a8t_row_live<Swiglu>(op, rt, r);
             const std::uint8_t* src =
-                op.codes + static_cast<std::int64_t>(ok ? a8t_row<Swiglu>(op, rt, r) : 0) * op.code_row_bytes +
+                op.codes +
+                static_cast<std::int64_t>(ok ? a8t_row<Swiglu>(op, rt, r) : 0) * op.code_row_bytes +
                 static_cast<std::int64_t>(grp) * S::kCodeBytesPerGroup + c * 16;
-            cp_async_zfill<16, Cache::cg>(base + kA8tXBytes + r * S::kCodeBytesPerGroup + c * 16, src,
-                                          ok ? 16 : 0);
+            cp_async_zfill<16, Cache::cg>(base + kA8tXBytes + r * S::kCodeBytesPerGroup + c * 16,
+                                          src, ok ? 16 : 0);
         }
         if (threadIdx.x < kA8tTokens / 4) {
-            const int t   = t0 + threadIdx.x * 4;
-            const bool ok = t < tp;
+            const int t      = t0 + threadIdx.x * 4;
+            const bool ok    = t < tp;
             const float* src = sx + static_cast<std::int64_t>(grp) * tp + (ok ? t : 0);
             cp_async_zfill<16, Cache::cg>(base + kA8tXBytes + kA8tCBytes + threadIdx.x * 16, src,
                                           ok ? 16 : 0);
@@ -1131,7 +828,8 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
         for (int m = 0; m < 2; ++m)
 #pragma unroll
-            for (int h = 0; h < 2; ++h) sw[m][h] = live[m][h] ? q3_scale(op, grow[m][h], grp) : 0.0F;
+            for (int h = 0; h < 2; ++h)
+                sw[m][h] = live[m][h] ? q3_scale(op, grow[m][h], grp) : 0.0F;
 
         std::uint32_t a[2][4][4];
 #pragma unroll
@@ -1164,9 +862,9 @@ __global__ void __launch_bounds__(256, 1)
                 for (int e = 0; e < 4; ++e) part[m][n][e] = 0;
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
-            const std::int8_t* bp = xs + (wt * 64 + n * 8 + g) * kA8tXPitch + 32 * tq;
-            const uint4 lo = *reinterpret_cast<const uint4*>(bp);
-            const uint4 hi = *reinterpret_cast<const uint4*>(bp + 16);
+            const std::int8_t* bp       = xs + (wt * 64 + n * 8 + g) * kA8tXPitch + 32 * tq;
+            const uint4 lo              = *reinterpret_cast<const uint4*>(bp);
+            const uint4 hi              = *reinterpret_cast<const uint4*>(bp + 16);
             const std::uint32_t b[4][2] = {{lo.x, lo.y}, {lo.z, lo.w}, {hi.x, hi.y}, {hi.z, hi.w}};
 #pragma unroll
             for (int sl = 0; sl < 4; ++sl)
@@ -1179,10 +877,14 @@ __global__ void __launch_bounds__(256, 1)
             const float s1 = ss[wt * 64 + n * 8 + 2 * tq + 1];
 #pragma unroll
             for (int m = 0; m < 2; ++m) {
-                total[m][n][0] = fmaf(sw[m][0] * s0, static_cast<float>(part[m][n][0]), total[m][n][0]);
-                total[m][n][1] = fmaf(sw[m][0] * s1, static_cast<float>(part[m][n][1]), total[m][n][1]);
-                total[m][n][2] = fmaf(sw[m][1] * s0, static_cast<float>(part[m][n][2]), total[m][n][2]);
-                total[m][n][3] = fmaf(sw[m][1] * s1, static_cast<float>(part[m][n][3]), total[m][n][3]);
+                total[m][n][0] =
+                    fmaf(sw[m][0] * s0, static_cast<float>(part[m][n][0]), total[m][n][0]);
+                total[m][n][1] =
+                    fmaf(sw[m][0] * s1, static_cast<float>(part[m][n][1]), total[m][n][1]);
+                total[m][n][2] =
+                    fmaf(sw[m][1] * s0, static_cast<float>(part[m][n][2]), total[m][n][2]);
+                total[m][n][3] =
+                    fmaf(sw[m][1] * s1, static_cast<float>(part[m][n][3]), total[m][n][3]);
             }
         }
     }
@@ -1197,7 +899,7 @@ __global__ void __launch_bounds__(256, 1)
         for (int n = 0; n < 8; ++n)
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
-                const int t = wt * 64 + n * 8 + 2 * tq + (e & 1);
+                const int t                          = wt * 64 + n * 8 + 2 * tq + (e & 1);
                 cs[t * kA8tCPitch + lrow[m][e >> 1]] = total[m][n][e];
             }
     __syncthreads();
@@ -1223,7 +925,7 @@ __global__ void __launch_bounds__(256, 1)
 // ---------------------------------------------------------------------------------------------
 // Host side.
 
-constexpr int kGemvMaxTokens = 8;
+constexpr int kSmallTMaxTokens = 8;
 
 Q3Operands q3_operands(const Tensor& x, const Weight& w) {
     const std::int64_t groups = w.padded_shape[1] / S::kGroupK;
@@ -1238,31 +940,11 @@ Q3Operands q3_operands(const Tensor& x, const Weight& w) {
 }
 
 void require_activation(const Tensor& x, const Weight& w, const char* label) {
-    if (x.dtype != DType::BF16 || x.ne[0] != w.k || x.ne[1] <= 0 || x.ne[2] != 1 ||
-        x.ne[3] != 1 || !x.is_contiguous() || x.data == nullptr ||
+    if (x.dtype != DType::BF16 || x.ne[0] != w.k || x.ne[1] <= 0 || x.ne[2] != 1 || x.ne[3] != 1 ||
+        !x.is_contiguous() || x.data == nullptr ||
         (reinterpret_cast<std::uintptr_t>(x.data) & 15u) != 0) {
         throw std::invalid_argument(std::string(label) +
                                     ": x must be contiguous 16-byte-aligned BF16 [K,T]");
-    }
-}
-
-template <int T, class Epilogue>
-void launch_gemv(const Q3Operands& op, const Epilogue& epilogue, int rows, cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>((rows + kGemvWarps - 1) / kGemvWarps));
-    q3_gemv_kernel<T, Epilogue><<<grid, kGemvThreads, 0, stream>>>(op, epilogue);
-}
-
-template <class Epilogue>
-void launch_gemv_tokens(const Q3Operands& op, const Epilogue& epilogue, cudaStream_t stream) {
-    switch (op.tokens) {
-    case 1: return launch_gemv<1>(op, epilogue, op.rows, stream);
-    case 2: return launch_gemv<2>(op, epilogue, op.rows, stream);
-    case 3: return launch_gemv<3>(op, epilogue, op.rows, stream);
-    case 4: return launch_gemv<4>(op, epilogue, op.rows, stream);
-    case 5: return launch_gemv<5>(op, epilogue, op.rows, stream);
-    case 6: return launch_gemv<6>(op, epilogue, op.rows, stream);
-    case 7: return launch_gemv<7>(op, epilogue, op.rows, stream);
-    default: return launch_gemv<8>(op, epilogue, op.rows, stream);
     }
 }
 
@@ -1278,55 +960,24 @@ void launch_gemm(const Q3Operands& op, const Epilogue& epilogue, cudaStream_t st
     kernel<<<grid, kGemmThreads, kGemmSmem, stream>>>(op, epilogue);
 }
 
-// Small-T tensor-core route on by default for K % 256 == 0; NINFER_Q3_SMALLT=0 keeps the GEMV
-// (A/B switch for measurements; both are A16 with FP32 accumulation).
-// NINFER_Q3_SMALLT selects the T <= 8 route: unset or 2 = register-direct tensor-core route
-// (default), 1 = shared-memory staged tensor-core route, 0 = warp-per-row GEMV.
-int small_t_mode() {
-    static const int mode = [] {
-        const char* v = std::getenv("NINFER_Q3_SMALLT");
-        return v == nullptr ? 2 : (v[0] == '0' ? 0 : v[0] == '1' ? 1 : 2);
-    }();
-    return mode;
-}
-
-bool small_t_enabled(const Q3Operands& op) {
-    const int mode = small_t_mode();
-    return (mode == 2) || (mode == 1 && op.k % kStK == 0);
-}
-
 template <bool Swiglu, class Epilogue>
 void launch_small_t(const Q3Operands& op, const Epilogue& epilogue, cudaStream_t stream) {
-    if (small_t_mode() == 2) {
-        const int rows = Swiglu ? op.rows / 2 : op.rows;
-        const dim3 grid(static_cast<unsigned>((rows + 15) / 16));
-        q3_rd_kernel<Swiglu ? 2 : 1, Swiglu, Epilogue><<<grid, 256, 0, stream>>>(op, epilogue);
-        return;
-    }
-    if constexpr (Swiglu) {
-        const dim3 grid(static_cast<unsigned>((op.rows / 2 + 15) / 16));
-        q3_small_t_kernel<32, true, Epilogue><<<grid, 256, 0, stream>>>(op, epilogue);
-    } else if (op.rows <= 8192) { // short outputs: 16-row tiles keep enough CTAs per SM
-        const dim3 grid(static_cast<unsigned>((op.rows + 15) / 16));
-        q3_small_t_kernel<16, false, Epilogue><<<grid, 256, 0, stream>>>(op, epilogue);
-    } else {
-        const dim3 grid(static_cast<unsigned>((op.rows + 31) / 32));
-        q3_small_t_kernel<32, false, Epilogue><<<grid, 256, 0, stream>>>(op, epilogue);
-    }
+    const int rows = Swiglu ? op.rows / 2 : op.rows;
+    const dim3 grid(static_cast<unsigned>((rows + 15) / 16));
+    q3_rd_kernel<Swiglu ? 2 : 1, Swiglu, Epilogue><<<grid, 256, 0, stream>>>(op, epilogue);
 }
 
 // Route override for tests (q3_force_route_for_test): 0 = automatic.
 int g_route_override = 0;
 
 // NINFER_Q3_A8 selects the prefill route for T >= 64. Default (unset or 1) = A8, the tall route
-// when the caller passes a workspace (v0.7 q3-prefill: PPL within 0.5 % of A16, prefill ~3.5x);
-// 0 = A16 tiles (exact BF16 activations); f = A8 through the in-kernel quantizing tile only (A/B of
-// the two A8 kernels, same bits). T < 64 (decode, MTP verify, small batches) is always A16.
+// when the caller passes a workspace (PPL within 0.5 % of A16, prefill ~3.5x); 0 = A16 tiles
+// (exact BF16 activations). T < 64 (decode, MTP verify, small batches) is always A16.
 int a8_env_mode() {
     static const int mode = [] {
         const char* v = std::getenv("NINFER_Q3_A8");
         if (v == nullptr || v[0] == '\0') return 3;
-        return v[0] == '0' ? 1 : v[0] == 'f' ? 2 : 3;
+        return v[0] == '0' ? 1 : 3;
     }();
     return mode;
 }
@@ -1348,7 +999,7 @@ std::size_t a8_scratch_bytes(std::int64_t tokens, std::int64_t k) {
 
 template <bool Swiglu, class Epilogue>
 void launch_a8(const Q3Operands& op, const Epilogue& epilogue, cudaStream_t stream) {
-    constexpr int Tt = Swiglu ? 32 : 64;
+    constexpr int Tt   = Swiglu ? 32 : 64;
     const int out_rows = Swiglu ? op.rows / 2 : op.rows;
     const dim3 grid(static_cast<unsigned>((op.tokens + Tt - 1) / Tt),
                     static_cast<unsigned>((out_rows + 127) / 128));
@@ -1359,11 +1010,11 @@ void launch_a8(const Q3Operands& op, const Epilogue& epilogue, cudaStream_t stre
 template <bool Swiglu, class Epilogue>
 void launch_a8t(const Q3Operands& op, const Epilogue& epilogue, const Q3Workspace& ws,
                 cudaStream_t stream) {
-    const int tp     = (op.tokens + 3) / 4 * 4;
-    const int groups = op.k / S::kGroupK;
-    auto* xq         = static_cast<std::int8_t*>(ws.data);
-    auto* sx = reinterpret_cast<float*>(static_cast<unsigned char*>(ws.data) +
-                                        a8_scratch_code_bytes(op.tokens, op.k));
+    const int tp             = (op.tokens + 3) / 4 * 4;
+    const int groups         = op.k / S::kGroupK;
+    auto* xq                 = static_cast<std::int8_t*>(ws.data);
+    auto* sx                 = reinterpret_cast<float*>(static_cast<unsigned char*>(ws.data) +
+                                                        a8_scratch_code_bytes(op.tokens, op.k));
     const std::int64_t items = static_cast<std::int64_t>(op.tokens) * groups;
     q3_a8_quantize_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(
         op.x, op.tokens, op.k, tp, xq, sx);
@@ -1409,10 +1060,8 @@ template <class Epilogue>
 void run(const Q3Operands& op, const Epilogue& epilogue, const Q3Workspace& ws,
          cudaStream_t stream) {
     if (try_a8<false>(op, epilogue, ws, stream)) return;
-    if (op.tokens <= kGemvMaxTokens && small_t_enabled(op)) {
+    if (op.tokens <= kSmallTMaxTokens) {
         launch_small_t<false>(op, epilogue, stream);
-    } else if (op.tokens <= kGemvMaxTokens) {
-        launch_gemv_tokens(op, epilogue, stream);
     } else {
         launch_gemm<false>(op, epilogue, stream);
     }
@@ -1481,8 +1130,8 @@ void q3_linear_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
     q3_linear_segments_dispatch(x, w, segments, stream, ws);
 }
 
-void q3_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual,
-                            cudaStream_t stream, const Q3Workspace& ws) {
+void q3_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream,
+                            const Q3Workspace& ws) {
     validate_q3_weight(w, "q3 linear_add");
     require_activation(x, w, "q3 linear_add");
     if (residual.dtype != DType::BF16 || residual.ne[0] != w.n || residual.ne[1] != x.ne[1] ||
@@ -1493,31 +1142,19 @@ void q3_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual,
         stream);
 }
 
-void q3_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out,
-                               cudaStream_t stream, const Q3Workspace& ws) {
+void q3_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                               const Q3Workspace& ws) {
     validate_q3_weight(w, "q3 linear_swiglu");
     require_activation(x, w, "q3 linear_swiglu");
-    if (w.n % 2 != 0 || out.dtype != DType::BF16 || out.ne[0] != w.n / 2 ||
-        out.ne[1] != x.ne[1] || !out.is_contiguous() || out.data == nullptr) {
+    if (w.n % 2 != 0 || out.dtype != DType::BF16 || out.ne[0] != w.n / 2 || out.ne[1] != x.ne[1] ||
+        !out.is_contiguous() || out.data == nullptr) {
         throw std::invalid_argument("q3 linear_swiglu: out must be contiguous BF16 [N/2,T]");
     }
     const Q3Operands op = q3_operands(x, w);
     const SwigluOut epilogue{static_cast<__nv_bfloat16*>(out.data), w.n / 2};
     if (try_a8<true>(op, epilogue, ws, stream)) return;
-    if (op.tokens <= kGemvMaxTokens && small_t_enabled(op)) {
+    if (op.tokens <= kSmallTMaxTokens) {
         launch_small_t<true>(op, epilogue, stream);
-    } else if (op.tokens <= kGemvMaxTokens) {
-        const dim3 grid(static_cast<unsigned>((w.n / 2 + kGemvWarps - 1) / kGemvWarps));
-        switch (op.tokens) {
-        case 1: q3_gemv_swiglu_kernel<1><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 2: q3_gemv_swiglu_kernel<2><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 3: q3_gemv_swiglu_kernel<3><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 4: q3_gemv_swiglu_kernel<4><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 5: q3_gemv_swiglu_kernel<5><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 6: q3_gemv_swiglu_kernel<6><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        case 7: q3_gemv_swiglu_kernel<7><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        default: q3_gemv_swiglu_kernel<8><<<grid, kGemvThreads, 0, stream>>>(op, epilogue); break;
-        }
     } else {
         launch_gemm<true>(op, epilogue, stream);
     }

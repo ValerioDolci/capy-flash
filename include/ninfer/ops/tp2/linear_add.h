@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of linear_add. Our file: ninfer/ops/linear_add.h is upstream's and
-// carries no hook.
+// Two-device (tp 2) forms of linear_add.
 //
 // Shapes registered for the two-device forms: NVFP4 and FP8 register the input-column halves
 // [5120,3072] and [5120,8704] of [5120,6144] and [5120,17408], each keeping the activation-

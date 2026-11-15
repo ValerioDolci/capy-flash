@@ -1,6 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 
 namespace ninfer::ops::detail::gated_delta_net::chunked {
 namespace {
@@ -354,8 +355,9 @@ template <int DV>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    CUDA_CHECK(cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    static FuncAttrPerDevice attribute;
+    attribute.ensure(chunk_recurrence_kernel<DV>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                     shared_bytes);
     chunk_recurrence_kernel<DV>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);
@@ -364,7 +366,9 @@ void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* contro
 
 } // namespace
 
-int forced_value_tile = 0; // gated_delta_net_force_value_tile_for_test
+int forced_value_tile = 0; // force_value_tile_for_test
+
+void force_value_tile_for_test(int tile) noexcept { forced_value_tile = tile; }
 
 int value_tile(int value_heads, int multiprocessor_count) {
     if (forced_value_tile == 64 || forced_value_tile == 32 || forced_value_tile == 16 ||
@@ -416,11 +420,3 @@ void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlCh
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net::chunked
-
-namespace ninfer::ops {
-
-void gated_delta_net_force_value_tile_for_test(int tile) noexcept {
-    detail::gated_delta_net::chunked::forced_value_tile = tile;
-}
-
-} // namespace ninfer::ops

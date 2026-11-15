@@ -8,22 +8,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 namespace ninfer::serve {
 namespace {
 
 using Json = RequestJson;
-
-void require_object(const Json& value, const char* message, const char* param = nullptr) {
-    if (!value.is_object()) { bad_request(message, param == nullptr ? "" : param); }
-}
-
-bool get_bool(const Json& object, const char* key, bool fallback) {
-    if (!object.contains(key) || object.at(key).is_null()) { return fallback; }
-    if (!object.at(key).is_boolean()) { bad_request(std::string(key) + " must be a boolean", key); }
-    return object.at(key).get<bool>();
-}
 
 std::optional<bool> get_optional_bool(const Json& object, const char* key) {
     if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
@@ -54,17 +45,6 @@ ChatRole parse_message_role(const std::string& role) {
     if (role == "assistant") { return ChatRole::Assistant; }
     if (role == "tool") { return ChatRole::Tool; }
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
-}
-
-std::string require_function_name(const Json& object, const char* param) {
-    if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("function name must be a string", param);
-    }
-    std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
-    }
-    return name;
 }
 
 void validate_standard_output_controls(const Json& body) {
@@ -256,14 +236,10 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
 
     ninfer::product::media_acquire::Source source;
-    source.value = std::move(url);
-    if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
-    }
+    source.value    = std::move(url);
+    const auto kind = ninfer::product::media_acquire::uri_source_kind(source.value);
+    if (!kind) { bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages"); }
+    source.kind = *kind;
     return source;
 }
 
@@ -327,7 +303,8 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
     }
 }
 
-std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_t index) {
+std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_t index,
+                                                 const RequestLimits& limits) {
     std::vector<ToolCall> calls;
     if (!message.contains("tool_calls") || message.at("tool_calls").is_null()) { return calls; }
     const Json& values = message.at("tool_calls");
@@ -353,7 +330,7 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
             bad_request("function tool_calls must contain string arguments", "messages");
         }
         check_request_json_nesting(function.at("arguments").get_ref<const std::string&>(),
-                                   "messages");
+                                   "messages", limits);
         calls.push_back(ToolCall{.id             = value.at("id").get<std::string>(),
                                  .name           = require_function_name(function, "messages"),
                                  .arguments_json = function.at("arguments").get<std::string>()});
@@ -361,8 +338,8 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
     return calls;
 }
 
-std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message,
-                                                             std::size_t index) {
+std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message, std::size_t index,
+                                                             const RequestLimits& limits) {
     if (!message.contains("function_call") || message.at("function_call").is_null()) {
         return std::nullopt;
     }
@@ -375,7 +352,8 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     if (!call.contains("arguments") || !call.at("arguments").is_string()) {
         bad_request("assistant function_call must contain string arguments", "messages");
     }
-    check_request_json_nesting(call.at("arguments").get_ref<const std::string&>(), "messages");
+    check_request_json_nesting(call.at("arguments").get_ref<const std::string&>(), "messages",
+                               limits);
     return ToolCall{.id             = {},
                     .name           = require_function_name(call, "messages"),
                     .arguments_json = call.at("arguments").get<std::string>()};
@@ -475,7 +453,7 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
     return turn;
 }
 
-ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
+ChatTurn parse_assistant_message(const Json& item, std::size_t index, const RequestLimits& limits) {
     if (item.contains("audio") && !item.at("audio").is_null()) {
         bad_request("assistant audio history requires resolving a previous audio response, which "
                     "NInfer cannot provide",
@@ -484,8 +462,9 @@ ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
 
     ChatTurn turn;
     turn.role       = ChatRole::Assistant;
-    turn.tool_calls = parse_assistant_tool_calls(item, index);
-    if (std::optional<ToolCall> legacy_call = parse_legacy_assistant_function_call(item, index)) {
+    turn.tool_calls = parse_assistant_tool_calls(item, index, limits);
+    if (std::optional<ToolCall> legacy_call =
+            parse_legacy_assistant_function_call(item, index, limits)) {
         turn.tool_calls.insert(turn.tool_calls.begin(), std::move(*legacy_call));
     }
     const std::optional<std::string> reasoning = parse_assistant_reasoning(item, index);
@@ -525,7 +504,7 @@ ChatTurn parse_regular_message(const Json& item, std::size_t index, ChatRole rol
     return turn;
 }
 
-ChatTurn parse_message(const Json& item, std::size_t index) {
+ChatTurn parse_message(const Json& item, std::size_t index, const RequestLimits& limits) {
     if (!item.is_object() || !item.contains("role") || !item.at("role").is_string()) {
         bad_request("message " + std::to_string(index) + " must be an object with a string role",
                     "messages");
@@ -540,11 +519,11 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
 
     if (role == ChatRole::Tool) { return parse_tool_message(item, index, legacy_function); }
     validate_non_tool_call_id(item);
-    if (role == ChatRole::Assistant) { return parse_assistant_message(item, index); }
+    if (role == ChatRole::Assistant) { return parse_assistant_message(item, index, limits); }
     return parse_regular_message(item, index, role);
 }
 
-void parse_messages(const Json& body, GenerationRequest& output) {
+void parse_messages(const Json& body, GenerationRequest& output, const RequestLimits& limits) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -552,7 +531,7 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     }
     output.messages.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
-        output.messages.push_back(parse_message(messages.at(index), index));
+        output.messages.push_back(parse_message(messages.at(index), index, limits));
     }
 }
 
@@ -622,8 +601,7 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         bad_request("tool_choice.allowed_tools.tools must be an array", "tool_choice");
     }
 
-    std::vector<std::string> allowed_names;
-    allowed_names.reserve(config.at("tools").size());
+    std::unordered_set<std::string> allowed_names;
     for (const Json& item : config.at("tools")) {
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
             bad_request("allowed tool entries must contain a string type", "tool_choice");
@@ -641,9 +619,7 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         if (!declared) {
             bad_request("allowed tool '" + name + "' is not present in tools", "tool_choice");
         }
-        if (std::find(allowed_names.begin(), allowed_names.end(), name) == allowed_names.end()) {
-            allowed_names.push_back(name);
-        }
+        allowed_names.insert(name);
     }
 
     if (mode == "required") {
@@ -653,12 +629,7 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
             "tool_choice", "tool_choice_not_supported");
     }
 
-    std::erase_if(output.tools, [&](const ToolDefinition& tool) {
-        const bool allowed =
-            std::find(allowed_names.begin(), allowed_names.end(), tool.name) != allowed_names.end();
-        if (!allowed) { output.filtered_out_tool_names.push_back(tool.name); }
-        return !allowed;
-    });
+    keep_allowed_tools(output, allowed_names);
     output.tool_choice.mode = ToolChoiceMode::Auto;
 }
 
@@ -817,11 +788,11 @@ void parse_reasoning_effort(const Json& body, GenerationRequest& output) {
 }
 
 void parse_stream_options(const Json& body, OpenAIChatRequest& output) {
-    output.stream = get_bool(body, "stream", false);
+    output.stream = optional_bool(body, "stream", false);
     if (!body.contains("stream_options") || body.at("stream_options").is_null()) { return; }
     const Json& options = body.at("stream_options");
     if (!options.is_object()) { bad_request("stream_options must be an object", "stream_options"); }
-    output.include_usage = get_bool(options, "include_usage", false);
+    output.include_usage = optional_bool(options, "include_usage", false);
     if (options.contains("include_obfuscation") && !options.at("include_obfuscation").is_null() &&
         !options.at("include_obfuscation").is_boolean()) {
         bad_request("include_obfuscation must be a boolean", "stream_options");
@@ -829,8 +800,8 @@ void parse_stream_options(const Json& body, OpenAIChatRequest& output) {
 }
 
 void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
-    output.timings_per_token = get_bool(body, "timings_per_token", false);
-    output.return_progress   = get_bool(body, "return_progress", false);
+    output.timings_per_token = optional_bool(body, "timings_per_token", false);
+    output.return_progress   = optional_bool(body, "return_progress", false);
 }
 
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
@@ -852,7 +823,7 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 } // namespace
 
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
-    require_object(body, "request body must be a JSON object");
+    require_object_body(body);
     validate_standard_output_controls(body);
     validate_compatibility_hints(body);
 
@@ -868,7 +839,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_tools(body, output.generation);
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
-    parse_messages(body, output.generation);
+    parse_messages(body, output.generation, limits);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     parse_stream_options(body, output);
@@ -879,14 +850,13 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
-    // Structured output (Neroued/ninfer eb6696ae, 8ffa3131): response_format text/json_object/
-    // json_schema and the structured_outputs extension, after tools and stops so that the
-    // combination rules see the whole request.
+    // Structured output: response_format text/json_object/json_schema and the structured_outputs
+    // extension, after tools and stops so that the combination rules see the whole request.
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
         parse_json_output_format(body.at("response_format"), output.generation, "response_format",
-                                 JsonFormatProtocol::Chat);
+                                 JsonFormatProtocol::Chat, limits);
     }
-    parse_structured_outputs(body, output.generation);
+    parse_structured_outputs(body, output.generation, limits);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }

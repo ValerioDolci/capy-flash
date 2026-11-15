@@ -1,4 +1,4 @@
-// The [8192,5120] two-device shard's copy of upstream's nvfp4/nvfp4_gdn_input_plan.cpp: the same
+// The [8192,5120] two-device shard's copy of nvfp4/nvfp4_gdn_input_plan.cpp: the same
 // routes and token cutoffs, calling the shard's launchers (nvfp4_gdn_input_shard.h).
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/tp2/nvfp4_gdn_input_shard.h"

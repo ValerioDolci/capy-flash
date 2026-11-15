@@ -53,8 +53,7 @@ executables. Both hold by construction (allocation at load, ownership by the Mod
 A gather reads one 5 KiB row per token over PCIe instead of from device memory. Decode reads a few
 rows per round (1 per rank in ordinary decode, 14 for an MTP3 round, about 32 for a DFlash2 K=7
 round), so the PCIe latency adds microseconds to a round of milliseconds. Prefill reads 5 KiB per
-prompt token on each rank, about 5 MiB per 1,024-token chunk. The tp 2 measurements on two
-RTX 5070 Ti are in the fork's validation notes; the option is off by default.
+prompt token on each rank, about 5 MiB per 1,024-token chunk. The option is off by default.
 
 ## Reporting
 

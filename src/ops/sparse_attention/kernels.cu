@@ -5,11 +5,12 @@
 // Provenance: the append codecs and the Tensor Core selected-key attention are ported from
 // giveen/ninfer-ext (src/ops/sparse_attention/kernels.cu @9c933f01, Apache-2.0). The pooled
 // block key published at append time follows ninfer6000 (flash_next_qsa.cu, compressed index
-// groups); the column-tiled scorer and the three-pass radix top-k are written for this fork.
+// groups); the column-tiled scorer and the three-pass radix top-k are written for this engine.
 #include "ops/sparse_attention/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/launcher/kernel_attr_once.h"
+#include "ops/launcher/rope.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
@@ -45,29 +46,36 @@ __device__ __forceinline__ std::int32_t lane_valid(const std::int32_t* valid, st
     return max(0, min(width, valid[lane]));
 }
 
-// Kernel-side indexer geometry: the FP32 inverse-frequency table is computed on the host.
+// Kernel-side indexer geometry: the FP32 inverse-frequency table is computed on the host, or is
+// the installed YaRN table (`yarn`), whose attention factor then multiplies cos and sin.
 struct IndexGeometry {
     std::int32_t index_heads;
     std::int32_t ratio;
     std::int32_t block_topk;
     std::int32_t rotary_dim;
     float rms_norm_eps;
+    float attention_scale;
     float inv_freq[kMaxPairs];
     std::uint8_t pair_axes[kMaxPairs];
 };
 
-IndexGeometry index_geometry(const QsaGeometry& g) {
+IndexGeometry index_geometry(const QsaGeometry& g, const TextRopeYarn* yarn) {
     IndexGeometry out{};
-    out.index_heads  = g.index_heads;
-    out.ratio        = g.ratio;
-    out.block_topk   = g.block_topk();
-    out.rotary_dim   = g.rotary_dim;
-    out.rms_norm_eps = g.rms_norm_eps;
+    out.index_heads     = g.index_heads;
+    out.ratio           = g.ratio;
+    out.block_topk      = g.block_topk();
+    out.rotary_dim      = g.rotary_dim;
+    out.rms_norm_eps    = g.rms_norm_eps;
+    out.attention_scale = yarn != nullptr ? yarn->attention_scale : 1.0F;
     for (int i = 0; i < g.rotary_dim / 2; ++i) {
-        // Hugging Face: 1 / theta ** (arange(0, dim, 2).float() / dim), all in FP32.
-        const float exponent = static_cast<float>(2 * i) / static_cast<float>(g.rotary_dim);
-        out.inv_freq[i]      = 1.0F / std::pow(g.rope_theta, exponent);
-        out.pair_axes[i]     = g.pair_axes[static_cast<std::size_t>(i)];
+        if (yarn != nullptr) {
+            out.inv_freq[i] = yarn->inv_freq[i];
+        } else {
+            // Hugging Face: 1 / theta ** (arange(0, dim, 2).float() / dim), all in FP32.
+            const float exponent = static_cast<float>(2 * i) / static_cast<float>(g.rotary_dim);
+            out.inv_freq[i]      = 1.0F / std::pow(g.rope_theta, exponent);
+        }
+        out.pair_axes[i] = g.pair_axes[static_cast<std::size_t>(i)];
     }
     return out;
 }
@@ -95,7 +103,9 @@ __device__ __forceinline__ std::int64_t block_key_offset(const std::int32_t* tab
 }
 
 // Rotates the warp-held 128-feature row (lane owns features 4*lane .. 4*lane+3) in place.
-// Pair i rotates features (i, i + rotary/2) with angle positions[axis_i] * inv_freq_i.
+// Pair i rotates features (i, i + rotary/2) with angle positions[axis_i] * inv_freq_i; Yarn
+// multiplies cos and sin by the YaRN attention factor.
+template <bool Yarn>
 __device__ __forceinline__ void rope_row(float (&x)[4], const IndexGeometry& g,
                                          const std::int32_t (&positions)[3], int lane) {
     const int half  = g.rotary_dim / 2;
@@ -111,6 +121,10 @@ __device__ __forceinline__ void rope_row(float (&x)[4], const IndexGeometry& g,
             const float angle = static_cast<float>(positions[g.pair_axes[pair]]) * g.inv_freq[pair];
             float s, c;
             sincosf(angle, &s, &c);
+            if constexpr (Yarn) {
+                s *= g.attention_scale;
+                c *= g.attention_scale;
+            }
             x[r] = d < half ? x[r] * c - other[r] * s : x[r] * c + other[r] * s;
         }
     }
@@ -303,6 +317,7 @@ __global__ void __launch_bounds__(kAppendThreads) qsa_append_kernel(AppendArgs a
 }
 
 // One warp per column that completes a block: pool, normalize, rotate and publish its key.
+template <bool Yarn>
 __global__ void __launch_bounds__(32) qsa_publish_block_kernel(AppendArgs a, IndexGeometry g) {
     const int column  = static_cast<int>(blockIdx.x);
     const int lane_id = static_cast<int>(threadIdx.x);
@@ -340,7 +355,7 @@ __global__ void __launch_bounds__(32) qsa_publish_block_kernel(AppendArgs a, Ind
         x[r] = __bfloat162float(__float2bfloat16_rn(x[r] * inv_ratio));
     }
     offset_rmsnorm_row(x, a.key_norm, g.rms_norm_eps, lane_id);
-    rope_row(x, g, first_position, lane_id);
+    rope_row<Yarn>(x, g, first_position, lane_id);
     const __nv_bfloat162 lo = __floats2bfloat162_rn(x[0], x[1]);
     const __nv_bfloat162 hi = __floats2bfloat162_rn(x[2], x[3]);
     uint2 packed;
@@ -427,7 +442,7 @@ __device__ __forceinline__ TileColumn tile_column(const SelectArgs& a, std::int3
 
 // CTA (x, y): pass tile y, blocks [x * chunk_blocks, +chunk_blocks). Thread (j, c) of the
 // kScoreBlocks x tile_columns grid scores block j of the current iteration for tile column c.
-template <int kScoreRegBlocks>
+template <int kScoreRegBlocks, bool Yarn>
 __global__ void __launch_bounds__((kScoreBlocks / kScoreRegBlocks) * kTileColumns)
     qsa_score_kernel(SelectArgs a, IndexGeometry g) {
     constexpr int kScoreLanes = kScoreBlocks / kScoreRegBlocks; // threads per column
@@ -478,7 +493,7 @@ __global__ void __launch_bounds__((kScoreBlocks / kScoreRegBlocks) * kTileColumn
 #pragma unroll
         for (int r = 0; r < 4; ++r) { x[r] = __bfloat162float(raw[4 * lane_id + r]); }
         offset_rmsnorm_row(x, a.query_norm, g.rms_norm_eps, lane_id);
-        rope_row(x, g, qpos, lane_id);
+        rope_row<Yarn>(x, g, qpos, lane_id);
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             query[(c * kMaxIndexHead + h) * kIndexDim + 4 * lane_id + r] = x[r];
@@ -1412,8 +1427,10 @@ void qsa_append_launch(const Tensor& k, const Tensor& v, const Tensor& index_key
         qsa_append_kernel<Storage><<<blocks, kAppendThreads, 0, stream>>>(args);
     });
     CUDA_CHECK(cudaGetLastError());
-    qsa_publish_block_kernel<<<args.width * args.lanes, 32, 0, stream>>>(args,
-                                                                         index_geometry(geometry));
+    const TextRopeYarn* yarn = text_rope_yarn(geometry.rotary_dim, geometry.rope_theta);
+    auto* publish =
+        yarn != nullptr ? qsa_publish_block_kernel<true> : qsa_publish_block_kernel<false>;
+    publish<<<args.width * args.lanes, 32, 0, stream>>>(args, index_geometry(geometry, yarn));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1441,26 +1458,34 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
                        const QsaSelectPlan& plan, float* scores, Tensor& selected, Tensor& counts,
                        cudaStream_t stream) {
     SelectArgs args{};
-    args.index_query      = static_cast<const __nv_bfloat16*>(index_query.data);
-    args.query_positions  = static_cast<const std::int32_t*>(query_rope_positions.data);
-    args.query_axes       = query_rope_positions.ne[1];
-    args.cache            = static_cast<const std::int32_t*>(cache_positions.data);
-    args.valid            = optional_i32(valid_columns);
-    args.table_rows       = static_cast<const std::int32_t*>(table_rows.data);
-    args.tables           = static_cast<const std::int32_t*>(index.block_tables.data);
-    args.table_stride     = index.block_tables.ne[0];
-    args.block_keys       = static_cast<const __nv_bfloat16*>(index.block_keys.data);
-    args.query_norm       = static_cast<const __nv_bfloat16*>(query_norm.data);
-    args.scores           = scores;
-    args.selected         = static_cast<std::int32_t*>(selected.data);
-    args.counts           = static_cast<std::int32_t*>(counts.data);
-    args.width            = cache_positions.ne[0];
-    args.lanes            = cache_positions.ne[1];
-    args.max_selected     = selected.ne[0];
-    args.tile_columns     = plan.tile_columns;
-    args.tiles_per_lane   = plan.tiles_per_lane;
-    args.max_blocks       = plan.max_blocks;
-    const IndexGeometry g = index_geometry(geometry);
+    args.index_query         = static_cast<const __nv_bfloat16*>(index_query.data);
+    args.query_positions     = static_cast<const std::int32_t*>(query_rope_positions.data);
+    args.query_axes          = query_rope_positions.ne[1];
+    args.cache               = static_cast<const std::int32_t*>(cache_positions.data);
+    args.valid               = optional_i32(valid_columns);
+    args.table_rows          = static_cast<const std::int32_t*>(table_rows.data);
+    args.tables              = static_cast<const std::int32_t*>(index.block_tables.data);
+    args.table_stride        = index.block_tables.ne[0];
+    args.block_keys          = static_cast<const __nv_bfloat16*>(index.block_keys.data);
+    args.query_norm          = static_cast<const __nv_bfloat16*>(query_norm.data);
+    args.scores              = scores;
+    args.selected            = static_cast<std::int32_t*>(selected.data);
+    args.counts              = static_cast<std::int32_t*>(counts.data);
+    args.width               = cache_positions.ne[0];
+    args.lanes               = cache_positions.ne[1];
+    args.max_selected        = selected.ne[0];
+    args.tile_columns        = plan.tile_columns;
+    args.tiles_per_lane      = plan.tiles_per_lane;
+    args.max_blocks          = plan.max_blocks;
+    const TextRopeYarn* yarn = text_rope_yarn(geometry.rotary_dim, geometry.rope_theta);
+    const IndexGeometry g    = index_geometry(geometry, yarn);
+    const bool full_tiles    = score_reg_blocks(plan.tile_columns) == kScoreRegBlocksFull;
+    auto* score =
+        full_tiles ? qsa_score_kernel<kScoreRegBlocksFull, false> : qsa_score_kernel<1, false>;
+    if (yarn != nullptr) {
+        score =
+            full_tiles ? qsa_score_kernel<kScoreRegBlocksFull, true> : qsa_score_kernel<1, true>;
+    }
 
     // Kernel attributes are per device: both tensor-parallel ranks launch this kernel.
     static FuncAttrPerDevice topk_attribute;
@@ -1483,13 +1508,7 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
             kScoreKeyBytes +
             static_cast<std::size_t>(plan.tile_columns) * kMaxIndexHead * kIndexDim * sizeof(float);
         const dim3 score_grid(static_cast<unsigned>(chunks), static_cast<unsigned>(pass));
-        if (score_reg_blocks(plan.tile_columns) == kScoreRegBlocksFull) {
-            qsa_score_kernel<kScoreRegBlocksFull>
-                <<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
-        } else {
-            qsa_score_kernel<1>
-                <<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
-        }
+        score<<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
         CUDA_CHECK(cudaGetLastError());
         const std::size_t staged =
             static_cast<std::size_t>(std::min(plan.max_blocks, kStagedBlocks));

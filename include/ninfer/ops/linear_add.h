@@ -39,8 +39,7 @@ namespace ninfer::ops {
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Registered weights are Q4_G64_FP16 RowSplit
  *   [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
- *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
- *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
+ *   [5120,6144] or [5120,17408], NVFP4 BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
  *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], or BF16 Contiguous [5120,6144]. T may
  *   be any positive value.
  *

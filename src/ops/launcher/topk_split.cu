@@ -1,6 +1,6 @@
 // Implements: include/ninfer/ops/tp2/linear_topk.h (topk_split_pack, topk_split_merge)
 // Match: contiguous I32/FP32 [16,U] candidates of linear_topk_split, BF16 [256,U] packed
-// candidates. Our file.
+// candidates.
 // Algorithm assumptions: a candidate is linear_topk's 64-bit total-order key, recomputed from its
 // decoded (score, id) pair (score_id_order_key inverts score_from_order_key/id_from_order_key,
 // including the INT_MAX sentinel); eight base-256 digits per key are integers BF16 represents
@@ -11,6 +11,7 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ops/common/math.h"
 #include "ops/common/score_id_order.cuh"
+#include "ops/common/validate.h"
 
 #include <cuda_bf16.h>
 
@@ -82,12 +83,6 @@ __global__ void topk_split_merge_kernel(const __nv_bfloat16* __restrict__ candid
     }
 }
 
-bool overlaps(const Tensor& a, const Tensor& b) {
-    const auto a0 = reinterpret_cast<std::uintptr_t>(a.data);
-    const auto b0 = reinterpret_cast<std::uintptr_t>(b.data);
-    return a0 < b0 + b.bytes() && b0 < a0 + a.bytes();
-}
-
 void require_matrix(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t columns,
                     const char* op, const char* label) {
     if (t.dtype != dtype || t.ne[0] != rows || t.ne[1] != columns || t.ne[2] != 1 || t.ne[3] != 1 ||
@@ -110,7 +105,8 @@ void topk_split_pack(const Tensor& candidate_ids, const Tensor& candidate_scores
     require_matrix(candidate_ids, DType::I32, kTopK, columns, op, "candidate_ids");
     require_matrix(candidate_scores, DType::FP32, kTopK, columns, op, "candidate_scores");
     require_matrix(candidates, DType::BF16, kTopKSplitCandidateRows, columns, op, "candidates");
-    if (overlaps(candidates, candidate_ids) || overlaps(candidates, candidate_scores)) {
+    if (detail::overlaps(candidates, candidate_ids) ||
+        detail::overlaps(candidates, candidate_scores)) {
         throw std::invalid_argument("topk_split_pack: candidates overlap an input");
     }
     topk_split_pack_kernel<<<static_cast<unsigned>(columns), kTopKSplitCandidateRows, 0, stream>>>(
@@ -128,8 +124,9 @@ void topk_split_merge(const Tensor& candidates, Tensor& candidate_ids, Tensor& c
     require_matrix(candidates, DType::BF16, kTopKSplitCandidateRows, columns, op, "candidates");
     require_matrix(candidate_ids, DType::I32, kTopK, columns, op, "candidate_ids");
     require_matrix(candidate_scores, DType::FP32, kTopK, columns, op, "candidate_scores");
-    if (overlaps(candidates, candidate_ids) || overlaps(candidates, candidate_scores) ||
-        overlaps(candidate_ids, candidate_scores)) {
+    if (detail::overlaps(candidates, candidate_ids) ||
+        detail::overlaps(candidates, candidate_scores) ||
+        detail::overlaps(candidate_ids, candidate_scores)) {
         throw std::invalid_argument("topk_split_merge: operands overlap");
     }
     topk_split_merge_kernel<<<static_cast<unsigned>(div_up(columns, kMergeColumns)),

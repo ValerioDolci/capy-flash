@@ -1,4 +1,4 @@
-// The [7168,5120] two-device shard's copy of upstream's nvfp4/nvfp4_attn_input_a4.cu: the same
+// The [7168,5120] two-device shard's copy of nvfp4/nvfp4_attn_input_a4.cu: the same
 // source, compiled with the shard's section output and entry points (nvfp4_attn_input_shard.h),
 // behind one shard-only route choice.
 #include "ops/attn_input_proj/tp2/nvfp4_attn_input_shard_prelude.h"
@@ -11,11 +11,11 @@
 
 namespace ninfer::ops::detail {
 
-// Past T=1024 upstream's TMA route (and the parent) read 256-token scale tiles. The shard keeps the
-// 128-token tiles up to the device's DeviceTuning bound (core/tp2/device_tuning.h): on an RTX 5070
-// Ti its 56 row tiles give 224 CTAs at 256 tokens per tile, 3.2 waves on 70 SMs, and 448 at 128,
-// measured at the 1024-token prefill chunk 196.5 -> 183.7 us, while from T=1025 the 256-token tile
-// is faster again (bound 1025, tune 2a596191). Every other T takes upstream's launcher unchanged.
+// Past T=1024 the family's TMA route (and the parent) read 256-token scale tiles. The shard keeps
+// the 128-token tiles up to the device's DeviceTuning bound (core/tp2/device_tuning.h): on an RTX
+// 5070 Ti its 56 row tiles give 224 CTAs at 256 tokens per tile, 3.2 waves on 70 SMs, and 448 at
+// 128, measured at the 1024-token prefill chunk 196.5 -> 183.7 us, while from T=1025 the 256-token
+// tile is faster again (bound 1025). Every other T takes the family's launcher unchanged.
 void nvfp4_attn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                       Tensor& gate, Tensor& k, Tensor& v,
                                       Nvfp4A4Workspace workspace, cudaStream_t stream) {

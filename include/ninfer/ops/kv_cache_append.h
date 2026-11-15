@@ -1,23 +1,11 @@
 #pragma once
 
-#include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
-#include <cstdint>
-
 namespace ninfer::ops {
-
-/**
- * Host launch-resource promise for device-selected prefix append. It bounds every device count
- * during capture/replay but neither selects nor publishes a committed frontier.
- */
-struct KVCacheAppendPrefixExecutionEnvelope {
-    std::uint32_t min_count = 0;
-    std::uint32_t max_count = 0;
-};
 
 /**
  * Append every K/V row to single-sequence paged growing-cache storage.
@@ -63,42 +51,5 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  */
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
-
-/**
- * Append device-selected BF16 prefixes to batched paged growing-cache storage.
- *
- * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and
- * table_rows are contiguous device I32 [B]. For row b and i in [0,counts[b]), k/v[:, :, i, b]
- * store K bit-for-bit and V as FP16_RNE(BF16 input) at logical position positions[i,b] through
- * table row table_rows[b]. The paged planes use head-major order [128,64,Nphysical,8]. No byte
- * belonging only to the rejected physical tail [counts[b],T) is written. Inputs are unchanged,
- * and the Op neither decides nor publishes a committed frontier.
- *
- * The caller guarantees T>0, B=1..8, envelope.min_count <= counts[b] <= envelope.max_count <= T,
- * sequential nonnegative live positions, materialized table entries for every position allowed by
- * the envelope, and pairwise non-aliasing of inputs and cache storage.
- */
-void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
-                            const Tensor& counts, const Tensor& table_rows,
-                            KVCacheAppendPrefixExecutionEnvelope envelope,
-                            PagedKVBatchLayerView cache, cudaStream_t stream);
-
-/**
- * Append device-selected BF16 prefixes to lane-owned cyclic storage.
- *
- * k/v, positions, counts, and their storage-conversion and mutation contracts match the paged
- * overload; lanes[b] selects the destination lane. The registered profiles have fixed geometry
- * D=128, Hkv=8 and capacity 2048 or 4096. Absolute position p maps to slot p mod capacity.
- * For a nonempty prefix, the caller guarantees that the row's existing live interval ends
- * immediately before positions[0,b]. Advancing it by counts[b] makes every overwritten old slot
- * dead, and one row commits at most the ring capacity. A zero count reads no positions or K/V
- * and changes no cache bytes. Physical T is independent of the committed prefix length.
- * Consequently, no two live writes race for one physical slot. The Op does not own or publish the
- * lane frontier.
- */
-void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
-                            const Tensor& counts, const Tensor& lanes,
-                            KVCacheAppendPrefixExecutionEnvelope envelope,
-                            CyclicKVCacheLayerView cache, cudaStream_t stream);
 
 } // namespace ninfer::ops

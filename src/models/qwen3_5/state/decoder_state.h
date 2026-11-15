@@ -78,7 +78,7 @@ struct PagedKVCacheLayout {
     std::int32_t kv_heads     = 0;
     PagedKVStorageLayout layer_storage;
     bool qsa_index = false;
-    // T64 elastic KV: the page planes are offsets into a second backing (the elastic arena), the
+    // Elastic KV: the page planes are offsets into a second backing (the elastic arena), the
     // execution tables into the main one.
     bool elastic_pages = false;
     // Active KV in RAM: the Host planes' layout size and the device region (absent when off, and
@@ -189,7 +189,7 @@ struct DecoderStateLayout {
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
 
-// `pages_builder` (T64 elastic KV, may be null): plans the page planes of both pools in a second
+// `pages_builder` (elastic KV, may be null): plans the page planes of both pools in a second
 // layout, bound to DecoderState's `elastic` backing.
 [[nodiscard]] DecoderStateLayout plan_decoder_state(LayoutBuilder& builder,
                                                     const DecoderStateSpec& spec,

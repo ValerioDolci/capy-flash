@@ -1,7 +1,6 @@
 #pragma once
 
 // Two-device (tp 2) projection helpers over the split linear Ops (ninfer/ops/tp2/*.h).
-// Our file: the upstream execution/linear.h carries no hook.
 
 #include "core/device.h"
 #include "models/qwen3_5/execution/linear.h"

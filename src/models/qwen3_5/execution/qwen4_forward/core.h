@@ -139,8 +139,7 @@ void Qwen4Forward<Arena>::copy_rows(int r, const Tensor& source, std::int32_t ro
     if constexpr (kExecute) {
         const std::size_t element  = dtype_size(source.dtype);
         const std::int64_t columns = source.numel() / source.ne[0];
-        // T139: a kernel, not a memcpy node: cudaGraphExecUpdate sometimes rejected the 2-D
-        // memcpy.
+        // A kernel, not a memcpy node: cudaGraphExecUpdate can reject the 2-D memcpy.
         ops::copy_rows(
             destination.data,
             static_cast<const std::byte*>(source.data) + static_cast<std::size_t>(row0) * element,

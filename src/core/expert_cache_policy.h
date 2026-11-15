@@ -26,11 +26,11 @@ enum class Rule : std::uint8_t {
     // hottest first (decayed frequency with admission, window count without, ties to the lower
     // id) and inserted in that order, otherwise in ascending id order.
     kEngine,
-    // lru_sim.py `lru`/`lru_id2`: one pass in ascending id order that touches hits and inserts
+    // The LRU simulator: one pass in ascending id order that touches hits and inserts
     // misses as it goes, so an insert may evict a hit of the same window not yet touched (which is
     // then fetched again). Requires no admission and no cap.
     kF0KSinglePass,
-    // cost_model.py trace_stats: as kEngine, but "a slot is free" is judged once at window start
+    // The window cost model: as kEngine, but "a slot is free" is judged once at window start
     // for all misses of the layer.
     kF0MWindowStartFree,
 };
@@ -56,27 +56,32 @@ struct PolicyConfig {
     double half_life_tokens = 0.0;
     // Most insertions per layer per window over all partitions; 0 = unlimited.
     std::int32_t insert_cap = 0;
-    // Victim of an insertion into a full partition (engine rule, decode windows; T61):
+    // Victim of an insertion into a full partition (engine rule, decode windows):
     // 0 = the least recently used expert. > 0 = frequency x recency: the expert with the lowest
     // f * 2^(-age / evict_tau_windows), f = its decayed frequency (half_life_tokens, as admission;
     // tracked also without admission), age = windows of this layer since its last use; ties go to
     // the least recently used, and experts used or inserted in the current window are not
     // candidates (if all are, the least recently used goes, as with 0). Prompt windows keep LRU.
     double evict_tau_windows = 0.0;
-    Rule rule                = Rule::kEngine;
-    // T69: a prompt window (decide_prompt) of T tokens adds its counts to the decayed frequency
+    // Hysteresis of a decode insertion into a full lane (engine rule): the candidate's decayed
+    // frequency must reach hysteresis_ratio * the victim's score + hysteresis_gain, so the two ends
+    // of the ranking do not trade places on noise. A declined swap costs a miss; a swap costs link
+    // traffic in both directions with the exclusive tier. 0 ratio = off.
+    double hysteresis_ratio = 0.0;
+    double hysteresis_gain  = 0.0;
+    Rule rule               = Rule::kEngine;
+    // A prompt window (decide_prompt) of T tokens adds its counts to the decayed frequency
     // weighted by the window's mean recency, hl * (1 - 2^(-T/hl)) / (T ln 2) (hl =
     // half_life_tokens; ~1 for a decode window, ~hl/(T ln 2) for a wide prompt chunk), as if its
     // tokens arrived one by one, instead of at full weight: a 16k-token chunk would otherwise
     // dominate the frequencies (and the frequency x recency victim) for thousands of decode tokens.
     bool recency_weighted_prompts = false;
-    // Elastic columns (T64): every partition has `elastic_columns` slots per layer beyond its
+    // Elastic columns: every partition has `elastic_columns` slots per layer beyond its
     // base slots (partition_slot_count), of which only the first `active` columns may hold
     // experts (set_active_columns; all of them initially). They are numbered column-major after
-    // the base slots and `elastic_gap` further pool slots, so the last columns are one contiguous
-    // tail of the pool: see ExpertCachePolicy::pool_slot. 0 = no elastic slots.
+    // the base slots, so the last columns are one contiguous tail of the pool: see
+    // ExpertCachePolicy::pool_slot. 0 = no elastic slots.
     std::int32_t elastic_columns = 0;
-    std::int32_t elastic_gap     = 0;
 };
 
 // One slot insertion: `expert` of the layer goes to `slot` of `partition`, replacing `victim`
@@ -142,17 +147,16 @@ public:
         return K / P + (partition >= P - K % P ? 1 : 0);
     }
 
-    // Pool slots of one partition: base slots of every layer, the gap, every elastic column.
+    // Pool slots of one partition: base slots of every layer, every elastic column.
     [[nodiscard]] static std::int64_t pool_slot_count(const PolicyConfig& config,
                                                       std::int32_t partition) noexcept {
         return static_cast<std::int64_t>(config.layers) *
-                   (partition_slot_count(config, partition) + config.elastic_columns) +
-               (config.elastic_columns > 0 ? config.elastic_gap : 0);
+               (partition_slot_count(config, partition) + config.elastic_columns);
     }
 
     [[nodiscard]] const PolicyConfig& config() const noexcept { return config_; }
 
-    // T69: changes PolicyConfig::insert_cap (>= 0) for the next windows.
+    // Changes PolicyConfig::insert_cap (>= 0) for the next windows.
     void set_insert_cap(std::int32_t cap);
 
     // Usable slots per layer of `partition` now: its base slots + the active elastic columns
@@ -190,12 +194,12 @@ public:
 
     // Pool slot of local slot `local` of `layer` in `partition`: local < base(layer):
     // base_offset(layer) + local (layer * base + local with uniform layers); else layers * base +
-    // elastic_gap + (local - base(layer)) * layers + layer.
+    // (local - base(layer)) * layers + layer.
     [[nodiscard]] std::int32_t pool_slot(std::int32_t partition, std::int32_t layer,
                                          std::int32_t local) const noexcept;
 
     /**
-     * Elastic columns (T64): makes `columns` (<= elastic_columns) elastic columns usable. Growing
+     * Elastic columns: makes `columns` (<= elastic_columns) elastic columns usable. Growing
      * only raises every layer's capacity: later insertions take the new slots. Shrinking keeps,
      * per layer and partition, its new capacity of experts and drops the coldest others (lowest
      * decayed frequency with admission, ties and the no-admission case by least recent use),
@@ -230,18 +234,18 @@ public:
      */
     void decide_prompt(std::int32_t layer, std::span<const Routed> routed, std::int32_t tokens,
                        LayerDecision& out);
-    // T211b: decide_prompt with at most `target_cap` targets per partition (> 0; capped by the
+    // decide_prompt with at most `target_cap` targets per partition (> 0; capped by the
     // slot count): only the window's `target_cap` most routed experts of each partition are made
     // resident, the other residents stay (in their recency order).
     void decide_prompt(std::int32_t layer, std::span<const Routed> routed, std::int32_t tokens,
                        std::int32_t target_cap, LayerDecision& out);
 
     /**
-     * T211: a prompt window of `layer` that leaves the decode's state alone: classifies as
+     * A prompt window of `layer` that leaves the decode's state alone: classifies as
      * decide_prompt() and counts as a window of the layer (the recency age), but inserts, evicts
      * and touches nothing and neither decays nor adds to the frequencies (a wide chunk's decay
      * would erase the decode's frequencies and its counts would steer admission and eviction for
-     * hundreds of decode windows). With `frequencies` (T211b) the window still decays and counts
+     * hundreds of decode windows). With `frequencies` the window still decays and counts
      * them as decide_prompt() does. Engine rule only.
      */
     void count_prompt(std::int32_t layer, std::span<const Routed> routed, std::int32_t tokens,
@@ -262,7 +266,7 @@ public:
     void clear_layer(std::int32_t layer, std::vector<std::int32_t>& evicted);
 
     /**
-     * T69 lending of a layer's base slots only: evicts the experts of `layer`'s base slots (every
+     * Lending of a layer's base slots only: evicts the experts of `layer`'s base slots (every
      * partition; appended to `evicted`) and blocks those slots until unblock_base(): the layer
      * keeps the experts of its elastic slots and may insert into its free elastic slots (its
      * capacity is the active columns). Frequencies and the survivors' recency are unchanged.
@@ -280,7 +284,7 @@ public:
     [[nodiscard]] std::int32_t capacity(std::int32_t layer, std::int32_t partition) const noexcept;
 
     /**
-     * T69: completes `layer` from a routing profile (experts hottest first) without evicting:
+     * Completes `layer` from a routing profile (experts hottest first) without evicting:
      * every partition takes its hottest absent experts up to its free capacity; on an empty
      * layer the same insertions as prefill(). Each partition's insertions go coldest first (the
      * hottest one most recently used, as prefill). Frequencies are unchanged. Appends the
@@ -313,7 +317,7 @@ private:
 
     // Per layer and partition: an intrusive LRU list over local slots and a bump allocator of
     // never-used slots (slots are only ever reassigned, never freed).
-    // T69: local slots [0, used) are occupied, free (in `free`, reused before `used` grows) or,
+    // Local slots [0, used) are occupied, free (in `free`, reused before `used` grows) or,
     // while `blocked`, empty base slots; slots from `used` on are free and unlisted.
     struct Lane {
         std::int32_t head  = -1;        // least recently used local slot

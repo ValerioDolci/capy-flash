@@ -1,7 +1,6 @@
 .git
 .cache
 .claude
-.codex
 .idea
 .pytest_cache
 .vscode

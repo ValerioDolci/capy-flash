@@ -1,4 +1,4 @@
-// The [8192,5120] two-device shard's copy of upstream's fp8/fp8_gdn_input_a8.cu: the same
+// The [8192,5120] two-device shard's copy of fp8/fp8_gdn_input_a8.cu: the same
 // source, compiled with the shard's section output and entry points (fp8_gdn_input_shard.h).
 #include "ops/gdn_input_proj/tp2/fp8_gdn_input_shard_prelude.h"
 
@@ -11,7 +11,7 @@
 
 namespace ninfer::ops::detail {
 
-// The shard's own split-K reservation: 32 row tiles, so Bulk (upstream's schedule above) splits
+// The shard's own split-K reservation: 32 row tiles, so Bulk (the parent's schedule above) splits
 // its last wave from T=193 (64 tiles) on, where the parent splits from T=257; MidBulk needs less.
 std::size_t fp8_gdn_input_shard_partial_capacity_bytes(std::int32_t max_tokens) {
     return max_tokens > 192 ? Bulk::kPartialBytes : 0;

@@ -4,7 +4,7 @@
 // device's [28672,5120] and its two-device output-row half [14336,5120], out [14336,T] and
 // [7168,T].
 //
-// Same scheme as the [17408,5120] half (tp2/linear_swiglu_half.h): upstream's NVFP4 plan and A4
+// Same scheme as the [17408,5120] half (tp2/linear_swiglu_half.h): the family's NVFP4 plan and A4
 // launcher compiled again with the problem geometry and the entry points renamed
 // (*_names.h); the decode, small-T and TMA launchers read the rows from the weight and are shared.
 // Every route, schedule and token cutoff is the [34816,5120] parent's, not re-measured at these

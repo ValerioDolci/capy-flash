@@ -3,8 +3,8 @@
 //
 // Ported from giveen/ninfer-ext tests/ops/test_sparse_attention.cpp (Apache-2.0) and extended:
 // published pooled block keys, cross-call and speculative-rollback publication, selection over
-// deep contexts (staged and unstaged top-k), the prefill multi-pass route, the 12/1 shard, and a
-// CUDA Graph replay of the decode chain.
+// deep contexts (staged and unstaged top-k), the prefill multi-pass route, the 12/1 shard, a
+// CUDA Graph replay of the decode chain, and the indexer under YaRN on each device.
 //
 // Oracles (all FP64 from represented inputs):
 // - qsa_append K/V: byte-identical to kv_cache_append of the same rows (every cache profile);
@@ -15,11 +15,13 @@
 // - qsa_attention: FP64 softmax over the device selection, reading K/V at their storage boundary,
 //   judged by the registered causal-attention criterion of the storage profile.
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_attention.h"
 
 #include "core/arena.h"
 #include "core/paged_kv_storage.h"
 #include "ops/attention_criteria.h"
+#include "ops/launcher/rope.h"
 #include "ops/op_tester.h"
 
 #include <cuda_fp16.h>
@@ -76,8 +78,14 @@ std::uint64_t mix(std::uint64_t a, std::uint64_t b, std::uint64_t c = 0, std::ui
     return (((a * 1000003ULL + b) * 1000033ULL + c) * 1000037ULL) + d;
 }
 
+// Added to every RoPE position, and the installed YaRN table (test_yarn_indexer).
+std::int32_t g_rope_offset              = 0;
+const ops::detail::TextRopeYarn* g_yarn = nullptr;
+
 // Three-axis positions of a token: distinct per axis so the pair-to-axis mapping matters.
-std::int32_t axis_position(std::int32_t token, int axis) { return token / (axis + 1) + 3 * axis; }
+std::int32_t axis_position(std::int32_t token, int axis) {
+    return token / (axis + 1) + 3 * axis + g_rope_offset;
+}
 
 double half_value(std::uint16_t bits) {
     __half h;
@@ -122,18 +130,23 @@ std::vector<double> offset_norm(const std::vector<double>& x, const std::vector<
     return out;
 }
 
-// The contract's FP32 inverse-frequency table and FP32 angle, then FP64 rotation.
+// The contract's FP32 inverse-frequency table and FP32 angle, then FP64 rotation. Under YaRN the
+// table is the installed one and its attention factor multiplies cos and sin.
 std::vector<double> rotate(std::vector<double> v, const std::int32_t position[3]) {
     for (int i = 0; i < kRotary / 2; ++i) {
         const float inv_freq =
-            1.0F / std::pow(1.0e7F, static_cast<float>(2 * i) / static_cast<float>(kRotary));
+            g_yarn != nullptr
+                ? g_yarn->inv_freq[i]
+                : 1.0F / std::pow(1.0e7F, static_cast<float>(2 * i) / static_cast<float>(kRotary));
+        const double factor = g_yarn != nullptr ? g_yarn->attention_scale : 1.0;
         // The contract's angle is the FP32 product (Hugging Face); the rotation is FP64.
         const double angle = static_cast<double>(
             static_cast<float>(position[kGeometry.pair_axes[static_cast<std::size_t>(i)]]) *
             inv_freq);
+        const double c = std::cos(angle) * factor, s = std::sin(angle) * factor;
         const double x0 = v[i], x1 = v[i + kRotary / 2];
-        v[i]               = x0 * std::cos(angle) - x1 * std::sin(angle);
-        v[i + kRotary / 2] = x1 * std::cos(angle) + x0 * std::sin(angle);
+        v[i]               = x0 * c - x1 * s;
+        v[i + kRotary / 2] = x1 * c + x0 * s;
     }
     return v;
 }
@@ -953,6 +966,41 @@ int test_shard_attention() {
     return failures;
 }
 
+// YaRN on the indexer (rope_install_text_yarn, factor 4, on every device): the published block keys
+// and the selection of a 2600-token lane (650 blocks for 512) against the oracles above, with the
+// RoPE positions moved past 1,040,000 (the original window is 262,144) and rotated by the installed
+// table and attention factor, as the attention heads are (ninfer_rope_yarn_test). The factor on
+// the query side scales every block score alike, so the block keys are what check it.
+int test_yarn_indexer() {
+    int device_count = 0;
+    cuda_check(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    std::vector<int> devices;
+    for (int d = 0; d < std::min(device_count, 2); ++d) { devices.push_back(d); }
+    ops::rope_install_text_yarn(devices, 4.0F, 262144, kRotary, kGeometry.rope_theta);
+    g_rope_offset = 1'040'000;
+    int failures  = 0;
+    for (const int device : devices) {
+        cuda_check(cudaSetDevice(device), "cudaSetDevice");
+        g_yarn = ops::detail::text_rope_yarn(kRotary, kGeometry.rope_theta);
+        std::vector<std::uint16_t> kn(kIndexDim);
+        for (int d = 0; d < kIndexDim; ++d) { kn[d] = f32_to_bf16(kKeyNorm[d]); }
+        DeviceBuffer dkn      = to_device(kn);
+        constexpr int kTokens = 2600;
+        Layer layer(1, kTokens, KvCacheStorage::BFloat16);
+        append(layer, bulk(1, 0, kTokens), dkn, nullptr);
+        const std::string where = "yarn x4 device " + std::to_string(device) + ": ";
+        failures += check_block_keys(layer, 0, kTokens, where + "qsa_append block keys");
+        const QueryWindow qw{4, {{2596, 2597, 2598, 2599}}, {4}, 0x28U};
+        failures += check_select(layer, qw, run_select(layer, qw, kTokens, nullptr),
+                                 where + "qsa_select W=4");
+    }
+    g_yarn        = nullptr;
+    g_rope_offset = 0;
+    ops::rope_install_text_yarn(devices, 1.0F, 262144, kRotary, kGeometry.rope_theta);
+    cuda_check(cudaSetDevice(0), "cudaSetDevice");
+    return failures;
+}
+
 // The decode chain (append, select, attention) captured once and replayed: no host sync and
 // replays bit-identical to eager calls over the same device inputs.
 int test_graph_replay() {
@@ -1180,6 +1228,7 @@ int main(int argc, char** argv) {
         failures += test_deep_select();
         failures += test_shard_attention();
         failures += test_graph_replay();
+        failures += test_yarn_indexer();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_attention\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

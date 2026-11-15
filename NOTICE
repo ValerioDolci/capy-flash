@@ -181,7 +181,8 @@ under the SIL Open Font License 1.1; no font software is included.
 
 MTP draft refit
 ---------------
-tools/mtp_refit/mtp_model.py follows the structure of tools/mtp_refit/mtp_ref.py in
+The MTP draft head of the published Qwen3.8-Flash-Next artifacts was refit with a
+model definition that follows the structure of mtp_ref.py in
   * Ciprian Ursu -- https://github.com/ursuciprian/qwen3.8-flash-next-dgx-spark-tp-2
     Licensed under the Apache License, Version 2.0.
 
@@ -238,5 +239,5 @@ Neroued/ninfer (commit 77c2e5e2); its README.ninfer.md lists the adaptations:
     (commit 3641b5c2) Copyright (c) 2024 by XGrammar Contributors. Licensed under
     the Apache License, Version 2.0 (third_party/xgrammar/LICENSE and NOTICE).
 The grammar, JSON Schema, regex and choice front end (src/text/grammar,
-json_schema, schema_composition, schema_types, json_input) and its tests come
+json_schema, schema_composition, json_input) and its tests come
 from Neroued/ninfer at the same commit.

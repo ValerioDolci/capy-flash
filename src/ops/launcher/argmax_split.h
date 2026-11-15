@@ -1,7 +1,7 @@
 #pragma once
 
 // ninfer::ops::detail - private launch prototypes of the two-device split argmax
-// (ninfer/ops/tp2/argmax.h). Our file: ops/launcher/argmax.h is upstream's.
+// (ninfer/ops/tp2/argmax.h).
 
 #include "core/tensor.h"
 

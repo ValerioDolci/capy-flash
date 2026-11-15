@@ -56,7 +56,6 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  * Logical shapes / supported domain:
  *   T may be any positive value. The registered profiles are:
  *   - Q4_G64_FP16 weight [34816,5120], x [5120,T], out [17408,T];
- *   - Q8_G32_FP16 weight [12288,2048], x [2048,T], out [6144,T];
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [28672,5120], x [5120,T], out [14336,T] (a dense FFN of

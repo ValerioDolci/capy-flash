@@ -20,7 +20,7 @@
 //      cancelled lane commits nothing (commit count 0 in the GDN and PLE folds). The survivor must
 //      finish its budget, and a request decoded afterwards on the same Engine must equal the same
 //      request on a fresh Engine (no state of the cancelled lane leaks into a later one).
-//   6. prefix reuse through the MTP prefix-reuse bridge (T66b), at tp 1 (mapped and offload
+//   6. prefix reuse through the MTP prefix-reuse bridge, at tp 1 (mapped and offload
 //      experts) and, with two devices, at tp 2 (offload), residency fixed at initialization
 //      (NINFER_QWEN4_EXPERT_FREEZE=all: placement must not depend on what an Engine served
 //      before). (a) Shared prefix: chat request A, then request B sharing A's system message
@@ -143,9 +143,9 @@ ninfer::GenerationResult generate(ninfer::Engine& engine, const std::vector<ninf
     return engine.generate(engine.prepare_tokens(ids, false), greedy(tokens));
 }
 
-// T43: a draft token shortlist file for the proposal heads (empty = the full vocabulary).
+// A draft token shortlist file for the proposal heads (empty = the full vocabulary).
 std::string g_shortlist;
-// T43: tensor-parallel width of generate_once (2 = both GPUs; MTP at tp 2 needs offload experts).
+// Tensor-parallel width of generate_once (2 = both GPUs; MTP at tp 2 needs offload experts).
 int g_tp = 1;
 
 ninfer::GenerationResult generate_once(const char* artifact, Experts experts,
@@ -461,7 +461,7 @@ int main() {
         return 77;
     }
     try {
-        // 6. prefix reuse through the MTP bridge (T66b), first: NINFER_TEST_QWEN4_REUSE_ONLY=1
+        // 6. prefix reuse through the MTP bridge, first: NINFER_TEST_QWEN4_REUSE_ONLY=1
         //    runs it alone. Residency fixed at initialization: the offload backend's GPU (W4A4)
         //    and CPU (W4A8) experts are not bit-identical.
         const bool reuse_only = std::getenv("NINFER_TEST_QWEN4_REUSE_ONLY") != nullptr;
@@ -492,7 +492,7 @@ int main() {
             exactness(artifact, Experts::Offload, "offload experts (frozen residency)");
         }
         cancelled_row(artifact);
-        // 4. T43 draft shortlist: proposals over the ID prefix [0, 3000) plus three high IDs (the
+        // 4. Draft shortlist: proposals over the ID prefix [0, 3000) plus three high IDs (the
         //    gathered extra rows; 3003 IDs, completed to 3008 rows): MTP == no-draft == oracle
         //    drafts (the verification head is the full one, whatever the proposals).
         g_shortlist = scratch_path("ninfer_qwen4_mtp_shortlist_") + ".txt";

@@ -1,10 +1,10 @@
-// v0.7 q3-prefill: GPU conformance and speed of the q3_g128_fp16 A8 prefill routes.
+// GPU conformance and speed of the q3_g128_fp16 A8 prefill routes.
 //
 // The A8 routes quantize each (token, 128-value group) of the activations to int8 with an FP32
 // scale amax / 127 (round to nearest even, clamp to +-127), take exact int32 dot products with the
 // 3-bit codes per group, and accumulate fmaf(w_scale * x_scale, float(partial), total) in group
-// order. Two kernels implement it: the in-kernel quantizing tile (route 2, the one the PPL of
-// 19/10 accepted) and the tall workspace route (route 3, v0.7 q3-prefill).
+// order. Two kernels implement it: the in-kernel quantizing tile (route 2, the one whose perplexity
+// was qualified) and the tall workspace route (route 3).
 //
 // Pre-registered criteria:
 //   (1) route 3 == route 2 bit for bit on every epilogue (Linear, residual add, SwiGLU, segments),
@@ -47,8 +47,13 @@ void cuda_ok(cudaError_t e, const char* what) {
 
 struct DeviceBytes {
     void* p = nullptr;
-    explicit DeviceBytes(std::size_t bytes) { cuda_ok(cudaMalloc(&p, bytes ? bytes : 16), "malloc"); }
+
+    explicit DeviceBytes(std::size_t bytes) {
+        cuda_ok(cudaMalloc(&p, bytes ? bytes : 16), "malloc");
+    }
+
     ~DeviceBytes() { cudaFree(p); }
+
     DeviceBytes(const DeviceBytes&)            = delete;
     DeviceBytes& operator=(const DeviceBytes&) = delete;
 };
@@ -70,7 +75,7 @@ std::uint16_t bf16_bits(float f) {
 // Host model of one q3_g128_fp16 matrix.
 struct HostQ3 {
     int n = 0, k = 0;
-    std::vector<std::int8_t> codes; // [n][k]
+    std::vector<std::int8_t> codes;    // [n][k]
     std::vector<std::uint16_t> scales; // [n][k/128] binary16
     std::vector<std::uint8_t> payload; // row-split payload
     std::size_t scale_offset = 0;
@@ -108,22 +113,22 @@ HostQ3 make_q3(int n, int k, std::uint32_t seed) {
 
 Weight device_weight(const HostQ3& h, const DeviceBytes& d) {
     Weight w;
-    w.payload          = d.p;
-    w.payload_bytes    = h.payload.size();
-    w.qtype            = QType::Q3_G128_FP16;
-    w.layout           = QuantLayout::RowSplit;
-    w.group_size       = 128;
-    w.group            = 128;
-    w.ndim             = 2;
+    w.payload       = d.p;
+    w.payload_bytes = h.payload.size();
+    w.qtype         = QType::Q3_G128_FP16;
+    w.layout        = QuantLayout::RowSplit;
+    w.group_size    = 128;
+    w.group         = 128;
+    w.ndim          = 2;
     w.n = w.shape[0] = w.padded_shape[0] = h.n;
     w.k = w.shape[1] = w.padded_shape[1] = h.k;
-    w.qdata          = d.p;
-    w.scales         = static_cast<std::uint8_t*>(d.p) + h.scale_offset;
-    w.scale_dtype    = DType::FP16;
-    w.scale_ne[0]    = h.k / 128;
-    w.scale_ne[1]    = h.n;
-    w.scale_nb[0]    = 2;
-    w.scale_nb[1]    = (h.k / 128) * 2;
+    w.qdata                              = d.p;
+    w.scales                             = static_cast<std::uint8_t*>(d.p) + h.scale_offset;
+    w.scale_dtype                        = DType::FP16;
+    w.scale_ne[0]                        = h.k / 128;
+    w.scale_ne[1]                        = h.n;
+    w.scale_nb[0]                        = 2;
+    w.scale_nb[1]                        = (h.k / 128) * 2;
     w.scale_nb[2] = w.scale_nb[3] = w.scale_nb[1] * h.n;
     return w;
 }
@@ -135,7 +140,6 @@ std::vector<std::uint16_t> make_x(int k, int t, std::uint32_t seed) {
     for (auto& v : x) v = bf16_bits(dist(rng));
     return x;
 }
-
 
 void report(const std::string& name, int bad, int total) {
     std::printf("%-64s %s (%d/%d)\n", name.c_str(), bad ? "FAIL" : "ok", bad, total);
@@ -158,15 +162,17 @@ std::vector<float> emulate_a8(const HostQ3& h, const std::vector<std::uint16_t>&
         for (int g = 0; g < groups; ++g) {
             float amax = 0.0F;
             for (int i = 0; i < 128; ++i) {
-                amax = std::fmax(amax, std::fabs(bf16_value(x[static_cast<std::size_t>(tok) * h.k + g * 128 + i])));
+                amax = std::fmax(amax, std::fabs(bf16_value(
+                                           x[static_cast<std::size_t>(tok) * h.k + g * 128 + i])));
             }
-            const float scale = amax > 0.0F ? amax / 127.0F : 0.0F;
-            const float inv   = amax > 0.0F ? 127.0F / amax : 0.0F;
+            const float scale                              = amax > 0.0F ? amax / 127.0F : 0.0F;
+            const float inv                                = amax > 0.0F ? 127.0F / amax : 0.0F;
             sx[static_cast<std::size_t>(tok) * groups + g] = scale;
             for (int i = 0; i < 128; ++i) {
-                const float v = bf16_value(x[static_cast<std::size_t>(tok) * h.k + g * 128 + i]) * inv;
+                const float v =
+                    bf16_value(x[static_cast<std::size_t>(tok) * h.k + g * 128 + i]) * inv;
                 long r = std::lrint(v);
-                r = r < -127 ? -127 : (r > 127 ? 127 : r);
+                r      = r < -127 ? -127 : (r > 127 ? 127 : r);
                 q[static_cast<std::size_t>(tok) * h.k + g * 128 + i] = static_cast<std::int8_t>(r);
             }
         }
@@ -176,13 +182,13 @@ std::vector<float> emulate_a8(const HostQ3& h, const std::vector<std::uint16_t>&
         for (int r = 0; r < h.n; ++r) {
             float total = 0.0F;
             for (int g = 0; g < groups; ++g) {
-                int part = 0;
+                int part             = 0;
                 const std::int8_t* c = h.codes.data() + static_cast<std::size_t>(r) * h.k + g * 128;
                 const std::int8_t* a = q.data() + static_cast<std::size_t>(tok) * h.k + g * 128;
                 for (int i = 0; i < 128; ++i) part += c[i] * a[i];
                 const float sw = __half2float(__ushort_as_half(h.scales[r * groups + g]));
-                total = std::fma(sw * sx[static_cast<std::size_t>(tok) * groups + g],
-                                 static_cast<float>(part), total);
+                total          = std::fma(sw * sx[static_cast<std::size_t>(tok) * groups + g],
+                                          static_cast<float>(part), total);
             }
             out[static_cast<std::size_t>(tok) * h.n + r] = total;
         }
@@ -193,9 +199,9 @@ std::vector<float> emulate_a8(const HostQ3& h, const std::vector<std::uint16_t>&
 enum class Kind { Linear, Add, Swiglu, Segments };
 
 // Runs one call on route `route` and returns every output (BF16 bits, segments concatenated).
-std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& dw, const DeviceBytes& dx,
-                                const std::vector<std::uint16_t>& residual, int t, int route,
-                                const DeviceBytes* ws, std::size_t ws_size) {
+std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& dw,
+                                const DeviceBytes& dx, const std::vector<std::uint16_t>& residual,
+                                int t, int route, const DeviceBytes* ws, std::size_t ws_size) {
     detail::q3_force_route_for_test(route);
     const Weight w = device_weight(h, dw);
     Tensor tx(dx.p, DType::BF16, {h.k, t});
@@ -207,7 +213,8 @@ std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& d
         if (kind == Kind::Linear) {
             detail::q3_linear_dispatch(tx, w, to, nullptr, q3ws);
         } else {
-            cuda_ok(cudaMemcpy(d.p, residual.data(), residual.size() * 2, cudaMemcpyHostToDevice), "r");
+            cuda_ok(cudaMemcpy(d.p, residual.data(), residual.size() * 2, cudaMemcpyHostToDevice),
+                    "r");
             detail::q3_linear_add_dispatch(tx, w, to, nullptr, q3ws);
         }
         cuda_ok(cudaDeviceSynchronize(), "call");
@@ -224,14 +231,15 @@ std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& d
         // Three uneven segments (the attention/GDN parents split the same way).
         const int a = h.n / 4, b = h.n / 8 * 3;
         const int rows[3] = {a, b, h.n - a - b};
-        DeviceBytes d0(static_cast<std::size_t>(rows[0]) * t * 2), d1(static_cast<std::size_t>(rows[1]) * t * 2),
+        DeviceBytes d0(static_cast<std::size_t>(rows[0]) * t * 2),
+            d1(static_cast<std::size_t>(rows[1]) * t * 2),
             d2(static_cast<std::size_t>(rows[2]) * t * 2);
         detail::Q3RowSegments seg;
         seg.count   = 3;
         seg.data[0] = static_cast<__nv_bfloat16*>(d0.p);
         seg.data[1] = static_cast<__nv_bfloat16*>(d1.p);
         seg.data[2] = static_cast<__nv_bfloat16*>(d2.p);
-        int end = 0;
+        int end     = 0;
         for (int s = 0; s < 3; ++s) {
             end += rows[s];
             seg.ld[s]  = rows[s];
@@ -242,7 +250,8 @@ std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& d
         const DeviceBytes* ds[3] = {&d0, &d1, &d2};
         for (int s = 0; s < 3; ++s) {
             std::vector<std::uint16_t> part(static_cast<std::size_t>(rows[s]) * t);
-            cuda_ok(cudaMemcpy(part.data(), ds[s]->p, part.size() * 2, cudaMemcpyDeviceToHost), "out");
+            cuda_ok(cudaMemcpy(part.data(), ds[s]->p, part.size() * 2, cudaMemcpyDeviceToHost),
+                    "out");
             out.insert(out.end(), part.begin(), part.end());
         }
     }
@@ -252,10 +261,14 @@ std::vector<std::uint16_t> call(Kind kind, const HostQ3& h, const DeviceBytes& d
 
 const char* kind_name(Kind k) {
     switch (k) {
-    case Kind::Linear: return "linear";
-    case Kind::Add: return "linear_add";
-    case Kind::Swiglu: return "linear_swiglu";
-    default: return "segments";
+    case Kind::Linear:
+        return "linear";
+    case Kind::Add:
+        return "linear_add";
+    case Kind::Swiglu:
+        return "linear_swiglu";
+    default:
+        return "segments";
     }
 }
 
@@ -274,30 +287,33 @@ void check(Kind kind, const HostQ3& h, const DeviceBytes& dw, int t, bool emulat
         report(tag + " T<64 stays A16", a16 == r3 ? 0 : 1, 1);
         return;
     }
-    const auto r2 = call(kind, h, dw, dx, residual, t, 2, nullptr, 0);
-    const auto r3 = call(kind, h, dw, dx, residual, t, 3, &ws, need);
+    const auto r2  = call(kind, h, dw, dx, residual, t, 2, nullptr, 0);
+    const auto r3  = call(kind, h, dw, dx, residual, t, 3, &ws, need);
     const auto r3b = call(kind, h, dw, dx, residual, t, 3, &ws, need);
-    int diff = 0;
+    int diff       = 0;
     for (std::size_t i = 0; i < r2.size(); ++i) diff += r2[i] != r3[i];
     report(tag + " tall == fused", diff, static_cast<int>(r2.size()));
     report(tag + " tall determinism", r3 == r3b ? 0 : 1, 1);
     if (need == 0) report(tag + " workspace size", 1, 1);
     if (!emulate || kind == Kind::Segments) return;
     const auto e = emulate_a8(h, x, t);
-    int bad = 0;
+    int bad      = 0;
     if (kind == Kind::Linear) {
         for (std::size_t i = 0; i < r3.size(); ++i) bad += r3[i] != bf16_bits(e[i]);
     } else if (kind == Kind::Add) {
-        for (std::size_t i = 0; i < r3.size(); ++i) bad += r3[i] != bf16_bits(bf16_value(residual[i]) + e[i]);
+        for (std::size_t i = 0; i < r3.size(); ++i)
+            bad += r3[i] != bf16_bits(bf16_value(residual[i]) + e[i]);
     } else {
         const int half = h.n / 2;
         for (int tok = 0; tok < t; ++tok)
             for (int r = 0; r < half; ++r) {
-                const double g = e[static_cast<std::size_t>(tok) * h.n + r];
-                const double u = e[static_cast<std::size_t>(tok) * h.n + r + half];
+                const double g   = e[static_cast<std::size_t>(tok) * h.n + r];
+                const double u   = e[static_cast<std::size_t>(tok) * h.n + r + half];
                 const double ref = g / (1.0 + std::exp(-g)) * u;
                 const double got = bf16_value(r3[static_cast<std::size_t>(tok) * half + r]);
-                if (!std::isfinite(got) || std::fabs(got - ref) > std::ldexp(std::fabs(ref), -8) + 1e-6) ++bad;
+                if (!std::isfinite(got) ||
+                    std::fabs(got - ref) > std::ldexp(std::fabs(ref), -8) + 1e-6)
+                    ++bad;
             }
     }
     report(tag + " tall == host A8 emulation", bad, static_cast<int>(r3.size()));
@@ -309,15 +325,20 @@ void bench() {
         Kind kind;
         int n, k;
     };
+
     const std::vector<B> shapes{
-        {"gate|up 1gpu", Kind::Swiglu, 34816, 5120}, {"down 1gpu", Kind::Add, 5120, 17408},
-        {"attn qkvg 1gpu", Kind::Segments, 14336, 5120}, {"gdn qkvz 1gpu", Kind::Segments, 16384, 5120},
+        {"gate|up 1gpu", Kind::Swiglu, 34816, 5120},
+        {"down 1gpu", Kind::Add, 5120, 17408},
+        {"attn qkvg 1gpu", Kind::Segments, 14336, 5120},
+        {"gdn qkvz 1gpu", Kind::Segments, 16384, 5120},
         {"out 1gpu", Kind::Add, 5120, 6144},
-        {"gate|up tp2", Kind::Swiglu, 17408, 5120}, {"down tp2", Kind::Add, 5120, 8704},
-        {"gdn qkvz tp2", Kind::Segments, 8192, 5120}, {"out tp2", Kind::Add, 5120, 3072},
+        {"gate|up tp2", Kind::Swiglu, 17408, 5120},
+        {"down tp2", Kind::Add, 5120, 8704},
+        {"gdn qkvz tp2", Kind::Segments, 8192, 5120},
+        {"out tp2", Kind::Add, 5120, 3072},
     };
-    std::printf("\nbench (us per call; TOPS = 2*N*K*T)\n%-16s %6s %10s %10s %10s %8s %8s %8s\n", "shape", "T",
-                "A16", "A8fused", "A8tall", "TOPS16", "TOPS8f", "TOPS8t");
+    std::printf("\nbench (us per call; TOPS = 2*N*K*T)\n%-16s %6s %10s %10s %10s %8s %8s %8s\n",
+                "shape", "T", "A16", "A8fused", "A8tall", "TOPS16", "TOPS8f", "TOPS8t");
     for (const auto& s : shapes) {
         const HostQ3 h = make_q3(s.n, s.k, 99u + s.n);
         DeviceBytes dw(h.payload.size());
@@ -364,8 +385,8 @@ void bench() {
             }
             detail::q3_force_route_for_test(0);
             const double ops = 2.0 * s.n * s.k * t;
-            std::printf("%-16s %6d %10.1f %10.1f %10.1f %8.1f %8.1f %8.1f\n", s.name, t, us[0], us[1], us[2],
-                        ops / us[0] * 1e-6, ops / us[1] * 1e-6, ops / us[2] * 1e-6);
+            std::printf("%-16s %6d %10.1f %10.1f %10.1f %8.1f %8.1f %8.1f\n", s.name, t, us[0],
+                        us[1], us[2], ops / us[0] * 1e-6, ops / us[1] * 1e-6, ops / us[2] * 1e-6);
         }
     }
 }
@@ -383,24 +404,27 @@ int main() {
         bench();
         return 0;
     }
+
     struct Shape {
         Kind kind;
         int n, k;
     };
+
     // 27B Text sites, their TP2 shards and a small odd shape (partial row tiles).
     const std::vector<Shape> shapes{
-        {Kind::Linear, 328, 2560},      {Kind::Add, 328, 2560},        {Kind::Swiglu, 328, 2560},
-        {Kind::Segments, 328, 2560},    {Kind::Linear, 5120, 6144},    {Kind::Add, 5120, 6144},
-        {Kind::Add, 5120, 17408},       {Kind::Add, 5120, 8704},       {Kind::Swiglu, 34816, 5120},
-        {Kind::Swiglu, 17408, 5120},    {Kind::Segments, 14336, 5120}, {Kind::Segments, 16384, 5120},
-        {Kind::Segments, 8192, 5120},   {Kind::Add, 5120, 3072},
+        {Kind::Linear, 328, 2560},    {Kind::Add, 328, 2560},        {Kind::Swiglu, 328, 2560},
+        {Kind::Segments, 328, 2560},  {Kind::Linear, 5120, 6144},    {Kind::Add, 5120, 6144},
+        {Kind::Add, 5120, 17408},     {Kind::Add, 5120, 8704},       {Kind::Swiglu, 34816, 5120},
+        {Kind::Swiglu, 17408, 5120},  {Kind::Segments, 14336, 5120}, {Kind::Segments, 16384, 5120},
+        {Kind::Segments, 8192, 5120}, {Kind::Add, 5120, 3072},
     };
     // Default policy: with NINFER_Q3_A8 unset the prefill widths take A8 (workspace requested),
     // T < 64 none.
     if (std::getenv("NINFER_Q3_A8") == nullptr) {
         report("default: A8 workspace requested at T=2048",
                detail::q3_workspace_bytes(5120, 2048) > 0 ? 0 : 1, 1);
-        report("default: no workspace at T=63", detail::q3_workspace_bytes(5120, 63) == 0 ? 0 : 1, 1);
+        report("default: no workspace at T=63", detail::q3_workspace_bytes(5120, 63) == 0 ? 0 : 1,
+               1);
     }
     for (const auto& s : shapes) {
         const HostQ3 h = make_q3(s.n, s.k, 11u * s.n + s.k);

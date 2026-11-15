@@ -1,23 +1,21 @@
 #pragma once
 
-// Per-GPU tuning of this fork: the one place where a board gets its measured values. Our file
-// (header-only, so it needs no registration in upstream's CMake lists).
+// Per-GPU tuning: the one place where a board gets its measured values. Header-only.
 //
 // Rows are matched by device properties (compute capability, SM count), first match wins; the
-// last row matches every device and carries the values measured on two RTX 5070 Ti, which is what
-// every device ran before the table existed. A new GPU adds a row above it (docs/maintainer/
-// upstream-merge.md, "Adding a new GPU"); nothing else is edited for its values.
+// last row matches every device and carries the values measured on two RTX 5070 Ti. A new GPU adds
+// a row above it; nothing else is edited for its values.
 //
 // Per-GPU choices that are NOT in the table, because they are compile-time schedule selections
-// inside upstream's Op code shared by every device (a runtime switch would change upstream's
+// inside the single-device Op code shared by every device (a runtime switch would change its
 // selectors; they run on every GPU as measured on the RTX 5070 Ti):
 //   - NVFP4 A16 sliced-K staged-token/row-tile instances and the MLP-down SIMT MinBlocksPerSm
 //     (91582814: nvfp4_schedule.cuh, nvfp4_linear_swiglu_small_t.cu, linear shapes n5120_k17408);
 //   - the INT8 attention split rule itself (169514ea, 21ad2f4a: int8/plan.cpp, grouped_mma.cuh),
 //     which reads the SM count below;
 //   - the mailbox poller's spin limit kPeerSpinLimit (ops/kernel/peer_exchange.cuh).
-// The shard and half problems otherwise inherit upstream's schedules and crossovers (A16/A8/A4
-// thresholds, MMA bands, TMA tiles) from the problem they halve.
+// The shard and half problems otherwise inherit the schedules and crossovers (A16/A8/A4
+// thresholds, MMA bands, TMA tiles) of the problem they halve.
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -42,7 +40,7 @@ struct DeviceTuning {
     int attention_sm_count;
 
     // NVFP4 attn_input_proj [7168,5120] shard, A4 TMA route: the first T that reads 256-token
-    // scale tiles; below it the 128-token tiles (upstream and the parent switch at T=1024).
+    // scale tiles; below it the 128-token tiles (the parent switches at T=1024).
     // ops/attn_input_proj/tp2/nvfp4_attn_input_shard_a4.cu.
     std::int32_t nvfp4_attn_input_shard_first_tiled256_tokens;
 

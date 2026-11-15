@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T43: draft token shortlist for the Qwen4Exp MTP proposal head (EngineOptions draft_shortlist).
+"""Draft token shortlist for the Qwen4Exp MTP proposal head (EngineOptions draft_shortlist).
 
 The shortlist is the union of
   * the token-ID prefix [0, --prefix): Qwen byte-level BPE assigns IDs in merge order, i.e. by
@@ -11,7 +11,7 @@ The shortlist is the union of
     math; same 248 320-token vocabulary as Qwen3.8-Flash-Next, vocab.json identical); the engine
     copies these rows of the head (the ones above the prefix);
   * every added (special) token of the tokenizer below the public token count (chat control);
-  * optionally (T186) the --extra-top most frequent tokens of a second ranking (--extra-ranking) not
+  * optionally the --extra-top most frequent tokens of a second ranking (--extra-ranking) not
     already in the list, e.g. tools/freq_corpus/fixtures/ranking/it.train.counts.i64 for Italian:
     with the default list 14.5 % of held-out Italian tokens fell outside it, 0.24 % with 8 192 more.
 Reproducible: deterministic (stable sort on counts, ties by lower ID); the output header records

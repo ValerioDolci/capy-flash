@@ -1,4 +1,4 @@
-// v07/prefill-slices: the column-slice plan of the sliced tp 2 prefill
+// The column-slice plan of the sliced tp 2 prefill
 // (models/qwen3_5/execution/tp2/prefill_slices.h), host only. The properties the schedule relies
 // on: the slices tile the chunk exactly, every boundary is a multiple of 128, no slice is narrower
 // than 64 columns, at most eight slices (the split exchange's lanes), and every chunk of at least
@@ -69,16 +69,17 @@ int main() {
     for (const std::int32_t width : {-128, 1, 64, 200, 1000}) {
         failures += check(!prefill_slice_plan(1024, width).usable(),
                           "invalid override " + std::to_string(width));
-        failures += check(!prefill_slice_width_valid(width), "valid(" + std::to_string(width) + ")");
+        failures +=
+            check(!prefill_slice_width_valid(width), "valid(" + std::to_string(width) + ")");
     }
-    // The examples of docs/v07/prefill-slices.md.
+    // Worked examples of the plan.
     failures += check_example(255, 0, 0);
     failures += check_example(256, 128, 2);
-    failures += check_example(300, 128, 2);   // 128 + 172
-    failures += check_example(500, 128, 4);   // 3x128 + 116
-    failures += check_example(513, 128, 4);   // 3x128 + 129
-    failures += check_example(700, 128, 5);   // 4x128 + 188
-    failures += check_example(1500, 256, 6);  // 5x256 + 220
+    failures += check_example(300, 128, 2);  // 128 + 172
+    failures += check_example(500, 128, 4);  // 3x128 + 116
+    failures += check_example(513, 128, 4);  // 3x128 + 129
+    failures += check_example(700, 128, 5);  // 4x128 + 188
+    failures += check_example(1500, 256, 6); // 5x256 + 220
     failures += check_example(2048, 512, 4);
     failures += check_example(4096, 1024, 4);
     failures += check_example(16384, 4096, 4);

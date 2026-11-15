@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agentic replay client (T71): for each session and turn t, POST /v1/chat/completions with the system prompt, the task and
+"""Agentic replay client: for each session and turn t, POST /v1/chat/completions with the system prompt, the task and
 turns 0..t (fixed assistant message + tool output as a user message), stream, greedy, max_tokens MAXNEW.
 Measures client-side TTFT (first streamed token) and decode tokens/s (usage.completion_tokens - 1 over first->last).
 Usage: replay.py URL MODEL sessions.json out.jsonl [maxnew]"""

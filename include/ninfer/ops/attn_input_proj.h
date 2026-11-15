@@ -44,8 +44,6 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *
  * Registered parent forms are:
  *
- * - Q8_G32_FP16 RowSplit `[9216,2048]`, with row counts `[4096,512,4096,512]`. `x` is
- *   BF16 `[2048,T]`, q/gate are BF16 `[4096,T]`, and k/v are BF16 `[512,T]`.
  * - BF16 Contiguous `[14336,5120]`, with row counts `[6144,1024,6144,1024]`. `x` is
  *   BF16 `[5120,T]`, q/gate are BF16 `[6144,T]`, and k/v are BF16 `[1024,T]`.
  * - NVFP4 BlockScaleK16M128x4 `[14336,5120]`, with the same logical row and tensor shapes as
@@ -53,13 +51,13 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  * - FP8_E4M3FN_ROW_BF16 RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16.
  *
- * `T` is the positive token extent of the Op contract. All three policies permit the BF16
- * and Q8_G32_FP16 A16 implementations. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the
- * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
- * positive T. FP8 accepts all policies at every positive T. AllowA8/AllowA4 permit the resolver to
- * choose a qualified A16 route or private activation quantization followed by A8 Tensor Core
- * computation. A16Only preserves the represented BF16 activation at every positive T; tile and
- * route cutoffs are private implementation choices, independent of speculative block width.
+ * `T` is the positive token extent of the Op contract. All three policies permit the BF16 A16
+ * implementation. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the resolver to select
+ * either a qualified A16 route or activation quantization to NVFP4 at every positive T. FP8 accepts
+ * all policies at every positive T. AllowA8/AllowA4 permit the resolver to choose a qualified A16
+ * route or private activation quantization followed by A8 Tensor Core computation. A16Only
+ * preserves the represented BF16 activation at every positive T; tile and route cutoffs are private
+ * implementation choices, independent of speculative block width.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the
  * logical values represented by the persistent weight and BF16 activation. The final four BF16
@@ -85,13 +83,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
- * Three-output Q8 specialization. The Q8_G32_FP16 RowSplit parent stores rows in order
- * [query 4096, key 1024, value 1024]. Registered parent forms are [6144,2048] with BF16
- * x [2048,T] for the Qwen3.6 companion and [6144,5120] with BF16 x [5120,T] for DFlash2.
- * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes the
- * three independent final allocations directly; no parent output or transient workspace is
- * materialized. T may be any positive value. Q and K remain raw projection outputs: this Op does
- * not normalize or rotate either tensor.
+ * Three-output Q8 specialization for DFlash2. The Q8_G32_FP16 RowSplit parent [6144,5120] stores
+ * rows in order [query 4096, key 1024, value 1024], with BF16 x [5120,T]. q is contiguous BF16
+ * [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes the three independent final
+ * allocations directly; no parent output or transient workspace is materialized. T may be any
+ * positive value. Q and K remain raw projection outputs: this Op does not normalize or rotate
+ * either tensor.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);

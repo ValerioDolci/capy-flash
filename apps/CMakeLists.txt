@@ -7,7 +7,7 @@ target_link_libraries(ninfer PRIVATE
   ninfer_product_logging
   ninfer_product_prompt_input)
 
-# tp 1 golden runner (tools/golden/README.md): public Engine API only, builds in upstream too.
+# tp 1 golden runner (tools/golden/README.md): public Engine API only.
 add_executable(ninfer-tp1-golden ../tools/golden/tp1_golden.cpp)
 target_link_libraries(ninfer-tp1-golden PRIVATE ninfer_engine)
 

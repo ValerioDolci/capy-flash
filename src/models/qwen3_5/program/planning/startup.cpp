@@ -9,12 +9,13 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/qwen4_layer_profile.h"
+#include "core/checked.h"
 #include "core/device.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
-#include "ninfer/ops/moe_predict.h"
 #include "ninfer/ops/moe_slots.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -44,18 +45,6 @@ namespace workspace = execution::workspace;
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
 
-std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
-    if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
-    return a + b;
-}
-
-std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(label);
-    }
-    return a * b;
-}
-
 // The routed-expert banks of the offload backend's cache layers (Text, then MTP under MTP).
 std::vector<execution::Qwen4ExpertBank> gguf_bank_list(const execution::Parameters& parameters,
                                                        SpeculativeBackend speculative) {
@@ -80,7 +69,7 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
-    return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    return kv_pages_for_tokens(capacity);
 }
 
 template <class ProfileAllowance>
@@ -184,7 +173,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
-    // T64 elastic KV: the KV page planes and the expert slot pools go to a second layout (the
+    // Elastic KV: the KV page planes and the expert slot pools go to a second layout (the
     // elastic arena, CUDA VMM); everything else stays in the ordinary persistent allocation, so
     // cross-device copies (tp 2) never touch VMM memory.
     LayoutBuilder elastic_builder;
@@ -295,7 +284,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring});
-    // With lent Qwen4Exp prompt workspace (T42) only the base chunk: a wider chunk keeps its
+    // With lent Qwen4Exp prompt workspace only the base chunk: a wider chunk keeps its
     // hidden in the lent arena and its last column here.
     const std::int32_t prefill_hidden_columns =
         plan.qwen4_base_chunk > 0
@@ -392,7 +381,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                 add_tensor(builder, DType::I32, {ops::kMoeSlotsTopK * ops::kMoeSlotsMaxTokens},
                            "Qwen4Exp expert device reads");
             // Rank 0's residency mirror (the CPU path's publish) and rank 1's (its miss-split
-            // share, T42): ~100 KB each.
+            // share): ~100 KB each.
             if (plan.tp == 2) {
                 q.cache_mirror =
                     add_tensor(builder, DType::I32,
@@ -406,7 +395,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                         "Qwen4Exp expert stream tables exceed int32")},
                            "Qwen4Exp expert stream tables");
             if (execution::staged_miss_split(plan.qwen4_experts)) {
-                // Staged GPU share of the misses (T18): scratch slots, their table, the pick list.
+                // Staged GPU share of the misses: scratch slots, their table, the pick list.
                 q.stage_table =
                     add_tensor(builder, DType::I32, {experts}, "Qwen4Exp miss split table");
                 q.stage_picks = add_tensor(builder, DType::I32, {execution::kMissSplitSlots + 1},
@@ -419,20 +408,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                     "Qwen4Exp miss split scratch slots");
                 }
             }
-            // T25 prefetch: staging slots after the cache's slots, and their bookkeeping.
-            q.staging_slots = static_cast<std::int32_t>(2U * plan.qwen4_experts.prefetch_slots);
-            if (q.staging_slots > 0) {
-                q.prefetch_tags  = add_tensor(builder, DType::I32, {q.staging_slots},
-                                              "Qwen4Exp prefetch staging tags");
-                q.prefetch_epoch = add_tensor(builder, DType::I32, {1}, "Qwen4Exp prefetch epoch");
-                q.prefetch_rows =
-                    add_tensor(builder, DType::I32,
-                               {checked_i32(std::uint64_t(layers) * std::uint64_t(experts),
-                                            "Qwen4Exp prefetch rows exceed int32")},
-                               "Qwen4Exp prefetch effective slot rows");
-                q.prefetch_workspace = builder.add(ops::moe_predict_workspace_bytes(), kArenaAlign,
-                                                   "Qwen4Exp prefetch predictor workspace");
-            }
             // ggml block banks: one arena of variable-size slots (Qwen4OffloadExperts::gguf_pool).
             std::vector<execution::Qwen4ExpertBank> banks;
             for (const auto& layer : parameters.qwen4->layers) {
@@ -441,17 +416,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
             if (mtp) { banks.push_back(parameters.qwen4_mtp->layer.moe().experts); }
             q.gguf = execution::Qwen4OffloadExperts::gguf_banks(banks);
             if (q.gguf) {
-                if (q.staging_slots > 0) {
-                    throw std::invalid_argument(
-                        "Qwen4Exp ggml block banks: the router-ahead prefetch is not implemented");
-                }
                 std::vector<std::int64_t> bytes;
                 for (const auto& b : banks) {
                     bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(b));
                 }
                 const auto layer_base = execution::Qwen4OffloadExperts::layer_slot_profile(
                     cache_layers, layers, q.expert_slots, q.elastic_columns,
-                    static_cast<std::int32_t>(plan.tp));
+                    static_cast<std::int32_t>(plan.tp), qwen4_exclusive_layers());
                 const auto pool =
                     execution::Qwen4OffloadExperts::gguf_pool(bytes, layer_base, q.elastic_columns);
                 // The pools slots, then the prefill rings (Qwen4OffloadExperts::gguf_ring_slots).
@@ -477,9 +448,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                    : 0;
                 }
             } else {
-                // Base slots, the prefetch staging slots, then the elastic columns.
+                // Base slots, then the elastic columns.
                 const auto planes = execution::Qwen4OffloadExperts::pool_plane_bytes(
-                    cache_layers, q.expert_slots + q.elastic_columns, q.staging_slots);
+                    cache_layers, q.expert_slots + q.elastic_columns);
                 for (std::size_t plane = 0; plane < planes.size(); ++plane) {
                     q.cache_pool[plane] = (elastic ? elastic_builder : builder)
                                               .add(static_cast<std::size_t>(planes[plane]),
@@ -488,15 +459,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                     const std::int64_t stride = execution::Qwen4OffloadExperts::plane_slot_bytes(
                         static_cast<std::int32_t>(plane));
                     q.elastic_first[plane] = static_cast<std::size_t>(
-                        (static_cast<std::int64_t>(cache_layers) * q.expert_slots +
-                         q.staging_slots) *
-                        stride);
+                        static_cast<std::int64_t>(cache_layers) * q.expert_slots * stride);
                     q.elastic_bytes[plane] = static_cast<std::size_t>(
                         static_cast<std::int64_t>(cache_layers) * q.elastic_columns * stride);
                 }
             }
         }
-        // T43: the draft shortlist head: rank 0 alone, or split over both ranks (rank 0's block
+        // The draft shortlist head: rank 0 alone, or split over both ranks (rank 0's block
         // is a view, rank 1 gathers the other half).
         const bool shortlist = plan.draft_prefix > 0 || !plan.draft_extras.empty();
         const std::int32_t shortlist_rows =
@@ -1244,10 +1213,10 @@ void validate_target_options(const execution::Parameters& parameters,
         options.max_context > parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
     }
-    // YaRN (ported 2026-10-24): the config's max_position_embeddings is the model's TRUE native
+    // YaRN: the config's max_position_embeddings is the model's TRUE native
     // window and stays untouched; an opt-in rope factor raises the addressable ceiling to
     // native x factor, which is what the rope table installed at startup actually serves.
-    // Factor 1 (the default) leaves this identical to the pre-YaRN engine.
+    // Factor 1 (the default) keeps the native window.
     const double yarn_factor = options.rope_yarn_factor > 1.0F ? options.rope_yarn_factor : 1.0;
     const std::uint64_t context_ceiling = static_cast<std::uint64_t>(
         static_cast<double>(parameters.model.config().text.max_position_embeddings) * yarn_factor);
@@ -1302,10 +1271,6 @@ void validate_target_options(const execution::Parameters& parameters,
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,5]");
         }
-        if (!(options.speculative.min_draft_probability >= 0.0F &&
-              options.speculative.min_draft_probability < 1.0F)) {
-            throw std::invalid_argument("MTP minimum draft probability must be in [0,1)");
-        }
         break;
     case SpeculativeBackend::DFlash2:
         if (!parameters.draft) {
@@ -1324,20 +1289,21 @@ void validate_target_options(const execution::Parameters& parameters,
         throw std::logic_error("Qwen3.5 Program: a rank's Parameters have no Text forward blocks");
     }
     if (parameters.model.config().text.qwen4()) {
-        // Qwen4Exp Text at one device (T20) or at tp 2 (T31), and MTP speculative decoding at
-        // one device (T24).
-        if (options.tp == 2 && models::load_options(options).hc_split_streams) {
-            throw std::invalid_argument("Qwen4ExpForCausalLM: the stream-split hyper-connection "
-                                        "mixers have no execution route (replicated mixers only)");
-        }
+        // Qwen4Exp Text at one device or at tp 2, and MTP speculative decoding.
         if (options.tp == 2 && options.speculative.backend == SpeculativeBackend::Mtp &&
             parameters.model.config().text.qwen4_routed_experts() &&
             options.routed_experts.backend != RoutedExpertBackend::Offload) {
             throw std::invalid_argument(
                 "Qwen4ExpForCausalLM: MTP at tp 2 runs with the offload expert backend");
         }
-        // T24: MTP over the full vocabulary. DFlash has no Qwen4Exp drafter; a trimmed proposal
-        // head (draft vocabulary) is a later lever.
+        // The load plan leaves the exclusive tails out of the page-locked banks: only the offload
+        // backend knows where those experts live.
+        if (qwen4_exclusive_layers() > 0 &&
+            options.routed_experts.backend != RoutedExpertBackend::Offload) {
+            throw std::invalid_argument("Qwen4ExpForCausalLM: NINFER_QWEN4_EXCLUSIVE_LAYERS needs "
+                                        "the offload expert backend");
+        }
+        // MTP only: DFlash has no Qwen4Exp drafter.
         if (options.speculative.backend != SpeculativeBackend::None &&
             options.speculative.backend != SpeculativeBackend::Mtp) {
             throw std::invalid_argument("Qwen4ExpForCausalLM: only MTP speculation is implemented");
@@ -1374,8 +1340,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_chunk          = inputs.prefill_chunk;
     impl->kv_lease_window_tokens = inputs.kv_lease_window_tokens;
     impl->draft_window           = inputs.draft_window;
-    impl->mtp_min_p              = inputs.mtp_min_p;
-    impl->mtp_window_rule        = inputs.mtp_window_rule;
     impl->speculative_backend    = inputs.speculative_backend;
     impl->proposal_head          = inputs.proposal_head;
     impl->features               = inputs.features;
@@ -1392,15 +1356,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_prefix           = inputs.draft_prefix;
     impl->draft_extras           = inputs.draft_extras;
     impl->draft_split            = inputs.draft_split;
-    // T42: Qwen4Exp prompts stream in chunks wider than prefill_chunk on workspace the offload
+    // Qwen4Exp prompts stream in chunks wider than prefill_chunk on workspace the offload
     // backend lends from the slot pool (the layers below the streaming ring), so the Program's
     // arena and the decode slot cache stay sized for prefill_chunk. The prompt chunk is the
     // largest prompt_chunk / 2^i (> prefill_chunk) whose workspace and ring fit in the Text layers
     // a prompt may lend (Qwen4OffloadExperts::may_lend, over the backend's per-layer base slots,
     // layer_slot_profile). The sizing probe (no slots yet) plans prefill_chunk only. The ring
     // counts as the runtime lends it (Qwen4OffloadExperts::ring_layers: half a layer of experts per
-    // GPU at tp 2): planning the 1-GPU ring at tp 2 cost FP4-Local (59 slots) its 16384-column
-    // chunk for 8192, so twice the chunks and expert streaming per prompt (o-prefill).
+    // GPU at tp 2); counting the full 1-GPU ring at tp 2 can halve the chunk on a small slot pool.
     std::size_t prompt_workspace = 0;
     std::vector<std::pair<std::uint32_t, std::size_t>> prompt_steps;
     {
@@ -1410,7 +1373,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         const auto& experts      = impl->qwen4_experts;
         const auto& text         = impl->parameters->model.config().text;
         const std::uint32_t base = impl->prefill_chunk;
-        // ggml block banks (capy-flash v0.7): the zero-copy prefill needs no ring, only the
+        // ggml block banks: the zero-copy prefill needs no ring, only the
         // borrowed workspace, counted in the arena bytes of the lent layers' base slots.
         const std::vector<execution::Qwen4ExpertBank> gguf_list =
             gguf_bank_list(*impl->parameters, impl->speculative_backend);
@@ -1422,10 +1385,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (text.qwen4_routed_experts() && experts.backend == RoutedExpertBackend::Offload &&
             experts.slots_per_layer > 0 && (experts.stream_min_tokens > 0 || gguf_lend) &&
             experts.prompt_chunk > base && !impl->causal_scoring && impl->capacity > base &&
-            // T64: at tp 2 the elastic expert pool is VMM memory, which a cross-device pull
+            // At tp 2 the elastic expert pool is VMM memory, which a cross-device pull
             // (ops::allreduce pull_peer) cannot read without P2P; the lent workspace lives there.
-            // The eager prefill all-reduce goes through the host-staged exchange (T56 C1), so the
-            // lending stays on unless the peer pull is forced back (T68).
+            // The eager prefill all-reduce goes through the host-staged exchange, so the lending
+            // stays on unless the peer pull is forced (NINFER_TP_HOST_EXCHANGE=0).
             !(impl->elastic_kv.enabled && impl->tp == 2 && peer_pull)) {
             const auto text_layers = static_cast<std::int32_t>(text.num_hidden_layers);
             // The cache's layers and their base slots as the backend lays them out (the MTP
@@ -1436,7 +1399,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 execution::Qwen4OffloadExperts::layer_slot_profile(
                     text_layers + (mtp_layer ? 1 : 0), text_layers,
                     static_cast<std::int32_t>(experts.slots_per_layer),
-                    static_cast<std::int32_t>(experts.elastic_columns), impl->tp);
+                    static_cast<std::int32_t>(experts.elastic_columns), impl->tp,
+                    qwen4_exclusive_layers());
             std::int32_t ring_layers =
                 gguf_lend ? 0
                           : execution::Qwen4OffloadExperts::ring_layers(
@@ -1487,7 +1451,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     impl->qwen4_base_chunk = base;
                     impl->prefill_chunk    = width;
                     prompt_workspace       = need;
-                    // T69: the narrower widths' needs (a chunk lends only what its width needs).
+                    // The narrower widths' needs (a chunk lends only what its width needs).
                     for (std::uint32_t w = width / 2; w > base; w /= 2) {
                         if (w % kPrefillChunkAlignment != 0) { break; }
                         prompt_steps.emplace_back(w, need_for(w));
@@ -1590,10 +1554,6 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .prefill_chunk          = std::min(options.prefill_chunk, options.max_context),
         .kv_lease_window_tokens = options.kv_lease_window_tokens,
         .draft_window           = options.speculative.draft_tokens,
-        .mtp_min_p              = options.speculative.backend == SpeculativeBackend::Mtp
-                                      ? options.speculative.min_draft_probability
-                                      : 0.0F,
-        .mtp_window_rule        = options.speculative.window_rule,
         .speculative_backend    = options.speculative.backend,
         .kv_storage             = options.kv_cache,
         .proposal_head          = options.speculative.proposal_head,
@@ -1605,9 +1565,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .tp_mailbox             = options.tp_mailbox,
         .context_cache          = options.context_cache,
     };
-    // T43: the draft shortlist (Qwen4Exp MTP): read and split here, the rows gathered by the
+    // The draft shortlist (Qwen4Exp MTP): read and split here, the rows gathered by the
     // Program. At tp 2 the prefix view is bounded by rank 0's vocabulary half.
-    // T55: with no shortlist given, a Qwen4Exp MTP engine uses the sidecar file shipped next to the
+    // With no shortlist given, a Qwen4Exp MTP engine uses the sidecar file shipped next to the
     // artifact (<artifact stem>.draft_shortlist.txt) when it exists and the head supports it;
     // "none" asks for full-vocabulary proposals explicitly.
     std::string shortlist_path = options.speculative.draft_shortlist;
@@ -1657,30 +1617,18 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         if (experts.slots_per_layer > 512 || experts.cpu_threads > 64 ||
             experts.admit_threshold < 0.0F || !(experts.half_life_tokens > 0.0F) ||
             !(experts.evict_tau_windows >= 0.0F) || !std::isfinite(experts.evict_tau_windows) ||
-            experts.device_reads > 16 || split.count > 16 || split.max_reads > 16 ||
-            !(split.fraction >= 0.0F && split.fraction <= 1.0F) ||
-            !(cost.cpu_read_slowdown >= 1.0F) || !nonneg(cost.cpu_fixed_us) ||
-            !nonneg(cost.cpu_expert_us) || !nonneg(cost.cpu_column_us) ||
-            !nonneg(cost.gpu_fixed_us) || !nonneg(cost.gpu_expert_us) ||
-            !nonneg(cost.gpu_column_us) || experts.prefetch_slots > 64 ||
-            !(experts.prefetch_min_score >= 0.0F) || experts.prefetch_first_layer == 0 ||
-            !(experts.prefetch_link_gbps > 0.0F)) {
+            split.max_reads > 16 || !(cost.cpu_read_slowdown >= 1.0F) ||
+            !nonneg(cost.cpu_fixed_us) || !nonneg(cost.cpu_expert_us) ||
+            !nonneg(cost.cpu_column_us) || !nonneg(cost.gpu_fixed_us) ||
+            !nonneg(cost.gpu_expert_us) || !nonneg(cost.gpu_column_us)) {
             throw std::invalid_argument(
                 "Engine routed_experts: slots_per_layer must be in [0,512], "
                 "cpu_threads <= 64 (0 = auto), admit_threshold >= 0, half_life > 0, "
                 "evict_tau_windows >= 0, "
-                "device_reads, miss_split count/max_reads <= 16, "
-                "miss_split fraction in [0,1], costs >= 0, slowdown >= 1, "
-                "prefetch_slots <= 64, prefetch_min_score >= 0, "
-                "prefetch_first_layer >= 1, prefetch_link_gbps > 0");
+                "miss_split max_reads <= 16, costs >= 0, slowdown >= 1");
         }
-        // Warm start is on by default (T25/T42) and only means something to the offload backend:
-        // other backends ignore it. Prefetch must be asked for, and runs at one device only.
-        if (experts.prefetch_slots > 0 &&
-            (experts.backend != RoutedExpertBackend::Offload || options.tp != 1)) {
-            throw std::invalid_argument("Engine routed_experts: prefetch needs the offload backend "
-                                        "at one device");
-        }
+        // Warm start is on by default and only means something to the offload backend:
+        // other backends ignore it.
         inputs.qwen4_experts = experts;
         if (options.elastic_kv.enabled) {
             if (!parameters.model.config().text.qwen4_routed_experts()) {

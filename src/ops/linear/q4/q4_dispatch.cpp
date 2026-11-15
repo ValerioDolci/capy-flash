@@ -18,12 +18,11 @@ constexpr std::array kShapes{
     ShapeEntry{7168, 5120, select_q4_n7168_k5120},
     ShapeEntry{34816, 5120, select_q4_n34816_k5120},
     ShapeEntry{131072, 5120, select_q4_n131072_k5120},
-    // v0.7 27b-16gb: the GSQ-3 artifact's full Q4 output head reuses the 131072-row selection
-    // (row-generic launchers); its own tuning is a measurement on the 5070 Ti, not done yet.
+    // The GSQ-3 artifact's full Q4 output head reuses the 131072-row selection (row-generic
+    // launchers), untuned on the RTX 5070 Ti.
     ShapeEntry{248320, 5120, select_q4_n131072_k5120},
     ShapeEntry{124160, 5120, select_q4_n131072_k5120}, // its tp 2 vocabulary half
     ShapeEntry{65536, 5120, select_q4_n65536_k5120},
-    ShapeEntry{131072, 2048, select_q4_n131072_k2048},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152},
 };

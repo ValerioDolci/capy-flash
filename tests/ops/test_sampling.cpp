@@ -754,7 +754,7 @@ int verify_all_equal(const std::string& label, const std::vector<int>& tokens, i
 
 int draws_for(int batch) { return batch * ((4096 + batch - 1) / batch); }
 
-// Port of upstream 08902f73 grammar_mask_contract: the only two legal tokens rank below the
+// Grammar mask contract, ported from ninfer: the only two legal tokens rank below the
 // unmasked top-20 (a filter applied after a top-20 would find nothing legal).
 int mask_below_unmasked_top20_contract() {
     int failures = 0;

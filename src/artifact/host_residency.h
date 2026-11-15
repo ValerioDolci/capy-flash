@@ -1,6 +1,6 @@
 #pragma once
 
-// Pinned / pageable split of the HostMapped parents (v0.7 pinned fallback).
+// Pinned / pageable split of the HostMapped parents (pinned fallback).
 //
 // The HostMapped parents (Qwen4Exp routed-expert banks, `--embedding-host`) normally share one
 // mapped page-locked allocation. Where the page-locked memory a process may hold is capped below
@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::artifact {
@@ -47,7 +48,7 @@ struct HostResidency {
 // True when some placement may be pageable (pageable_rank > 0).
 [[nodiscard]] bool any_pageable_candidate(std::span<const HostMappedPlacement> placements) noexcept;
 
-// #40: the page-locked limit that free CMA memory implies. Linux counts free CMA pages in
+// The page-locked limit that free CMA memory implies. Linux counts free CMA pages in
 // MemAvailable (Ubuntu 26.04's kernel 7.0 reserves its kexec-handover scratch as CMA: 9.2 GiB on
 // a 64 GiB machine) and ordinary pageable pages may use them, but cudaHostRegister pins with
 // FOLL_LONGTERM, which must first migrate every page out of CMA. A page-locked buffer larger than
@@ -60,5 +61,17 @@ struct HostResidency {
 cma_pinned_limit(std::uint64_t total_bytes, std::uint64_t available_bytes,
                  std::uint64_t cma_free_bytes, std::uint64_t host_mapped_bytes,
                  std::uint64_t reserved_bytes, std::uint64_t engine_bytes) noexcept;
+
+// MemTotal, MemAvailable and CmaFree of /proc/meminfo in bytes (0 when unreadable or absent).
+struct HostMemInfo {
+    std::uint64_t total     = 0;
+    std::uint64_t available = 0;
+    std::uint64_t cma_free  = 0;
+};
+
+[[nodiscard]] HostMemInfo read_host_meminfo();
+
+// `bytes` as "x.y GiB".
+[[nodiscard]] std::string gib_text(std::uint64_t bytes);
 
 } // namespace ninfer::artifact

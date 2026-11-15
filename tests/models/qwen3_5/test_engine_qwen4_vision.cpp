@@ -22,7 +22,7 @@
 //      same kernels on the same bytes, so a late, missing or misplaced copy changes the answer.
 //   4. the image reaches the model: a different image changes the answer.
 //   5. prefix reuse: the second turn of the image conversation resumes the retained prefix (the
-//      text-only suffix continues the multimodal prefix with its rope delta, T209) and equals its
+//      text-only suffix continues the multimodal prefix with its rope delta) and equals its
 //      no-draft control.
 //   6. one device (tp 1): the image prompt under MTP equals its no-draft control.
 #include "ninfer/engine.h"

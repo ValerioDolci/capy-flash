@@ -1,7 +1,9 @@
-// Modified for fngine from llama.cpp/ggml:ggml/src/ggml-cpu/arch/x86/quants.c @ 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
+// Modified for fngine from llama.cpp/ggml:ggml/src/ggml-cpu/arch/x86/quants.c @
+// 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
 // SPDX-License-Identifier: MIT
-// Modified for capy-flash from fngine:src/cpu/iq_cpu.h @ c20a885 (satellitedown/fngine; this file is
-// SPDX MIT because it derives from ggml). See NOTICE. capy-flash changes: namespace
+//
+// Modified for capy-flash from fngine:src/cpu/iq_cpu.h @ c20a885 (satellitedown/fngine; this file
+// is SPDX MIT because it derives from ggml). See NOTICE. capy-flash changes: namespace
 // ninfer::ops::host::gguf, include paths, lazily built constant tables (no AVX-512 code runs
 // before the ISA has been checked), run-time ISA dispatch with an AVX2 form of every kernel.
 #pragma once
@@ -12,7 +14,8 @@
 // Both produce the same decoded bytes, the same packed activations and the same dot / silu_mul
 // outputs bit for bit (tests/ops/test_host_gguf_isa.cpp); the AVX2 kernels compute the integer
 // block sums with vpmaddubsw/vpmaddwd (exact here: |w| <= 127), keep every 512-bit FP32 lane set as
-// two 256-bit halves with the same per-lane operations and reduce them as _mm512_reduce_add_ps does.
+// two 256-bit halves with the same per-lane operations and reduce them as _mm512_reduce_add_ps
+// does.
 //
 // Two kernel-native layouts, both built from 64-element "chunks" (one zmm of int8):
 //
@@ -36,7 +39,7 @@
 //    acc  = fma(float(isum), F_r * DA_t, acc)                     float(isum) is exact (< 2^24)
 // and finally out = horizontal sum of acc's 16 lanes.
 #include "ggml-iq/ggml-iq.h"
-#include "ops/sparse_moe/host/host_nvfp4.h"  // HostIsa, host_isa()
+#include "ops/sparse_moe/host/host_nvfp4.h" // HostIsa, host_isa()
 
 #include <cstddef>
 #include <cstdint>
@@ -47,20 +50,20 @@ namespace ninfer::ops::host::gguf {
 
 // Values are the GGML type ids (Q2_0 = 42 in the vendored ggml).
 enum class WeightFormat : int32_t {
-  IQ3_XXS = 18,
-  IQ4_NL = 20,
-  IQ3_S = 21,
-  IQ2_S = 22,
-  IQ4_XS = 23,
-  Q2_0 = 42,
+    IQ3_XXS = 18,
+    IQ4_NL  = 20,
+    IQ3_S   = 21,
+    IQ2_S   = 22,
+    IQ4_XS  = 23,
+    Q2_0    = 42,
 };
 
 enum class ActFormat : int32_t { Q8_K, Q8_0 };
 
 struct FormatInfo {
-  int32_t block_elems;  // weight elements per GGUF block
-  int32_t block_bytes;  // bytes per GGUF block
-  ActFormat act;        // activation quantization the format pairs with
+    int32_t block_elems; // weight elements per GGUF block
+    int32_t block_bytes; // bytes per GGUF block
+    ActFormat act;       // activation quantization the format pairs with
 };
 
 // ------------------------------------------------------------------ instruction sets
@@ -78,30 +81,30 @@ struct FormatInfo {
 // The kernels of one ISA; the free functions below (and those of host_q8.h) are those of
 // host_gguf_isa(). Same arguments and checks as the free functions.
 struct HostGgufKernels {
-  HostIsa isa;
-  void (*decode_rows)(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
-                      int32_t k, void* dst);
-  void (*pack_act_q8_K)(const block_q8_K* x, int32_t k, void* dst);
-  void (*pack_act_q8_0)(const block_q8_0* x, int32_t k, void* dst);
-  void (*quantize_pack_bf16)(ActFormat act, const uint16_t* x, int32_t k, void* dst);
-  void (*quantize_pack_f32)(ActFormat act, const float* x, int32_t k, void* dst);
-  void (*quantize_pack_bf16_q8k_g32)(const uint16_t* x, int32_t k, void* dst);
-  void (*quantize_pack_bf16_q8f32)(ActFormat act, const uint16_t* x, int32_t k, void* dst);
-  void (*quantize_pack_f32_q8f32)(ActFormat act, const float* x, int32_t k, void* dst);
-  void (*quantize_pack_q8_0_half_q8f32)(const float* x32, int32_t group, int32_t half, void* dst);
-  void (*quantize_pack_q8_0_half)(const float* x32, int32_t group, int32_t half, void* dst);
-  void (*gemm_decoded)(WeightFormat fmt, const void* wdec, int32_t nrows, int32_t k,
-                       const void* const* acts, int32_t T, float* out, std::size_t ldo);
-  void (*decode_rows_bf16)(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
-                           int32_t k, uint16_t* dst);
-  void (*gemm_bf16)(const uint16_t* weights, int32_t nrows, int32_t k, const void* const* acts,
-                    int32_t T, float* out, std::size_t ldo);
-  void (*silu_mul)(const float* g, const float* u, float* h, int32_t n);
-  // host_q8.h
-  void (*quantize_row_q8_K_bf16)(const uint16_t* x, block_q8_K* y, int64_t k);
-  void (*quantize_row_q8_K_f32)(const float* x, block_q8_K* y, int64_t k);
-  void (*quantize_row_q8_0_bf16)(const uint16_t* x, block_q8_0* y, int64_t k);
-  void (*quantize_row_q8_0_f32)(const float* x, block_q8_0* y, int64_t k);
+    HostIsa isa;
+    void (*decode_rows)(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
+                        int32_t k, void* dst);
+    void (*pack_act_q8_K)(const block_q8_K* x, int32_t k, void* dst);
+    void (*pack_act_q8_0)(const block_q8_0* x, int32_t k, void* dst);
+    void (*quantize_pack_bf16)(ActFormat act, const uint16_t* x, int32_t k, void* dst);
+    void (*quantize_pack_f32)(ActFormat act, const float* x, int32_t k, void* dst);
+    void (*quantize_pack_bf16_q8k_g32)(const uint16_t* x, int32_t k, void* dst);
+    void (*quantize_pack_bf16_q8f32)(ActFormat act, const uint16_t* x, int32_t k, void* dst);
+    void (*quantize_pack_f32_q8f32)(ActFormat act, const float* x, int32_t k, void* dst);
+    void (*quantize_pack_q8_0_half_q8f32)(const float* x32, int32_t group, int32_t half, void* dst);
+    void (*quantize_pack_q8_0_half)(const float* x32, int32_t group, int32_t half, void* dst);
+    void (*gemm_decoded)(WeightFormat fmt, const void* wdec, int32_t nrows, int32_t k,
+                         const void* const* acts, int32_t T, float* out, std::size_t ldo);
+    void (*decode_rows_bf16)(WeightFormat fmt, const void* rows, std::size_t row_bytes,
+                             int32_t nrows, int32_t k, uint16_t* dst);
+    void (*gemm_bf16)(const uint16_t* weights, int32_t nrows, int32_t k, const void* const* acts,
+                      int32_t T, float* out, std::size_t ldo);
+    void (*silu_mul)(const float* g, const float* u, float* h, int32_t n);
+    // host_q8.h
+    void (*quantize_row_q8_K_bf16)(const uint16_t* x, block_q8_K* y, int64_t k);
+    void (*quantize_row_q8_K_f32)(const float* x, block_q8_K* y, int64_t k);
+    void (*quantize_row_q8_0_bf16)(const uint16_t* x, block_q8_0* y, int64_t k);
+    void (*quantize_row_q8_0_f32)(const float* x, block_q8_0* y, int64_t k);
 };
 
 // Throws std::runtime_error when the CPU does not run `isa` (host_gguf_isa_supported).
@@ -135,11 +138,12 @@ void pack_act_q8_K(const block_q8_K* x, int32_t k, void* dst);
 void pack_act_q8_0(const block_q8_0* x, int32_t k, void* dst);
 // Quantize (bit-identical to quantize_row_q8_{K,0}_ref) and pack one row.
 void quantize_pack_bf16(ActFormat act, const uint16_t* x, int32_t k, void* dst);
-// capy-flash: the packed Q8_K-format row (for IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS weights) with one
+// The packed Q8_K-format row (for IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS weights) with one
 // activation scale per 32 values: ggml's Q8_0 codes and binary16 scales of each 32-value block, as
-// GPU kernels quantize (q8_1 per 32), instead of Q8_K's one scale per 256. gemm_decoded is unchanged.
+// GPU kernels quantize (q8_1 per 32), instead of Q8_K's one scale per 256. gemm_decoded is
+// unchanged.
 void quantize_pack_bf16_q8k_g32(const uint16_t* x, int32_t k, void* dst);
-// capy-flash: the activation codec of the GPU GGUF Ops (include/ninfer/ops/moe_slots_gguf.h), for
+// The activation codec of the GPU GGUF Ops (include/ninfer/ops/moe_slots_gguf.h), for
 // both packed forms: per 32 values d = amax / 127 in FP32, q = roundf(v / d) (0 for an all-zero
 // block). Q8_K-format rows carry one scale per 32 values (lanes 2m, 2m + 1), Q8_0-format rows two
 // per 64-value group. The half form writes one 32-value block into half `half` of group `group`.
@@ -164,8 +168,8 @@ void gemm_decoded(WeightFormat fmt, const void* wdec, int32_t nrows, int32_t k,
 // form runs the same FMAs under MXCSR DAZ + FTZ).
 void decode_rows_bf16(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
                       int32_t k, uint16_t* dst);
-void gemm_bf16(const uint16_t* weights, int32_t nrows, int32_t k,
-               const void* const* acts, int32_t T, float* out, std::size_t ldo);
+void gemm_bf16(const uint16_t* weights, int32_t nrows, int32_t k, const void* const* acts,
+               int32_t T, float* out, std::size_t ldo);
 
 // h[i] = silu(g[i]) * u[i] (vectorized exp, max rel. error ~2 ulp; deterministic).
 void silu_mul(const float* g, const float* u, float* h, int32_t n);
@@ -179,4 +183,4 @@ void cpu_dot(WeightFormat fmt, const void* row, int nblk, const void* acts, int 
 void cpu_dot_ptr(WeightFormat fmt, const void* row, int nblk, const void* const* acts, int T,
                  float* out);
 
-}  // namespace ninfer::ops::host::gguf
+} // namespace ninfer::ops::host::gguf

@@ -6,7 +6,7 @@
 #
 #   --dir DIR          where the release and the model go (default ~/capy-flash)
 #   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-#                      102 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
+#                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
 #   --version vX.Y.Z   release tag (default: the latest release)
 #   --check            only check the machine, download nothing
 #   --no-model         download the release only
@@ -18,7 +18,7 @@ usage() {
 usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
   --dir DIR          where the release and the model go (default ~/capy-flash)
   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-                     102 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
+                     108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
   --version vX.Y.Z   release tag (default: the latest release)
   --check            only check the machine, download nothing
   --no-model         download the release only
@@ -53,7 +53,7 @@ case $model in
     artifact=qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
     launcher=serve-flash-next.sh
     model_id=capy-flash
-    need_ram_gib=70 need_disk_gb=135 need_simd=1 need_gpus=2 ;;
+    need_ram_gib=75 need_disk_gb=135 need_simd=1 need_gpus=2 ;;
   flash-next-64gb)
     # v0.7: GSQ-RCO i-quant experts (48 GiB page-locked instead of 65); small RAM caches for 64 GB.
     hf_repo=Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash
@@ -61,7 +61,7 @@ case $model in
     launcher=serve-flash-next.sh
     launcher_flags=" --host-kv-mib 1024 --host-state-slots 2"
     model_id=capy-flash
-    need_ram_gib=56 need_disk_gb=110 need_simd=1 need_gpus=1 ;;
+    need_ram_gib=56 need_disk_gb=118 need_simd=1 need_gpus=1 ;;
   27b-16gb)
     # v0.7: ISTA-DASLab's 3-bit GSQ weights on ONE 16 GB GPU (MMLU-Pro below the NVFP4 27B: see the README).
     hf_repo=Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash

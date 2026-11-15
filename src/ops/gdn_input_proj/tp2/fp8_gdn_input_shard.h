@@ -2,13 +2,13 @@
 
 // The FP8 [8192,5120] two-device shard of gdn_input_proj: one device's 8 of 16 key heads and 24 of
 // 48 value heads of the [16384,5120] parent, in the parent's Q|K|V|Z order, so qkv takes
-// 1024 + 1024 + 3072 rows and z 3072. Our file.
+// 1024 + 1024 + 3072 rows and z 3072.
 //
-// The shard runs upstream's own FP8 gdn_input_proj sources, compiled a second time by the
+// The shard runs the parent's own FP8 gdn_input_proj sources, compiled a second time by the
 // fp8_gdn_input_shard_*.cu/.cpp translation units of this directory with the section output and
 // the entry points renamed (fp8_gdn_input_shard_names.h). Both share K, so every route, schedule
-// and token cutoff is the parent's, by construction and after every upstream change; only the
-// split-K partial reservation is the shard's own (fewer row tiles split earlier).
+// and token cutoff is the parent's by construction; only the split-K partial reservation is the
+// shard's own (fewer row tiles split earlier).
 
 #include "core/weight.h"
 #include "core/arena.h"
@@ -47,7 +47,7 @@ void fp8_gdn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor&
 
 // Whether the snapshot and record forms quantize the activation for this policy and B/W block.
 // Their A8 frontier differs from the bare projection's; the two-device shard follows it too
-// (tp2/fp8_gdn_conv_plan_tp2.inc).
+// (fp8/fp8_gdn_conv_plan.cpp).
 [[nodiscard]] bool fp8_gdn_conv_uses_a8(LinearPolicy policy, std::int32_t width,
                                         std::int32_t batch_size);
 

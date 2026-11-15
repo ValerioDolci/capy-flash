@@ -1,4 +1,4 @@
-// Two-device parity of the Qwen3.8-Flash-Next mixers at tp 2 (T30): each rank runs its head shard
+// Two-device parity of the Qwen3.8-Flash-Next mixers at tp 2: each rank runs its head shard
 // of the same logical computation, and every rank output is compared with the single-device
 // computation of the same global heads.
 //
@@ -19,7 +19,7 @@
 // MTP verify (W = 4, valid 4/3, commits 3/2).
 //
 // QSA layer fixture after tests/ops/test_sparse_attention.cpp, GDN fixture after
-// tests/ops/test_flash_next_gdn.cpp (T11). Needs two CUDA devices; 77 with fewer.
+// tests/ops/test_flash_next_gdn.cpp. Needs two CUDA devices; 77 with fewer.
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"

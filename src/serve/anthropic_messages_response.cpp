@@ -7,9 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
-#include <cstdio>
 #include <iterator>
 #include <optional>
 #include <stdexcept>
@@ -21,13 +19,6 @@ namespace {
 
 using Json        = nlohmann::json;
 using OrderedJson = nlohmann::ordered_json;
-
-std::string random_identifier(const char* prefix) {
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%016llx",
-                  static_cast<unsigned long long>(random_id_bits()));
-    return std::string(prefix) + buffer.data();
-}
 
 constexpr std::string_view kThinkingSignatureMarker = "ninfer-reasoning.v1:";
 constexpr std::string_view kBase64Alphabet =
@@ -175,8 +166,8 @@ ApiError normalize_anthropic_error(ApiError error) {
 std::string make_anthropic_error_body(const ApiError& api_error, const std::string& request_id) {
     const ApiError error = normalize_anthropic_error(api_error);
     // The Anthropic error object has no param: structured-output errors carry their request
-    // location (schema JSON Pointer included) in the message, as upstream 2734a56e does for all
-    // errors. Other errors keep their message unchanged.
+    // location (schema JSON Pointer included) in the message. Other errors keep their message
+    // unchanged.
     const std::string message = is_output_constraint_param(error.param)
                                     ? error.param + ": " + error.message
                                     : error.message;

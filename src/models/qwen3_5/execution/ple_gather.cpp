@@ -1,14 +1,10 @@
 #include "models/qwen3_5/execution/ple_gather.h"
 
-#include "models/qwen3_5/execution/ple_rows.h"
-
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <climits>
-#include <cstdlib>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -57,8 +53,8 @@ std::uint16_t float_to_bf16(float value) {
 
 } // namespace
 
-PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency residency, bool prefetch)
-    : table_(std::move(table)), hash_(std::move(hash)), residency_(residency), prefetch_(prefetch) {
+PleGather::PleGather(PleTableView table, PleHashConfig hash, bool prefetch)
+    : table_(std::move(table)), hash_(std::move(hash)), prefetch_(prefetch) {
     const std::uint32_t heads = hash_.heads();
     if (hash_.ngram_size < 2 || hash_.ngram_size > kMaximumNgram || hash_.heads_per_ngram == 0 ||
         hash_.multipliers.size() != hash_.ngram_size || hash_.head_moduli.size() != heads ||
@@ -97,17 +93,12 @@ PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency reside
             }
         }
     }
-    if (residency_ == PleResidency::Stream) {
-        reader_ = std::make_unique<PleRowReader>(table_.segments);
-    } else {
-        for (const auto& segment : table_.segments) {
-            if (segment.data == nullptr) {
-                throw std::invalid_argument("mapped PLE residency needs mapped segments");
-            }
+    for (const auto& segment : table_.segments) {
+        if (segment.data == nullptr) {
+            throw std::invalid_argument("mapped PLE residency needs mapped segments");
         }
-        const char* resident = std::getenv("NINFER_QWEN4_PLE_RESIDENT_SCALES");
-        if (fp8 && (resident == nullptr || resident[0] != '0')) { load_scales(); }
     }
+    if (fp8) { load_scales(); }
 }
 
 void PleGather::load_scales() {
@@ -142,6 +133,12 @@ void PleGather::load_scales() {
                 std::memcpy(scales_.data() + at, segment.data + within, take);
                 at += take;
             });
+    }
+    // A plane that repeats one multiplier on every row keeps only that multiplier: every row reads
+    // the same two bytes it would read from the plane.
+    if (bytes >= 2 && std::memcmp(scales_.data(), scales_.data() + 2, bytes - 2) == 0) {
+        std::vector<std::byte>(scales_.begin(), scales_.begin() + 2).swap(scales_);
+        scale_stride_ = 0;
     }
 }
 
@@ -289,7 +286,7 @@ void PleGather::prefetch_mapped(std::span<const std::uint64_t> rows) const {
 
 void PleGather::prefetch(std::span<const std::int32_t> tokens, std::size_t first,
                          std::size_t count) {
-    if (reader_ || !prefetch_ || first > tokens.size() || count > tokens.size() - first) { return; }
+    if (!prefetch_ || first > tokens.size() || count > tokens.size() - first) { return; }
     const std::uint32_t heads = hash_.heads();
     std::vector<std::uint64_t> rows(count * heads);
     for (std::size_t i = 0; i < count; ++i) {
@@ -310,73 +307,25 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
     for (std::size_t i = 0; i < count; ++i) {
         column_rows(tokens, first + i, std::span<std::uint64_t>(rows.data() + i * heads, heads));
     }
-    // Stream: a range that straddles two volume segments is read as one sub-range per segment and
-    // joined in `joined` (offset `joined_at[k]`); `sub_first[k]` is range k's first sub-range.
-    std::vector<std::uint32_t> sub_first, joined_at;
-    std::vector<std::byte> joined;
     const std::size_t per_row = ranges_per_row();
     const auto record         = static_cast<std::uint32_t>(table_.row_record_bytes());
-    if (reader_) {
-        std::vector<PleRowReader::Range> ranges;
-        ranges.reserve(per_row * rows.size() + 2);
-        sub_first.assign(per_row * rows.size(), 0);
-        joined_at.assign(per_row * rows.size(), UINT32_MAX);
-        std::vector<std::pair<std::size_t, std::uint32_t>> split; // (range k, sub-range count)
-        const auto add = [&](std::size_t k, std::uint64_t object_offset, std::uint32_t bytes) {
-            sub_first[k]      = static_cast<std::uint32_t>(ranges.size());
-            std::uint32_t sub = 0;
-            for_each_piece(
-                object_offset, bytes,
-                [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
-                    ranges.push_back(
-                        {segment.object_offset + within, static_cast<std::uint32_t>(take)});
-                    ++sub;
-                });
-            if (sub > 1) {
-                split.emplace_back(k, sub);
-                joined_at[k] = static_cast<std::uint32_t>(joined.size());
-                joined.resize(joined.size() + bytes);
-            }
-        };
-        for (std::size_t r = 0; r < rows.size(); ++r) {
-            add(per_row * r, rows[r] * table_.row_bytes, record);
-            if (per_row == 2) { add(2 * r + 1, table_.scale_plane + rows[r] * 2U, 2U); }
-        }
-        reader_->read(ranges);
-        for (const auto [k, sub] : split) {
-            std::size_t at = joined_at[k];
-            for (std::uint32_t i = 0; i < sub; ++i) {
-                const auto& range = ranges[sub_first[k] + i];
-                std::memcpy(joined.data() + at, reader_->data(sub_first[k] + i), range.bytes);
-                at += range.bytes;
-            }
-        }
-    } else if (prefetch_) {
-        prefetch_mapped(rows);
-    }
-    const auto streamed = [&](std::size_t k) -> const std::byte* {
-        return joined_at[k] != UINT32_MAX ? joined.data() + joined_at[k]
-                                          : reader_->data(sub_first[k]);
-    };
+    if (prefetch_) { prefetch_mapped(rows); }
     const auto decode = [&](std::size_t begin, std::size_t end) {
-        std::vector<std::byte> bounce(record); // a straddling row's record (Mapped)
+        std::vector<std::byte> bounce(record); // a straddling row's record
         std::array<std::byte, 2> scale_bounce{};
         for (std::size_t i = begin; i < end; ++i) {
             for (std::uint32_t head = 0; head < heads; ++head) {
                 const std::size_t r = i * heads + head;
                 std::uint16_t* values =
                     out.data() + i * width_ + static_cast<std::size_t>(head) * table_.row_width;
-                const std::byte* codes =
-                    reader_ ? streamed(per_row * r)
-                            : locate(rows[r] * table_.row_bytes, record, bounce.data());
+                const std::byte* codes = locate(rows[r] * table_.row_bytes, record, bounce.data());
                 if (per_row == 1) {
                     decode_nvfp4_row(codes, values);
                     continue;
                 }
                 const std::byte* scale =
-                    reader_ ? streamed(2 * r + 1)
-                    : !scales_.empty()
-                        ? scales_.data() + rows[r] * 2U
+                    !scales_.empty()
+                        ? scales_.data() + rows[r] * scale_stride_
                         : locate(table_.scale_plane + rows[r] * 2U, 2, scale_bounce.data());
                 decode_fp8_row(codes, scale, values);
             }

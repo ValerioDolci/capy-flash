@@ -6,6 +6,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
+#include "ops/gdn_input_proj/tp2/fp8_gdn_input_shard.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -205,6 +206,12 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                        fp8_gdn_record_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+// The A8 frontier of the snapshot and record forms, for the two-device shard
+// (fp8_gdn_input_shard.h).
 
-#include "ops/gdn_input_proj/tp2/fp8_gdn_conv_plan_tp2.inc"
+bool fp8_gdn_conv_uses_a8(LinearPolicy policy, std::int32_t width, std::int32_t batch_size) {
+    return fp8_gdn_snapshot_resolve_plan(policy, width, batch_size).schedule ==
+           Fp8GdnConvScheduleId::MaterializedA8;
+}
+
+} // namespace ninfer::ops::detail

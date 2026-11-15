@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/engine_options.h"
 #include "product/tensor_parallel_options.h"
 
 #include <charconv>
@@ -72,20 +73,7 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--devices") {
             out.devices = ninfer::product::parse_devices(value("--devices"));
         } else if (option == "--kv-dtype") {
-            const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
-            } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
-            } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-            } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
-            }
+            out.kv = ninfer::product::parse_kv_dtype(value("--kv-dtype"));
         } else if (option == "--embedding-host") {
             out.embedding_host = true;
         } else if (option == "--output") {

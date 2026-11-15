@@ -3,7 +3,6 @@ ninfer_add_op_bench(ninfer_residual_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sigmoid_mul_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_pack_tail_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_pack_tail_bench.cu")
-ninfer_add_op_bench(ninfer_l2norm_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/l2norm_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_gating_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj_bench.cu")
 ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
@@ -11,8 +10,6 @@ ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
 ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_dynamic_grouped_conv_add_bench.cu")
 ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net_bench.cu")
-ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention_bench.cu")
 ninfer_add_op_bench(ninfer_qsa_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_bench.cu")
 ninfer_add_op_bench(ninfer_qsa_staging_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_staging_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_replay_bench.cu")
@@ -30,7 +27,6 @@ ninfer_add_op_bench(ninfer_prepare_ragged_prefix_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_ragged_prefix_bench.cu")
 ninfer_add_op_bench(ninfer_embedding_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/embedding_bench.cu")
 ninfer_add_op_bench(ninfer_position_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/position_bench.cu")
-ninfer_add_op_bench(ninfer_cast_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/cast_bench.cu")
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/argmax_bench.cu")
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_conv1d_silu_bench.cu")
 ninfer_add_op_bench(ninfer_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_bench.cu")
@@ -44,7 +40,6 @@ ninfer_add_op_bench(ninfer_q8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_swiglu_bench.cu")
 ninfer_add_op_bench(ninfer_fp8_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_swiglu_bench.cu")
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q4_linear_swiglu_bench.cu")
-ninfer_add_op_bench(ninfer_q8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q8_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_q5_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/q5_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_add_bench.cu")

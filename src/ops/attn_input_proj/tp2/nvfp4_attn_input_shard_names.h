@@ -1,6 +1,6 @@
-// Renames that turn upstream's NVFP4 attn_input_proj sources into the [7168,5120] shard's when a
+// Renames that turn the parent's NVFP4 attn_input_proj sources into the [7168,5120] shard's when a
 // translation unit of this directory includes them. Include it once, after
-// nvfp4_attn_input_shard_prelude.h and right before the upstream source.
+// nvfp4_attn_input_shard_prelude.h and right before the parent's source.
 
 #define Nvfp4AttentionInputOutput                 Nvfp4AttnInputShardOutput
 #define nvfp4_attn_input_a16_launch               nvfp4_attn_input_shard_a16_launch

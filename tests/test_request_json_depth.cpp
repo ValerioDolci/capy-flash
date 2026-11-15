@@ -1,4 +1,4 @@
-// capy-flash: client JSON nested as deep as --max-request-json-depth allows must cross the whole
+// Client JSON nested as deep as --max-request-json-depth allows must cross the whole
 // prompt path (body check, parse, protocol lowering, prompt translation, chat-template rendering
 // with the real Qwen3.8 template and tokenizer) without exhausting the stack; one level more is a
 // 400 before parsing. Every place where a client can nest JSON is covered: tool schemas, tool-call
@@ -185,13 +185,13 @@ int main(int argc, char** argv) {
     }
     const bool unguarded = argc == 3 && std::string(argv[1]) == "--unguarded";
     const std::size_t depth =
-        unguarded ? std::stoul(argv[2]) : static_cast<std::size_t>(max_request_json_depth());
+        unguarded ? std::stoul(argv[2]) : static_cast<std::size_t>(RequestLimits{}.max_json_depth);
     const auto frontend = make_frontend(directory);
     int failures        = 0;
     for (const auto& c : cases()) {
         const std::string text = body_text(c, depth);
         try {
-            if (!unguarded) check_request_json_nesting(text, {});
+            if (!unguarded) check_request_json_nesting(text, {}, {});
             RequestJson body  = RequestJson::parse(text);
             const auto prompt = frontend.prepare(c.lower(body));
             std::cout << c.name << " at " << depth << " levels: " << prompt.token_ids().size()
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
         bool refused = false;
         try {
             const std::string over = body_text(c, depth + 1);
-            check_request_json_nesting(over, {});
+            check_request_json_nesting(over, {}, {});
             (void)c.lower(RequestJson::parse(over)); // arguments: checked where they are read
         } catch (const ApiException& error) {
             refused = error.error().status == 400 && error.error().code == "request_json_too_deep";

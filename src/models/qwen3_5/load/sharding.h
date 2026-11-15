@@ -56,10 +56,6 @@ namespace ninfer::models::qwen3_5::loading {
 //            hidden_projection}, and every hyper-connection mixer ({attn_hc,ffn_hc}/*,
 //            {text,mtp}/hc_head/*, with mtp/hidden_norm): each rank keeps the whole wide
 //            residual and mixes it locally.
-//   Rows/Columns by residual streams, with options.hc_split_streams instead: rank r keeps streams
-//            [r*hc/2, (r+1)*hc/2) — rows of the mixers' norm and Up, of the PLE key/query/conv
-//            norms and of mtp/hidden_norm; columns of Down|inject and of the PLE convolution
-//            (two all-reduces per mixer, see execution).
 //   SingleDevice(block % 2)  moe/shared/{gate,up,down}: the shared expert of Text block i is
 //            whole on rank i % 2 (the MTP block follows the Text blocks), since its 640-wide
 //            intermediate has no tile-aligned half in the stored formats.

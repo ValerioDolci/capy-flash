@@ -1,7 +1,6 @@
 // tp 1 golden runner: loads an artifact on one device through the public Engine API, decodes a
-// deterministic byte-id prompt greedily and prints the generated token ids. The same source
-// builds against this fork and against upstream ninfer (public headers only), so the two
-// binaries' outputs can be compared token for token; see tools/golden/README.md.
+// deterministic byte-id prompt greedily and prints the generated token ids, which the gate compares
+// token for token with a recorded reference; see tools/golden/README.md.
 #include "ninfer/engine.h"
 #include "ninfer/types.h"
 
@@ -57,10 +56,8 @@ int main(int argc, char** argv) {
             max_context = static_cast<std::uint32_t>(std::stoul(value()));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(std::stoul(value()));
-#ifdef NINFER_HAS_EMBEDDING_HOST
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
-#endif
         } else if (arg == "--kv-dtype") {
             const std::string dtype = value();
             if (dtype == "bf16") {

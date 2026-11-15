@@ -8,10 +8,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,14 +24,6 @@
 
 namespace ninfer::serve {
 namespace {
-
-void write_exception(httplib::Response& res, const std::exception& ex) {
-    ApiError error;
-    error.status  = 500;
-    error.type    = "internal_error";
-    error.message = ex.what();
-    write_openai_error(res, error);
-}
 
 bool is_anthropic_path(std::string_view path) { return path.starts_with("/v1/messages"); }
 
@@ -38,6 +34,16 @@ bool is_openai_path(std::string_view path) {
 void ensure_openai_request_id(const httplib::Request& request, httplib::Response& response) {
     if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
         response.set_header("x-request-id", new_openai_request_id());
+    }
+}
+
+// An error raised outside a protocol handler, in the shape of the API the path belongs to.
+void write_route_error(const httplib::Request& request, httplib::Response& response,
+                       const ApiError& error) {
+    if (is_anthropic_path(request.path)) {
+        write_anthropic_error(response, error, new_anthropic_request_id());
+    } else {
+        write_openai_error(response, error);
     }
 }
 
@@ -150,6 +156,14 @@ std::string response_request_id(const httplib::Response& response) {
 
 } // namespace
 
+ApiError internal_error(std::string message) {
+    ApiError error;
+    error.status  = 500;
+    error.type    = "server_error";
+    error.message = std::move(message);
+    return error;
+}
+
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
     response.set_content(make_error_body(error), "application/json");
@@ -177,18 +191,14 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         error.code    = "request_too_large";
         error.message = "request body exceeds the configured payload limit of " +
                         std::to_string(options.max_request_bytes) + " bytes";
-    } else if (response.status == 404 && request.path.rfind("/v1/messages", 0) == 0) {
+    } else if (response.status == 404 && is_anthropic_path(request.path)) {
         error.status  = 404;
         error.code    = "not_found";
         error.message = "requested Anthropic resource was not found";
     } else {
         return httplib::Server::HandlerResponse::Unhandled;
     }
-    if (request.path.rfind("/v1/messages", 0) == 0) {
-        write_anthropic_error(response, error, new_anthropic_request_id());
-    } else {
-        write_openai_error(response, error);
-    }
+    write_route_error(request, response, error);
     return httplib::Server::HandlerResponse::Handled;
 }
 
@@ -301,12 +311,14 @@ bool origin_header_is_local(std::string_view origin_header) noexcept {
 }
 
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
-    : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
-                                                            options_.response_store_max_bytes),
+    : options_(std::move(options)),
+      request_limits_{.default_max_tokens = options_.default_max_tokens,
+                      .max_json_depth     = options_.max_request_json_depth,
+                      .constraints        = options_.constraint_limits},
+      openai_responses_store_(options_.response_store_max_records,
+                              options_.response_store_max_bytes),
       operational_log_(logger),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
-    configure_output_constraint_limits(options_.constraint_limits);
-    configure_max_request_json_depth(options_.max_request_json_depth);
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -342,6 +354,206 @@ void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failur
 
 std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestLogContext context) {
     return std::make_shared<RequestLifecycle>(*this, std::move(context));
+}
+
+void HttpServer::serve_generation(const httplib::Request& req, httplib::Response& res,
+                                  std::shared_ptr<GenerationEndpoint> endpoint,
+                                  std::string protocol, GenerationRequest& generation,
+                                  const RequestLogMetadata& metadata,
+                                  ninfer::GenerationObservationOptions observation,
+                                  ContextCacheHints cache_hints) {
+    const std::uint64_t req_id = ++request_seq_;
+    const auto reject          = [&](const ApiError& error) {
+        record_request_rejected(
+            make_request_rejection_log_context(req_id, protocol, generation, metadata, error));
+        endpoint->write_error(res, error);
+    };
+    PreparedRequest prepared;
+    try {
+        prepared = service_->prepare(
+            generation,
+            metadata.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
+            observation, [&req] { return client_disconnected(req); }, std::move(cache_hints));
+    } catch (const ApiException& exception) {
+        reject(endpoint->api_error(exception.error()));
+        return;
+    } catch (const std::exception& exception) {
+        reject(endpoint->internal_error(exception));
+        return;
+    }
+
+    endpoint->identify(prepared);
+    auto lifecycle = begin_request(
+        make_request_log_context(req_id, std::move(protocol), generation, metadata, prepared));
+    generation.messages.clear();
+
+    // A step after the generation: a failure is logged against `phase` and returned as the error
+    // the client receives.
+    const auto after_generation = [endpoint,
+                                   lifecycle](RequestFailurePhase phase,
+                                              const auto& step) -> std::optional<ApiError> {
+        try {
+            step();
+            return std::nullopt;
+        } catch (const ApiException& exception) {
+            const ApiError error = endpoint->api_error(exception.error());
+            lifecycle->response_failure(make_request_failure(phase, error));
+            return error;
+        } catch (const std::exception& exception) {
+            lifecycle->response_failure(make_internal_request_failure(phase, exception.what()));
+            return endpoint->internal_error(exception);
+        }
+    };
+
+    if (!metadata.stream) {
+        GenerationOutcome outcome;
+        try {
+            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+        } catch (const ApiException& exception) {
+            const ApiError error = endpoint->api_error(exception.error());
+            lifecycle->failure(make_generation_request_failure(error));
+            endpoint->write_error(res, error);
+            return;
+        } catch (const std::exception& exception) {
+            lifecycle->failure(
+                make_internal_request_failure(RequestFailurePhase::Generation, exception.what()));
+            endpoint->write_error(res, endpoint->internal_error(exception));
+            return;
+        }
+        lifecycle->done(outcome);
+        if (outcome.finish_reason == ninfer::FinishReason::Cancelled &&
+            !endpoint->renders_cancelled()) {
+            // Only the client cancels a non-streaming run (it disconnected).
+            lifecycle->response_failure(
+                make_client_disconnected_failure(RequestFailurePhase::Transport));
+            return;
+        }
+        std::optional<ApiError> error = after_generation(
+            RequestFailurePhase::ResponseRender, [&] { endpoint->render(prepared, outcome); });
+        if (!error) {
+            error = after_generation(RequestFailurePhase::ResponseStore,
+                                     [&] { endpoint->store(prepared); });
+        }
+        if (!error) {
+            error = after_generation(RequestFailurePhase::ResponseRender, [&] {
+                set_owned_json_content(res, endpoint->body(), prepared.lifetime);
+            });
+        }
+        if (error) { endpoint->write_error(res, *error); }
+        return;
+    }
+
+    try {
+        auto stream = std::make_shared<HttpGenerationStream>(std::move(prepared));
+        endpoint->open_stream(stream->prepared);
+
+        prepare_sse_response(res);
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, stream, endpoint, lifecycle, after_generation](std::size_t,
+                                                                  httplib::DataSink& sink) -> bool {
+                if (stream->started.exchange(true, std::memory_order_acq_rel)) {
+                    sink.done();
+                    return true;
+                }
+                SseTransport transport(sink, stream->cancelled);
+                const auto send_error = [&](const ApiError& error) {
+                    try {
+                        endpoint->write_stream_error(transport, error);
+                        sink.done();
+                        return true;
+                    } catch (const ClientDisconnected&) {
+                        lifecycle->response_failure(
+                            make_client_disconnected_failure(RequestFailurePhase::Transport));
+                        return false;
+                    } catch (const ResponseRenderFailure& exception) {
+                        lifecycle->response_failure(make_internal_request_failure(
+                            RequestFailurePhase::ResponseRender, exception.what()));
+                        return false;
+                    }
+                };
+                try {
+                    endpoint->write_start(transport);
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_error(endpoint->internal_error(exception));
+                }
+
+                GenerationOutcome outcome;
+                try {
+                    StreamSink output;
+                    endpoint->attach(output, transport);
+                    output.is_cancelled = [&] { return transport.poll(); };
+
+                    outcome = service_->run(stream->prepared, &output);
+                } catch (const ClientDisconnected&) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                } catch (const ResponseRenderFailure& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::ResponseRender, exception.what()));
+                    return send_error(endpoint->internal_error(exception));
+                } catch (const ApiException& exception) {
+                    const ApiError error = endpoint->api_error(exception.error());
+                    lifecycle->failure(make_generation_request_failure(error));
+                    return send_error(error);
+                } catch (const std::exception& exception) {
+                    lifecycle->failure(make_internal_request_failure(
+                        RequestFailurePhase::Generation, exception.what()));
+                    return send_error(endpoint->internal_error(exception));
+                }
+
+                lifecycle->done(outcome);
+                if (outcome.finish_reason == ninfer::FinishReason::Cancelled &&
+                    !endpoint->renders_cancelled()) {
+                    // The client closed the stream (SseTransport::poll): no closing events.
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
+                std::vector<std::string> closing;
+                std::vector<std::string> terminal;
+                std::optional<ApiError> error =
+                    after_generation(RequestFailurePhase::ResponseRender,
+                                     [&] { closing = endpoint->finish(outcome); });
+                if (!error) {
+                    error = after_generation(RequestFailurePhase::ResponseStore,
+                                             [&] { endpoint->store(stream->prepared); });
+                }
+                if (!error) {
+                    error = after_generation(RequestFailurePhase::ResponseRender,
+                                             [&] { terminal = endpoint->terminal(); });
+                }
+                if (error) { return send_error(*error); }
+                try {
+                    transport.write(closing);
+                    transport.write(terminal);
+                    sink.done();
+                    return true;
+                } catch (const ClientDisconnected&) {
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
+            },
+            [stream, lifecycle](bool successful) {
+                stream->cancelled.store(true, std::memory_order_release);
+                if (!successful || !stream->started.load(std::memory_order_acquire)) {
+                    lifecycle->failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                }
+            });
+    } catch (const std::exception& exception) {
+        lifecycle->failure(
+            make_internal_request_failure(RequestFailurePhase::ResponseRender, exception.what()));
+        endpoint->write_error(res, endpoint->internal_error(exception));
+    }
 }
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
@@ -461,11 +673,7 @@ void HttpServer::register_routes() {
                 error.code    = "forbidden";
                 error.message = "refused a cross-origin or non-local request; bind a non-loopback "
                                 "address or pass --cors to allow browser clients";
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, error, new_anthropic_request_id());
-                } else {
-                    write_openai_error(res, error);
-                }
+                write_route_error(req, res, error);
                 return httplib::Server::HandlerResponse::Handled;
             }
             if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
@@ -484,12 +692,7 @@ void HttpServer::register_routes() {
                 error.type    = "invalid_request_error";
                 error.code    = "invalid_api_key";
                 error.message = "missing or invalid API key";
-                // Render the 401 in the shape the target endpoint speaks.
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, error, new_anthropic_request_id());
-                } else {
-                    write_openai_error(res, error);
-                }
+                write_route_error(req, res, error);
                 return httplib::Server::HandlerResponse::Handled;
             }
             return httplib::Server::HandlerResponse::Unhandled;
@@ -507,38 +710,19 @@ void HttpServer::register_routes() {
                         make_request_failure(RequestFailurePhase::Http, e.error()),
                         response_request_id(res));
                 }
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, e.error(), new_anthropic_request_id());
-                } else {
-                    write_openai_error(res, e.error());
-                }
+                write_route_error(req, res, e.error());
             } catch (const std::exception& e) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
                     make_internal_request_failure(RequestFailurePhase::Http, e.what()),
                     response_request_id(res));
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    ApiError error;
-                    error.status  = 500;
-                    error.message = e.what();
-                    write_anthropic_error(res, error, new_anthropic_request_id());
-                } else {
-                    write_exception(res, e);
-                }
+                write_route_error(req, res, internal_error(e.what()));
             } catch (...) {
                 operational_log_.http_failure(
                     endpoint_name(req.path),
                     make_internal_request_failure(RequestFailurePhase::Http, "unknown error"),
                     response_request_id(res));
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = "unknown error";
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, error, new_anthropic_request_id());
-                } else {
-                    write_openai_error(res, error);
-                }
+                write_route_error(req, res, internal_error("unknown error"));
             }
         });
 

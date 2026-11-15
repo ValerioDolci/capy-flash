@@ -5,6 +5,7 @@
 #include "ops/hyper_connection/launch.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/common/validate.h"
 
 #include <algorithm>
 #include <cmath>
@@ -35,13 +36,6 @@ void require_matrix(const Tensor& t, DType dtype, const char* op, const char* la
 }
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 0xFU) == 0; }
-
-// Whether the bytes of two tensors intersect.
-bool overlaps(const Tensor& a, const Tensor& b) {
-    const auto begin_a = reinterpret_cast<std::uintptr_t>(a.data);
-    const auto begin_b = reinterpret_cast<std::uintptr_t>(b.data);
-    return begin_a < begin_b + b.bytes() && begin_b < begin_a + a.bytes();
-}
 
 void require_q8(const Weight& w, std::int32_t n, std::int32_t k, const char* op,
                 const char* label) {
@@ -120,10 +114,10 @@ MixGeometry validate_mix(const Tensor& residual, const HyperConnectionWeights& w
         require_matrix(*inject, DType::FP32, op, "inject");
         require(inject->ne[0] == kHcStreams && inject->ne[1] == tokens, op,
                 "inject must be FP32 [4,T]");
-        require(!overlaps(*inject, residual) && !overlaps(*inject, mixed), op,
+        require(!detail::overlaps(*inject, residual) && !detail::overlaps(*inject, mixed), op,
                 "inject must not overlap");
     }
-    require(!overlaps(mixed, residual), op, "mixed must not overlap residual");
+    require(!detail::overlaps(mixed, residual), op, "mixed must not overlap residual");
     return g;
 }
 
@@ -135,11 +129,11 @@ void validate_combine(const Tensor& y, const Tensor& inject, const Tensor& resid
     require(residual.ne[0] == y.ne[0] * inject.ne[0] && residual.ne[1] == y.ne[1] &&
                 inject.ne[1] == y.ne[1],
             op, "residual must be [S*H,T] for y [H,T] and inject [S,T]");
-    require(!overlaps(y, residual) && !overlaps(inject, residual), op,
+    require(!detail::overlaps(y, residual) && !detail::overlaps(inject, residual), op,
             "y and inject must not overlap residual");
 }
 
-// T103 diagnostic: NINFER_QWEN4_HC_GENERAL=1 sends small-T mixers through the general route too
+// Diagnostic: NINFER_QWEN4_HC_GENERAL=1 sends small-T mixers through the general route too
 // (the route of T > 8), to separate the route from the weight format.
 bool general_route_forced() {
     static const bool forced = [] {
@@ -246,7 +240,7 @@ void grouped_offset_rmsnorm(const Tensor& x, const Tensor& weight, std::int32_t 
     require(groups > 0 && x.ne[0] % groups == 0, op, "groups must divide the row width");
     require(out.ne[0] == x.ne[0] && out.ne[1] == x.ne[1], op, "x/out shapes differ");
     require(eps > 0 && std::isfinite(eps), op, "eps must be positive and finite");
-    require(!overlaps(x, out), op, "x and out must not overlap");
+    require(!detail::overlaps(x, out), op, "x and out must not overlap");
     detail::grouped_offset_rmsnorm_launch(x, weight, groups, eps, out, stream);
 }
 
@@ -257,7 +251,7 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     require_matrix(residual, DType::BF16, op, "residual");
     require(streams > 0 && residual.ne[0] == x.ne[0] * streams && residual.ne[1] == x.ne[1], op,
             "residual must be [S*H,T]");
-    require(!overlaps(x, residual), op, "x and residual must not overlap");
+    require(!detail::overlaps(x, residual), op, "x and residual must not overlap");
     detail::hyper_connection_expand_launch(x, streams, residual, stream);
 }
 
@@ -292,7 +286,7 @@ void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
     const MixGeometry geometry = validate_mix(residual, weights, eps, mixed, inject, op);
     validate_combine(previous_y, previous_inject, residual, op);
     require(previous_inject.ne[0] == kHcStreams, op, "previous_inject must be FP32 [4,T]");
-    require(inject == nullptr || !overlaps(*inject, previous_inject), op,
+    require(inject == nullptr || !detail::overlaps(*inject, previous_inject), op,
             "inject must not overlap previous_inject");
     const std::int32_t tokens = residual.ne[1];
     auto scope                = workspace.scope();

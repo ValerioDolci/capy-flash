@@ -4,9 +4,9 @@
 // The failure is injected with a link-time wrapper around cudaStreamSynchronize, which the Engine
 // worker calls on every decode round (ProgramImpl::synchronize_devices). The wrapper throws: a CUDA
 // error returned to CUDA_CHECK aborts the process by design, which a supervisor already sees. No
-// exchange reported a hang, so the Engine cannot recover by stepping the transport down (issue
-// #20, ninfer_serve_tp_transport_recovery_real_test) and fails as a whole. The wrapper affects
-// only this test executable; the production path has no fault hooks.
+// exchange reported a hang, so the Engine cannot recover by stepping the transport down
+// (ninfer_serve_tp_transport_recovery_real_test) and fails as a whole. The wrapper affects only
+// this test executable; the production path has no fault hooks.
 #include "product/logging/logging.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"

@@ -34,7 +34,7 @@ context with Vision and 8 device state slots.
   and MTP head are read from the BF16 copies inside the QUASAR checkpoint and quantized with the official
   `_optional` choices (Q4-Q8). Components: text, vision, MTP (the DFlash2 drafter is not included).
 - **Source revision:** `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` at `15d2e47b`.
-- **Size:** 17.4 GB on disk. At `--tp 2` with the production flags below: 13,083 / 12,743 MiB per board
+- **Size:** 17.4 GB on disk. At `--tp 2` with 196,608 tokens, Vision and MTP: 13,083 / 12,743 MiB per board
   (official NVFP4 artifact: 15,035 / 14,695).
 
 ## Sources and licenses
@@ -43,7 +43,7 @@ context with Vision and 8 device state slots.
 |---|---|---|
 | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | base model (architecture; the checkpoint below carries its vision and MTP weights) | Apache-2.0 |
 | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | all weights: NVFP4 projections (QAT) plus BF16 vision, MTP, head | Apache-2.0 |
-| [Neroued/ninfer](https://github.com/Neroued/ninfer) | converter (unchanged in the fork), single-GPU runtime | Apache-2.0 |
+| [Neroued/ninfer](https://github.com/Neroued/ninfer) | converter, single-GPU runtime | Apache-2.0 |
 | [ValerioDolci/capy-flash](https://github.com/ValerioDolci/capy-flash) (formerly ninfer-tp2) | two-GPU runtime this artifact was verified with | Apache-2.0 |
 
 This artifact is redistributed under Apache-2.0. All credit for the quantization goes to the QUASAR-QAT
@@ -58,10 +58,10 @@ plus the QUASAR checkpoint). This one was built independently from the QUASAR ch
 
 ## Conversion
 
-Recipe [`quasar_recipe.py`](quasar_recipe.py) (next to this card; at the root of the Hub repository). The
-converter is upstream's (unchanged in the fork); running the result at `--tp 2` needs the fork at commit
-`d24bffd2` or later for the NVFP4 split projections. The QUASAR checkpoint is both the `--model` and the
-`quantized` source; no BF16 copy of Qwen3.8-27B is required. From the root of a capy-flash (formerly `ninfer-tp2`) checkout:
+Recipe [`quasar_recipe.py`](quasar_recipe.py) (next to this card; at the root of the Hub repository). Running
+the result at `--tp 2` needs capy-flash at commit `d24bffd2` or later for the NVFP4 split projections. The
+QUASAR checkpoint is both the `--model` and the `quantized` source; no BF16 copy of Qwen3.8-27B is required.
+From the root of a capy-flash (formerly `ninfer-tp2`) checkout:
 
 ```bash
 python3 -m tools.convert \
@@ -106,22 +106,20 @@ the report the converter wrote (every object's method and sources, formats, timi
   container v3, artifact id `1a09e96c3a16496aa60ce2895402bcd7`.
 - Weights read from `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` at `15d2e47bffe5d8ad23928879f8f7d2f74909e259`
   (2026-09-16), the only tensor source.
-- Converted on 2026-09-24 with upstream's `tools.convert` from this fork at `fa8c9e39` (converter unchanged
-  from upstream v3); verified at `--tp 2` with the fork at `d24bffd2` on 2× RTX 5070 Ti, CUDA 13.1.1,
-  driver 595.91.
+- Converted on 2026-09-24 with `tools.convert` from capy-flash at `fa8c9e39`; verified at `--tp 2` with
+  capy-flash at `d24bffd2` on 2× RTX 5070 Ti, CUDA 13.1.1, driver 595.91.
 
-## Serving (production flags on 2× RTX 5070 Ti 16 GB, no P2P)
+## Serving (2× RTX 5070 Ti 16 GB, no P2P)
 
 ```bash
-ninfer-serve qwen3_8_27b_quasar_nvfp4.ninfer --tp 2 --devices 0,1 --kv-dtype int8 \
-  --max-context 196608 --kv-capacity 196608 --device-state-slots 4 --max-concurrency 1 \
-  --spec mtp --draft-tokens 3 --vision --vision-device 0 --max-vision-tokens 4096
+serve-tp2.sh qwen3_8_27b_quasar_nvfp4.ninfer                  # release launcher (install.sh --model 27b)
+ninfer-serve qwen3_8_27b_quasar_nvfp4.ninfer --profile 27b    # the same profile, without the launcher
 ```
 
 262,144 tokens with `--vision` and 8 device state slots also fit. Single GPU (`--tp 1`) should fit a 24 GB+
 `sm_120a` board (untested).
 
-## Measured quality (2026-09-24, this fork at `--tp 2`, flags above, one run per task, T = 0)
+## Measured quality (capy-flash at `--tp 2`, 196,608 tokens, MTP 3, Vision, one run per task, T = 0)
 
 Paired per-item comparison against the same QUASAR weights served by vLLM 0.30 (exact McNemar):
 

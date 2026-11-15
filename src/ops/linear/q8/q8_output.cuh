@@ -1,5 +1,5 @@
 #pragma once
-// T128c: the Q8 launchers write BF16 (default) or FP32 out, from out.dtype.
+// The Q8 launchers write BF16 (default) or FP32 out, from out.dtype.
 #include "core/tensor.h"
 #include "ops/linear/common/output.cuh"
 

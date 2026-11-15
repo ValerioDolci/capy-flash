@@ -12,12 +12,12 @@
 //                  for T <= 8 written by the (single-block) kernel itself after a system-wide
 //                  fence of every thread's writes, for wider calls by two stream memory writes
 //                  (each preceded by a system-wide fence)
-//   ...            the device keeps working: resident experts (T15 qf_moe), anything else
+//   ...            the device keeps working: resident experts, anything else
 //   accumulate(l)  cuStreamWaitValue32(done[l] >= 1), then a kernel y += host partial (FP32,
 //                  read once from mapped memory; skipped when the host had no expert)
 // The wait is executed by the stream front end: it holds no SM, so cooperative kernels queued on
-// other streams (T10's HC kernel at T <= 8 needs every SM) are unaffected, and the stream is held
-// only where the sum is needed. No kernel ever spins on a host flag.
+// other streams (the hyper-connection kernel at T <= 8 needs every SM) are unaffected, and the
+// stream is held only where the sum is needed. No kernel ever spins on a host flag.
 //
 // Host side: one service thread (member 0 of the pinned HostCpuPool) polls ready[l] of the layer it
 // expects next and of the layer it served last (a layer called in several slices of <= max_tokens
@@ -56,26 +56,20 @@ namespace ninfer::ops::host {
 struct HostMoeResidency;
 
 // How a call's routed experts that the device does not hold (the misses) are divided between the
-// host executor and the device itself, which then reads its share of the expert weights over PCIe
-// (T18). Decided per publish, on the device, from the call's routing: per layer and per window.
-// The distinct misses are put in an order and the device takes a prefix of it:
-//   Count     the first `count` in route order (T22's device_reads)
-//   Fraction  floor(fraction * n + 0.5) of the n misses
-//   Cost      the prefix length g in [0, min(n, max_reads)] minimizing max(host(n - g), device(g)),
-//             the smallest on ties, 0 when n <= min_misses, with
-//               host(m)   = host_fixed_us + host_slowdown(g) * sum(host_expert_us + host_column_us
-//               * (c - 1)) device(g) = device_fixed_us + sum(device_expert_us + device_column_us *
-//               (c - 1))
-//             (c = columns routed to the expert, host(0) = device(0) = 0, host_slowdown(g) =
-//             host_read_slowdown when g > 0, else 1: the device's reads take host RAM bandwidth)
-// Fraction and Cost order the misses by columns, most first, then route order (tools/cost_model.py
-// split_choice is the same rule).
+// host executor and the device itself, which then reads its share of the expert weights over
+// PCIe. Decided per publish, on the device, from the call's routing: per layer and per window.
+// The distinct misses are ordered by columns, most first, then route order, and with mode Cost the
+// device takes the prefix of length g in [0, min(n, max_reads)] minimizing max(host(n - g),
+// device(g)), the smallest on ties, 0 when n <= min_misses, with
+//   host(m)   = host_fixed_us + host_slowdown(g) * sum(host_expert_us + host_column_us * (c - 1))
+//   device(g) = device_fixed_us + sum(device_expert_us + device_column_us * (c - 1))
+// (c = columns routed to the expert, host(0) = device(0) = 0, host_slowdown(g) =
+// host_read_slowdown when g > 0, else 1: the device's reads take host RAM bandwidth).
 struct HostMoeSplit {
-    enum class Mode : std::int32_t { Off = 0, Count = 1, Fraction = 2, Cost = 3 };
+    // The values are written to the expert trace ("split": {"mode"}).
+    enum class Mode : std::int32_t { Off = 0, Cost = 3 };
     static constexpr std::int32_t kMaxReads = 16;
     Mode mode                               = Mode::Off;
-    std::int32_t count                      = 0;
-    float fraction                          = 0.0F;
     std::int32_t min_misses                 = 2;
     std::int32_t max_reads                  = kMaxReads;
     float host_fixed_us                     = 13.0F;
@@ -121,6 +115,7 @@ struct HostMoeCostFit {
     float column_us      = 0.0F;
     float rms_us         = 0.0F; // residual of the kept samples
 };
+
 [[nodiscard]] HostMoeCostFit fit_host_costs(std::span<const HostMoeCostSample> samples,
                                             float default_column_us);
 
@@ -188,13 +183,13 @@ struct HostMoeCallRecord {
 // Capturable. Staged device share: copies the four planes of the experts a split publish picked
 // (share.picks: ids, then their count at [HostMoeSplit::kMaxReads]) from the host bank (plane q of
 // expert e at bank[q] + e * plane_bytes[q], host-mapped) into scratch slot k of staging[q] (k = the
-// position in picks), with a streaming kernel of `blocks` CTAs (16: as fast as 64-128 in the T18
-// probe, and leaves the SMs to the resident experts; every byte read once over PCIe, many
+// position in picks), with a streaming kernel of `blocks` CTAs (16: as fast as 64-128 when
+// measured, and leaves the SMs to the resident experts; every byte read once over PCIe, many
 // loads in flight; 16-byte units where plane base and size allow, 4-byte otherwise). Returns at
 // once when nothing was picked. Planes 4-byte aligned, plane_bytes multiples of 4. Capturable. The
 // device share a split publish_table with the same ids, table and split would pick (reads, picks,
 // scratch table), without publishing anything: at tp 2 the other GPU runs it on its own copy of the
-// residency mirror and computes the share over its own link (T42).
+// residency mirror and computes the share over its own link.
 void select_device_share(cudaStream_t stream, std::int32_t tokens, std::int32_t top_k,
                          const std::int32_t* ids, const std::int32_t* slot_table,
                          std::int32_t experts, const HostMoeSplit& split,
@@ -343,7 +338,7 @@ private:
     std::atomic<std::int64_t> cost_capacity_{0};
     mutable std::mutex cost_mutex_;
     std::vector<HostMoeCostSample> cost_samples_;
-    // T98 validation dump (NINFER_HOST_MOE_DUMP=<file>): every served decode call (<= 8 tokens
+    // Validation dump (NINFER_HOST_MOE_DUMP=<file>): every served decode call (<= 8 tokens
     // with host experts) as the executor saw it (layer, ids, alpha, x, out) plus the partial the
     // device's accumulate actually read (`echo_`, mapped, written by the accumulate kernel),
     // collected at the next serve. Written at destruction.
@@ -357,10 +352,6 @@ private:
     std::int64_t dump_pending_       = -1; // byte offset of the last record's echo block, or -1
     std::int32_t dump_pending_layer_ = 0, dump_pending_tokens_ = 0;
     float* echo_ = nullptr; // mapped [layers][kHostMaxTokens * hidden]
-    // NINFER_HOST_MOE_EARLY_PARTIAL=1 (v07/decode-overheads B): decode accumulates load the host
-    // partial together with the active word (one PCIe round trip instead of two); read when the
-    // accumulates are captured.
-    bool early_partial_ = false;
 };
 
 } // namespace ninfer::ops::host

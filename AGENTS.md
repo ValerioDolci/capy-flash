@@ -184,7 +184,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
-| Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
+| Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `README.md` (Benchmarks) |
 | In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.

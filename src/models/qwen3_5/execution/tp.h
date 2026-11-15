@@ -37,12 +37,9 @@ struct Qwen4Runtime;      // execution/qwen4_runtime.h
 // heads, the Dense intermediate width and the vocabulary are divided by `width`; the hidden size,
 // head dimensions, layer schedule and RoPE are unchanged. It names the per-rank extents of the
 // shared workspace recipes, KV planes and GDN state pools. Qwen4Exp keeps its MoE geometry (routed
-// experts partitioned by ID, shared expert whole on one rank per block), its QSA indexer and PLE,
-// and with `hc_split_streams` halves the hyper-connection streams (the rank's residual is
-// hc_count/width streams wide). Throws std::invalid_argument for an extent `width` does not
-// divide.
-[[nodiscard]] TextConfig shard_text_config(const TextConfig& config, int width,
-                                           bool hc_split_streams = false);
+// experts partitioned by ID, shared expert whole on one rank per block), its QSA indexer, PLE and
+// hyper-connection streams. Throws std::invalid_argument for an extent `width` does not divide.
+[[nodiscard]] TextConfig shard_text_config(const TextConfig& config, int width);
 
 // Rank 1's copy of the ordinary decode control. The Program publishes it on rank 1's stream before
 // the call, by uploading the same OrdinaryDecodeIngress record rank 0 receives into a frame of

@@ -78,4 +78,8 @@ void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlCh
                        DeviceExecutionView execution);
 int value_tile(int value_heads, int multiprocessor_count);
 
+// Test hook: the recurrence's value tile (64, 32, 16 or 8 state columns per CTA) instead of the
+// launch rule; 0 restores the rule. Every tile computes the same bits.
+void force_value_tile_for_test(int tile) noexcept;
+
 } // namespace ninfer::ops::detail::gated_delta_net::chunked

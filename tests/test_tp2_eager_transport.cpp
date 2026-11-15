@@ -1,7 +1,7 @@
-// v07/p2p-overlap: the tp 2 eager transport decision (models/qwen3_5/program/tp2/eager_transport.h),
-// host only. The property that matters for boards without P2P: for every input without peer access
-// and without NINFER_TP_PEER_OVERLAP=force, no PeerLanes are attached and the HostExchange decision
-// is the v0.6 formula (program_impl_tp2.inc before this branch), so their eager path is unchanged.
+// The tp 2 eager transport decision (models/qwen3_5/program/tp2/eager_transport.h), host only.
+// The property that matters for boards without P2P: for every input without peer access and
+// without NINFER_TP_PEER_OVERLAP=force, no PeerLanes are attached and the HostExchange decision is
+// the reference rule below, so their eager path is the HostExchange alone.
 
 #include "models/qwen3_5/program/tp2/eager_transport.h"
 
@@ -19,8 +19,9 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
-// The v0.6 formula, verbatim (capy/v0.7 fee39e14, program_impl_tp2.inc:194-201).
-bool v06_host_exchange(bool peer_access, bool elastic_kv, std::string_view forced) {
+// The HostExchange rule, written independently: without peer access or with elastic KV, unless
+// NINFER_TP_HOST_EXCHANGE decides.
+bool reference_host_exchange(bool peer_access, bool elastic_kv, std::string_view forced) {
     const bool host_exchange_auto = !peer_access || elastic_kv;
     return forced != "0" && (forced == "1" || host_exchange_auto);
 }
@@ -28,7 +29,7 @@ bool v06_host_exchange(bool peer_access, bool elastic_kv, std::string_view force
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures                          = 0;
     const std::string_view host_envs[]    = {"", "0", "1", "2", "on"};
     const std::string_view overlap_envs[] = {"", "0", "1", "auto", "force", "FORCE"};
     for (const bool peer : {false, true}) {
@@ -36,15 +37,15 @@ int main() {
             for (const std::string_view host : host_envs) {
                 for (const std::string_view overlap : overlap_envs) {
                     const auto t = tp2_eager_transport(peer, elastic, host, overlap);
-                    const std::string label = "peer=" + std::to_string(peer) +
-                                              " elastic=" + std::to_string(elastic) + " host='" +
-                                              std::string(host) + "' overlap='" +
-                                              std::string(overlap) + "'";
-                    // 1. The HostExchange decision is the v0.6 one for every input.
-                    failures += check(t.host_exchange == v06_host_exchange(peer, elastic, host),
-                                      label + ": host exchange differs from v0.6");
+                    const std::string label =
+                        "peer=" + std::to_string(peer) + " elastic=" + std::to_string(elastic) +
+                        " host='" + std::string(host) + "' overlap='" + std::string(overlap) + "'";
+                    // 1. The HostExchange decision follows the reference rule for every input.
+                    failures +=
+                        check(t.host_exchange == reference_host_exchange(peer, elastic, host),
+                              label + ": host exchange differs from the reference rule");
                     // 2. Without P2P and without force: no lanes (the boards without P2P keep
-                    //    exactly the v0.6 eager path).
+                    //    the HostExchange alone).
                     if (!peer && overlap != "force") {
                         failures += check(!t.peer_lanes, label + ": lanes attached without P2P");
                     }
@@ -59,7 +60,7 @@ int main() {
                         failures += check(!t.peer_lanes, label + ": =0 with lanes");
                     }
                     // 5. Outside force, lanes never coexist with a HostExchange (the host lanes
-                    //    keep serving the split-phase sums wherever v0.6 had them).
+                    //    keep serving the split-phase sums wherever there is one).
                     if (overlap != "force") {
                         failures += check(!(t.peer_lanes && t.host_exchange),
                                           label + ": lanes next to a HostExchange");
@@ -85,7 +86,7 @@ int main() {
         failures += check(t.host_exchange && t.peer_lanes && !t.peer_lanes_direct,
                           "no-P2P force: host exchange + driver-staged lanes");
     }
-    // 9. Flash-Next on P2P (elastic KV): HostExchange as in v0.6, no lanes.
+    // 9. Flash-Next on P2P (elastic KV): HostExchange, no lanes.
     {
         const auto t = tp2_eager_transport(true, true, "", "");
         failures += check(t.host_exchange && !t.peer_lanes, "P2P elastic: host exchange only");

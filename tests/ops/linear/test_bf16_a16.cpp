@@ -290,8 +290,8 @@ int run_bf16_linear() {
     return failures;
 }
 
-// Qwen3.8-Flash-Next BF16 projections (FP4-Local): hyper-connection Down(+inject) and Up, whole
-// and stream-split, the MTP dense layer and the PLE key|value parent. Token counts straddle every
+// Qwen3.8-Flash-Next BF16 projections (FP4-Local): hyper-connection Down(+inject) and Up, the
+// MTP dense layer and the PLE key|value parent. Token counts straddle every
 // selector cutoff (8, 16, 64, 128, 256, 512, 1024) and leave partial token tiles.
 int run_qwen4_linear() {
     struct Shape {
@@ -299,8 +299,7 @@ int run_qwen4_linear() {
         std::uint32_t seed;
     };
 
-    constexpr Shape kShapes[]{{324, 10240, 421U},  {320, 10240, 423U}, {324, 5120, 425U},
-                              {320, 5120, 427U},   {10240, 320, 429U}, {5120, 320, 431U},
+    constexpr Shape kShapes[]{{324, 10240, 421U},  {320, 10240, 423U}, {10240, 320, 429U},
                               {13312, 2560, 433U}, {6656, 2560, 435U}, {640, 2560, 437U},
                               {2560, 6144, 439U},  {2560, 3072, 441U}, {1280, 2560, 443U},
                               {2560, 640, 445U},   {2560, 2560, 447U}, {12800, 2560, 449U}};

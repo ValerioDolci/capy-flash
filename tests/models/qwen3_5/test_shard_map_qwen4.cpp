@@ -1,12 +1,12 @@
 // Qwen4Exp (Qwen3.8-Flash-Next) tensor-parallel placement (load/sharding.h), host only.
 //
-// 1. The logical rule of every Qwen4Exp parameter at tp 2, default and with hc_split_streams.
+// 1. The logical rule of every Qwen4Exp parameter at tp 2.
 // 2. The combined placement of the real model's parents (48 blocks + MTP, both official recipes,
 //    the converter's grouping as written to the artifact: q|k|gate|v, q|k|v|z, a|b, HC down|inject,
 //    shared gate|up, router|shared_score, indexer query|key, PLE key|value): every rank shard is
 //    accepted by the slicer at the stored format's tile boundaries and has the per-rank shape the
-//    split Ops consume, and the per-rank device bytes are printed (the T30 dossier's table).
-// 3. Rejections: a Qwen4Exp parameter without a rule, an odd stream split.
+//    split Ops consume, and the per-rank device bytes are printed.
+// 3. Rejections: a Qwen4Exp parameter without a rule.
 // 4. A dense Qwen4Exp FFN: mlp/* split like the Qwen3.5 dense block, no MoE rule applies, the
 //    per-rank config halves the intermediate width.
 
@@ -71,8 +71,6 @@ qwen::Config flash_next(std::uint32_t layers = 48) {
 }
 
 const LoadOptions kTp2{.speculative = SpeculativeBackend::Mtp, .tp = 2};
-const LoadOptions kTp2Split{
-    .speculative = SpeculativeBackend::Mtp, .tp = 2, .hc_split_streams = true};
 
 Ranges halves(std::uint64_t total, int device) {
     return {{static_cast<std::uint64_t>(device) * total / 2, total / 2}};
@@ -106,17 +104,11 @@ void logical_policy() {
         for (const auto* leaf : {"attention/query_norm", "attention/key_norm"}) {
             expect(config, p + leaf, {256}, ShardAxis::Replicated);
         }
-        // The indexer is replicated in both modes.
-        for (const auto& options : {kTp2, kTp2Split}) {
-            expect(config, p + "attention/indexer_query", {512, kH}, ShardAxis::Replicated, {}, 0,
-                   options);
-            expect(config, p + "attention/indexer_key", {128, kH}, ShardAxis::Replicated, {}, 0,
-                   options);
-            expect(config, p + "attention/indexer_query_norm", {128}, ShardAxis::Replicated, {}, 0,
-                   options);
-            expect(config, p + "attention/indexer_key_norm", {128}, ShardAxis::Replicated, {}, 0,
-                   options);
-        }
+        // The indexer is replicated.
+        expect(config, p + "attention/indexer_query", {512, kH}, ShardAxis::Replicated);
+        expect(config, p + "attention/indexer_key", {128, kH}, ShardAxis::Replicated);
+        expect(config, p + "attention/indexer_query_norm", {128}, ShardAxis::Replicated);
+        expect(config, p + "attention/indexer_key_norm", {128}, ShardAxis::Replicated);
     }
     // GDN: 8 key heads with their 24 value heads per rank.
     const std::string g = "text/layers/0/gdn/";
@@ -161,45 +153,26 @@ void logical_policy() {
         expect(config, p + "moe/shared/down", {kH, 640}, ShardAxis::SingleDevice, {}, rank);
     }
 
-    // Hyper-connections: replicated by default; split by residual streams with the flag.
+    // Hyper-connections: replicated.
     for (const std::string p :
          {"text/layers/0/attn_hc/", "text/layers/3/ffn_hc/", "mtp/layers/0/attn_hc/"}) {
         expect(config, p + "norm", {kWide}, ShardAxis::Replicated);
         expect(config, p + "down", {320, kWide}, ShardAxis::Replicated);
         expect(config, p + "inject", {4, kWide}, ShardAxis::Replicated);
         expect(config, p + "up", {kWide, 320}, ShardAxis::Replicated);
-        expect(config, p + "norm", {kWide}, ShardAxis::Rows, {halves(kWide, 0), halves(kWide, 1)},
-               0, kTp2Split);
-        expect(config, p + "up", {kWide, 320}, ShardAxis::Rows,
-               {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
-        for (const auto* leaf : {"down", "inject"}) {
-            expect(config, p + leaf, {320, kWide}, ShardAxis::Columns,
-                   {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
-        }
     }
     for (const std::string p : {"text/hc_head/", "mtp/hc_head/"}) {
         expect(config, p + "down", {320, kWide}, ShardAxis::Replicated);
-        expect(config, p + "down", {320, kWide}, ShardAxis::Columns,
-               {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
-        expect(config, p + "up", {kWide, 320}, ShardAxis::Rows,
-               {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
     }
-    // PLE: key|value projection and the table replicated in both modes; the per-lane norms and
-    // convolution follow the residual streams.
+    // PLE: replicated (key|value projection, table, per-lane norms and convolution).
     const std::string ple = "text/layers/1/ple/";
-    for (const auto& options : {kTp2, kTp2Split}) {
-        expect(config, ple + "key", {kWide, kH}, ShardAxis::Replicated, {}, 0, options);
-        expect(config, ple + "value", {kH, kH}, ShardAxis::Replicated, {}, 0, options);
-        expect(config, ple + "table", {320001536, 160}, ShardAxis::Replicated, {}, 0, options);
-    }
+    expect(config, ple + "key", {kWide, kH}, ShardAxis::Replicated);
+    expect(config, ple + "value", {kH, kH}, ShardAxis::Replicated);
+    expect(config, ple + "table", {320001536, 160}, ShardAxis::Replicated);
     for (const auto* leaf : {"key_norm", "query_norm", "conv_norm"}) {
         expect(config, ple + leaf, {kWide}, ShardAxis::Replicated);
-        expect(config, ple + leaf, {kWide}, ShardAxis::Rows, {halves(kWide, 0), halves(kWide, 1)},
-               0, kTp2Split);
     }
     expect(config, ple + "convolution", {4, kWide}, ShardAxis::Replicated);
-    expect(config, ple + "convolution", {4, kWide}, ShardAxis::Columns,
-           {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
 
     // Vocabulary, MTP stem.
     expect(config, "text/token_embedding", {kVocab, kH}, ShardAxis::Replicated);
@@ -209,11 +182,9 @@ void logical_policy() {
            {halves(kVocab, 0), halves(kVocab, 1)});
     for (const auto* name :
          {"mtp/embedding_norm", "mtp/embedding_projection", "mtp/hidden_projection"}) {
-        expect(config, name, {kH, kH}, ShardAxis::Replicated, {}, 0, kTp2Split);
+        expect(config, name, {kH, kH}, ShardAxis::Replicated);
     }
     expect(config, "mtp/hidden_norm", {kWide}, ShardAxis::Replicated);
-    expect(config, "mtp/hidden_norm", {kWide}, ShardAxis::Rows,
-           {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
     expect(config, "vision/layers/0/attention/query", {1152, 1152}, ShardAxis::SingleDevice, {}, 1,
            {.tp = 2, .vision_rank = 1});
 
@@ -227,25 +198,15 @@ void logical_policy() {
     rejects<std::invalid_argument>(
         [&] { (void)loading::logical_shard("text/layersX/attn_hc/norm", {kWide}, config, kTp2); },
         "a malformed block name was placed");
-    auto three                            = config;
-    three.text.hyper_connection->hc_count = 3;
-    rejects<std::invalid_argument>(
-        [&] {
-            (void)loading::logical_shard("text/layers/0/attn_hc/norm", {3 * kH}, three, kTp2Split);
-        },
-        "three streams were split over two ranks");
 
     // Per-rank Text config.
-    const auto rank  = qwen::execution::shard_text_config(config.text, 2);
-    const auto split = qwen::execution::shard_text_config(config.text, 2, true);
+    const auto rank = qwen::execution::shard_text_config(config.text, 2);
     require(rank.attention->num_attention_heads == 12 && rank.attention->num_key_value_heads == 1 &&
                 rank.gdn->linear_num_key_heads == 8 && rank.gdn->linear_num_value_heads == 24 &&
                 rank.vocab_size == kVocab / 2 &&
                 std::get<qwen::MoeConfig>(rank.ffn).num_experts == 512 &&
                 rank.residual_width() == kWide && rank.sparse_attention->indexer_heads == 4,
             "per-rank Qwen4Exp config");
-    require(split.residual_width() == kWide / 2 && split.hyper_connection->hc_count == 2,
-            "per-rank Qwen4Exp config with split streams");
 }
 
 // Dense FFN: gate/up rows and down columns halved per rank (Text and MTP blocks); the MoE leaves of
@@ -532,34 +493,18 @@ void combined_placements() {
             {"gdn/output", {kH, 3072}},
             {"text/output_head", {kVocab / 2, kH}},
         };
-        std::map<std::string, artifact::Shape> split_shards = shards;
-        split_shards.insert({{"down|inject", {324, 5120}},
-                             {"hc_head/down", {320, 5120}},
-                             {"hc/up", {5120, 320}},
-                             {"hc_head/up", {5120, 320}},
-                             {"hc/norm", {5120}},
-                             {"ple/convolution", {4, 5120}}});
-        const auto tp1   = place(config, parents, LoadOptions{.tp = 1}, {});
-        const auto tp2   = place(config, parents, kTp2, shards);
-        const auto split = place(config, parents, kTp2Split, split_shards);
+        const auto tp1 = place(config, parents, LoadOptions{.tp = 1}, {});
+        const auto tp2 = place(config, parents, kTp2, shards);
         std::printf("== %s, 48 blocks + MTP, device weights (routed experts host-mapped, PLE table "
                     "file-mapped)\n",
                     recipe.name);
         print("tp 2, HC replicated", tp2, tp1.total[0]);
-        print("tp 2, HC split by streams", split, tp1.total[0]);
-        const auto hc = tp2.by_kind.at("hc")[0] - split.by_kind.at("hc")[0];
-        std::printf("  HC split frees %llu B per rank (HC %llu -> %llu B)\n",
-                    static_cast<unsigned long long>(hc),
-                    static_cast<unsigned long long>(tp2.by_kind.at("hc")[0]),
-                    static_cast<unsigned long long>(split.by_kind.at("hc")[0]));
         // Shared experts alternate: 24 Text blocks + MTP on rank 0, 24 on rank 1.
         const auto& shared = tp2.by_kind.at("shared expert");
         require(shared[0] + shared[1] == tp1.by_kind.at("shared expert")[0] &&
                     shared[0] * 24 == shared[1] * 25,
                 "shared experts do not alternate between the ranks");
-        require(tp2.by_kind.at("hc")[0] == tp1.by_kind.at("hc")[0] &&
-                    split.by_kind.at("hc")[0] * 2 == tp1.by_kind.at("hc")[0],
-                "HC bytes per rank");
+        require(tp2.by_kind.at("hc")[0] == tp1.by_kind.at("hc")[0], "HC bytes per rank");
     }
 }
 

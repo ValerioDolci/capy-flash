@@ -1,7 +1,6 @@
 #pragma once
 
 // Two-device (tp 2) forms of the Gated DeltaNet mixer projections (gdn.h).
-// Our file: the upstream header carries no hook.
 
 #include "models/qwen3_5/execution/gdn.h"
 #include "core/device.h"

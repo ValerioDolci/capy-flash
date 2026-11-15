@@ -7,27 +7,14 @@
 #include <cuda_runtime.h>
 
 namespace ninfer::models::qwen3_5::execution {
+namespace {
 
-void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          ops::CausalAttentionExecutionEnvelope envelope) {
-    if (frame.replay_records == nullptr) {
-        throw std::logic_error("speculative target verify has no ReplaySSM record storage");
-    }
-    card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
-    if (frame.feature_sink != nullptr) {
-        card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
-                                 frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens, *frame.feature_sink);
-    } else {
-        card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
-                                 frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
-                                 frame.target_tokens);
-    }
+// After the verify forward: the drafts the target accepts and, per lane, the hidden of its last
+// accepted column into the continuation store (both device counts).
+void accept_verified_drafts(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                            TargetVerifyFrameView& frame) {
     if (frame.forced_targets.data != nullptr) {
-        // T59 replay: the reference continuation stands in for the computed argmax.
+        // Replay: the reference continuation stands in for the computed argmax.
         CUDA_CHECK(
             ::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
                                           frame.target_tokens.bytes(), execution.device.stream));
@@ -51,6 +38,22 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                             frame.selected_hidden, execution.device.stream);
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
                  execution.device.stream);
+}
+
+} // namespace
+
+void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                          TextContext& card, TargetVerifyFrameView frame,
+                          ops::CausalAttentionExecutionEnvelope envelope) {
+    if (frame.replay_records == nullptr) {
+        throw std::logic_error("speculative target verify has no ReplaySSM record storage");
+    }
+    card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
+                             frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
+                             envelope, frame.target_hidden, frame.target_logits,
+                             frame.target_tokens, frame.feature_sink);
+    accept_verified_drafts(execution, continuation_hidden_store, frame);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

@@ -245,7 +245,7 @@ void ElasticArena::set_mapped(std::span<const std::size_t> mapped, cudaStream_t 
     } catch (...) {
         // A shared granule can lose its old owner without being in the initial release set.
         if (!releasing) { CUDA_CHECK(cudaDeviceSynchronize()); }
-        // The capybara keeps its old pond, not half a new one.
+        // Roll back to the old backing, not half of the new one.
         std::copy(fixed_.begin(), fixed_.end(), scratch_.begin());
         for (const auto& r : ranges_) { mark_prefix(scratch_, r.offset, r.mapped, granule_); }
         for (std::size_t k = 0; k < scratch_.size(); ++k) {

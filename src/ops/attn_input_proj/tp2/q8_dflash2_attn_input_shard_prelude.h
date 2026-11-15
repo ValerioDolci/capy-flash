@@ -20,7 +20,7 @@
 namespace ninfer::ops::detail {
 
 // The shard's query|key|value section output: a rank's 16 of the 32 query heads and 4 of the 8
-// KV heads of D128, in the parent's section order. The parent's segment sizes, which the upstream
+// KV heads of D128, in the parent's section order. The parent's segment sizes, which the parent's
 // source writes as template arguments, are ignored.
 template <int, int, int>
 using Q8DFlash2AttnInputShardOutput =

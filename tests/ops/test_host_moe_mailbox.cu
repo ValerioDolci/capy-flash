@@ -8,13 +8,13 @@
 // device leaves y untouched (no partial read), graph replays with new routing between launches,
 // one trace record per served layer, and the failure path (an executor exception) releases every
 // wait so the graph completes, with failed() set and y untouched.
-// Miss split (T18, split_shares): for every HostMoeSplit mode the device's share equals an
+// Miss split (split_shares): for every split case the device's share equals an
 // independent host implementation of the rule (reads, pick list, scratch table, split counters:
 // exact), the host computes exactly the complement (y = y0 + device partial + host partial bit for
 // bit), the staged share (streaming copy into scratch slots, then moe_slots) is bit-identical to
 // the zero-copy one, and against the FP64 oracle (fixture decode, unquantized activations) the
 // device share stays within moe_slots' W4A4 bound (relative L2 0.18, test_moe_slots kW4A4), the
-// host share within 0.05 (W4A8: T16 measured 0.011-0.013; 4x margin) and their sum within 0.18.
+// host share within 0.05 (W4A8 measured 0.011-0.013; 4x margin) and their sum within 0.18.
 #include "host_moe_fixture.h"
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -38,8 +38,7 @@ using namespace ninfer::test::host_moe;
 
 namespace {
 
-// The shares are checked against W4A8 references; A4 (the GPU activation codec) is the default
-// since v0.2.1.
+// The shares are checked against W4A8 references; A4 (the GPU activation codec) is the default.
 HostMoeExecutor::Options w4a8_options() {
     HostMoeExecutor::Options o;
     o.a4 = false;
@@ -244,12 +243,6 @@ int reference_share(const HostMoeSplit& s, const std::vector<int>& cols) {
     switch (s.mode) {
     case HostMoeSplit::Mode::Off:
         return 0;
-    case HostMoeSplit::Mode::Count:
-        return std::max(0, std::min(s.count, cap));
-    case HostMoeSplit::Mode::Fraction:
-        return std::max(
-            0,
-            std::min(cap, static_cast<int>(std::floor(s.fraction * static_cast<float>(n) + 0.5F))));
     case HostMoeSplit::Mode::Cost: {
         if (n <= s.min_misses) return 0;
         auto host = [&](int from, float slow) {
@@ -450,14 +443,6 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
 
     std::vector<Case> cases;
     {
-        HostMoeSplit c;
-        c.mode  = HostMoeSplit::Mode::Count;
-        c.count = 3;
-        cases.push_back({"count3", c});
-        HostMoeSplit f;
-        f.mode     = HostMoeSplit::Mode::Fraction;
-        f.fraction = 0.4F;
-        cases.push_back({"fraction0.4", f});
         HostMoeSplit
             a; // cost: device 2.5x host per expert, host columns cost a lot (ordering matters)
         a.mode               = HostMoeSplit::Mode::Cost;
@@ -475,10 +460,11 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         HostMoeSplit m = a;
         m.min_misses   = 64; // never: every miss stays on the host
         cases.push_back({"cost-min64", m});
-        HostMoeSplit all;
-        all.mode     = HostMoeSplit::Mode::Fraction;
-        all.fraction = 1.0F;
-        cases.push_back({"fraction1", all});
+        HostMoeSplit all     = a; // a free device share: every miss when they fit in max_reads
+        all.min_misses       = 0;
+        all.device_fixed_us  = 0.0F;
+        all.device_expert_us = 0.0F;
+        cases.push_back({"cost-free", all});
     }
     std::normal_distribution<float> normal(0.0F, 1.0F);
     std::uniform_real_distribution<float> w(0.02F, 0.3F);
@@ -559,11 +545,9 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
                 else
                     ++it->cols;
             }
-            if (c.split.mode != HostMoeSplit::Mode::Count) {
-                std::stable_sort(miss.begin(), miss.end(), [](const Miss& a, const Miss& b) {
-                    return a.cols != b.cols ? a.cols > b.cols : a.first < b.first;
-                });
-            }
+            std::stable_sort(miss.begin(), miss.end(), [](const Miss& a, const Miss& b) {
+                return a.cols != b.cols ? a.cols > b.cols : a.first < b.first;
+            });
             std::vector<int> cols;
             for (const auto& m : miss) cols.push_back(m.cols);
             const int g = reference_share(c.split, cols);
@@ -759,8 +743,8 @@ int main() {
     cfg.intermediate   = I;
     cfg.cpus           = spread_cpus(6);
     cfg.trace_capacity = 1024;
-    cfg.executor.a4 =
-        false; // the shares are checked against the W4A8 reference (A4 is the default since v0.2.1)
+    // The shares are checked against the W4A8 reference (A4 is the default).
+    cfg.executor.a4 = false;
 
     // Host reference executor on its own pool (the mailbox's service thread owns the first cpus).
     const auto ref_cpus = std::vector<int>(cfg.cpus.begin() + 3, cfg.cpus.end());

@@ -11,7 +11,7 @@
 // experts still defines its output, per-token weights of a repeated expert are summed in top-k
 // order, the arrival counters are cleared by the first kernel (no state between calls), and the
 // workspace is caller-owned; both kernels run over a compacted list of the distinct resident
-// experts on persistent grids with a rolling weight prefetch (T46; per-(row, token) arithmetic
+// experts on persistent grids with a rolling weight prefetch (per-(row, token) arithmetic
 // unchanged, output bit-identical to the one-CTA-per-position kernels).
 //
 // Same quantization recipe as FlashInfer's CUTLASS MoE (TensorRT-LLM kernels): activations are
@@ -46,7 +46,7 @@ constexpr int HQ = HB / 4, IQ = IB / 4; // 40, 10 quads (64 elements) per row
 constexpr int G1_THREADS = 128, G1_BLOCKS_PER_POS = I / 16;
 constexpr int G2_THREADS = 256, G2_ROWS = 128, G2_TILES = H / G2_ROWS;
 // Compacted kernels: register caps for 3 gemm1 / 2 gemm2 CTAs per SM (no spills at these caps),
-// persistent grids of G1_GRID_PER_SM / G2_GRID_PER_SM CTAs per SM (T46 sweep on the RTX 5070 Ti:
+// persistent grids of G1_GRID_PER_SM / G2_GRID_PER_SM CTAs per SM (sweep on the RTX 5070 Ti:
 // 2/2 best at the decode window shapes; the free gemm1 capacity lets gemm2 CTAs start and
 // prefetch their weights while gemm1 drains).
 constexpr int G1_MIN_BLOCKS = 3, G2_MIN_BLOCKS = 2;

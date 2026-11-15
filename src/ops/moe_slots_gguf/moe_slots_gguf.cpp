@@ -3,6 +3,7 @@
 #include "ninfer/ops/moe_slots_gguf.h"
 
 #include "ops/moe_slots_gguf/launch.h"
+#include "ops/common/validate.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -35,12 +36,6 @@ void require_columns(const Tensor& t, std::int32_t rows, std::int32_t tokens, co
 }
 
 bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; }
-
-bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
-    const auto pa = reinterpret_cast<std::uintptr_t>(a);
-    const auto pb = reinterpret_cast<std::uintptr_t>(b);
-    return pa < pb + b_bytes && pb < pa + a_bytes;
-}
 
 // The shared part of both Ops' contracts: inputs, layer, formats; returns T.
 std::int32_t validate_inputs(const Tensor& x, const Tensor& routed_ids,
@@ -104,10 +99,10 @@ void require_workspace(WorkspaceArena& workspace, std::size_t need, const char* 
 void require_no_overlap(const Tensor& out, const Tensor& x, const Tensor& ids, const Tensor& w,
                         const MoeGgufLayer& layer, WorkspaceArena& workspace, const char* op) {
     for (const Tensor* t : {&x, &ids, &w, &layer.slot_table}) {
-        require(!overlaps(out.data, out.bytes(), t->data, t->bytes()), op,
+        require(!detail::overlaps(out.data, out.bytes(), t->data, t->bytes()), op,
                 "out must not overlap an input");
     }
-    require(!overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()), op,
+    require(!detail::overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()), op,
             "out must not overlap the workspace");
 }
 
@@ -155,7 +150,7 @@ void moe_slots_gguf(const Tensor& x, const Tensor& routed_ids, const Tensor& rou
     call.experts    = experts_of(layer);
     call.accumulate = mode == MoeSlotsOutput::Accumulate;
     call.out_f32    = out.dtype == DType::FP32 ? static_cast<float*>(out.data) : nullptr;
-    call.out_bf16 = out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
+    call.out_bf16   = out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
     detail::gguf_decode_launch(call, ws, stream);
 }
 
@@ -176,7 +171,7 @@ void moe_grouped_gguf(const Tensor& x, const Tensor& routed_ids, const Tensor& r
     require_columns(out, kMoeSlotsHidden, tokens, kOp, "out");
     require(aligned16(out.data), kOp, "out must be 16-byte aligned");
 
-    const std::int32_t chunk         = std::min(tokens, detail::kGgufGroupedChunkColumns);
+    const std::int32_t chunk          = std::min(tokens, detail::kGgufGroupedChunkColumns);
     const detail::GgufGroupedLayout l = detail::gguf_grouped_layout(chunk);
     require_workspace(workspace, l.total, kOp);
     require_no_overlap(out, x, routed_ids, routed_weights, layer, workspace, kOp);

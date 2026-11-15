@@ -2,9 +2,8 @@
 
 // Structured-output request and observation types (constrained decoding). The definitions are
 // taken from Neroued/ninfer 77c2e5e2 (include/ninfer/types.h and
-// include/ninfer/observability/execution.h) and kept in a capy-flash-owned header so that
-// types.h only gains an include. Nothing in the engine consumes them yet: the text library
-// (src/text/grammar.h) is their only user until the frontend/engine hooks land.
+// include/ninfer/observability/execution.h) and kept in a separate header so that
+// types.h only gains an include.
 
 #include <cstddef>
 #include <cstdint>
@@ -47,7 +46,7 @@ struct OutputConstraint {
     bool operator==(const OutputConstraint&) const = default;
 };
 
-// capy-flash: limits that keep one client's constraint from stopping the server, stalling the
+// Limits that keep one client's constraint from stopping the server, stalling the
 // other requests or exhausting host memory. Input limits are checked before compilation (and
 // already in the HTTP layer); the compilation runs under a deadline with bounded concurrency; the
 // matcher work of a generating request runs under a per-round limit, a cumulative budget of
@@ -73,8 +72,8 @@ struct OutputConstraintLimits {
     // commit's accept), on the calling thread; the wall clock is checked at 5x as a safety net.
     std::uint32_t round_budget_ms = 20;
     // Cumulative matcher CPU time of one request: request_budget_ms plus round_allowance_ms for
-    // every round it has run. 5 ms per round: a legitimate domain-name `pattern` measured 3.4 ms
-    // per round with every core busy (Flash-Next, 48 busy loops), where 2 ms failed it.
+    // every round it has run. 5 ms per round: a legitimate domain-name `pattern` needs about 3.4 ms
+    // per round with every core busy.
     std::uint32_t request_budget_ms  = 1000;
     std::uint32_t round_allowance_ms = 5;
     // Memory of one request's matcher history (it grows with the output, quadratically for an
@@ -99,8 +98,8 @@ enum class ToolConstraintMode : std::uint8_t { Automatic, Basic };
 
 // Engine-level tool selection (distinct from the wire-level serve::ToolChoice). Declarations
 // belong to PromptOptions. Selection and cardinality affect this generation only.
-// capy-flash default: Automatic (upstream: Basic), so that tool_choice:auto without strict tools
-// keeps today's unconstrained path and its stop strings.
+// Default Automatic, so that tool_choice:auto without strict tools keeps the
+// unconstrained path and its stop strings.
 struct ToolChoice {
     ToolChoiceMode mode = ToolChoiceMode::Auto;
     std::optional<std::vector<std::string>> allowed_names;

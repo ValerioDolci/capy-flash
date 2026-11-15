@@ -1,4 +1,4 @@
-// T103 (docs/capy-flash/development-log.md): generic BF16 A16 linear for the shapes the finite
+// Generic BF16 A16 linear for the shapes the finite
 // registry (bf16_dispatch.cpp) does not name, e.g. Qwen3.8-Flash-Next's GDN q|k|v|z
 // [16384,2560] / [8192,2560] kept in BF16, and for the small-T widths of the named
 // Qwen3.8-Flash-Next shapes (shapes/qwen4_exp.cu). Correctness first: any N, K, T (16-byte vector

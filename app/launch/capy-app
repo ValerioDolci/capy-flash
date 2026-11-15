@@ -1,0 +1,15 @@
+#!/bin/sh
+# capy-flash app launcher: finds a Python >= 3.9 (standard library only) and starts the app from this checkout/tarball.
+# Started from a desktop icon the PATH is minimal, so the usual install locations are tried explicitly.
+here=$(cd "$(dirname "$0")/.." && pwd)
+for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+    cd "$here" && exec "$py" -m capy_app "$@"
+  fi
+done
+msg="capy-flash app needs Python 3.9 or newer"
+if [ "$(uname)" = Darwin ]; then
+  osascript -e "display alert \"capy-flash\" message \"$msg (xcode-select --install provides it).\"" >/dev/null 2>&1
+fi
+echo "$msg" >&2
+exit 1

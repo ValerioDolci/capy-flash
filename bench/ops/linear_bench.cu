@@ -83,21 +83,6 @@ constexpr SuiteEntry kQwen27bEntries[] = {
     {"27b.vision_merger_fc2", QType::Q8_G32_FP16, 5120, 4608, TClass::VisionStep4},
 };
 
-// The registered hidden-2048 geometries (heads, projections and Vision merger output).
-constexpr SuiteEntry kHidden2048Entries[] = {
-    {"h2048.n248320_q6", QType::Q6_G64_FP16, 248320, 2048, TClass::Continuous},
-    {"h2048.n131072_q4", QType::Q4_G64_FP16, 131072, 2048, TClass::Continuous},
-    {"h2048.k4096_q8", QType::Q8_G32_FP16, 2048, 4096, TClass::Continuous},
-    {"h2048.k16384_q8", QType::Q8_G32_FP16, 2048, 16384, TClass::Continuous},
-    {"h2048.vision_patch", QType::Q6_G64_FP16, 1152, 1536, TClass::VisionStep4},
-    {"h2048.vision_qkv", QType::Q4_G64_FP16, 3456, 1152, TClass::VisionStep4},
-    {"h2048.vision_attn_out", QType::Q5_G64_FP16, 1152, 1152, TClass::VisionStep4},
-    {"h2048.vision_fc1", QType::Q4_G64_FP16, 4304, 1152, TClass::VisionStep4},
-    {"h2048.vision_fc2", QType::Q5_G64_FP16, 1152, 4304, TClass::VisionStep4},
-    {"h2048.vision_merger_fc1", QType::Q8_G32_FP16, 4608, 4608, TClass::VisionStep4},
-    {"h2048.vision_merger_fc2", QType::Q8_G32_FP16, 2048, 4608, TClass::VisionStep4},
-};
-
 struct Sweep {
     std::int32_t begin = 0;
     std::int32_t end   = 0;
@@ -322,7 +307,7 @@ void usage(const char* argv0) {
                  "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
                  "  %s --qtype Q4|Q5|Q6|Q8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
-                 "  %s --suite qwen3_6_27b|hidden2048|all [options]\n\n"
+                 "  %s --suite qwen3_6_27b|all [options]\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
@@ -401,8 +386,8 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--t and --sweep are mutually exclusive");
     }
     if (opt.have_suite) {
-        if (opt.suite != "qwen3_6_27b" && opt.suite != "hidden2048" && opt.suite != "all") {
-            throw std::invalid_argument("--suite must be qwen3_6_27b, hidden2048, or all");
+        if (opt.suite != "qwen3_6_27b" && opt.suite != "all") {
+            throw std::invalid_argument("--suite must be qwen3_6_27b or all");
         }
         if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
@@ -466,9 +451,6 @@ std::vector<BenchPoint> expand_points(const Options& opt) {
     if (opt.have_suite) {
         if (opt.suite == "qwen3_6_27b" || opt.suite == "all") {
             append_suite(points, kQwen27bEntries);
-        }
-        if (opt.suite == "hidden2048" || opt.suite == "all") {
-            append_suite(points, kHidden2048Entries);
         }
         return points;
     }

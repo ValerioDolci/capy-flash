@@ -459,46 +459,6 @@ int run_q4_q5() {
     return failures;
 }
 
-int run_q8() {
-    constexpr std::int32_t kHidden    = 2048;
-    constexpr std::int32_t kValueRows = 4096;
-    constexpr std::int32_t kZRows     = 4096;
-    DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 1501U));
-
-    int failures   = 0;
-    const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                         std::uint32_t seed) {
-        const std::size_t snapshot_bytes =
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
-        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, width, width);
-        return run_case(
-            "Q8 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
-            kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
-            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
-                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                                                  initial, snapshot_base, q, k, v, z, workspace,
-                                                  stream);
-            },
-            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
-                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
-                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, workspace, stream);
-            },
-            seed);
-    };
-    failures += run(2, 1, {1}, 1511U);
-    failures += run(16, 1, {}, 1521U);
-    failures += run(16, 8, {16, 13, 9, 7, 5, 3, 2, 1}, 1531U);
-    failures += parent.verify_preserved("Q8 record parent weight");
-    return failures;
-}
-
 int run_nvfp4() {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
@@ -603,7 +563,6 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
-    failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
     failures += run_steps();

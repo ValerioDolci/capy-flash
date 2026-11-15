@@ -115,11 +115,6 @@ __device__ int device_share_size(const HostMoeSplit& s, int n, const unsigned ch
     if (n <= 0) return 0;
     const int cap = min(n, min(s.max_reads, kMaxDeviceReads));
     switch (s.mode) {
-    case HostMoeSplit::Mode::Count:
-        return max(0, min(s.count, cap));
-    case HostMoeSplit::Mode::Fraction:
-        return max(0,
-                   min(cap, static_cast<int>(floorf(s.fraction * static_cast<float>(n) + 0.5F))));
     case HostMoeSplit::Mode::Cost: {
         if (n <= s.min_misses) return 0;
         float rest = 0.0F;
@@ -145,7 +140,7 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
                                const float* __restrict__ alpha, Residency resident, int routes,
                                int x_vectors, std::uint32_t tokens, SlotDevice out, LogDevice log,
                                Doorbell bell) {
-    // A programmatic dependent of the routing (T49): everything below reads its outputs. No early
+    // A programmatic dependent of the routing: everything below reads its outputs. No early
     // trigger: the kernels after a publish (shared expert) are ordinary launches.
     pdl::wait_for_dependencies();
     if (blockIdx.x == 0 && threadIdx.x == 0 && log.stamp != nullptr) *log.stamp = global_ns();
@@ -198,16 +193,13 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
                 columns[j] = static_cast<unsigned char>(c);
             }
             __syncthreads();
-            const bool by_route = split.mode == HostMoeSplit::Mode::Count;
             for (int j = static_cast<int>(threadIdx.x); j < routes;
                  j += static_cast<int>(blockDim.x)) {
                 if (first[j] == 0) continue;
                 int rank = 0;
                 for (int i = 0; i < routes; ++i) {
                     if (first[i] == 0 || i == j) continue;
-                    rank += by_route
-                                ? (i < j)
-                                : (columns[i] > columns[j] || (columns[i] == columns[j] && i < j));
+                    rank += columns[i] > columns[j] || (columns[i] == columns[j] && i < j);
                 }
                 order_id[rank]      = route_id[j];
                 order_columns[rank] = columns[j];
@@ -302,7 +294,7 @@ struct StagePlanes {
 };
 
 // Grid-stride copy of picks[0..n) experts' planes, 4 independent loads in flight per thread
-// (host-mapped reads are latency bound: bytes in flight set the rate, F0-E).
+// (host-mapped reads are latency bound: bytes in flight set the rate).
 __global__ void stage_kernel(StagePlanes p, const std::int32_t* __restrict__ picks) {
     const int n = picks[kMaxDeviceReads];
     if (n <= 0) return;
@@ -356,36 +348,15 @@ __device__ __forceinline__ bool host_partial_present(const std::uint32_t* active
     return present != 0;
 }
 
-// v07/decode-overheads B (NINFER_HOST_MOE_EARLY_PARTIAL=1, decode calls only): every thread issues
-// its partial load before thread 0's read of the active word, so the two PCIe round trips overlap
-// instead of following each other (the partial is complete before the kernel starts: the host
-// writes it, then active, then releases done, which the stream waited for). A call without host
-// experts then reads its partial for nothing (T x H x 4 bytes, ignored). Volatile asm: the load
-// stays ahead of the barrier in host_partial_present; the register is waited for at its first use.
-__device__ __forceinline__ float4 ldcv_early(const float4* p) {
-    float4 v;
-    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
-                 : "l"(p));
-    return v;
-}
-
 __global__ void accumulate_bf16_kernel(__nv_bfloat16* __restrict__ y, const float* partial,
                                        const std::uint32_t* active, int vectors,
-                                       unsigned long long* stamp, int early) {
+                                       unsigned long long* stamp) {
     if (stamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *stamp = global_ns();
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    float4 a{}, b{};
-    if (early != 0 && i < vectors) {
-        a = ldcv_early(reinterpret_cast<const float4*>(partial) + 2 * i);
-        b = ldcv_early(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
-    }
     if (!host_partial_present(active)) return;
     if (i >= vectors) return;
-    if (early == 0) {
-        a = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
-        b = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
-    }
+    const float4 a   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
+    const float4 b   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
     uint4 raw        = reinterpret_cast<uint4*>(y)[i];
     auto* h          = reinterpret_cast<__nv_bfloat162*>(&raw);
     const float p[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
@@ -402,17 +373,14 @@ __global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partia
                                       const std::uint32_t* active, int vectors,
                                       unsigned long long* stamp,
                                       const float* __restrict__ device_partial, float* echo,
-                                      float* echo_y, int early) {
+                                      float* echo_y) {
     if (stamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *stamp = global_ns();
-    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    float4 a{};
-    if (early != 0 && i < vectors) a = ldcv_early(reinterpret_cast<const float4*>(partial) + i);
+    const int i     = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const bool host = host_partial_present(active);
     if (!host && device_partial == nullptr && echo_y == nullptr) return;
     if (i >= vectors) return;
     float4 v = reinterpret_cast<float4*>(y)[i];
-    if (echo_y != nullptr)
-        reinterpret_cast<float4*>(echo_y)[i] = v; // T98: the device's own partial
+    if (echo_y != nullptr) reinterpret_cast<float4*>(echo_y)[i] = v; // the device's own partial
     if (!host && device_partial == nullptr) return;
     if (device_partial != nullptr) {
         const float4 d = reinterpret_cast<const float4*>(device_partial)[i];
@@ -422,8 +390,8 @@ __global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partia
         v.w += d.w;
     }
     if (host) {
-        if (early == 0) a = __ldcv(reinterpret_cast<const float4*>(partial) + i);
-        if (echo != nullptr) reinterpret_cast<float4*>(echo)[i] = a; // T98: what the device read
+        const float4 a = __ldcv(reinterpret_cast<const float4*>(partial) + i);
+        if (echo != nullptr) reinterpret_cast<float4*>(echo)[i] = a; // what the device read
         v.x += a.x;
         v.y += a.y;
         v.z += a.z;
@@ -469,31 +437,8 @@ std::int64_t HostMoeMailbox::now_ns() noexcept {
 
 HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpertLayer> layers)
     : config_(std::move(config)), layers_(std::move(layers)) {
-    // Measurement overrides (T35 A/B runs of the engine without a rebuild).
-    if (const char* v = std::getenv("NINFER_HOST_MOE_SCHEDULE"); v != nullptr && *v != 0) {
-        config_.executor.schedule =
-            std::string(v) == "dynamic" ? Schedule::Dynamic : Schedule::Static;
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_MEMBER_QUANT"); v != nullptr && *v != 0) {
-        config_.executor.member_quantize = std::atoi(v) != 0;
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_STEAL"); v != nullptr && *v != 0) {
-        config_.executor.steal = std::atoi(v) != 0;
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_PREFETCH"); v != nullptr && *v != 0) {
-        config_.executor.prefetch_rows = std::atoi(v);
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_DOWN_PREFETCH"); v != nullptr && *v != 0) {
-        config_.executor.down_prefetch_kib = std::atoi(v);
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_W4A4"); v != nullptr && *v != 0) {
-        config_.executor.emulate_w4a4 = std::atoi(v) != 0; // T98 validation
-    }
     if (const char* v = std::getenv("NINFER_HOST_MOE_A4"); v != nullptr && *v != 0) {
-        config_.executor.a4 = std::atoi(v) != 0; // T98: CPU with the GPU's W4A4 activation codec
-    }
-    if (const char* v = std::getenv("NINFER_HOST_MOE_EARLY_PARTIAL"); v != nullptr && *v != 0) {
-        early_partial_ = std::atoi(v) != 0; // v07/decode-overheads B
+        config_.executor.a4 = std::atoi(v) != 0; // CPU with the GPU's W4A4 activation codec
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_CPUS"); v != nullptr && *v != 0) {
         // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
@@ -690,14 +635,12 @@ void HostMoeMailbox::publish_table(cudaStream_t stream, std::int32_t layer, std:
         throw std::invalid_argument("host MoE mailbox: routing log offset out of range");
     }
     const bool splitting = split.mode != HostMoeSplit::Mode::Off;
-    const auto mode      = static_cast<std::int32_t>(split.mode);
-    if (mode < 0 || mode > static_cast<std::int32_t>(HostMoeSplit::Mode::Cost) ||
-        (splitting && (share.reads == nullptr || tokens * config_.top_k > kMaxRoutes ||
-                       split.max_reads < 0 || split.max_reads > kMaxDeviceReads ||
-                       split.count < 0 || !(split.fraction >= 0.0F && split.fraction <= 1.0F) ||
-                       split.min_misses < 0 || !(split.host_read_slowdown >= 1.0F)))) {
+    if (splitting && (split.mode != HostMoeSplit::Mode::Cost || share.reads == nullptr ||
+                      tokens * config_.top_k > kMaxRoutes || split.max_reads < 0 ||
+                      split.max_reads > kMaxDeviceReads || split.min_misses < 0 ||
+                      !(split.host_read_slowdown >= 1.0F))) {
         throw std::invalid_argument("host MoE mailbox: a split needs a reads output, <= 8 tokens, "
-                                    "max_reads/count in [0,16], fraction in [0,1], slowdown >= 1");
+                                    "max_reads in [0,16], slowdown >= 1");
     }
     publish_impl(
         stream, layer, tokens, x, ids, alpha,
@@ -811,8 +754,7 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
     const int vectors      = tokens * config_.hidden / 8;
     constexpr int kThreads = 256;
     accumulate_bf16_kernel<<<(vectors + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer),
-        early_partial_ && tokens <= kHostMaxTokens ? 1 : 0);
+        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -837,8 +779,7 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
         echo_ != nullptr && tokens <= kHostMaxTokens
             ? echo_ + static_cast<std::size_t>(2 * layer + 1) * kHostMaxTokens *
                           static_cast<std::size_t>(config_.hidden)
-            : nullptr,
-        early_partial_ && tokens <= kHostMaxTokens ? 1 : 0);
+            : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -904,11 +845,11 @@ namespace {
 // singular.
 bool solve_costs(std::span<const HostMoeCostSample> s, const std::vector<char>& keep,
                  bool with_column, double column, std::array<double, 3>& out) {
-    const int n = with_column ? 3 : 2;
+    const int n    = with_column ? 3 : 2;
     double a[3][4] = {};
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (keep[i] == 0) continue;
-        const double c = static_cast<double>(s[i].pairs - s[i].experts);
+        const double c    = static_cast<double>(s[i].pairs - s[i].experts);
         const double x[3] = {1.0, static_cast<double>(s[i].experts), c};
         const double y    = static_cast<double>(s[i].us) - (with_column ? 0.0 : column * c);
         for (int r = 0; r < n; ++r) {
@@ -960,7 +901,7 @@ HostMoeCostFit fit_host_costs(std::span<const HostMoeCostSample> samples, float 
         const double mad = std::max(sorted[sorted.size() / 2], 0.5);
         for (std::size_t i = 0; i < samples.size(); ++i) keep[i] = r[i] <= 4.0 * mad ? 1 : 0;
     }
-    double ss = 0.0;
+    double ss         = 0.0;
     std::int32_t kept = 0;
     for (std::size_t i = 0; i < samples.size(); ++i) {
         if (keep[i] == 0) continue;
@@ -1030,7 +971,7 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
     *v.ready  = 0;
     r.layer   = layer;
     r.tokens  = static_cast<std::int32_t>(load_acquire(v.tokens));
-    // T98: the previous dumped call's accumulate ran before this publish (stream order).
+    // The previous dumped call's accumulate ran before this publish (stream order).
     if (!dump_path_.empty()) dump_fill_echo();
     const std::int32_t routes = r.tokens * config_.top_k;
     bool any                  = false;
@@ -1048,7 +989,8 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
             const std::lock_guard lock(cost_mutex_);
             if (static_cast<std::int64_t>(cost_samples_.size()) <
                 cost_capacity_.load(std::memory_order_relaxed)) {
-                cost_samples_.push_back({st.experts, st.pairs, 1e-3F * static_cast<float>(st.end_ns)});
+                cost_samples_.push_back(
+                    {st.experts, st.pairs, 1e-3F * static_cast<float>(st.end_ns)});
             }
         }
     }
@@ -1150,8 +1092,13 @@ void HostMoeMailbox::service() {
     std::int32_t layer = 0;
     try {
         HostCpuPool pool(config_.cpus);
+        HostMoeExecutor::Options executor_options = config_.executor;
+        executor_options.gguf_only =
+            std::all_of(layers_.begin(), layers_.end(), [](const HostExpertLayer& l) {
+                return l.format == HostExpertFormat::Gguf;
+            });
         HostMoeExecutor executor(pool, config_.hidden, config_.intermediate, config_.max_tokens,
-                                 config_.top_k, config_.executor);
+                                 config_.top_k, executor_options);
         started_.store(1, std::memory_order_release);
         using clock         = std::chrono::steady_clock;
         auto last           = clock::now();

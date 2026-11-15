@@ -27,7 +27,7 @@ enum class QType : std::uint16_t {
     GGUF_IQ2_S   = 14,
     GGUF_IQ4_XS  = 15,
     GGUF_Q2_0    = 16,
-    Q3_G128_FP16 = 17, // v0.7 27b-16gb: 3-bit GSQ body, 48 code bytes per 128 (artifacts store the name)
+    Q3_G128_FP16 = 17, // 27b-16gb: 3-bit GSQ body, 48 code bytes per 128 (artifacts store the name)
 };
 
 enum class QuantLayout : std::uint16_t {

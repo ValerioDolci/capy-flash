@@ -9,7 +9,7 @@
 
 namespace ninfer::runtime {
 
-// Structured output (upstream 08902f73): token masks of the constrained rows of one Program call.
+// Structured output (ported from ninfer): token masks of the constrained rows of one Program call.
 // Borrowed for that call only; the Engine maps compact rows to request-owned matchers.
 class TokenMaskProvider {
 public:

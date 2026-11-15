@@ -33,9 +33,8 @@ struct Options {
     double create_gib = 0.0;
     std::string mode = "mapped", cache = "cold", format = "fp8";
     std::vector<int> tokens{1, 4, 8};
-    int repeat = 30;
-    double lead_us =
-        0.0; // T53: prefetch() this long before the timed gather (0 = no prefetch call)
+    int repeat     = 30;
+    double lead_us = 0.0; // prefetch() this long before the timed gather (0 = no prefetch call)
 };
 
 std::vector<int> list(const std::string& text) {
@@ -55,10 +54,9 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help") {
-            std::puts(
-                "usage: ninfer_ple_gather_bench --file PATH [--create-gib G] "
-                "[--format fp8|nvfp4] [--mode mapped|mapped-noprefetch|stream] [--cache cold|warm] "
-                "[--tokens T,...] [--repeat N]");
+            std::puts("usage: ninfer_ple_gather_bench --file PATH [--create-gib G] "
+                      "[--format fp8|nvfp4] [--mode mapped|mapped-noprefetch] [--cache cold|warm] "
+                      "[--tokens T,...] [--repeat N]");
             std::exit(0);
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
@@ -84,6 +82,8 @@ Options parse(int argc, char** argv) {
     }
     if (o.file.empty()) throw std::invalid_argument("--file is required");
     if (o.format != "fp8" && o.format != "nvfp4") throw std::invalid_argument("unknown --format");
+    if (o.mode != "mapped" && o.mode != "mapped-noprefetch")
+        throw std::invalid_argument("unknown --mode");
     return o;
 }
 
@@ -172,10 +172,8 @@ int main(int argc, char** argv) {
             table.row_bytes   = kRowWidth;
             table.scale_plane = scale_plane(table.rows);
         }
-        table.segments = {{0, bytes, static_cast<const std::byte*>(map), o.file, 0}};
-        const PleResidency residency =
-            o.mode == "stream" ? PleResidency::Stream : PleResidency::Mapped;
-        PleGather gather(table, official_hash(table.rows), residency, o.mode == "mapped");
+        table.segments = {{0, bytes, static_cast<const std::byte*>(map)}};
+        PleGather gather(table, official_hash(table.rows), o.mode == "mapped");
         std::printf("table=%s %.2f GiB format=%s rows=%llu mode=%s cache=%s\n", o.file.c_str(),
                     bytes / double(1ULL << 30), o.format.c_str(),
                     static_cast<unsigned long long>(table.rows), o.mode.c_str(), o.cache.c_str());
@@ -190,7 +188,7 @@ int main(int argc, char** argv) {
                 }
                 if (o.cache == "cold") { ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
                 if (o.lead_us > 0.0) {
-                    // T53: the engine's next-round prefetch, `lead_us` of other host work earlier.
+                    // The engine's next-round prefetch, `lead_us` of other host work earlier.
                     const auto issued = std::chrono::steady_clock::now();
                     gather.prefetch(tokens, 2, static_cast<std::size_t>(t));
                     while (std::chrono::duration<double, std::micro>(

@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/engine_options.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -47,15 +48,6 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
         throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
     }
     return static_cast<std::uint32_t>(value);
-}
-
-KvCacheStorage parse_kv_cache(std::string_view text) {
-    if (text == "bf16") { return KvCacheStorage::BFloat16; }
-    if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -352,7 +344,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value("--kv-dtype"));
+            options.kv_cache = product::parse_kv_dtype(value("--kv-dtype"));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {

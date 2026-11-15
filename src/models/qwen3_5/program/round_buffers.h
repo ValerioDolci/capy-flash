@@ -58,7 +58,7 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
-    // T59 replay (NINFER_QWEN4_REPLAY, validation/measurement): the target token of every
+    // Replay (NINFER_QWEN4_REPLAY, validation/measurement): the target token of every
     // verification column ([K+1, C], the reference continuation). Copied over the computed argmax
     // before acceptance only in a Program built with the replay on; otherwise never read.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> forced_targets{};
@@ -72,7 +72,7 @@ struct MtpDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
     // Natural-log softmax probability of every proposal (same layout as next_drafts); written
-    // only by rounds captured with draft log-probabilities (adaptive window, T41).
+    // only by rounds captured with draft log-probabilities (NINFER_QWEN4_MTP_CALIB).
     std::array<float, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_draft_logprobs{};
 };
 
@@ -246,7 +246,7 @@ struct MtpDecodeState {
     Tensor state_destination_slots;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
-    Tensor forced_targets; // T59 replay, [K+1, C]
+    Tensor forced_targets; // replay, [K+1, C]
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;

@@ -78,11 +78,6 @@ inline DeviceBuffer make_zeros(std::size_t bytes) {
     return d;
 }
 
-// cudaDeviceProp memory-clock fields were removed in CUDA 13; the in-process
-// GB/s is informational anyway (ncu is the acceptance gate), so report against
-// the known RTX 5090 roofline constant.
-inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
-
 struct ColdTiming {
     double median_us = 0.0;
     double min_us    = 0.0;

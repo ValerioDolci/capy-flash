@@ -6,6 +6,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>
@@ -329,9 +330,9 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         sizeof(M64ReusableStorage<TileColumns, kBlockK, kRowsPerProducer>) +
         (kRowsPerProducer > 64 ? TileColumns * kLinearTopK * sizeof(std::uint64_t) : 0);
     if constexpr (shared_bytes > 48 * 1024) {
-        CUDA_CHECK(
-            cudaFuncSetAttribute(q8_m64_linear_topk_kernel<TileColumns, kBlockK, kRowsPerProducer>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+        static FuncAttrPerDevice attribute;
+        attribute.ensure(q8_m64_linear_topk_kernel<TileColumns, kBlockK, kRowsPerProducer>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
     }
     q8_m64_linear_topk_kernel<TileColumns, kBlockK, kRowsPerProducer>
         <<<dim3(workspace.producer_groups, div_up(hidden.ne[1], TileColumns)),

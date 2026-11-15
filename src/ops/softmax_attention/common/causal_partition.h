@@ -6,8 +6,8 @@
 
 namespace ninfer::ops::detail {
 
-// RTX 5090 target, still used by the FP8, NVFP4 and K8V4 plans. Wave budgets remain owned by
-// each dtype plan.
+// RTX 5090 target, still used by the BF16, FP8, NVFP4 and K8V4 plans. Wave budgets remain owned
+// by each dtype plan.
 inline constexpr int kCausalAttentionSmCount = 170;
 
 // Streaming multiprocessors of the current device (170 on an RTX 5090, 70 on an RTX 5070 Ti),

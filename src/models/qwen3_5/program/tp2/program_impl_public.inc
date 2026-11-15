@@ -1,7 +1,7 @@
 // Class-body fragment of ProgramImpl (program/program_impl.h), included in its public section
 // right after `workspace_plan`: the two-device (tp 2) runtime. The position matters: rank 1's
 // storage and the mailbox are declared before rank 0's storage and the graph families so that
-// they are destroyed after them. Not a header; our file, see docs/maintainer/upstream-merge.md.
+// they are destroyed after them. Not a header.
 
 public:
 // Tensor-parallel rank 1 (width 2 only). It holds rank 0's workspace layout (with Vision, only
@@ -19,7 +19,7 @@ struct PeerRuntime {
     [[nodiscard]] static const PersistentLayout& layout(const SequencePlanImpl& plan);
 
     DeviceContext& device;
-    std::unique_ptr<ElasticArena> elastic_arena; // T64, as ProgramImpl::elastic_arena
+    std::unique_ptr<ElasticArena> elastic_arena; // as ProgramImpl::elastic_arena
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
@@ -44,19 +44,19 @@ struct PeerRuntime {
     Tensor qwen4_expert_table;
     Tensor qwen4_decode_ple_rows;
     Tensor qwen4_ple_record; // MTP rounds: rank 1's PLE convolution inputs
-    // Offloaded experts (T33): rank 1's slot pool, slot table and divisor copy.
+    // Offloaded experts: rank 1's slot pool, slot table and divisor copy.
     std::array<std::byte*, 4> qwen4_cache_pool{};
     std::int32_t* qwen4_cache_table   = nullptr;
     float* qwen4_cache_divisors       = nullptr;
-    std::int32_t* qwen4_stream_tables = nullptr; // prefill streaming tables (T42)
-    // Miss-split share on rank 1 (T42): residency mirror, reads, staged scratch.
+    std::int32_t* qwen4_stream_tables = nullptr; // prefill streaming tables
+    // Miss-split share on rank 1: residency mirror, reads, staged scratch.
     std::int32_t* qwen4_cache_mirror = nullptr;
     std::int32_t* qwen4_cache_reads  = nullptr;
     std::int64_t* qwen4_slot_offsets = nullptr; // ggml block banks (Qwen4PersistentLayout)
     std::int32_t* qwen4_stage_table  = nullptr;
     std::int32_t* qwen4_stage_picks  = nullptr;
     std::array<std::byte*, 4> qwen4_staging{};
-    // T43 split draft shortlist: rank 1's gathered head rows (code, high, scale planes).
+    // Split draft shortlist: rank 1's gathered head rows (code, high, scale planes).
     std::array<std::byte*, 3> qwen4_draft_planes{};
 };
 
@@ -72,16 +72,16 @@ std::optional<CudaCompletionEvent> peer_context_completion_;
 // attached to peer_events. Declared before peer_events, which points to it, and before the
 // graph families, whose kernels address its slab: both are destroyed first.
 std::optional<ops::PeerMailbox> peer_mailbox;
-// The eager all-reduces' pinned-host transport (T56: prefill chunks), attached to peer_events
+// The eager all-reduces' pinned-host transport (prefill chunks), attached to peer_events
 // without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=0 / =1 force it off / on). Declared
 // before peer_events, which points to it.
 std::optional<ops::HostExchange> host_exchange;
-// v07/p2p-overlap: the split-phase sums' direct-copy lanes, attached to peer_events with peer
+// The split-phase sums' direct-copy lanes, attached to peer_events with peer
 // access and no HostExchange (NINFER_TP_PEER_OVERLAP=0 / =force: off / also without P2P).
 // Declared before peer_events, which points to it.
 std::optional<ops::PeerLanes> peer_lanes;
 std::optional<ops::PeerEvents> peer_events;
-// PR #64: the side streams of the tp 2 GDN gating overlap. Declared before the graph families,
+// The side streams of the tp 2 GDN gating overlap. Declared before the graph families,
 // which capture work on its streams and events: they are destroyed first.
 std::optional<execution::GdnGatingOverlap> gdn_gating_overlap;
 std::optional<DecodeGraphPeerBridge> graph_bridge;

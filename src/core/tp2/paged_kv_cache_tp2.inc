@@ -1,6 +1,6 @@
 // Translation-unit fragment of src/core/paged_kv_cache.cpp, included once at its end (after its
 // closing namespace), so the two-device code below shares that file's private helpers without
-// copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
+// copying them. Not a header.
 //
 // Two-device (tp 2) KV mirrors: rank 1's page and execution-table pools replay rank 0's physical
 // mutations (attach_mirror, the page runs both pools share, the mirror's execution-row lease).

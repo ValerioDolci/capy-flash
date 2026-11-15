@@ -1,7 +1,7 @@
 #pragma once
 
-// Structured output (P4): the Engine side of runtime::TokenMaskProvider. capy-flash file; the
-// shape follows upstream 08902f73 (EngineCore::RoundMasks).
+// Structured output: the Engine side of runtime::TokenMaskProvider, ported from ninfer
+// (EngineCore::RoundMasks).
 
 #include "runtime/contract/execution.h"
 

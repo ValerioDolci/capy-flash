@@ -17,7 +17,7 @@ namespace ninfer::ops::detail {
 template <int Rows, int K>
 [[nodiscard]] Bf16Launch select_bf16_qwen4_dense(std::int32_t tokens);
 
-// T103: generic BF16 A16 linear (bf16_generic.cu) for every shape the registry does not name.
+// Generic BF16 A16 linear (bf16_generic.cu) for every shape the registry does not name.
 void launch_bf16_generic(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -160,7 +160,7 @@ std::uint64_t Xxh64Stream::digest() const noexcept {
 
 namespace {
 
-constexpr char kMagic[8] = {'N', 'I', 'D', 'K', 'V', '0', '0', '2'};
+constexpr char kMagic[8]                = {'N', 'I', 'D', 'K', 'V', '0', '0', '2'};
 constexpr std::size_t kFixedHeaderBytes = 168;
 constexpr std::size_t kCheckpointBytes  = 24;
 constexpr std::size_t kSectionBytes     = 32;
@@ -179,10 +179,13 @@ std::uint64_t block_count(std::uint64_t bytes) noexcept {
 class ByteWriter {
 public:
     explicit ByteWriter(std::vector<std::byte>& out) : out_(out) {}
-    template <class T> void put(T value) {
+
+    template <class T>
+    void put(T value) {
         const auto* p = reinterpret_cast<const std::byte*>(&value);
         out_.insert(out_.end(), p, p + sizeof(T));
     }
+
     void put_bytes(const void* data, std::size_t length) {
         const auto* p = static_cast<const std::byte*>(data);
         out_.insert(out_.end(), p, p + length);
@@ -195,18 +198,22 @@ private:
 class ByteReader {
 public:
     ByteReader(const std::byte* data, std::size_t length) : data_(data), length_(length) {}
-    template <class T> bool get(T& value) {
+
+    template <class T>
+    bool get(T& value) {
         if (length_ - offset_ < sizeof(T)) { return false; }
         std::memcpy(&value, data_ + offset_, sizeof(T));
         offset_ += sizeof(T);
         return true;
     }
+
     bool get_bytes(void* out, std::size_t length) {
         if (length_ - offset_ < length) { return false; }
         std::memcpy(out, data_ + offset_, length);
         offset_ += length;
         return true;
     }
+
     [[nodiscard]] std::size_t offset() const noexcept { return offset_; }
 
 private:
@@ -223,10 +230,10 @@ std::uint64_t layout_sections(std::vector<DiskKVSectionInfo>& sections, std::siz
         section.first_block = blocks;
         blocks += block_count(section.bytes);
     }
-    const std::uint64_t header = align_up(kFixedHeaderBytes + key_bytes +
-                                              checkpoints * kCheckpointBytes +
-                                              sections.size() * kSectionBytes + blocks * 8U + 8U,
-                                          kDiskKVAlignment);
+    const std::uint64_t header =
+        align_up(kFixedHeaderBytes + key_bytes + checkpoints * kCheckpointBytes +
+                     sections.size() * kSectionBytes + blocks * 8U + 8U,
+                 kDiskKVAlignment);
     std::uint64_t offset = header;
     for (DiskKVSectionInfo& section : sections) {
         section.offset = offset;
@@ -364,7 +371,7 @@ bool remove_temporary_if_dead(const std::filesystem::path& path) {
     const std::string name = path.filename().string();
     const std::size_t temp = name.find(".tmp.");
     if (temp == std::string::npos) { return false; }
-    const long pid = std::strtol(name.c_str() + temp + 5, nullptr, 10);
+    const long pid  = std::strtol(name.c_str() + temp + 5, nullptr, 10);
     const bool dead = pid <= 0 || pid == static_cast<long>(::getpid()) ||
                       (::kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH);
     std::error_code error;
@@ -387,7 +394,7 @@ std::optional<DiskKVRecordHeader> DiskKVCache::read_header(int fd, std::uint64_t
     char magic[8];
     std::uint32_t version = 0, kind = 0, key_len = 0, token_count = 0, checkpoints = 0,
                   sections = 0;
-    std::uint64_t blocks = 0;
+    std::uint64_t blocks   = 0;
     DiskKVRecordHeader header;
     (void)fixed.get_bytes(magic, sizeof(magic));
     (void)fixed.get(version);
@@ -548,64 +555,8 @@ bool DiskKVRecordFile::read_prefix(
     return true;
 }
 
-bool DiskKVRecordFile::read_prefix_pipelined(
-    std::uint32_t section_index, std::uint64_t bytes, std::span<std::byte> first,
-    std::span<std::byte> second,
-    const std::function<void(std::span<const std::byte>, std::uint64_t)>& issue,
-    const std::function<void()>& wait) {
-    if (fd_ < 0 || section_index >= header_.sections.size() || first.empty() ||
-        first.size() != second.size() || first.size() % kDiskKVBlockBytes != 0 ||
-        reinterpret_cast<std::uintptr_t>(first.data()) % kDiskKVAlignment != 0 ||
-        reinterpret_cast<std::uintptr_t>(second.data()) % kDiskKVAlignment != 0) {
-        return false;
-    }
-    const DiskKVSectionInfo& section = header_.sections[section_index];
-    if (bytes > section.bytes) { return false; }
-    if (bytes == 0) { return true; }
-    const std::uint64_t chunk = first.size();
-    const auto load = [&](std::uint64_t position, std::byte* into) -> std::uint64_t {
-        const std::uint64_t want = std::min<std::uint64_t>(chunk, bytes - position);
-        const std::uint64_t end =
-            std::min<std::uint64_t>(align_up(position + want, kDiskKVBlockBytes), section.bytes);
-        const std::uint64_t length = end - position;
-        bool ok                    = false;
-        if (direct_fd_ >= 0) {
-            const std::uint64_t padded = align_up(length, kDiskKVAlignment);
-            ok = padded <= chunk && pread_all(direct_fd_, into, padded, section.offset + position);
-        }
-        if (!ok && !pread_all(fd_, into, length, section.offset + position)) { return 0; }
-        return length;
-    };
-    std::byte* buffers[2] = {first.data(), second.data()};
-    std::uint64_t loaded  = 0;
-    std::thread loader;
-    struct Joiner {
-        std::thread& thread;
-        ~Joiner() {
-            if (thread.joinable()) { thread.join(); }
-        }
-    } joiner{loader};
-    const std::uint64_t first_length = load(0, buffers[0]);
-    for (std::uint64_t position = 0, index = 0; position < bytes; position += chunk, ++index) {
-        if (loader.joinable()) { loader.join(); }
-        const std::uint64_t length = position == 0 ? first_length : loaded;
-        if (length == 0) { return false; }
-        std::byte* data          = buffers[index % 2];
-        const std::uint64_t want = std::min<std::uint64_t>(chunk, bytes - position);
-        const std::uint64_t next = position + chunk;
-        if (next < bytes) {
-            loader = std::thread([&, next, index] { loaded = load(next, buffers[(index + 1) % 2]); });
-        }
-        issue(std::span<const std::byte>(data, want), position);
-        const bool verified = verify_section(header_, section, data, position, length);
-        wait();
-        if (!verified) { return false; }
-    }
-    return true;
-}
-
 std::optional<std::uint64_t> DiskKVRecordFile::read_region(std::uint32_t first_section,
-                                                          std::span<std::byte> into) {
+                                                           std::span<std::byte> into) {
     if (fd_ < 0 || first_section >= header_.sections.size() ||
         reinterpret_cast<std::uintptr_t>(into.data()) % kDiskKVAlignment != 0) {
         return std::nullopt;
@@ -668,14 +619,18 @@ std::filesystem::path DiskKVCache::temp_path(const std::filesystem::path& final_
 }
 
 DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
-    if (options_.directory.empty()) { throw std::invalid_argument("disk KV cache needs a directory"); }
+    if (options_.directory.empty()) {
+        throw std::invalid_argument("disk KV cache needs a directory");
+    }
     if (options_.staging_buffers == 0 || options_.staging_bytes == 0 ||
         options_.staging_bytes % kDiskKVBlockBytes != 0) {
         throw std::invalid_argument("disk KV staging buffers must be whole 4 MiB blocks");
     }
     if (!options_.allocate || !options_.release) {
-        options_.allocate = [](std::size_t bytes) { return std::aligned_alloc(kDiskKVAlignment, bytes); };
-        options_.release  = [](void* data) { std::free(data); };
+        options_.allocate = [](std::size_t bytes) {
+            return std::aligned_alloc(kDiskKVAlignment, bytes);
+        };
+        options_.release = [](void* data) { std::free(data); };
     }
     key_hash_             = xxh64(options_.key.data(), options_.key.size());
     stats_.capacity_bytes = options_.capacity_bytes;
@@ -684,7 +639,8 @@ DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
     std::error_code error;
     std::filesystem::create_directories(manifests_dir_, error);
     std::filesystem::create_directories(blobs_dir_, error);
-    if (!std::filesystem::is_directory(manifests_dir_) || !std::filesystem::is_directory(blobs_dir_)) {
+    if (!std::filesystem::is_directory(manifests_dir_) ||
+        !std::filesystem::is_directory(blobs_dir_)) {
         throw std::runtime_error("disk KV cache directory " + options_.directory.string() +
                                  " cannot be created");
     }
@@ -696,7 +652,7 @@ DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
     }
     // One directory = one server: the accounting of the cap and of the files is per process.
     const std::filesystem::path lock = options_.directory / ".lock";
-    lock_fd_ = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    lock_fd_                         = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock_fd_ < 0) {
         throw std::runtime_error("disk KV cache: cannot open " + lock.string() + ": " +
                                  std::strerror(errno));
@@ -720,7 +676,7 @@ DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
     // Free-space margin: max(10 GiB, 5 % of the file system) unless given.
     if (options_.min_free_bytes == 0) {
         std::uint64_t total = 0;
-        struct statvfs vfs {};
+        struct statvfs vfs{};
         if (!options_.free_bytes && ::statvfs(blobs_dir_.c_str(), &vfs) == 0) {
             total = static_cast<std::uint64_t>(vfs.f_blocks) * vfs.f_frsize;
         }
@@ -728,8 +684,8 @@ DiskKVCache::DiskKVCache(Options options) : options_(std::move(options)) {
     }
     stats_.min_free_bytes = options_.min_free_bytes;
     std::random_device random;
-    next_id_ = (static_cast<std::uint64_t>(random()) << 32U) ^ static_cast<std::uint64_t>(random()) ^
-               static_cast<std::uint64_t>(now_ns());
+    next_id_ = (static_cast<std::uint64_t>(random()) << 32U) ^
+               static_cast<std::uint64_t>(random()) ^ static_cast<std::uint64_t>(now_ns());
     scan();
     buffers_.reserve(options_.staging_buffers);
     for (std::size_t index = 0; index < options_.staging_buffers; ++index) {
@@ -760,7 +716,7 @@ DiskKVCache::~DiskKVCache() {
 
 std::optional<std::string> DiskKVCache::directory_holder(const std::filesystem::path& directory) {
     const std::filesystem::path lock = directory / ".lock";
-    const int fd = ::open(lock.c_str(), O_RDONLY | O_CLOEXEC);
+    const int fd                     = ::open(lock.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) { return std::nullopt; }
     std::optional<std::string> holder;
     if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
@@ -779,7 +735,7 @@ std::uint64_t DiskKVCache::free_bytes() const {
     if (options_.free_bytes) {
         bytes = options_.free_bytes();
     } else {
-        struct statvfs vfs {};
+        struct statvfs vfs{};
         if (::statvfs(blobs_dir_.c_str(), &vfs) == 0) {
             bytes = static_cast<std::uint64_t>(vfs.f_bavail) * vfs.f_frsize;
         }
@@ -810,13 +766,14 @@ void DiskKVCache::scan() {
         const std::string stem = path.stem().string();
         const auto a           = stem.size() == 32 ? parse_hex64(stem.substr(0, 16)) : std::nullopt;
         const auto b           = stem.size() == 32 ? parse_hex64(stem.substr(16)) : std::nullopt;
-        struct stat st {};
+        struct stat st{};
         if (path.extension() != ".nkvb" || !a || !b || ::stat(path.c_str(), &st) != 0) {
             if (std::filesystem::remove(path, error)) { ++stats_.removed_broken; }
             continue;
         }
-        blobs_[DiskKVBlobId{*a, *b}] =
-            Blob{.bytes = static_cast<std::uint64_t>(st.st_size), .refs = 0, .last_use_ns = mtime_ns(st)};
+        blobs_[DiskKVBlobId{*a, *b}] = Blob{.bytes       = static_cast<std::uint64_t>(st.st_size),
+                                            .refs        = 0,
+                                            .last_use_ns = mtime_ns(st)};
         used_bytes_ += static_cast<std::uint64_t>(st.st_size);
     }
     for (const auto& item : std::filesystem::directory_iterator(manifests_dir_, error)) {
@@ -828,7 +785,7 @@ void DiskKVCache::scan() {
         if (path.extension() != ".nidkv") { continue; }
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) { continue; }
-        struct stat st {};
+        struct stat st{};
         std::optional<DiskKVRecordHeader> header;
         if (::fstat(fd, &st) == 0) {
             header = read_header(fd, static_cast<std::uint64_t>(st.st_size));
@@ -907,9 +864,8 @@ void DiskKVCache::remove_manifest(std::vector<Entry>::iterator it) {
 // Caller holds mutex_.
 bool DiskKVCache::make_room(std::uint64_t bytes) {
     for (;;) {
-        const bool over_cap = used_bytes_ + bytes > options_.capacity_bytes;
-        const bool low_space =
-            free_bytes() < bytes + reserved_bytes_ + options_.min_free_bytes;
+        const bool over_cap  = used_bytes_ + bytes > options_.capacity_bytes;
+        const bool low_space = free_bytes() < bytes + reserved_bytes_ + options_.min_free_bytes;
         if (!over_cap && !low_space) { return true; }
         // Orphan blobs first (oldest), then the least recently used manifest.
         auto orphan = blobs_.end();
@@ -975,7 +931,7 @@ std::uint64_t DiskKVCache::record_file_bytes(const DiskKVRecordSpec& spec, std::
 std::uint64_t DiskKVCache::begin_session(std::span<const DiskKVBlobId> ids,
                                          std::vector<bool>& present) {
     std::lock_guard lock(mutex_);
-    const std::uint64_t session = ++next_session_;
+    const std::uint64_t session     = ++next_session_;
     std::vector<DiskKVBlobId>& pins = sessions_[session];
     present.assign(ids.size(), false);
     for (std::size_t index = 0; index < ids.size(); ++index) {
@@ -1014,7 +970,9 @@ std::optional<DiskKVCache::Writer> DiskKVCache::begin_record(DiskKVRecordSpec sp
         // One reference per blob.
         std::vector<DiskKVBlobId> unique;
         for (const DiskKVBlobId& id : spec.blob_refs) {
-            if (std::find(unique.begin(), unique.end(), id) == unique.end()) { unique.push_back(id); }
+            if (std::find(unique.begin(), unique.end(), id) == unique.end()) {
+                unique.push_back(id);
+            }
         }
         for (DiskKVCheckpoint& checkpoint : spec.checkpoints) {
             if (checkpoint.state_section >= spec.blob_refs.size()) { return std::nullopt; }
@@ -1023,8 +981,9 @@ std::optional<DiskKVCache::Writer> DiskKVCache::begin_record(DiskKVRecordSpec sp
                 std::find(unique.begin(), unique.end(), state) - unique.begin());
         }
         spec.blob_refs = std::move(unique);
-        header.sections.push_back({.kind  = static_cast<std::uint32_t>(DiskKVSectionKind::BlobRefs),
-                                   .bytes = static_cast<std::uint64_t>(spec.blob_refs.size()) * 16U});
+        header.sections.push_back(
+            {.kind  = static_cast<std::uint32_t>(DiskKVSectionKind::BlobRefs),
+             .bytes = static_cast<std::uint64_t>(spec.blob_refs.size()) * 16U});
         job->section = 2;
     }
     header.sections.insert(header.sections.end(), spec.sections.begin(), spec.sections.end());
@@ -1034,17 +993,20 @@ std::optional<DiskKVCache::Writer> DiskKVCache::begin_record(DiskKVRecordSpec sp
         }
         checkpoint.digest = xxh64(spec.tokens.data(), checkpoint.frontier * sizeof(std::int32_t));
     }
-    header.header_bytes = layout_sections(header.sections, spec.checkpoints.size(), options_.key.size());
-    header.file_bytes   = sections_end(header.sections, header.header_bytes);
-    header.key          = options_.key;
-    header.key_hash     = key_hash_;
-    header.token_count  = static_cast<std::uint32_t>(spec.tokens.size());
-    header.created_ns   = static_cast<std::uint64_t>(now_ns());
-    header.full_digest  = xxh64(spec.tokens.data(), spec.tokens.size() * sizeof(std::int32_t));
-    header.meta         = spec.meta;
-    header.checkpoints  = spec.checkpoints;
+    header.header_bytes =
+        layout_sections(header.sections, spec.checkpoints.size(), options_.key.size());
+    header.file_bytes    = sections_end(header.sections, header.header_bytes);
+    header.key           = options_.key;
+    header.key_hash      = key_hash_;
+    header.token_count   = static_cast<std::uint32_t>(spec.tokens.size());
+    header.created_ns    = static_cast<std::uint64_t>(now_ns());
+    header.full_digest   = xxh64(spec.tokens.data(), spec.tokens.size() * sizeof(std::int32_t));
+    header.meta          = spec.meta;
+    header.checkpoints   = spec.checkpoints;
     std::uint64_t blocks = 0;
-    for (const DiskKVSectionInfo& section : header.sections) { blocks += block_count(section.bytes); }
+    for (const DiskKVSectionInfo& section : header.sections) {
+        blocks += block_count(section.bytes);
+    }
     header.block_hashes.reserve(blocks);
     job->tokens  = std::move(spec.tokens);
     job->refs    = std::move(spec.blob_refs);
@@ -1072,7 +1034,7 @@ std::optional<DiskKVCache::Writer> DiskKVCache::begin_record(DiskKVRecordSpec sp
     }
     job->final_path = manifest ? manifest_path(job->id) : blob_path(spec.blob);
     job->temp       = temp_path(job->final_path);
-    job->fd = ::open(job->temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    job->fd         = ::open(job->temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (job->fd < 0) {
         std::lock_guard lock(mutex_);
         used_bytes_ -= job->reserved;
@@ -1160,7 +1122,8 @@ bool DiskKVCache::Writer::commit() {
     }
     {
         std::lock_guard lock(cache_->mutex_);
-        cache_->queue_.push_back(Item{.kind = Item::Kind::Commit, .id = id_, .buffer = {}, .bytes = 0});
+        cache_->queue_.push_back(
+            Item{.kind = Item::Kind::Commit, .id = id_, .buffer = {}, .bytes = 0});
     }
     cache_->queue_cv_.notify_one();
     cache_ = nullptr;
@@ -1171,7 +1134,8 @@ void DiskKVCache::Writer::abort() noexcept {
     if (cache_ == nullptr) { return; }
     try {
         std::lock_guard lock(cache_->mutex_);
-        cache_->queue_.push_back(Item{.kind = Item::Kind::Abort, .id = id_, .buffer = {}, .bytes = 0});
+        cache_->queue_.push_back(
+            Item{.kind = Item::Kind::Abort, .id = id_, .buffer = {}, .bytes = 0});
     } catch (...) {}
     cache_->queue_cv_.notify_one();
     cache_ = nullptr;
@@ -1222,8 +1186,8 @@ void DiskKVCache::writer_loop() {
             continue;
         }
         if (!job->started && !job->failed && item.kind != Item::Kind::Abort) {
-            job->started     = true;
-            job->first_write = std::chrono::steady_clock::now();
+            job->started                    = true;
+            job->first_write                = std::chrono::steady_clock::now();
             const DiskKVSectionInfo& tokens = job->header.sections.front();
             bool ok = pwrite_all(job->fd, job->tokens.data(), tokens.bytes, tokens.offset);
             for (std::uint64_t begin = 0; ok && begin < tokens.bytes; begin += kDiskKVBlockBytes) {
@@ -1235,11 +1199,12 @@ void DiskKVCache::writer_loop() {
             if (ok && job->header.kind == DiskKVRecordKind::Manifest) {
                 const DiskKVSectionInfo& refs = job->header.sections[1];
                 ok = pwrite_all(job->fd, job->refs.data(), refs.bytes, refs.offset);
-                for (std::uint64_t begin = 0; ok && begin < refs.bytes; begin += kDiskKVBlockBytes) {
+                for (std::uint64_t begin = 0; ok && begin < refs.bytes;
+                     begin += kDiskKVBlockBytes) {
                     const std::uint64_t length =
                         std::min<std::uint64_t>(kDiskKVBlockBytes, refs.bytes - begin);
-                    job->header.block_hashes.push_back(
-                        xxh64(reinterpret_cast<const std::byte*>(job->refs.data()) + begin, length));
+                    job->header.block_hashes.push_back(xxh64(
+                        reinterpret_cast<const std::byte*>(job->refs.data()) + begin, length));
                 }
             }
             job->failed = !ok;
@@ -1332,9 +1297,10 @@ void DiskKVCache::writer_loop() {
         }
         {
             std::lock_guard lock(mutex_);
-            jobs_.erase(std::remove_if(jobs_.begin(), jobs_.end(),
-                                       [&](const auto& candidate) { return candidate.get() == job; }),
-                        jobs_.end());
+            jobs_.erase(
+                std::remove_if(jobs_.begin(), jobs_.end(),
+                               [&](const auto& candidate) { return candidate.get() == job; }),
+                jobs_.end());
             --in_flight_;
         }
         idle_cv_.notify_all();
@@ -1360,7 +1326,9 @@ void DiskKVCache::finish_job(Job& job) {
         ++job.section;
     }
     std::uint64_t blocks = 0;
-    for (const DiskKVSectionInfo& section : header.sections) { blocks += block_count(section.bytes); }
+    for (const DiskKVSectionInfo& section : header.sections) {
+        blocks += block_count(section.bytes);
+    }
     bool ok = job.section == header.sections.size() && header.block_hashes.size() == blocks;
     if (ok && manifest) {
         // Every blob of the manifest must be pinned by its save (on disk, not evictable).
@@ -1375,7 +1343,7 @@ void DiskKVCache::finish_job(Job& job) {
     }
     if (ok) {
         const std::vector<std::byte> bytes = encode_header(header);
-        ok = pwrite_all(job.fd, bytes.data(), bytes.size(), 0) &&
+        ok                                 = pwrite_all(job.fd, bytes.data(), bytes.size(), 0) &&
              ::ftruncate(job.fd, static_cast<off_t>(header.file_bytes)) == 0 &&
              ::fdatasync(job.fd) == 0;
     }
@@ -1405,8 +1373,7 @@ void DiskKVCache::finish_job(Job& job) {
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - job.first_write).count();
     if (manifest || header.file_bytes >= (64ULL << 20U)) {
-        std::fprintf(stderr,
-                     "[disk-kv] writer: %s %s on disk, %.0f MiB in %.0f ms (%.1f GB/s)\n",
+        std::fprintf(stderr, "[disk-kv] writer: %s %s on disk, %.0f MiB in %.0f ms (%.1f GB/s)\n",
                      manifest ? "manifest" : "blob",
                      manifest ? hex64(header.id).c_str() : header.blob.hex().c_str(),
                      static_cast<double>(header.file_bytes) / (1024.0 * 1024.0), seconds * 1000.0,
@@ -1425,7 +1392,8 @@ void DiskKVCache::finish_job(Job& job) {
             ++existing->second.refs;
             existing->second.last_use_ns = now_ns();
         } else {
-            blobs_[header.blob] = Blob{.bytes = header.file_bytes, .refs = 1, .last_use_ns = now_ns()};
+            blobs_[header.blob] =
+                Blob{.bytes = header.file_bytes, .refs = 1, .last_use_ns = now_ns()};
         }
         job.reserved       = 0;
         const auto session = sessions_.find(job.session);
@@ -1491,7 +1459,8 @@ bool DiskKVCache::drain(std::chrono::steady_clock::time_point deadline) {
         }
         queue_.clear();
         for (auto& job : jobs_) {
-            queue_.push_back(Item{.kind = Item::Kind::Abort, .id = job->id, .buffer = {}, .bytes = 0});
+            queue_.push_back(
+                Item{.kind = Item::Kind::Abort, .id = job->id, .buffer = {}, .bytes = 0});
         }
         for (Item& item : kept) { queue_.push_back(item); }
         lock.unlock();
@@ -1511,7 +1480,7 @@ std::optional<DiskKVRecordFile> DiskKVCache::open_blob(DiskKVBlobId id) const {
     DiskKVRecordFile file;
     file.fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (file.fd_ < 0) { return std::nullopt; }
-    struct stat st {};
+    struct stat st{};
     if (::fstat(file.fd_, &st) != 0) { return std::nullopt; }
     std::optional<DiskKVRecordHeader> header =
         read_header(file.fd_, static_cast<std::uint64_t>(st.st_size));
@@ -1581,6 +1550,7 @@ std::optional<DiskKVCache::Match> DiskKVCache::find(std::span<const std::int32_t
         DiskKVCheckpoint checkpoint;
         std::vector<DiskKVBlobId> refs;
     };
+
     std::vector<Candidate> candidates;
     {
         std::lock_guard lock(mutex_);
@@ -1615,7 +1585,7 @@ std::optional<DiskKVCache::Match> DiskKVCache::find(std::span<const std::int32_t
         file.fd_    = ::open(candidate.path.c_str(), O_RDONLY | O_CLOEXEC);
         bool broken = file.fd_ < 0;
         if (!broken) {
-            struct stat st {};
+            struct stat st{};
             std::optional<DiskKVRecordHeader> header;
             if (::fstat(file.fd_, &st) == 0) {
                 header = read_header(file.fd_, static_cast<std::uint64_t>(st.st_size));
@@ -1626,17 +1596,18 @@ std::optional<DiskKVCache::Match> DiskKVCache::find(std::span<const std::int32_t
         }
         bool match = false;
         if (!broken) {
-            const std::uint64_t bytes = static_cast<std::uint64_t>(candidate.checkpoint.frontier) * 4U;
+            const std::uint64_t bytes =
+                static_cast<std::uint64_t>(candidate.checkpoint.frontier) * 4U;
             if (chunk.empty()) { chunk.resize(kDiskKVBlockBytes); }
             match  = true;
-            broken = !file.read_prefix(0, bytes, chunk, [&](std::span<const std::byte> data,
-                                                            std::uint64_t offset) {
-                if (std::memcmp(data.data(),
-                                reinterpret_cast<const std::byte*>(prompt.data()) + offset,
-                                data.size()) != 0) {
-                    match = false;
-                }
-            });
+            broken = !file.read_prefix(
+                0, bytes, chunk, [&](std::span<const std::byte> data, std::uint64_t offset) {
+                    if (std::memcmp(data.data(),
+                                    reinterpret_cast<const std::byte*>(prompt.data()) + offset,
+                                    data.size()) != 0) {
+                        match = false;
+                    }
+                });
         }
         if (broken) {
             discard(candidate.id, std::nullopt);

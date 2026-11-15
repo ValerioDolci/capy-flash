@@ -1,7 +1,6 @@
 #pragma once
 
 // Two-device (tp 2) forms of the dense FFN and the MTP post-mixer FFN (ffn.h).
-// Our file: the upstream header carries no hook.
 
 #include "models/qwen3_5/execution/ffn.h"
 #include "core/device.h"

@@ -1,4 +1,5 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 
 #include "ops/gdn_criteria.h"
 #include "ops/gdn_ref.h"
@@ -675,7 +676,7 @@ int tile_parity_case() {
     std::vector<float> first_state;
     int failures = 0;
     for (const int tile : {64, 32, 16, 8}) {
-        ops::gated_delta_net_force_value_tile_for_test(tile);
+        ops::detail::gated_delta_net::chunked::force_value_tile_for_test(tile);
         out.fill(0xff);
         state_out.fill(0xff);
         ops::gated_delta_net(q, k, v, g, beta, scale, test_case.normalize_qk, workspace,
@@ -696,7 +697,7 @@ int tile_parity_case() {
             ++failures;
         }
     }
-    ops::gated_delta_net_force_value_tile_for_test(0);
+    ops::detail::gated_delta_net::chunked::force_value_tile_for_test(0);
     std::cout << "GDN tile parity 64/32/16/8: " << (failures == 0 ? "same bits" : "FAIL")
               << std::endl;
     return failures;
@@ -729,20 +730,20 @@ int main() {
     failures += contract_rejection_cases();
     failures += tile_parity_case();
 
-    failures += run_case({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
-    failures += run_case({"27b recurrent", 16, 48, 7, false}, 12007U);
-    failures += run_case({"35b recurrent", 16, 32, 15, true}, 12015U);
+    failures +=
+        run_case({"16/48 recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
+    failures += run_case({"16/48 recurrent", 16, 48, 7, false}, 12007U);
+    failures += run_case({"16/32 recurrent", 16, 32, 15, true}, 12015U);
 
     struct Geometry {
         const char* name;
         int qk_heads, value_heads, tokens;
     };
 
-    for (const auto geometry :
-         {Geometry{"qwen-27b", 16, 48, 1025}, Geometry{"qwen-35b-a3b", 16, 32, 1025},
-          Geometry{"kimi-k3", 96, 96, 1025}, Geometry{"glm5.3-flash", 64, 64, 1025},
-          Geometry{"single-head", 1, 1, 65}, Geometry{"shared-qk", 1, 3, 65},
-          Geometry{"generic-grouped-map", 5, 15, 65}}) {
+    for (const auto geometry : {Geometry{"16/48", 16, 48, 1025}, Geometry{"16/32", 16, 32, 1025},
+                                Geometry{"96/96", 96, 96, 1025}, Geometry{"64/64", 64, 64, 1025},
+                                Geometry{"single-head", 1, 1, 65}, Geometry{"shared-qk", 1, 3, 65},
+                                Geometry{"generic-grouped-map", 5, 15, 65}}) {
         for (bool normalize : {false, true}) {
             failures += run_case({geometry.name, geometry.qk_heads, geometry.value_heads,
                                   geometry.tokens, normalize},
@@ -779,15 +780,16 @@ int main() {
         failures +=
             run_case({stress.name, 1, 3, stress.tokens, false}, stress.seed, stress.pattern, true);
     }
-    failures += run_case({"35b zero decay", 16, 32, 4097, true}, 16032U, InputPattern::ZeroDecay);
+    failures += run_case({"16/32 zero decay", 16, 32, 4097, true}, 16032U, InputPattern::ZeroDecay);
     failures +=
-        run_case({"35b weak decay", 16, 32, 4097, true}, 16032U, InputPattern::WeakDecay, true);
-    failures += run_case({"27b strong tail", 16, 48, 65, true}, 12065U, InputPattern::StrongDecay);
+        run_case({"16/32 weak decay", 16, 32, 4097, true}, 16032U, InputPattern::WeakDecay, true);
+    failures +=
+        run_case({"16/48 strong tail", 16, 48, 65, true}, 12065U, InputPattern::StrongDecay);
     // The first checkpoint is the aligned T=64 prefix of the identical T=65 stress input.
-    failures += run_case({"27b strong continuation", 16, 48, 65, true}, 12065U,
+    failures += run_case({"16/48 strong continuation", 16, 48, 65, true}, 12065U,
                          InputPattern::StrongDecay, true, {64, 1});
 
-    failures += run_case({"27b prefill continuation", 16, 48, 2049, true}, 14249U,
+    failures += run_case({"16/48 prefill continuation", 16, 48, 2049, true}, 14249U,
                          InputPattern::ZeroState, false, {1024, 1024, 1});
     failures += run_case({"weak prefill continuation", 1, 3, 4097, true}, 14297U,
                          InputPattern::WeakDecay, true, {1024, 1024, 1024, 1024, 1});
@@ -804,13 +806,14 @@ int main() {
     }
 
     // The production decode path updates selected state-pool slots in place at width one.
-    failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,
-                                  12101u);
-    failures += batch_update_case({"35b selected-slot near-zero", 16, 32, 1, true, true}, {6}, {6},
-                                  8, 12201u);
-    failures += batch_update_case({"35b ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
-                                  {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
-    failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
+    failures += batch_update_case({"16/48 selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7},
+                                  8, 12101u);
+    failures += batch_update_case({"16/32 selected-slot near-zero", 16, 32, 1, true, true}, {6},
+                                  {6}, 8, 12201u);
+    failures +=
+        batch_update_case({"16/32 ordinary", 16, 32, 1, true}, {8, 9, 10, 11, 12, 13, 14, 15},
+                          {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
+    failures += batch_update_case({"16/32 mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
                                   {1, 3, 5, 7}, 8, 13101u);
 
     print_summaries();

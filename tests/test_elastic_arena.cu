@@ -1,5 +1,4 @@
-// GPU test of ElasticArena (core/elastic_arena.h) and the elastic backing of DeviceKVPagePool
-// (T64):
+// GPU test of ElasticArena (core/elastic_arena.h) and the elastic backing of DeviceKVPagePool:
 //   - granule bookkeeping: a granule is backed exactly when it intersects a fixed byte or a
 //     range's mapped prefix (ranges that start or end inside a granule share it with their fixed
 //     neighbours); physical_delta() predicts set_mapped()'s change exactly;
@@ -424,7 +423,7 @@ void test_pool_host_backing(int mirror_device) {
 
 } // namespace
 
-// T68: memcpy_device_async between an elastic (VMM) arena on device 1 and a cudaMalloc buffer on
+// memcpy_device_async between an elastic (VMM) arena on device 1 and a cudaMalloc buffer on
 // device 0, eagerly, on either device's stream. Without P2P a plain UVA copy cannot read VMM memory
 // of a device other than the stream's (cudaErrorInvalidValue); the helper takes the peer copy.
 void test_cross_device_copy() {

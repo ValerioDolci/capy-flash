@@ -1,5 +1,6 @@
 #include "core/host_kv_arena.h"
 
+#include "core/checked.h"
 #include "core/dtype.h"
 
 #include <algorithm>
@@ -13,18 +14,6 @@ namespace ninfer {
 namespace {
 
 constexpr std::size_t kHostKVAlignment = 256;
-
-std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
-    if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
-    return a + b;
-}
-
-std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(label);
-    }
-    return a * b;
-}
 
 std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
@@ -309,84 +298,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     descriptor.pages       = pages;
     descriptor.active      = true;
     occupied_bytes_ += bytes;
-    bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
-}
-
-std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
-    std::span<const HostKVAllocationHandle> proposed_releases,
-    std::span<const HostKVAllocationRequest> target_allocations) const {
-    if (proposed_releases.empty() && target_allocations.empty()) { return std::nullopt; }
-    if (target_allocations.size() > free_descriptors_.size() + proposed_releases.size()) {
-        return std::nullopt;
-    }
-
-    HostKVAllocationRecipe recipe;
-    recipe.owner_          = this;
-    recipe.arena_revision_ = revision_;
-    recipe.releases_.reserve(proposed_releases.size());
-    recipe.targets_.reserve(target_allocations.size());
-
-    std::vector<FreeExtent> simulated = free_extents_;
-    const auto insert_extent          = [&](FreeExtent extent) {
-        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
-                                                   return candidate.offset < offset;
-                                               });
-        auto inserted       = simulated.insert(position, extent);
-        if (inserted != simulated.begin()) {
-            auto previous = inserted - 1;
-            if (previous->offset + previous->bytes == inserted->offset) {
-                previous->bytes += inserted->bytes;
-                inserted = simulated.erase(inserted);
-                inserted = previous;
-            }
-        }
-        const auto next = inserted + 1;
-        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
-            inserted->bytes += next->bytes;
-            simulated.erase(next);
-        }
-    };
-
-    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
-        const HostKVAllocationHandle handle = proposed_releases[index];
-        if (!valid_handle(handle) ||
-            std::find(proposed_releases.begin(),
-                      proposed_releases.begin() + static_cast<std::ptrdiff_t>(index),
-                      handle) != proposed_releases.begin() + static_cast<std::ptrdiff_t>(index)) {
-            return std::nullopt;
-        }
-        const Descriptor& descriptor = descriptors_[handle.descriptor_];
-        insert_extent({descriptor.offset, descriptor.bytes});
-        recipe.releases_.push_back(handle);
-    }
-
-    for (const HostKVAllocationRequest& request : target_allocations) {
-        if (request.layout == nullptr || request.pages == 0) { return std::nullopt; }
-        const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
-        if (!layout_index ||
-            request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
-            return std::nullopt;
-        }
-        const std::size_t bytes =
-            request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
-        if (extent == simulated.end()) { return std::nullopt; }
-        const std::size_t offset = extent->offset;
-        extent->offset += bytes;
-        extent->bytes -= bytes;
-        if (extent->bytes == 0) { simulated.erase(extent); }
-        recipe.targets_.push_back(HostKVAllocationRecipe::Target{
-            .layout = *layout_index,
-            .pages  = request.pages,
-            .offset = offset,
-            .bytes  = bytes,
-        });
-    }
-    return recipe;
 }
 
 bool HostKVArena::can_allocate_after_suballocation_releases(
@@ -498,56 +410,6 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     return true;
 }
 
-bool HostKVArena::apply_recipe(HostKVAllocationRecipe&& recipe,
-                               std::span<HostKVAllocation* const> proposed_releases,
-                               std::span<HostKVAllocation> target_allocations) noexcept {
-    if (recipe.owner_ != this || recipe.arena_revision_ != revision_ ||
-        recipe.releases_.size() != proposed_releases.size() ||
-        recipe.targets_.size() != target_allocations.size()) {
-        return false;
-    }
-    for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
-        const HostKVAllocation* allocation = proposed_releases[index];
-        if (allocation == nullptr || allocation->handle() != recipe.releases_[index] ||
-            !valid_handle(recipe.releases_[index])) {
-            return false;
-        }
-    }
-    for (std::size_t index = 0; index < target_allocations.size(); ++index) {
-        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
-        if (target_allocations[index].valid() || target.layout >= layouts_.size() ||
-            target.pages == 0 ||
-            layouts_[target.layout].page_stride >
-                std::numeric_limits<std::size_t>::max() / target.pages ||
-            layouts_[target.layout].page_stride * static_cast<std::size_t>(target.pages) !=
-                target.bytes) {
-            return false;
-        }
-    }
-
-    // All generations and outputs are validated before the first mutation. The recipe was minted
-    // from this exact revision, so every operation below is an invariant-preserving adoption.
-    for (HostKVAllocation* allocation : proposed_releases) {
-        if (!allocation->release()) { std::terminate(); }
-    }
-    for (std::size_t index = 0; index < recipe.targets_.size(); ++index) {
-        const HostKVAllocationRecipe::Target& target = recipe.targets_[index];
-        std::optional<HostKVAllocation> allocation =
-            allocate(layouts_[target.layout], target.pages);
-        if (!allocation) { std::terminate(); }
-        const Descriptor& descriptor = descriptors_[allocation->descriptor_];
-        if (descriptor.offset != target.offset || descriptor.bytes != target.bytes) {
-            std::terminate();
-        }
-        target_allocations[index] = std::move(*allocation);
-    }
-    recipe.owner_          = nullptr;
-    recipe.arena_revision_ = 0;
-    recipe.releases_.clear();
-    recipe.targets_.clear();
-    return true;
-}
-
 std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocation&& allocation,
                                                                  std::uint32_t page_offset) {
     if (!valid_handle(allocation.handle())) {
@@ -578,7 +440,6 @@ std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocatio
     const std::uint32_t right_generation = right.generation;
     const std::uint32_t left_index       = allocation.descriptor_;
     allocation.disarm();
-    bump_revision();
     return {HostKVAllocation(*this, left_index, left_generation),
             HostKVAllocation(*this, right_index, right_generation)};
 }
@@ -629,7 +490,6 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     increment_generation(descriptor.generation);
     free_descriptors_.push_back(descriptor_index);
     insert_free_extent(released);
-    bump_revision();
     return true;
 }
 
@@ -656,11 +516,6 @@ void HostKVArena::insert_free_extent(FreeExtent extent) noexcept {
 std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noexcept {
     if (!backing_) { return nullptr; }
     return static_cast<std::byte*>(backing_->data()) + descriptor.offset;
-}
-
-void HostKVArena::bump_revision() noexcept {
-    ++revision_;
-    if (revision_ == 0) { ++revision_; }
 }
 
 } // namespace ninfer

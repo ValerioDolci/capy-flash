@@ -1,9 +1,9 @@
 #pragma once
 
 // Structured output (constrained decoding) on the Qwen frontend: the per-model grammar compiler
-// and the per-request matcher construction. capy-flash file (structured output P3); the matcher
-// itself is the text library ported from Neroued/ninfer 77c2e5e2 (src/text/grammar.h), the
-// vocabulary and admission rules follow upstream 08902f73 (frontend.cpp make_output_session).
+// and the per-request matcher construction. The matcher itself is the text library
+// (src/text/grammar.h); it and the vocabulary and admission rules (frontend.cpp
+// make_output_session) are ported from ninfer.
 
 #include "ninfer/types.h"
 

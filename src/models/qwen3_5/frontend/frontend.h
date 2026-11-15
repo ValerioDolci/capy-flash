@@ -29,7 +29,7 @@ struct FrontendOptions {
     // Structured output: byte budget of the compiled-grammar cache (frontend/output_constraint.h;
     // upstream 256 MiB, smaller here for the 64 GB Flash-Next profile whose RAM is mostly pinned).
     std::size_t grammar_cache_bytes = 64ULL * 1024 * 1024;
-    // capy-flash: compilation deadline/concurrency, matcher budgets and input limits.
+    // Compilation deadline/concurrency, matcher budgets and input limits.
     OutputConstraintLimits constraint_limits;
 };
 

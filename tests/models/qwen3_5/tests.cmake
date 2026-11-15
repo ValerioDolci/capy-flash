@@ -12,7 +12,7 @@ ninfer_add_test(ninfer_qwen4_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_qwen4.cpp"
   LIBRARIES ninfer_model_loading)
 
-# Qwen4Exp at tp 2 (T30): placement of every parameter of a real-geometry artifact, per-rank
+# Qwen4Exp at tp 2: placement of every parameter of a real-geometry artifact, per-rank
 # bytes, and (two devices) every device parent byte-compared with the host-applied slice. Skips
 # (77) without --artifact.
 ninfer_add_test(ninfer_qwen4_tp2_loading_test
@@ -39,10 +39,6 @@ ninfer_add_test(ninfer_qwen4_offload_experts_test
 
 ninfer_add_test(ninfer_qwen4_draft_head_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_draft_head.cpp"
-  LIBRARIES ninfer_model_runtime)
-
-ninfer_add_test(ninfer_qwen4_expert_window_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_expert_window.cpp"
   LIBRARIES ninfer_model_runtime)
 
 set_tests_properties(
@@ -86,7 +82,7 @@ set_tests_properties(
   ninfer_qwen3_5_prefix_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-# Qwen4Exp at tp 2 against tp 1 through the Engine (T31). Skips (77) without
+# Qwen4Exp at tp 2 against tp 1 through the Engine. Skips (77) without
 # NINFER_TEST_QWEN4_ARTIFACT (the synthetic fn4) or without two devices.
 ninfer_add_test(ninfer_qwen4_tp2_engine_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_qwen4_tp2.cpp"
@@ -96,7 +92,7 @@ set_tests_properties(
   ninfer_qwen4_tp2_engine_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-# Qwen4Exp MTP rounds through the Engine (T37): MTP == no-draft == oracle drafts with mapped and
+# Qwen4Exp MTP rounds through the Engine: MTP == no-draft == oracle drafts with mapped and
 # offloaded experts, and a cancelled row. Skips (77) without NINFER_TEST_QWEN4_ARTIFACT (a
 # synthetic artifact with an MTP layer: tools/capy_flash/make_test_artifact.sh).
 ninfer_add_test(ninfer_qwen4_mtp_engine_test
@@ -251,7 +247,7 @@ ninfer_add_test(ninfer_qwen3_5_ple_gather_test
 add_executable(ninfer_qwen4_tf_driver "${CMAKE_CURRENT_LIST_DIR}/qwen4_tf_driver.cpp")
 target_link_libraries(ninfer_qwen4_tf_driver PRIVATE ninfer_engine)
 
-# capy-flash v0.7: the GGUF slot arena of the offload backend against the expert cache's slot
+# The GGUF slot arena of the offload backend against the expert cache's slot
 # numbering (CPU only).
 ninfer_add_test(ninfer_qwen4_gguf_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_gguf_pool.cpp"

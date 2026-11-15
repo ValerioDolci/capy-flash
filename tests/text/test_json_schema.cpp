@@ -19,7 +19,7 @@ ninfer::text::GrammarCompiler make_compiler() {
     for (int i = 0; i < 256; ++i) vocabulary.emplace_back(1, static_cast<char>(i));
     vocabulary.emplace_back();
     // The oracle checks literal JSON Schema semantics against `jsonschema`: strict mode (the
-    // capy-flash default, --constraint-json-strict) is tested in test_constraint_limits.cpp.
+    // default, --constraint-json-strict) is tested in test_constraint_limits.cpp.
     return {std::move(vocabulary),
             {256},
             4 * 1024 * 1024,
@@ -114,7 +114,7 @@ void whitespace_contracts(ninfer::text::GrammarCompiler& compiler) {
          {" \t\r\n{ \n}\t", "{\n  \"x\" \t: [1, true, {\"s\": \" a \\t b \"}]\n}",
           "{\"x\": \"ok\", \"y\": 2}"})
         check(accepts(compiler, object, text), "JSON object rejected structural whitespace");
-    // Whitespace runs are bounded (audit I3: a model stuck on blanks ran to max_tokens); the
+    // Whitespace runs are bounded (a model stuck on blanks would run to max_tokens); the
     // bound fits formatted output and applies around the value and between tokens alike.
     const int bound = ninfer::text::kMaxJsonWhitespace;
     check(

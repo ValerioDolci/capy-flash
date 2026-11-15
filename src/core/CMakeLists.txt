@@ -15,7 +15,6 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
   expert_cache_policy.cpp
   expert_cache.cu
-  expert_staging.cu
   elastic_arena.cu
   uva_copy.cu
 )

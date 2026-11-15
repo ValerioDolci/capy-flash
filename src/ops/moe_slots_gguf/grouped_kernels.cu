@@ -1,4 +1,6 @@
-// Modified for capy-flash from fngine:src/kernels/moe/moe_grouped_gemm.cu and fngine:src/kernels/moe/moe_prefill.cu @ c20a885 (satellitedown/fngine, Apache License 2.0). See NOTICE.
+// Modified for capy-flash from fngine:src/kernels/moe/moe_grouped_gemm.cu and
+// fngine:src/kernels/moe/moe_prefill.cu @ c20a885 (satellitedown/fngine, Apache License 2.0). See
+// NOTICE.
 //
 // Implements: include/ninfer/ops/moe_slots_gguf.h (moe_grouped_gguf)
 //
@@ -24,8 +26,10 @@
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
+#include "ops/common/moe_grouping.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 
 #include <cuda_bf16.h>
 
@@ -43,12 +47,12 @@ constexpr int kHidden       = kMoeSlotsHidden;       // 2560
 constexpr int kInter        = kMoeSlotsIntermediate; // 640
 constexpr int kTopK         = kMoeSlotsTopK;         // 10
 constexpr int kThreads      = 256;
-constexpr int kBK           = 64;                    // K elements per pipeline step
-constexpr int kChunksPerRow = kBK / 8;               // 16-byte chunks per smem row
+constexpr int kBK           = 64;                     // K elements per pipeline step
+constexpr int kChunksPerRow = kBK / 8;                // 16-byte chunks per smem row
 constexpr int kTileM        = kGgufGroupedTileTokens; // tokens
-constexpr int kTileN        = 64;                    // weight rows (per matrix)
-constexpr int kGuRowTiles   = kInter / kTileN;       // 10
-constexpr int kDownRowTiles = kHidden / kTileN;      // 40
+constexpr int kTileN        = 64;                     // weight rows (per matrix)
+constexpr int kGuRowTiles   = kInter / kTileN;        // 10
+constexpr int kDownRowTiles = kHidden / kTileN;       // 40
 constexpr int kScanThreads  = kGgufGroupedMaxExperts;
 
 // Swizzled 16-byte chunk offset (in bf16 elements) inside a [rows][64] bf16 tile.
@@ -153,15 +157,15 @@ __device__ __forceinline__ int raw_misalign4(const std::uint8_t* row, std::int64
 
 template <Format F>
 struct GateUpCfg {
-    static constexpr int kRow        = kRowBytes<F, kHidden>;
-    static constexpr int kSegElems   = 256;                           // one raw stage
-    static constexpr int kSegBytes   = kRow / (kHidden / kSegElems);  // bytes of 256 elements
-    static constexpr int kRawStride  = raw_stride4(kSegBytes);
-    static constexpr int kStepsPerSeg = kSegElems / kBK;              // 4
-    static constexpr int kAElems     = kTileM * kBK;                  // 2 buffers
-    static constexpr int kWElems     = 2 * kTileN * kBK;              // single buffer
-    static constexpr int kRawBytes   = 2 * kTileN * kRawStride;       // single buffer
-    static constexpr int kSmem       = 2 * kAElems * 2 + kWElems * 2 + kRawBytes;
+    static constexpr int kRow         = kRowBytes<F, kHidden>;
+    static constexpr int kSegElems    = 256;                          // one raw stage
+    static constexpr int kSegBytes    = kRow / (kHidden / kSegElems); // bytes of 256 elements
+    static constexpr int kRawStride   = raw_stride4(kSegBytes);
+    static constexpr int kStepsPerSeg = kSegElems / kBK;         // 4
+    static constexpr int kAElems      = kTileM * kBK;            // 2 buffers
+    static constexpr int kWElems      = 2 * kTileN * kBK;        // single buffer
+    static constexpr int kRawBytes    = 2 * kTileN * kRawStride; // single buffer
+    static constexpr int kSmem        = 2 * kAElems * 2 + kWElems * 2 + kRawBytes;
 };
 
 // ------------------------------------------------------------------------------- gate/up
@@ -182,8 +186,8 @@ __global__ void __launch_bounds__(kThreads, 2)
     if (tile_idx >= *tile_count) return;
     constexpr int kSteps = kHidden / kBK; // 40
     extern __shared__ __align__(128) std::uint8_t smem_raw[];
-    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw); // [2][64][64]
-    __nv_bfloat16* Ws = As + 2 * C::kAElems;                          // [128][64]
+    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw);       // [2][64][64]
+    __nv_bfloat16* Ws = As + 2 * C::kAElems;                              // [128][64]
     std::uint8_t* Raw = reinterpret_cast<std::uint8_t*>(Ws + C::kWElems); // [128][kRawStride]
     __shared__ const __nv_bfloat16* s_rows[kTileM];
     __shared__ const std::uint8_t* s_wrow[2 * kTileN];
@@ -329,9 +333,9 @@ __global__ void __launch_bounds__(kThreads, 2)
     if (tile_idx >= *tile_count) return;
     constexpr int kSteps = kInter / kBK; // 10
     extern __shared__ __align__(128) std::uint8_t smem_raw[];
-    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw);      // [2][64][64]
-    __nv_bfloat16* Ws = As + 2 * C::kAElems;                               // [64][64]
-    std::uint8_t* Raw = reinterpret_cast<std::uint8_t*>(Ws + C::kWElems);  // [64][kRawStride]
+    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw);       // [2][64][64]
+    __nv_bfloat16* Ws = As + 2 * C::kAElems;                              // [64][64]
+    std::uint8_t* Raw = reinterpret_cast<std::uint8_t*>(Ws + C::kWElems); // [64][kRawStride]
     __shared__ const __nv_bfloat16* s_rows[kTileM];
     __shared__ const std::uint8_t* s_wrow[kTileN];
 
@@ -456,7 +460,8 @@ __device__ __forceinline__ int slot_of(const std::int32_t* ids, const GgufExpert
     const int s = ex.table[e];
     if (s >= 0 && s < ex.slots) return s;
     // Hybrid blob form: a non-resident expert read in place from the host bank.
-    if (ex.host_table != nullptr && ex.slot_offset != nullptr && ex.host_table[e] >= 0) return ex.slots;
+    if (ex.host_table != nullptr && ex.slot_offset != nullptr && ex.host_table[e] >= 0)
+        return ex.slots;
     return -1;
 }
 
@@ -474,9 +479,9 @@ __global__ void __launch_bounds__(kScanThreads)
                 std::int32_t* tile_count, const std::uint8_t** expert_gate_up,
                 const std::uint8_t** expert_down) {
     __shared__ int s_scan[32];
-    const int e  = threadIdx.x;
-    const int c  = e < ex.experts ? counts[e] : 0;
-    const int nt = (c + kTileM - 1) / kTileM;
+    const int e     = threadIdx.x;
+    const int c     = e < ex.experts ? counts[e] : 0;
+    const int nt    = (c + kTileM - 1) / kTileM;
     int total_pairs = 0, total_tiles = 0;
     const int off   = block_exclusive_scan(c, s_scan, &total_pairs);
     const int tile0 = block_exclusive_scan(nt, s_scan, &total_tiles);
@@ -510,63 +515,12 @@ __global__ void __launch_bounds__(kScanThreads)
     }
 }
 
-__global__ void place_kernel(const std::int32_t* ids, const std::int32_t* rank, int assignments,
-                             const std::int32_t* offsets, std::int32_t* packed_token,
-                             std::int32_t* packed_index) {
-    const int a = int(blockIdx.x * blockDim.x + threadIdx.x);
-    if (a >= assignments) return;
-    const int r = rank[a];
-    if (r < 0) {
-        packed_index[a] = -1;
-        return;
-    }
-    const int position     = offsets[ids[a]] + r;
-    packed_token[position] = a / kTopK;
-    packed_index[a]        = position;
-}
-
-// One CTA per column; thread i owns features [8i, 8i+8). Routes without a slot add nothing.
-constexpr int kMergeThreads = kHidden / 8;
-
-__global__ void __launch_bounds__(kMergeThreads)
-    merge_kernel(const float* grouped, const std::int32_t* packed_index, const float* weights,
-                 float* out) {
-    const int column  = int(blockIdx.x);
-    const int feature = int(threadIdx.x) * 8;
-    float sum[8]      = {};
-#pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-        const int row = packed_index[column * kTopK + k];
-        if (row < 0) continue;
-        const float weight  = weights[column * kTopK + k];
-        const float* source = grouped + std::int64_t(row) * kHidden + feature;
-        const float4 a      = *reinterpret_cast<const float4*>(source);
-        const float4 b      = *reinterpret_cast<const float4*>(source + 4);
-        const float v[8]    = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
-#pragma unroll
-        for (int i = 0; i < 8; ++i) sum[i] = fmaf(weight, v[i], sum[i]);
-    }
-    float* destination = out + std::int64_t(column) * kHidden + feature;
-    *reinterpret_cast<float4*>(destination)     = make_float4(sum[0], sum[1], sum[2], sum[3]);
-    *reinterpret_cast<float4*>(destination + 4) = make_float4(sum[4], sum[5], sum[6], sum[7]);
-}
-
 // ------------------------------------------------------------------------------ dispatch
-constexpr int kMaxDevices = 16;
-
 // Raises the dynamic shared-memory limit of `Kernel` once per device.
 template <auto Kernel>
 void allow_smem(int bytes) {
-    static bool done[kMaxDevices] = {};
-    int device                    = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    if (device < 0 || device >= kMaxDevices)
-        throw std::runtime_error("moe_grouped_gguf: device index out of range");
-    if (!done[device]) {
-        CUDA_CHECK(
-            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        done[device] = true;
-    }
+    static FuncAttrPerDevice attribute;
+    attribute.ensure(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
 }
 
 template <Format F>
@@ -584,8 +538,8 @@ void launch_down(const GgufGroupedPiece& c, int grid_tiles, cudaStream_t stream)
     constexpr int smem    = DownCfg<F>::kSmem;
     constexpr auto kernel = &grouped_down_kernel<F>;
     allow_smem<kernel>(smem);
-    kernel<<<grid_tiles * kDownRowTiles, kThreads, smem, stream>>>(
-        c.tiles, c.tile_count, c.expert_down, c.h, c.grouped);
+    kernel<<<grid_tiles * kDownRowTiles, kThreads, smem, stream>>>(c.tiles, c.tile_count,
+                                                                   c.expert_down, c.h, c.grouped);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -630,24 +584,40 @@ void gguf_grouped_launch(const GgufGroupedPiece& c, cudaStream_t stream) {
     scan_kernel<<<1, kScanThreads, 0, stream>>>(c.experts, c.counts, c.offsets, c.tiles,
                                                 c.tile_count, c.expert_gate_up, c.expert_down);
     CUDA_CHECK(cudaGetLastError());
-    place_kernel<<<blocks, 256, 0, stream>>>(c.ids, c.rank, assignments, c.offsets, c.packed_token,
-                                             c.packed_index);
+    moe_grouping_place_kernel<kTopK><<<blocks, 256, 0, stream>>>(
+        c.ids, c.rank, assignments, c.offsets, c.packed_token, c.packed_index);
     CUDA_CHECK(cudaGetLastError());
     switch (c.experts.gate_up_format) {
-    case Format::IQ2_S: launch_gate_up<Format::IQ2_S>(c, grid_tiles, stream); break;
-    case Format::IQ3_XXS: launch_gate_up<Format::IQ3_XXS>(c, grid_tiles, stream); break;
-    case Format::IQ3_S: launch_gate_up<Format::IQ3_S>(c, grid_tiles, stream); break;
-    case Format::IQ4_XS: launch_gate_up<Format::IQ4_XS>(c, grid_tiles, stream); break;
-    case Format::IQ4_NL: launch_gate_up<Format::IQ4_NL>(c, grid_tiles, stream); break;
-    default: throw std::invalid_argument("moe_grouped_gguf: unsupported gate/up format");
+    case Format::IQ2_S:
+        launch_gate_up<Format::IQ2_S>(c, grid_tiles, stream);
+        break;
+    case Format::IQ3_XXS:
+        launch_gate_up<Format::IQ3_XXS>(c, grid_tiles, stream);
+        break;
+    case Format::IQ3_S:
+        launch_gate_up<Format::IQ3_S>(c, grid_tiles, stream);
+        break;
+    case Format::IQ4_XS:
+        launch_gate_up<Format::IQ4_XS>(c, grid_tiles, stream);
+        break;
+    case Format::IQ4_NL:
+        launch_gate_up<Format::IQ4_NL>(c, grid_tiles, stream);
+        break;
+    default:
+        throw std::invalid_argument("moe_grouped_gguf: unsupported gate/up format");
     }
     switch (c.experts.down_format) {
-    case Format::IQ4_NL: launch_down<Format::IQ4_NL>(c, grid_tiles, stream); break;
-    case Format::Q2_0: launch_down<Format::Q2_0>(c, grid_tiles, stream); break;
-    default: throw std::invalid_argument("moe_grouped_gguf: unsupported down format");
+    case Format::IQ4_NL:
+        launch_down<Format::IQ4_NL>(c, grid_tiles, stream);
+        break;
+    case Format::Q2_0:
+        launch_down<Format::Q2_0>(c, grid_tiles, stream);
+        break;
+    default:
+        throw std::invalid_argument("moe_grouped_gguf: unsupported down format");
     }
-    merge_kernel<<<c.columns, kMergeThreads, 0, stream>>>(c.grouped, c.packed_index, c.weights,
-                                                          c.out);
+    moe_grouping_merge_kernel<kHidden, kTopK>
+        <<<c.columns, kHidden / 8, 0, stream>>>(c.grouped, c.packed_index, c.weights, c.out);
     CUDA_CHECK(cudaGetLastError());
 }
 

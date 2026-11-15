@@ -42,9 +42,24 @@ private:
     ApiError error_;
 };
 
+// Protocol default when the client omits max_tokens. Engine independently
+// clamps the request to its effective context capacity.
+inline constexpr int kDefaultMaxTokens = 8192;
+// Nesting of objects and arrays in a request body (and in JSON carried as a string, such as tool
+// call arguments), checked on the bytes before parsing: the prompt path reads client JSON with
+// recursive code (rendering, copies, serialization), so a deep document must not reach it.
+inline constexpr std::uint32_t kDefaultMaxRequestJsonDepth = 1000;
+
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    int default_max_tokens = kDefaultMaxTokens;
+    // --max-request-json-depth: client JSON nesting; over it a request is a 400
+    // request_json_too_deep.
+    std::uint32_t max_json_depth = kDefaultMaxRequestJsonDepth;
+    // --constraint-max-kib, --constraint-max-depth, --constraint-max-items: an over-limit schema,
+    // grammar, regex or choice list is a 400 constraint_limit_exceeded naming the limit, before
+    // anything recursive or costly sees it.
+    ninfer::OutputConstraintLimits constraints;
 };
 
 enum class ContentKind {
@@ -197,7 +212,7 @@ struct GenerationRequest {
     // Structured output (constrained decoding): at most one per request. constraint_param is the
     // wire field it came from ("response_format.json_schema.schema", "text.format.schema",
     // "output_config.format.schema", "structured_outputs.<kind>"); schema compiler errors append
-    // their JSON Pointer to it. Unset = unconstrained request, translated exactly as before.
+    // their JSON Pointer to it. Unset = unconstrained request.
     std::optional<ninfer::OutputConstraint> constraint;
     std::string constraint_param;
 

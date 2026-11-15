@@ -336,8 +336,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             }
 
             Tensor draft0 = round.next_drafts.slice(1, 0, 1).view({batch_size});
-            // T41: each proposal step's softmax log-probability of its argmax over the proposal
-            // vocabulary (the full head, rank 0 holding the gathered logits at tp 2, or T43's
+            // Each proposal step's softmax log-probability of its argmax over the proposal
+            // vocabulary (the full head, rank 0 holding the gathered logits at tp 2, or the
             // draft shortlist), written by the proposal itself.
             std::array<Tensor, kMtpDecodeMaximumDrafts> logprob_views;
             const auto draft_logprob = [&](std::int32_t step) -> Tensor* {

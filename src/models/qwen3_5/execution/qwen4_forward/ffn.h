@@ -63,11 +63,9 @@ void Qwen4Forward<Arena>::plain_ffn(std::size_t layer, RankTensors& x, const Ran
 }
 
 template <class Arena>
-void Qwen4Forward<Arena>::ffn(std::size_t layer, const RankTensors& wide, const RankTensors& x,
-                              RankTensors& y, const RankTensors& staging_bf16,
-                              const RankTensors& staging_fp32) {
+void Qwen4Forward<Arena>::ffn(std::size_t layer, const RankTensors& x, RankTensors& y,
+                              const RankTensors& staging_bf16, const RankTensors& staging_fp32) {
     if (moe_ffn()) {
-        ahead(layer, wide);
         moe(layer, x, y, staging_fp32);
     } else {
         dense(layer, x, y, staging_bf16);

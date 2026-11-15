@@ -63,7 +63,6 @@ enum class Format : std::uint8_t {
     Q4Q5,
     Nvfp4,
     Fp8,
-    Q8,
     All,
 };
 
@@ -199,9 +198,8 @@ Format parse_format(std::string_view value) {
     if (value == "q4q5") return Format::Q4Q5;
     if (value == "nvfp4") return Format::Nvfp4;
     if (value == "fp8") return Format::Fp8;
-    if (value == "q8") return Format::Q8;
     if (value == "all") return Format::All;
-    throw std::invalid_argument("--format must be q4q5, nvfp4, fp8, q8, or all");
+    throw std::invalid_argument("--format must be q4q5, nvfp4, fp8, or all");
 }
 
 Form parse_form(std::string_view value) {
@@ -238,7 +236,7 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --format q4q5|nvfp4|fp8|q8|all  Default q4q5.\n"
+                 "  --format q4q5|nvfp4|fp8|all  Default q4q5.\n"
                  "  --form snapshot|record|both  Default snapshot.\n"
                  "  --nvfp4-policy a16|a4        Default a4.\n"
                  "  --fp8-policy a16|a8          Default a8.\n"
@@ -564,58 +562,6 @@ private:
     ops::LinearPolicy policy_;
 };
 
-class Q8Fixture {
-public:
-    explicit Q8Fixture(std::size_t flush_bytes)
-        : parent_(bench::make_row_split_weight(QType::Q8_G32_FP16, 12288, 2048, 2048, 505U)),
-          conv_weight_(bench::make_bf16(static_cast<std::size_t>(8192) * 4, 107U)),
-          flush_(flush_bytes) {
-        bench::flush_l2(flush_, nullptr);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    [[nodiscard]] Tensor conv_weight() const {
-        return Tensor(conv_weight_.p, DType::BF16, {8192, 4});
-    }
-
-    [[nodiscard]] const char* profile() const noexcept { return "q8"; }
-
-    [[nodiscard]] GdnGeometry geometry() const noexcept { return {2048, 2048, 2048, 4096, 4096}; }
-
-    [[nodiscard]] std::size_t workspace_capacity(Form form, std::int32_t batch,
-                                                 std::int32_t tokens) const {
-        if (form == Form::Record) {
-            return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 4096, batch,
-                                                                            tokens, tokens);
-        }
-        return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, batch,
-                                                                          tokens, tokens);
-    }
-
-    void launch(Form form, const Tensor& x, Tensor& conv_states, const Tensor& initial,
-                const Tensor& snapshot_base, const Tensor& valid_columns, Tensor& conv_record,
-                Tensor& query, Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-        Tensor convolution_weight = conv_weight();
-        if (form == Form::Record) {
-            ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, workspace, stream);
-        } else {
-            ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, workspace, stream);
-        }
-    }
-
-    void flush(cudaStream_t stream) { bench::flush_l2(flush_, stream); }
-
-private:
-    bench::PackedQuantizedWeight parent_;
-    DeviceBuffer conv_weight_;
-    bench::L2FlushBuffer flush_;
-};
-
 template <class Fixture>
 class BenchmarkState {
 public:
@@ -933,7 +879,6 @@ int main(int argc, char** argv) {
         const char* configured_format = options.format == Format::Q4Q5    ? "q4q5"
                                         : options.format == Format::Nvfp4 ? "nvfp4"
                                         : options.format == Format::Fp8   ? "fp8"
-                                        : options.format == Format::Q8    ? "q8"
                                                                           : "all";
         std::printf(
             "# op=gdn_input_proj_conv form=%s format=%s nvfp4_policy=%s fp8_policy=%s gpu=%s "
@@ -957,10 +902,6 @@ int main(int argc, char** argv) {
         }
         if (options.format == Format::Fp8 || options.format == Format::All) {
             Fp8Fixture fixture(static_cast<std::size_t>(options.flush_bytes), options.fp8_policy);
-            run_fixture(fixture, options, context.stream, results);
-        }
-        if (options.format == Format::Q8 || options.format == Format::All) {
-            Q8Fixture fixture(static_cast<std::size_t>(options.flush_bytes));
             run_fixture(fixture, options, context.stream, results);
         }
         write_csv(options.csv_out, results, options, context);

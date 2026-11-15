@@ -59,7 +59,7 @@ struct MoeGroupedPiece {
 
 void moe_grouped_launch(const MoeGroupedPiece& piece, cudaStream_t stream);
 
-// T56: a call wider than one piece. gate/up runs ONCE over the whole call, grouped by expert
+// A call wider than one piece. gate/up runs ONCE over the whole call, grouped by expert
 // (each expert's weights read once per call instead of once per piece); the down projection and
 // the merge run per piece of <= kMoeGroupedChunkColumns columns (their FP32 per-assignment
 // outputs bound the workspace), reading the call's grouped h through a per-piece row map. Every

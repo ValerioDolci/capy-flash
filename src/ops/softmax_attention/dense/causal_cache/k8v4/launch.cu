@@ -66,8 +66,6 @@ void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
     if (plan.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan.partition, partial.view(), stream);
-    else if (plan.query_heads == 16)
-        grouped_instance<CausalD256H16Kv2>(p, view, input, plan.partition, partial.view(), stream);
     else
         throw std::invalid_argument("K8V4 attention: unsupported head geometry");
 }
@@ -117,8 +115,6 @@ void execute_parallel(const CausalAttentionOperands& p, K8V4KvReadView cache,
     };
     if (plan.query_heads == 24)
         invoke.template operator()<CausalD256H24Kv4>();
-    else if (plan.query_heads == 16)
-        invoke.template operator()<CausalD256H16Kv2>();
     else
         throw std::invalid_argument("K8V4 attention: unsupported head geometry");
 }

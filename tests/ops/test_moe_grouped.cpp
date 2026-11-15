@@ -15,6 +15,7 @@
 #include "ninfer/ops/moe_slots.h"
 
 #include "core/arena.h"
+#include "ops/nvfp4_test_codec.h"
 #include "ops/op_tester.h"
 #include "ops/metadata_timing.cuh"
 
@@ -59,44 +60,6 @@ constexpr ReductionCriterion kRecipe{5.0e-3, 0.0, 5.0e-2};
 // token by < 1e-2 relative, ~1e-4 of the routes): 1e-3 relative L2, 1e-2 gross.
 constexpr ReductionCriterion kSameRecipe{1.0e-3, 0.0, 1.0e-2};
 constexpr float kDivisorJitter = 0.98742F; // see reference()
-
-const float kE2M1[16] = {0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
-                         -0.F, -0.5F, -1.F, -1.5F, -2.F, -3.F, -4.F, -6.F};
-
-float e4m3_decode(std::uint8_t c) {
-    const int sign = c >> 7, e = (c >> 3) & 15, m = c & 7;
-    float v = 0.F;
-    if (e == 0)
-        v = static_cast<float>(m) * std::ldexp(1.0F, -9);
-    else
-        v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
-    return sign ? -v : v;
-}
-
-// E4M3FN round-to-nearest-even, satfinite, of a non-negative value (the activation scale).
-float e4m3_rn(float v) {
-    if (!(v > 0.0F)) return 0.0F;
-    if (v >= 448.0F) return 448.0F;
-    int ex = 0;
-    std::frexp(v, &ex);                        // v = f * 2^ex, f in [0.5,1)
-    const int exponent = std::max(ex - 1, -6); // subnormal step below 2^-6
-    const float step   = std::ldexp(1.0F, exponent - 3);
-    return std::min(std::nearbyint(v / step) * step, 448.0F);
-}
-
-// E2M1 round-to-nearest-even (ties to the even code), satfinite.
-float e2m1_rn(float v) {
-    static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a              = std::fabs(v);
-    float r                    = 6.0F;
-    for (int i = 0; i < 7; ++i) {
-        if (a > grid[i + 1]) continue;
-        const float mid = 0.5F * (grid[i] + grid[i + 1]);
-        r = a < mid ? grid[i] : a > mid ? grid[i + 1] : (i % 2 == 0 ? grid[i] : grid[i + 1]);
-        break;
-    }
-    return std::copysign(r, v);
-}
 
 // The documented activation profile for 16 values: codes (as values) and the E4M3 scale.
 void quant16(const float* v, float gs, float* codes, float& sf) {
@@ -621,7 +584,7 @@ int missing_case(const Model& m, Runner& runner, const DevicePool& pool,
     return failures;
 }
 
-// (4) A call wider than one piece (T56: gate/up grouped over the whole call, down and merge per
+// (4) A call wider than one piece (gate/up grouped over the whole call, down and merge per
 // piece) equals its pieces called separately, bit for bit: two full pieces and a tail, and an
 // exact multiple of the piece width.
 int piece_case(const Model& m, Runner& runner, const DevicePool& pool,

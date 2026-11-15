@@ -54,7 +54,8 @@ ninfer_add_test(ninfer_turn_anchors_test
 
 ninfer_add_test(ninfer_serve_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve
+  NEEDS_SOURCE_DIR)
 
 ninfer_add_test(ninfer_reasoning_retry_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_reasoning_retry.cpp"
@@ -104,7 +105,7 @@ target_link_options(ninfer_serve_tp_transport_recovery_real_test PRIVATE
   "LINKER:--wrap=_ZN6ninfer6models7qwen3_57Program22recover_peer_transportB5cxx11Ev")
 set_tests_properties(ninfer_serve_tp_transport_recovery_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
-# Documentation guard: every serve flag, NINFER_* variable, conversion recipe and Tnn tag of the
-# sources appears in the user docs (tools/check_docs.py).
+# Documentation guard: every serve flag, NINFER_* variable and conversion recipe of the sources
+# appears in the user docs (tools/check_docs.py).
 add_test(NAME ninfer_docs_guard_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/check_docs.py ${PROJECT_SOURCE_DIR})

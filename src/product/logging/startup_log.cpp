@@ -313,7 +313,7 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                             load.devices.size() == 1 ? "" : "s");
     }
     if (load.host_pageable_bytes != 0) {
-        // v0.7 pinned fallback: part of the expert banks beyond the page-locked limit.
+        // Pinned fallback: part of the expert banks beyond the page-locked limit.
         const std::string why =
             load.host_pinned_alloc_failed
                 ? std::string("the driver refused the whole page-locked allocation")

@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next launcher for the release tarball: serve-flash-next.sh <artifact.ninfer> [ninfer-serve flags...]
 # The capy-flash serving profile, `ninfer-serve --profile flash-next` (two 16 GB sm_120 boards, no P2P, routed experts that do not fit in VRAM on the
 # CPU): INT8 KV with the elastic KV / expert-slot budget, 262,144-token context, MTP with 3 draft tokens, one
-# request at a time. Needs about 70 GiB of free RAM (checked at startup). Environment overrides:
+# request at a time. Needs about 75 GiB of free RAM (checked at startup). Environment overrides:
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1; one id = one GPU, 64 GB edition)  NINFER_MAX_CONTEXT (262144)
 #   NINFER_MODEL_ID (capy-flash: the `model` name requests must use)
 # Extra flags are appended and win over the profile. Run it under a supervisor that restarts on a

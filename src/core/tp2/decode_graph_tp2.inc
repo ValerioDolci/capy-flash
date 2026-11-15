@@ -1,7 +1,6 @@
 // Translation-unit fragment of src/core/decode_graph.cpp, included once at its end (after its
 // closing namespace): the dual-device capture (DecodeGraphPeerBridge, the peer capture overload,
-// node_count) and the cudaGraphExecUpdate diagnostic that update() reports. Not a header. Our
-// file; see docs/maintainer/upstream-merge.md.
+// node_count) and the cudaGraphExecUpdate diagnostic that update() reports. Not a header.
 //
 // Multi-device capture constraints (CUDA 13.1). Re-qualify them on any new two-GPU topology.
 //

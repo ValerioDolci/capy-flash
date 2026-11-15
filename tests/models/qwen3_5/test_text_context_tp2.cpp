@@ -1030,8 +1030,8 @@ int consistency() {
 } // namespace
 
 int main(int argc, char** argv) {
-    // `write DIR` writes the synthetic artifact to DIR/model.ninfer and keeps it: the tp 1 golden
-    // gate (tools/golden) runs it through this fork and through upstream. No device is needed.
+    // `write DIR` writes the synthetic artifact to DIR/model.ninfer and keeps it for the tp 1
+    // golden gate (tools/golden). No device is needed.
     if (argc > 2 && std::string(argv[1]) == "write") {
         try {
             SyntheticArtifact file{std::filesystem::path(argv[2])};

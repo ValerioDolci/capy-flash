@@ -1,6 +1,7 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 
 #include "ops/rmsnorm_rope/launch.h"
+#include "ops/common/validate.h"
 
 #include <array>
 #include <cstddef>
@@ -33,25 +34,19 @@ void require_tensor(const Tensor& tensor, DType dtype, const std::array<std::int
     }
 }
 
-bool overlaps(const Tensor& first, const Tensor& second) {
-    const auto first_begin  = reinterpret_cast<std::uintptr_t>(first.data);
-    const auto second_begin = reinterpret_cast<std::uintptr_t>(second.data);
-    return first_begin < second_begin + second.bytes() &&
-           second_begin < first_begin + first.bytes();
-}
-
 void require_pair_nonoverlap(const Tensor& positions, const Tensor& q_norm_weight,
                              const Tensor& k_norm_weight, const Tensor& q, const Tensor& k) {
-    if (overlaps(q, k) || overlaps(q, positions) || overlaps(q, q_norm_weight) ||
-        overlaps(q, k_norm_weight) || overlaps(k, positions) || overlaps(k, q_norm_weight) ||
-        overlaps(k, k_norm_weight)) {
+    if (detail::overlaps(q, k) || detail::overlaps(q, positions) ||
+        detail::overlaps(q, q_norm_weight) || detail::overlaps(q, k_norm_weight) ||
+        detail::overlaps(k, positions) || detail::overlaps(k, q_norm_weight) ||
+        detail::overlaps(k, k_norm_weight)) {
         throw std::invalid_argument("rmsnorm_rope: pair mutable tensors overlap another operand");
     }
 }
 
 void require_single_nonoverlap(const Tensor& positions, const Tensor& norm_weight,
                                const Tensor& x) {
-    if (overlaps(x, positions) || overlaps(x, norm_weight)) {
+    if (detail::overlaps(x, positions) || detail::overlaps(x, norm_weight)) {
         throw std::invalid_argument(
             "rmsnorm_rope: single mutable tensor overlaps a read-only input");
     }

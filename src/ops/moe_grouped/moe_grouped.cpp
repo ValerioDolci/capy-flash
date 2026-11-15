@@ -3,10 +3,10 @@
 #include "ninfer/ops/moe_grouped.h"
 
 #include "ops/moe_grouped/launch.h"
+#include "ops/common/validate.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -44,12 +44,6 @@ void require_plane(const MoeSlotPlane& plane, std::int64_t bytes, std::int64_t a
                 "-byte aligned");
     require(plane.stride == bytes,
             std::string(label) + " plane must be planar (stride = one expert's plane bytes)");
-}
-
-bool overlaps(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes) {
-    const auto pa = reinterpret_cast<std::uintptr_t>(a);
-    const auto pb = reinterpret_cast<std::uintptr_t>(b);
-    return pa < pb + b_bytes && pb < pa + a_bytes;
 }
 
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
@@ -133,7 +127,7 @@ MoeGroupedWideLayout moe_grouped_wide_layout(std::int32_t columns) {
 
 std::size_t moe_grouped_nvfp4_workspace_bytes(std::int32_t max_tokens) {
     require(max_tokens >= 1, "max_tokens must be positive");
-    // Wider calls group the whole call for gate/up (T56): the wide layout of max_tokens covers
+    // Wider calls group the whole call for gate/up: the wide layout of max_tokens covers
     // every narrower call (its arrays only grow with the width).
     const std::size_t piece =
         detail::moe_grouped_layout(std::min(max_tokens, kMoeGroupedChunkColumns)).total;
@@ -176,13 +170,8 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
     require_dense(out, DType::FP32, "out");
     require_columns(out, kMoeSlotsHidden, tokens, "out");
 
-    const std::int32_t chunk = std::min(tokens, kMoeGroupedChunkColumns);
-    // NINFER_MOE_GROUPED_PIECES=1 keeps the per-piece gate/up (A/B runs on one binary; same bits).
-    static const bool pieces_only = [] {
-        const char* v = std::getenv("NINFER_MOE_GROUPED_PIECES");
-        return v != nullptr && std::string(v) == "1";
-    }();
-    const bool wide                       = tokens > kMoeGroupedChunkColumns && !pieces_only;
+    const std::int32_t chunk              = std::min(tokens, kMoeGroupedChunkColumns);
+    const bool wide                       = tokens > kMoeGroupedChunkColumns;
     const detail::MoeGroupedLayout layout = detail::moe_grouped_layout(chunk);
     const std::size_t need = wide ? detail::moe_grouped_wide_layout(tokens).total : layout.total;
     require(workspace.base() != nullptr && workspace.capacity() >= need &&
@@ -190,10 +179,10 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
             "insufficient workspace capacity");
     for (const Tensor* t : {&x, &routed_ids, &routed_weights, &layer.slot_table,
                             &layer.gate_up_divisors, &layer.down_divisors}) {
-        require(!overlaps(out.data, out.bytes(), t->data, t->bytes()),
+        require(!detail::overlaps(out.data, out.bytes(), t->data, t->bytes()),
                 "out must not overlap an input");
     }
-    require(!overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()),
+    require(!detail::overlaps(out.data, out.bytes(), workspace.base(), workspace.capacity()),
             "out must not overlap the workspace");
 
     auto scope        = workspace.scope();

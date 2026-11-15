@@ -42,7 +42,7 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
         round.tokens, round.row_counts, round.row_stride, round.timing);
     // Structured output: a row fails only if execution reached a dead-end position, i.e. one of
-    // its first `produced` positions (upstream 08902f73).
+    // its first `produced` positions (as in ninfer).
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::int32_t produced = round.row_counts.empty() ? 1 : round.row_counts[row];
         const std::uint32_t reached = produced <= 0 ? 0U
@@ -600,8 +600,8 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
 
 // A cancelled request keeps the context it already holds. A same-session follow-up consumes its
 // source continuation when it materializes (the previous turn's checkpoint moves into the active
-// sequence), so discarding the cancelled sequence also discarded that checkpoint and the next turn
-// rebuilt the whole conversation (issue #3). Cataloguing the sequence at its committed frontier,
+// sequence), so discarding the cancelled sequence would also discard that checkpoint and the next
+// turn would rebuild the whole conversation. Cataloguing the sequence at its committed frontier,
 // exactly like a finished turn, keeps the inherited checkpoints, the turn-closure rewrite captured
 // so far and the frontier itself: a different follow-up resumes from the closure, the same prompt
 // sent again resumes from the frontier.

@@ -1,7 +1,6 @@
 #pragma once
 
-// Two-device (tp 2) forms of gdn_input_proj. Our file: ninfer/ops/gdn_input_proj.h is upstream's
-// and carries no hook.
+// Two-device (tp 2) forms of gdn_input_proj.
 
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"

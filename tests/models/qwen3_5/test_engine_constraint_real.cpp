@@ -444,7 +444,7 @@ void rejection(ninfer::Engine& engine) {
 }
 
 // A zero-suffix prefix hit samples the first token from the retained hidden with the lane's
-// sampling config: the mask must be bound there too (upstream 08902f73 test).
+// sampling config: the mask must be bound there too (a case ported from ninfer's tests).
 void exact_hit(ninfer::Engine& engine) {
     const auto raw = engine.tokenize_text("A raw prompt checkpoint. Answer yes or no: ");
     auto seed      = request(1, 0.0F, std::nullopt);

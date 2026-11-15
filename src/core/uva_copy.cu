@@ -58,7 +58,7 @@ int stream_device(cudaStream_t stream) {
     if (stream == nullptr) {
         CUDA_CHECK(cudaGetDevice(&device));
     } else {
-        // The capybara knows its pond even while the graph is being drawn.
+        // The stream's context gives its device, also while the stream is being captured.
         CUcontext context = nullptr;
         CUresult result   = cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &context);
         if (result == CUDA_SUCCESS) { result = cuCtxGetDevice_v2(&device, context); }

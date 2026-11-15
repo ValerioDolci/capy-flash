@@ -10,10 +10,9 @@
 //   minus bound, the order must be non-increasing within bound, and the ids distinct.
 // Weights: softmax renormalized over the Op's own chosen ids from FP64 logits, |err| <= 2e-5 (FP32
 // exp of logits shifted by the maximum: a few ulp of values <= 1, plus the logit error times the
-// weight). Shared gate: sigmoid of the FP64 score row, |err| <= 2e-6. By default columns >= 64
-// take the tensor-core logits (NINFER_QWEN4_ROUTER_MMA=0, ctest ninfer_moe_route_simt_test, keeps
-// the SIMT kernel everywhere), whose FP32 accumulation is not the SIMT kernel's (T183: gate
-// error 2.9e-6 at T=300). The contract bound then applies to the gate too: |err| <= max(2e-6,
+// weight). Shared gate: sigmoid of the FP64 score row, |err| <= 2e-6. Columns >= 64 take the
+// tensor-core logits, whose FP32 accumulation is not the SIMT kernel's (gate error 2.9e-6 at
+// T=300). The contract bound then applies to the gate too: |err| <= max(2e-6,
 // bound_E(t) / 4), the FP32 accumulation bound of the score row (as for the logits) times the
 // sigmoid's Lipschitz constant. Valid columns: a column past its lane's valid count must hold ids
 // -1 and weights 0 exactly (its shared gate is still checked); the other columns are checked as
@@ -26,7 +25,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <numeric>
@@ -131,8 +129,7 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
 
     int failures        = 0;
     double worst_weight = 0, worst_gate = 0, worst_gate_ratio = 0, worst_margin_ratio = 0;
-    const char* mma_env      = std::getenv("NINFER_QWEN4_ROUTER_MMA");
-    const bool mma           = (mma_env == nullptr || mma_env[0] != '0') && tokens >= 64;
+    const bool mma           = tokens >= 64;
     int near_tie_differences = 0;
     int masked               = 0;
     for (int t = 0; t < tokens; ++t) {
@@ -313,7 +310,7 @@ int main() {
             run_route_case("moe_route valid columns graph", 12, 95U, false, true, {4, 1, 2});
         // MTP AR step: one column per lane, lanes past their extent route nothing.
         failures += run_route_case("moe_route valid columns W=1", 3, 97U, false, false, {1, 0, 1});
-        // MTP alignment (T52): W = 4 of 4 lanes, only the accepted (last valid) column routes;
+        // MTP alignment: W = 4 of 4 lanes, only the accepted (last valid) column routes;
         // counts 4, 1, 0 (nothing), 2.
         failures +=
             run_route_case("moe_route last valid", 16, 99U, false, false, {4, 1, 0, 2}, true);

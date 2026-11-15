@@ -1,8 +1,7 @@
 // Translation-unit fragment of src/models/qwen3_5/execution/draft.cpp, included once at its end
 // (after its closing namespace): the split DFlash2 drafter at tensor-parallel width 2
 // (execution/tp2/draft_split.h), sharing draft.cpp's private helpers (the context append, the
-// dynamic convolution's prepare, the feature sinks). Not a header. Our file; see
-// docs/maintainer/upstream-merge.md.
+// dynamic convolution's prepare, the feature sinks). Not a header.
 //
 // Rank r holds its 16 of the 32 query heads and 4 of the 8 KV heads of every drafter layer, half of
 // the MLP rows and the matching input columns of the attention output and MLP down projections;
@@ -119,8 +118,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
                 Tensor attention = work.alloc(DType::BF16, {128, kSplitQueryHeads, width, batch});
                 ops::sliding_window_attention_head_block(
                     query, key, value, positions[r], valid[r], slots[r],
-                    {128, kSplitQueryHeads, kSplitKvHeads},
-                    dimension(config.sliding_window),
+                    {128, kSplitQueryHeads, kSplitKvHeads}, dimension(config.sliding_window),
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     ranks[r].dflash->local_layer(static_cast<std::uint32_t>(layer)),
                     envelopes.local, work, attention, stream);
@@ -301,7 +299,7 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     }
     // The round continues into the target forward's captured mailbox exchanges, and a rank that
     // reaches its first exchange spins on the peer. Under WSL2 the peer's outstanding pull from
-    // this device stalls behind that spin (issue #1), so the target's inbound copies must be
+    // this device stalls behind that spin, so the target's inbound copies must be
     // complete before either rank enters the mailbox phase: the rendezvous the MTP path gets from
     // its draft phase's staged collectives.
     // Only once the draft phase runs on the staged copies (the WSL2 step-down, or
@@ -357,7 +355,7 @@ void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size,
 
 void dflash_append_context_peer(DFlashPeerDrafter& peer, const qwen3_5::DFlashDecodeIngress& host,
                                 std::int32_t batch, std::uint32_t draft_window,
-                                ops::KVCacheAppendPrefixExecutionEnvelope envelope) {
+                                ops::ContextKVMaterializeExecutionEnvelope envelope) {
     ExecutionCore& core = peer.execution;
     if (!core.io.dflash_decode) {
         throw std::logic_error("DFlash2 tp2: rank 1 has no DFlash decode frame");
