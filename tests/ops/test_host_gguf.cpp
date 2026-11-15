@@ -42,7 +42,7 @@ using g::WeightFormat;
 namespace {
 
 constexpr int kMaxT = 8;
-int g_failures = 0;
+int g_failures      = 0;
 
 #define CHECK(cond, ...)                                                                           \
     do {                                                                                           \
@@ -69,35 +69,62 @@ float bf16_value(std::uint16_t b) {
 
 struct AlignedBuf {
     std::uint8_t* p = nullptr;
+
     explicit AlignedBuf(std::size_t n) {
         p = static_cast<std::uint8_t*>(std::aligned_alloc(64, (n + 63) / 64 * 64));
         std::memset(p, 0, (n + 63) / 64 * 64);
     }
+
     ~AlignedBuf() { std::free(p); }
-    AlignedBuf(const AlignedBuf&) = delete;
+
+    AlignedBuf(const AlignedBuf&)            = delete;
     AlignedBuf& operator=(const AlignedBuf&) = delete;
 };
 
 void dequantize(WeightFormat fmt, const void* row, float* y, int k) {
     switch (fmt) {
-    case WeightFormat::IQ2_S: dequantize_row_iq2_s(static_cast<const block_iq2_s*>(row), y, k); return;
-    case WeightFormat::IQ3_XXS: dequantize_row_iq3_xxs(static_cast<const block_iq3_xxs*>(row), y, k); return;
-    case WeightFormat::IQ3_S: dequantize_row_iq3_s(static_cast<const block_iq3_s*>(row), y, k); return;
-    case WeightFormat::IQ4_XS: dequantize_row_iq4_xs(static_cast<const block_iq4_xs*>(row), y, k); return;
-    case WeightFormat::IQ4_NL: dequantize_row_iq4_nl(static_cast<const block_iq4_nl*>(row), y, k); return;
-    case WeightFormat::Q2_0: dequantize_row_q2_0(static_cast<const block_q2_0*>(row), y, k); return;
+    case WeightFormat::IQ2_S:
+        dequantize_row_iq2_s(static_cast<const block_iq2_s*>(row), y, k);
+        return;
+    case WeightFormat::IQ3_XXS:
+        dequantize_row_iq3_xxs(static_cast<const block_iq3_xxs*>(row), y, k);
+        return;
+    case WeightFormat::IQ3_S:
+        dequantize_row_iq3_s(static_cast<const block_iq3_s*>(row), y, k);
+        return;
+    case WeightFormat::IQ4_XS:
+        dequantize_row_iq4_xs(static_cast<const block_iq4_xs*>(row), y, k);
+        return;
+    case WeightFormat::IQ4_NL:
+        dequantize_row_iq4_nl(static_cast<const block_iq4_nl*>(row), y, k);
+        return;
+    case WeightFormat::Q2_0:
+        dequantize_row_q2_0(static_cast<const block_q2_0*>(row), y, k);
+        return;
     }
 }
 
 float generic_dot(WeightFormat fmt, const void* row, const void* act, int k) {
     float s = 0.0F;
     switch (fmt) {
-    case WeightFormat::IQ2_S: ggml_vec_dot_iq2_s_q8_K_generic(k, &s, 0, row, 0, act, 0, 1); break;
-    case WeightFormat::IQ3_XXS: ggml_vec_dot_iq3_xxs_q8_K_generic(k, &s, 0, row, 0, act, 0, 1); break;
-    case WeightFormat::IQ3_S: ggml_vec_dot_iq3_s_q8_K_generic(k, &s, 0, row, 0, act, 0, 1); break;
-    case WeightFormat::IQ4_XS: ggml_vec_dot_iq4_xs_q8_K_generic(k, &s, 0, row, 0, act, 0, 1); break;
-    case WeightFormat::IQ4_NL: ggml_vec_dot_iq4_nl_q8_0_generic(k, &s, 0, row, 0, act, 0, 1); break;
-    case WeightFormat::Q2_0: ggml_vec_dot_q2_0_q8_0_generic(k, &s, 0, row, 0, act, 0, 1); break;
+    case WeightFormat::IQ2_S:
+        ggml_vec_dot_iq2_s_q8_K_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
+    case WeightFormat::IQ3_XXS:
+        ggml_vec_dot_iq3_xxs_q8_K_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
+    case WeightFormat::IQ3_S:
+        ggml_vec_dot_iq3_s_q8_K_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
+    case WeightFormat::IQ4_XS:
+        ggml_vec_dot_iq4_xs_q8_K_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
+    case WeightFormat::IQ4_NL:
+        ggml_vec_dot_iq4_nl_q8_0_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
+    case WeightFormat::Q2_0:
+        ggml_vec_dot_q2_0_q8_0_generic(k, &s, 0, row, 0, act, 0, 1);
+        break;
     }
     return s;
 }
@@ -106,8 +133,8 @@ float generic_dot(WeightFormat fmt, const void* row, const void* act, int k) {
 struct RowSet {
     std::string label;
     WeightFormat fmt;
-    int k = 0;
-    int rows = 0;
+    int k                 = 0;
+    int rows              = 0;
     std::size_t row_bytes = 0;
     std::vector<std::uint8_t> data;
 };
@@ -115,7 +142,12 @@ struct RowSet {
 std::uint16_t half_bits(float f) { return GGML_FP32_TO_FP16(f); }
 
 RowSet synthetic(WeightFormat fmt, int k, int rows, std::mt19937_64& rng) {
-    RowSet s{std::string("synthetic ") + g::format_name(fmt), fmt, k, rows, g::weight_row_bytes(fmt, k), {}};
+    RowSet s{std::string("synthetic ") + g::format_name(fmt),
+             fmt,
+             k,
+             rows,
+             g::weight_row_bytes(fmt, k),
+             {}};
     s.data.resize(s.row_bytes * rows);
     for (auto& b : s.data) b = static_cast<std::uint8_t>(rng());
     const g::FormatInfo fi = g::format_info(fmt);
@@ -154,16 +186,21 @@ std::vector<RowSet> bank_rows(const std::string& dir, int rows) {
             const auto& e = entry.at(role);
             WeightFormat fmt;
             if (!format_of(e.at("format").get<std::string>(), &fmt)) continue;
-            RowSet s{"layer " + layer + " " + role + " " + g::format_name(fmt), fmt,
-                     e.at("shape")[1].get<int>(), rows, e.at("row_bytes").get<std::size_t>(), {}};
+            RowSet s{"layer " + layer + " " + role + " " + g::format_name(fmt),
+                     fmt,
+                     e.at("shape")[1].get<int>(),
+                     rows,
+                     e.at("row_bytes").get<std::size_t>(),
+                     {}};
             const long long total = e.at("shape")[0].get<long long>();
             s.data.resize(s.row_bytes * rows);
             const int fd = ::open((dir + "/" + e.at("file").get<std::string>()).c_str(), O_RDONLY);
             if (fd < 0) continue;
             for (int r = 0; r < rows; ++r) {
                 const long long row = (total - 1) * r / std::max(rows - 1, 1);
-                const ssize_t got = ::pread(fd, s.data.data() + r * s.row_bytes, s.row_bytes,
-                                            static_cast<off_t>(row) * static_cast<off_t>(s.row_bytes));
+                const ssize_t got =
+                    ::pread(fd, s.data.data() + r * s.row_bytes, s.row_bytes,
+                            static_cast<off_t>(row) * static_cast<off_t>(s.row_bytes));
                 CHECK(got == static_cast<ssize_t>(s.row_bytes), "%s: short read", s.label.c_str());
             }
             ::close(fd);
@@ -174,7 +211,7 @@ std::vector<RowSet> bank_rows(const std::string& dir, int rows) {
 }
 
 void check_rows(const RowSet& s, std::mt19937_64& rng) {
-    const int k = s.k;
+    const int k        = s.k;
     const ActFormat af = g::format_info(s.fmt).act;
     // Activations: BF16 columns with varied scales, a few outliers, one all-zero 32-block.
     std::normal_distribution<float> nd(0.F, 1.F);
@@ -199,18 +236,20 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
         for (int i = 0; i < k; ++i) xf[i] = bf16_value(xt[i]);
         if (af == ActFormat::Q8_K) {
             g::quantize_row_q8_K_bf16(xt, reinterpret_cast<block_q8_K*>(ours.data() + arb * t), k);
-            quantize_row_q8_K_ref(xf.data(), reinterpret_cast<block_q8_K*>(ref.data() + arb * t), k);
+            quantize_row_q8_K_ref(xf.data(), reinterpret_cast<block_q8_K*>(ref.data() + arb * t),
+                                  k);
         } else {
             g::quantize_row_q8_0_bf16(xt, reinterpret_cast<block_q8_0*>(ours.data() + arb * t), k);
-            quantize_row_q8_0_ref(xf.data(), reinterpret_cast<block_q8_0*>(ref.data() + arb * t), k);
+            quantize_row_q8_0_ref(xf.data(), reinterpret_cast<block_q8_0*>(ref.data() + arb * t),
+                                  k);
         }
         g::quantize_pack_bf16(af, xt, k, packed.p + pb * t);
         acts[t] = packed.p + pb * t;
     }
     // ggml's reference leaves bsums of an all-zero Q8_K block unwritten (the port writes 0): no
     // such block here except t = 3's first 32 values, which do not zero a whole 256-block.
-    CHECK(std::memcmp(ours.data(), ref.data(), ours.size()) == 0, "%s: Q8 quantizer differs from ggml ref",
-          s.label.c_str());
+    CHECK(std::memcmp(ours.data(), ref.data(), ours.size()) == 0,
+          "%s: Q8 quantizer differs from ggml ref", s.label.c_str());
 
     // (2)-(4) dots.
     const std::size_t drb = g::decoded_row_bytes(s.fmt, k);
@@ -219,7 +258,7 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
     double worst_generic = 0.0, err2 = 0.0, ref2 = 0.0;
     int tile_mismatch = 0, t_mismatch = 0;
     for (int r0 = 0; r0 < s.rows; r0 += 8) {
-        const int nr = std::min(8, s.rows - r0);
+        const int nr             = std::min(8, s.rows - r0);
         const std::uint8_t* rows = s.data.data() + std::size_t(r0) * s.row_bytes;
         g::decode_rows(s.fmt, rows, s.row_bytes, nr, k, dec.p);
         float out8[8 * kMaxT];
@@ -244,23 +283,29 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
                 const float gen = generic_dot(s.fmt, row, ours.data() + arb * t, k);
                 // sum |w a| over the quantized activation values.
                 std::vector<float> aq(k);
-                if (af == ActFormat::Q8_K) dequantize_row_q8_K(reinterpret_cast<const block_q8_K*>(ours.data() + arb * t), aq.data(), k);
-                else dequantize_row_q8_0(reinterpret_cast<const block_q8_0*>(ours.data() + arb * t), aq.data(), k);
+                if (af == ActFormat::Q8_K)
+                    dequantize_row_q8_K(reinterpret_cast<const block_q8_K*>(ours.data() + arb * t),
+                                        aq.data(), k);
+                else
+                    dequantize_row_q8_0(reinterpret_cast<const block_q8_0*>(ours.data() + arb * t),
+                                        aq.data(), k);
                 double mag = 0.0, exact = 0.0;
                 for (int i = 0; i < k; ++i) {
                     mag += std::fabs(double(w[i]) * aq[i]);
                     exact += double(w[i]) * bf16_value(x[std::size_t(t) * k + i]);
                 }
-                const double rel = mag > 0 ? std::fabs(double(got) - gen) / mag : std::fabs(double(got) - gen);
+                const double rel =
+                    mag > 0 ? std::fabs(double(got) - gen) / mag : std::fabs(double(got) - gen);
                 worst_generic = std::max(worst_generic, rel);
                 err2 += (got - exact) * (got - exact);
                 ref2 += exact * exact;
             }
         }
     }
-    CHECK(worst_generic <= std::ldexp(1.0, -17), "%s: |kernel - ggml generic| = %.3g sum|wa|", s.label.c_str(),
-          worst_generic);
-    CHECK(tile_mismatch == 0, "%s: %d results depend on the row tile", s.label.c_str(), tile_mismatch);
+    CHECK(worst_generic <= std::ldexp(1.0, -17), "%s: |kernel - ggml generic| = %.3g sum|wa|",
+          s.label.c_str(), worst_generic);
+    CHECK(tile_mismatch == 0, "%s: %d results depend on the row tile", s.label.c_str(),
+          tile_mismatch);
     CHECK(t_mismatch == 0, "%s: %d results depend on T", s.label.c_str(), t_mismatch);
 
     // (4b) Q8_K formats with per-32 activation scales (quantize_pack_bf16_q8k_g32): against FP64
@@ -274,11 +319,12 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
         for (int t = 0; t < kMaxT; ++t) {
             g::quantize_pack_bf16_q8k_g32(x.data() + std::size_t(t) * k, k, fine.p + pb * t);
             facts[t] = fine.p + pb * t;
-            g::quantize_row_q8_0_bf16(x.data() + std::size_t(t) * k, reinterpret_cast<block_q8_0*>(q0.data() + q0b * t), k);
+            g::quantize_row_q8_0_bf16(x.data() + std::size_t(t) * k,
+                                      reinterpret_cast<block_q8_0*>(q0.data() + q0b * t), k);
         }
         std::vector<float> aq(k);
         for (int r0 = 0; r0 < s.rows; r0 += 8) {
-            const int nr = std::min(8, s.rows - r0);
+            const int nr             = std::min(8, s.rows - r0);
             const std::uint8_t* rows = s.data.data() + std::size_t(r0) * s.row_bytes;
             g::decode_rows(s.fmt, rows, s.row_bytes, nr, k, dec.p);
             float out8[8 * kMaxT];
@@ -286,7 +332,8 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
             for (int r = 0; r < nr; ++r) {
                 dequantize(s.fmt, rows + std::size_t(r) * s.row_bytes, w.data(), k);
                 for (int t = 0; t < kMaxT; ++t) {
-                    dequantize_row_q8_0(reinterpret_cast<const block_q8_0*>(q0.data() + q0b * t), aq.data(), k);
+                    dequantize_row_q8_0(reinterpret_cast<const block_q8_0*>(q0.data() + q0b * t),
+                                        aq.data(), k);
                     double mag = 0.0, emu = 0.0, exact = 0.0;
                     for (int i = 0; i < k; ++i) {
                         mag += std::fabs(double(w[i]) * aq[i]);
@@ -294,13 +341,15 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
                         exact += double(w[i]) * bf16_value(x[std::size_t(t) * k + i]);
                     }
                     const double got = out8[r * kMaxT + t];
-                    g32_worst = std::max(g32_worst, mag > 0 ? std::fabs(got - emu) / mag : std::fabs(got - emu));
+                    g32_worst        = std::max(g32_worst, mag > 0 ? std::fabs(got - emu) / mag
+                                                                   : std::fabs(got - emu));
                     g32_err2 += (got - exact) * (got - exact);
                     g32_ref2 += exact * exact;
                 }
             }
         }
-        CHECK(g32_worst <= std::ldexp(1.0, -17), "%s: g32 |kernel - FP64| = %.3g sum|wa|", s.label.c_str(), g32_worst);
+        CHECK(g32_worst <= std::ldexp(1.0, -17), "%s: g32 |kernel - FP64| = %.3g sum|wa|",
+              s.label.c_str(), g32_worst);
     }
 
     // (5) BF16 dequantization.
@@ -311,14 +360,18 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
         dequantize(s.fmt, s.data.data() + std::size_t(r) * s.row_bytes, w.data(), k);
         for (int i = 0; i < k; ++i) bad += b16[std::size_t(r) * k + i] != bf16_rne(w[i]);
     }
-    CHECK(bad == 0, "%s: %ld BF16 dequantized values differ from RNE(ggml dequantize)", s.label.c_str(), bad);
+    CHECK(bad == 0, "%s: %ld BF16 dequantized values differ from RNE(ggml dequantize)",
+          s.label.c_str(), bad);
     std::printf("%-34s rows %3d k %4d  |kernel-generic| <= %.2e sum|wa|  T/tile bit-identical %s  "
                 "bf16 exact %s  rel.L2 vs BF16 activations %.3e\n",
-                s.label.c_str(), s.rows, k, worst_generic, (tile_mismatch + t_mismatch) ? "NO" : "yes",
-                bad ? "NO" : "yes", std::sqrt(err2 / std::max(ref2, 1e-300)));
+                s.label.c_str(), s.rows, k, worst_generic,
+                (tile_mismatch + t_mismatch) ? "NO" : "yes", bad ? "NO" : "yes",
+                std::sqrt(err2 / std::max(ref2, 1e-300)));
     if (af == ActFormat::Q8_K) {
-        std::printf("%-34s   with per-32 activation scales: |kernel-FP64| <= %.2e sum|wa|  rel.L2 vs BF16 "
-                    "activations %.3e\n", "", g32_worst, std::sqrt(g32_err2 / std::max(g32_ref2, 1e-300)));
+        std::printf(
+            "%-34s   with per-32 activation scales: |kernel-FP64| <= %.2e sum|wa|  rel.L2 vs BF16 "
+            "activations %.3e\n",
+            "", g32_worst, std::sqrt(g32_err2 / std::max(g32_ref2, 1e-300)));
     }
 }
 
@@ -326,18 +379,22 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
 
 int main(int argc, char** argv) {
     if (!ninfer::ops::host::host_experts_supported()) {
-        std::printf("SKIP: this CPU runs neither ISA of the GGUF host kernels (AVX2 + FMA + F16C)\n");
+        std::printf(
+            "SKIP: this CPU runs neither ISA of the GGUF host kernels (AVX2 + FMA + F16C)\n");
         return 77;
     }
     std::printf("GGUF host kernels: %s (NINFER_HOST_ISA selects)\n",
                 ninfer::ops::host::host_isa_name(g::host_gguf_isa()));
     std::mt19937_64 rng(0x5EED1234ULL);
+
     const struct {
         WeightFormat fmt;
         int k;
-    } kFormats[] = {{WeightFormat::IQ2_S, 2560}, {WeightFormat::IQ3_XXS, 2560}, {WeightFormat::IQ3_S, 2560},
-                    {WeightFormat::IQ4_XS, 2560}, {WeightFormat::IQ4_NL, 640},  {WeightFormat::Q2_0, 640},
+    } kFormats[] = {{WeightFormat::IQ2_S, 2560},  {WeightFormat::IQ3_XXS, 2560},
+                    {WeightFormat::IQ3_S, 2560},  {WeightFormat::IQ4_XS, 2560},
+                    {WeightFormat::IQ4_NL, 640},  {WeightFormat::Q2_0, 640},
                     {WeightFormat::IQ4_NL, 2560}, {WeightFormat::Q2_0, 2560}};
+
     for (const auto& f : kFormats) check_rows(synthetic(f.fmt, f.k, 21, rng), rng);
     const char* dir = argc > 1 ? argv[1] : std::getenv("NINFER_GGUF_BANKS");
     if (dir != nullptr && *dir) {
@@ -345,7 +402,8 @@ int main(int argc, char** argv) {
         CHECK(!sets.empty(), "no bank rows under %s", dir);
         for (const auto& s : sets) check_rows(s, rng);
     } else {
-        std::printf("(no bank directory: real GSQ-RCO rows not checked; pass it as argv[1] or NINFER_GGUF_BANKS)\n");
+        std::printf("(no bank directory: real GSQ-RCO rows not checked; pass it as argv[1] or "
+                    "NINFER_GGUF_BANKS)\n");
     }
     if (g_failures) {
         std::printf("FAILED: %d check(s)\n", g_failures);
