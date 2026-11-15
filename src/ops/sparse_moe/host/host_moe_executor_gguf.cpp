@@ -97,6 +97,18 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     const std::int32_t H = hidden_, I = intermediate_, T = job.tokens;
     const gguf::ActFormat xact = gguf::format_info(g.gate_up).act;
     GgufMember& me             = gguf_members_[static_cast<std::size_t>(member)];
+    const bool big             = gguf_big_[static_cast<std::size_t>(member)] != 0;
+    const auto decode_rows     = big ? K.decode_rows_big : K.decode_rows;
+    // Options::gguf_ecore_tail: a small-core member leaves the last `tail` items of a phase.
+    const std::int32_t tail =
+        options_.gguf_big_gather && !big &&
+                std::find(gguf_big_.begin(), gguf_big_.end(), 1) != gguf_big_.end()
+            ? options_.gguf_ecore_tail
+            : 0;
+    const auto claim = [&](std::atomic<std::int32_t>& next, std::int32_t count) {
+        if (tail > 0 && count - next.load(std::memory_order_relaxed) < tail) return count;
+        return next.fetch_add(1, std::memory_order_relaxed);
+    };
     stamp(member, 0);
     // Tokens: x of every token with a host expert, quantized once for the call.
     const auto used = static_cast<std::int32_t>(used_tokens_.size());
@@ -112,7 +124,7 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     // Gate/up: items (expert u, 32 intermediate rows s); h of each of its pairs.
     const std::int32_t U = unique_count_, slices = I / kGgufRows;
     const std::int32_t items = U * slices;
-    for (std::int32_t it; (it = gguf_next_[1].fetch_add(1, std::memory_order_relaxed)) < items;) {
+    for (std::int32_t it; (it = claim(gguf_next_[1], items)) < items;) {
         const std::int32_t u = it / slices, s = it % slices;
         const std::int32_t e  = unique_[static_cast<std::size_t>(u)];
         const std::int32_t p0 = pair_begin_[static_cast<std::size_t>(u)];
@@ -129,11 +141,11 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
         const std::uint8_t* up = gate + static_cast<std::size_t>(I) * g.gate_up_row_bytes;
         for (std::int32_t c = 0; c < kGgufRows / kGgufChunk; ++c) {
             const std::size_t off = static_cast<std::size_t>(c) * kGgufChunk * g.gate_up_row_bytes;
-            K.decode_rows(g.gate_up, gate + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
+            decode_rows(g.gate_up, gate + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
             K.gemm_decoded(g.gate_up, me.dec.get(), kGgufChunk, H, me.acts.data(), n,
                            me.gate.data() + static_cast<std::size_t>(c) * kGgufChunk * n,
                            static_cast<std::size_t>(n));
-            K.decode_rows(g.gate_up, up + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
+            decode_rows(g.gate_up, up + off, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
             K.gemm_decoded(g.gate_up, me.dec.get(), kGgufChunk, H, me.acts.data(), n,
                            me.up.data() + static_cast<std::size_t>(c) * kGgufChunk * n,
                            static_cast<std::size_t>(n));
@@ -155,7 +167,7 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     if (member == 0) phase_ns_[1] = steady_ns_now();
     // Down: items of 32 output rows; every host expert in ascending id order, then the next item.
     const std::int32_t outs = H / kGgufRows;
-    for (std::int32_t it; (it = gguf_next_[2].fetch_add(1, std::memory_order_relaxed)) < outs;) {
+    for (std::int32_t it; (it = claim(gguf_next_[2], outs)) < outs;) {
         const std::int32_t r0 = it * kGgufRows;
         for (std::int32_t t = 0; t < T; ++t) {
             std::memset(job.out + static_cast<std::size_t>(t) * H + r0, 0,
@@ -174,9 +186,9 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
                 g.down_rows + (static_cast<std::size_t>(row_e) * H + static_cast<std::size_t>(r0)) *
                                   g.down_row_bytes;
             for (std::int32_t c = 0; c < kGgufRows / kGgufChunk; ++c) {
-                K.decode_rows(g.down,
-                              rows + static_cast<std::size_t>(c) * kGgufChunk * g.down_row_bytes,
-                              g.down_row_bytes, kGgufChunk, I, me.dec.get());
+                decode_rows(g.down,
+                            rows + static_cast<std::size_t>(c) * kGgufChunk * g.down_row_bytes,
+                            g.down_row_bytes, kGgufChunk, I, me.dec.get());
                 K.gemm_decoded(g.down, me.dec.get(), kGgufChunk, I, me.acts.data(), n,
                                me.part.data(), static_cast<std::size_t>(n));
                 for (std::int32_t r = 0; r < kGgufChunk; ++r) {

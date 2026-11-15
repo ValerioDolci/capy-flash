@@ -352,6 +352,17 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
               s.label.c_str(), g32_worst);
     }
 
+    // (6) Big-core decoder (hybrid CPUs): the same decoded bytes as decode_rows.
+    {
+        const g::HostGgufKernels& K = g::host_gguf_kernels(g::host_gguf_isa());
+        const std::size_t db        = g::decoded_row_bytes(s.fmt, k);
+        AlignedBuf plain(db * std::size_t(s.rows)), big(db * std::size_t(s.rows));
+        K.decode_rows(s.fmt, s.data.data(), s.row_bytes, s.rows, k, plain.p);
+        K.decode_rows_big(s.fmt, s.data.data(), s.row_bytes, s.rows, k, big.p);
+        CHECK(std::memcmp(plain.p, big.p, db * std::size_t(s.rows)) == 0,
+              "%s: decode_rows_big differs from decode_rows", s.label.c_str());
+    }
+
     // (5) BF16 dequantization.
     std::vector<std::uint16_t> b16(std::size_t(s.rows) * k);
     g::decode_rows_bf16(s.fmt, s.data.data(), s.row_bytes, s.rows, k, b16.data());

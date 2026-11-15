@@ -35,6 +35,8 @@ void check_k(WeightFormat fmt, std::int32_t k);
 #define NINFER_GGUF_ISA_ENTRY_POINTS                                                               \
     void decode_rows(WeightFormat fmt, const void* rows, std::size_t row_bytes,                    \
                      std::int32_t nrows, std::int32_t k, void* dst);                               \
+    void decode_rows_big(WeightFormat fmt, const void* rows, std::size_t row_bytes,                \
+                         std::int32_t nrows, std::int32_t k, void* dst);                           \
     void pack_act_q8_K(const block_q8_K* x, std::int32_t k, void* dst);                            \
     void pack_act_q8_0(const block_q8_0* x, std::int32_t k, void* dst);                            \
     void quantize_pack_bf16(ActFormat act, const std::uint16_t* x, std::int32_t k, void* dst);     \

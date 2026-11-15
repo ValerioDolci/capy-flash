@@ -824,6 +824,12 @@ inline void unpermute_q8k(const uint8_t* g, __m512i (&out)[4]) {
 // BF16 = RNE(float(w) * F) of the decoded layout, in natural element order. Each row segment is
 // expanded by one decode_rows call into an L1-resident scratch, then converted in registers
 // (Q8_K groups are transposed back from the VNNI lane order with shuffles).
+// Big cores: the same decoder (AVX-512 CPUs are not hybrid).
+void decode_rows_big(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
+                     int32_t k, void* dst) {
+    ::ninfer::ops::host::gguf::detail::avx512::decode_rows(fmt, rows, row_bytes, nrows, k, dst);
+}
+
 void decode_rows_bf16(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
                       int32_t k, uint16_t* dst) {
     check_k(fmt, k);

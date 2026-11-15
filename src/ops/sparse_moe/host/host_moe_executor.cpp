@@ -9,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -259,9 +260,31 @@ std::vector<int> packed_cpus(std::int32_t count, std::int32_t first) {
     return out;
 }
 
+const std::vector<int>& big_core_cpus() {
+    static const std::vector<int> cpus = [] {
+        std::ifstream in("/sys/devices/cpu_core/cpus");
+        std::string line;
+        if (!in || !std::getline(in, line) || line.empty()) return std::vector<int>{};
+        try {
+            return parse_cpu_list(line);
+        } catch (const std::invalid_argument&) { return std::vector<int>{}; }
+    }();
+    return cpus;
+}
+
+std::vector<std::uint8_t> big_core_members(std::span<const int> cpus, std::span<const int> big) {
+    std::vector<std::uint8_t> out;
+    out.reserve(cpus.size());
+    for (const int cpu : cpus) {
+        out.push_back(std::find(big.begin(), big.end(), cpu) != big.end() ? 1 : 0);
+    }
+    return out;
+}
+
 // ------------------------------------------------------------------ pool
 HostCpuPool::HostCpuPool(std::span<const int> cpus, double spin_ms)
-    : size_(static_cast<std::int32_t>(cpus.size())), spin_ms_(spin_ms) {
+    : size_(static_cast<std::int32_t>(cpus.size())), spin_ms_(spin_ms),
+      cpus_(cpus.begin(), cpus.end()) {
     if (cpus.empty()) throw std::invalid_argument("host MoE pool: no cpus");
     pin_current_thread(cpus[0]);
     threads_.reserve(cpus.size() - 1);
@@ -346,6 +369,13 @@ HostMoeExecutor::HostMoeExecutor(HostCpuPool& pool, std::int32_t hidden, std::in
     if (!options.gguf_only) {
         x_act_ = W4A8ActivationBuffer(hidden, max_tokens);
         h_act_ = W4A8ActivationBuffer(intermediate, max_pairs);
+    }
+    gguf_big_.assign(static_cast<std::size_t>(pool.size()), 0);
+    if (options.gguf_big_gather) {
+        gguf_big_ = big_core_members(pool.cpus(), big_core_cpus());
+        std::fprintf(stderr, "host MoE executor: GGUF big-core decoder on %d of %d threads\n",
+                     static_cast<int>(std::count(gguf_big_.begin(), gguf_big_.end(), 1)),
+                     pool.size());
     }
     const auto n = static_cast<std::size_t>(pool.size());
     acc_.assign(n,

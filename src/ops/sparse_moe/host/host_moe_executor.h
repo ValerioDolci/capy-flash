@@ -144,6 +144,12 @@ struct HostCpuTopology {
 [[nodiscard]] std::vector<int> parse_cpu_list(std::string_view text);
 // Whether the process affinity (taskset, cgroup cpuset) as read at its first use includes `cpu`.
 [[nodiscard]] bool process_may_run_on(int cpu);
+// Logical CPUs of the big cores of a hybrid CPU (Intel P-cores: /sys/devices/cpu_core/cpus), read
+// once; empty when the CPU is not hybrid or the file is missing.
+[[nodiscard]] const std::vector<int>& big_core_cpus();
+// 1 for each of `cpus` (pool members in order) that is in `big`, else 0.
+[[nodiscard]] std::vector<std::uint8_t> big_core_members(std::span<const int> cpus,
+                                                         std::span<const int> big);
 
 // Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest allowed SMT
 // sibling of each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...
@@ -164,6 +170,9 @@ public:
 
     [[nodiscard]] std::int32_t size() const noexcept { return size_; }
 
+    // The cpu of each member (member i is pinned to cpus()[i]).
+    [[nodiscard]] std::span<const int> cpus() const noexcept { return cpus_; }
+
     // Runs body(member, pool) on every member including the caller; returns when all finished.
     using Body = void (*)(void* context, std::int32_t member);
     void run(Body body, void* context);
@@ -180,6 +189,7 @@ private:
 
     std::int32_t size_ = 1;
     double spin_ms_    = 20.0;
+    std::vector<int> cpus_;
     std::vector<std::thread> threads_;
     Body body_     = nullptr;
     void* context_ = nullptr;
@@ -206,6 +216,14 @@ public:
         // Every layer is a ggml block bank: the NVFP4 activation buffers are not allocated, and an
         // NVFP4 layer is refused.
         bool gguf_only = false;
+        // NINFER_HOST_GGUF_BIG_GATHER=1: members on big cores of a hybrid CPU
+        // decode GGUF rows with gguf::HostGgufKernels::decode_rows_big (vpgather IQ3 grids: fast on
+        // P-cores, ~2x slower on E-cores, which keep decode_rows). Same bytes either way.
+        bool gguf_big_gather = false;
+        // With gguf_big_gather and at least one big-core member (NINFER_HOST_GGUF_ECORE_TAIL=N):
+        // the other members claim no gate/up or down item once fewer than N remain, so the end of a
+        // phase runs on the big cores (an E-core item takes ~3x a P-core one). 0 = off.
+        std::int32_t gguf_ecore_tail = 0;
     };
 
     // `max_tokens` >= 1 bounds the tokens of one call (any value; buffers scale with it).
@@ -262,6 +280,7 @@ private:
     Options options_;
     const HostNvfp4Kernels& kernels_;
     const gguf::HostGgufKernels& gguf_kernels_; // gguf::host_gguf_isa(kernels_.isa)
+    std::vector<std::uint8_t> gguf_big_; // per member: decode_rows_big (Options::gguf_big_gather)
 
     // Current call. Pairs (token, host expert) are grouped by expert (CSR): expert u owns pairs
     // [pair_begin_[u], pair_begin_[u+1]), tokens ascending; experts in ascending id order.

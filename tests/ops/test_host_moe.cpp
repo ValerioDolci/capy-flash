@@ -567,6 +567,21 @@ void test_cpu_list() {
     }
 }
 
+// The members on big cores of a hybrid CPU (they decode GGUF rows with decode_rows_big).
+void test_big_core_members() {
+    using ninfer::ops::host::big_core_members;
+    const std::vector<int> big = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    expect(big_core_members(std::vector<int>{0, 2, 4, 16, 17}, big) ==
+               std::vector<std::uint8_t>({1, 1, 1, 0, 0}),
+           "big cores: P-core members flagged, E-core members not");
+    expect(big_core_members(std::vector<int>{16, 3}, big) == std::vector<std::uint8_t>({0, 1}),
+           "big cores: member order kept");
+    expect(big_core_members(std::vector<int>{0, 2}, std::vector<int>{}) ==
+               std::vector<std::uint8_t>({0, 0}),
+           "big cores: not a hybrid CPU, no member flagged");
+    expect(big_core_members(std::vector<int>{}, big).empty(), "big cores: no members");
+}
+
 } // namespace
 
 int main() {
@@ -579,6 +594,7 @@ int main() {
     std::mt19937_64 rng(20261007);
     test_auto_threads();
     test_cpu_list();
+    test_big_core_members();
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape
     test_layer(rng, 5, 256, 128, false);  // small shape: one row tile, odd expert count

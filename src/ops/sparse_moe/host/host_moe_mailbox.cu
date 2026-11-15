@@ -440,6 +440,12 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     if (const char* v = std::getenv("NINFER_HOST_MOE_A4"); v != nullptr && *v != 0) {
         config_.executor.a4 = std::atoi(v) != 0; // CPU with the GPU's W4A4 activation codec
     }
+    if (const char* v = std::getenv("NINFER_HOST_GGUF_BIG_GATHER"); v != nullptr && *v != 0) {
+        config_.executor.gguf_big_gather = std::atoi(v) != 0; // hybrid Intel, AVX2
+    }
+    if (const char* v = std::getenv("NINFER_HOST_GGUF_ECORE_TAIL"); v != nullptr && *v != 0) {
+        config_.executor.gguf_ecore_tail = std::max(std::atoi(v), 0); // with BIG_GATHER
+    }
     if (const char* v = std::getenv("NINFER_HOST_MOE_CPUS"); v != nullptr && *v != 0) {
         // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
         try {

@@ -236,6 +236,18 @@ void run_layer(const Layer& L, std::mt19937_64& rng, int Tmax) {
     check(outs[0] == outs[1] && outs[1] == outs[2],
           L.name + ": result depends on the thread count");
     {
+        // Big-core decoder and the E-core tail (on a hybrid CPU 12 threads mix P-
+        // and E-cores; elsewhere both options leave the plain path): the same bits.
+        h::HostCpuPool pool(h::spread_cpus(12));
+        h::HostMoeExecutor::Options o{};
+        o.gguf_big_gather = true;
+        o.gguf_ecore_tail = 8;
+        h::HostMoeExecutor ex(pool, H, I, std::max(Tmax, 8), K, o);
+        std::vector<float> out(std::size_t(Tmax) * H, 123.F);
+        ex.run(L.layer, h::HostMoeJob{Tmax, K, x.data(), ids.data(), alpha.data(), out.data()});
+        check(out == outs[0], L.name + ": big-core decoder / E-core tail change the result");
+    }
+    {
         // A GGUF-only executor (no NVFP4 activation buffers) computes the same bits.
         h::HostCpuPool pool(h::spread_cpus(3));
         h::HostMoeExecutor::Options options;
