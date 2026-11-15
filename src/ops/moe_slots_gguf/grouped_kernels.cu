@@ -230,7 +230,9 @@ __global__ void __launch_bounds__(kThreads, 2)
     }
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int wm = warp & 1, wn = warp >> 1;
+    // Token halves on warps 0-3 / 4-7 (warp w issues on scheduler w % 4): a tile of <= 32 tokens
+    // keeps all four tensor units of the SM busy instead of two.
+    const int wm = warp >> 2, wn = warp & 3;
     const bool active = wm * 32 < n;
     float acc[2][4][4];
 #pragma unroll
@@ -264,6 +266,7 @@ __global__ void __launch_bounds__(kThreads, 2)
                 load_b_frags(Ws, kTileN + wn * 16, kk, lane, bu);
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
+                    if (wm * 32 + mt * 16 >= n) continue; // padding rows only, never stored
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
                         mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
@@ -367,7 +370,9 @@ __global__ void __launch_bounds__(kThreads, 2)
     }
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int wm = warp & 1, wn = warp >> 1;
+    // Token halves on warps 0-3 / 4-7 (warp w issues on scheduler w % 4): a tile of <= 32 tokens
+    // keeps all four tensor units of the SM busy instead of two.
+    const int wm = warp >> 2, wn = warp & 3;
     const bool active = wm * 32 < n;
     float acc[2][2][4];
 #pragma unroll
@@ -396,11 +401,13 @@ __global__ void __launch_bounds__(kThreads, 2)
                 load_a_frags(A, wm * 32, kk, lane, a);
                 load_b_frags(Ws, wn * 16, kk, lane, b);
 #pragma unroll
-                for (int mt = 0; mt < 2; ++mt)
+                for (int mt = 0; mt < 2; ++mt) {
+                    if (wm * 32 + mt * 16 >= n) continue; // padding rows only, never stored
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt)
                         mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
                                  a[mt][0], a[mt][1], a[mt][2], a[mt][3], b[nt][0], b[nt][1]);
+                }
             }
         }
         if (ks + 1 < kSteps) {

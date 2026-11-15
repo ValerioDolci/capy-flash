@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.13.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.13.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -248,9 +248,11 @@ prompt, 512 tokens).
 | Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | agentic replay decode median | 182 tok/s |
 | Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7d5d03o3rf01ex9g9wiw) | 234 tok/s |
 | Flash-Next 64 GB | 2 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 2,168 / 3,924 / 3,994 tok/s |
+| Flash-Next 64 GB | 2 | v0.13.1, 2026-11-15 | prefill, cold, 30k / 200k-token source-code prompts | 4,876 / 4,359 tok/s (v0.13.0: 4,541 / 4,041) |
 | Flash-Next 64 GB | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7dm603o7rf01i54inoup) | 121 tok/s |
 | Flash-Next 64 GB | 1 | v0.7.1, 2026-10-22 | agentic replay: decode median / total time / time to first token, median / prompt tokens from cache | 104 tok/s / 276 s / 1.9 s / 83 % |
 | Flash-Next 64 GB | 1 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 1,671 / 2,838 / 2,921 tok/s |
+| Flash-Next 64 GB | 1 | v0.13.1, 2026-11-15 | prefill, cold, 30k / 200k-token source-code prompts | 3,738 / 3,505 tok/s (v0.13.0: 3,306 / 3,040) |
 | Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | decode, 8k-token real-text prompt, MTP | 139 tok/s |
 | Qwen3.8-27B 3-bit | 1 | v0.7.0 | prefill 4k / 16k | 3,401 / 3,211 tok/s |
 | Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7ebb03ofrf01mkfqs948) | 174 tok/s |
@@ -351,6 +353,12 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.13.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.1))
+- Faster prefill for the 64 GB edition, same tokens: the grouped GGUF expert kernels use all four warp schedulers and
+  8192-column pieces ([PR #78](https://github.com/ValerioDolci/capy-flash/pull/78) by @Mici81), and the widest prompt
+  chunk is 32768 where it fits ([PR #79](https://github.com/ValerioDolci/capy-flash/pull/79) by @Mici81). Cold prefill
+  of a 200k-token prompt: +8 % on two GPUs, +15 % on one. Flash-Next NVFP4 and the 27B are unchanged.
 
 **v0.13.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.0))
 - A cleanup release: at every default and profile the same tokens at the same speed as v0.12.0, with about 42,000

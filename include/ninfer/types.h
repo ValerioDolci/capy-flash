@@ -303,7 +303,9 @@ struct RoutedExpertOptions {
     // cache keeps its slots. The planner takes the largest of prompt_chunk, prompt_chunk / 2, ...
     // (> prefill_chunk) whose workspace fits, with the ring, in half the Text layers' slots.
     // 0 or <= prefill_chunk: off (every chunk is prefill_chunk wide, on the Program's arena).
-    std::uint32_t prompt_chunk = 16384;
+    // A wider chunk spreads the per-chunk expert copies and dequantization over more tokens and
+    // does not change the bits; where 32768 does not fit, the planner falls back to 16384, 8192...
+    std::uint32_t prompt_chunk = 32768;
     // Elastic expert columns per GPU (see ElasticKvOptions): resolved by the Engine when
     // ElasticKvOptions::enabled and slots_per_layer is 0; set by hand only with both explicit.
     std::uint32_t elastic_columns = 0;
