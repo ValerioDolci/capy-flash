@@ -8,6 +8,7 @@
 #include "core/device_scope.h"
 #include "ninfer/ops/moe_grouped.h"
 #include "ninfer/ops/moe_slots.h"
+#include "ops/moe_slots_gguf/launch.h"
 #include "ops/sparse_moe/host/host_moe_mailbox.h"
 
 #include <immintrin.h>
@@ -155,6 +156,39 @@ void gguf_partial(const Tensor& x, const Tensor& ids, const Tensor& weights,
     } else {
         WorkspaceArena scratch(work.alloc_bytes(ops::moe_grouped_gguf_workspace_bytes(T)));
         ops::moe_grouped_gguf(x, ids, weights, view, partial, scratch, stream);
+    }
+}
+
+// T62 for ggml block banks: a prompt chunk's partial in the published column groups, each reported
+// as soon as it is enqueued so that its exchange overlaps the next group's experts (as run_nvfp4
+// does). A group is rounded up to whole pieces of moe_grouped_gguf, which are independent: the same
+// bits as one call. Without it the whole partial leaves after the last group, and at every MoE
+// layer of the chunk both GPUs wait for the exchange. A tail too short for the grouped kernel
+// joins the group before it.
+void gguf_partial_grouped(const Tensor& x, const Tensor& ids, const Tensor& weights,
+                          const ops::MoeGgufLayer& view, Tensor& partial, WorkspaceArena& work,
+                          cudaStream_t stream) {
+    Qwen4ColumnGroups* groups = qwen4_column_groups;
+    const std::int32_t T      = x.ne[1];
+    const std::int32_t unit   = ops::detail::kGgufGroupedChunkColumns;
+    const std::int32_t G      = groups != nullptr && groups->group_columns > 0
+                                    ? (groups->group_columns + unit - 1) / unit * unit
+                                    : 0;
+    if (G <= 0 || T <= G || T <= ops::kMoeSlotsMaxTokens || groups->done != 0) {
+        gguf_partial(x, ids, weights, view, partial, work, stream);
+        return;
+    }
+    for (std::int32_t first = 0; first < T;) {
+        std::int32_t n = std::min(G, T - first);
+        if (T - first - n <= ops::kMoeSlotsMaxTokens) { n = T - first; }
+        Tensor out = partial.slice(1, first, n);
+        gguf_partial(x.slice(1, first, n), ids.slice(1, first, n), weights.slice(1, first, n), view,
+                     out, work, stream);
+        first += n;
+        if (first < T) {
+            groups->ready(first - n, n);
+            groups->done = first;
+        }
     }
 }
 
@@ -1662,7 +1696,11 @@ void Qwen4OffloadExperts::run_gguf(std::int32_t layer, const Qwen4ExpertBank& ba
         } else {
             view.host_table = row; // zero-copy
         }
-        gguf_partial(x, ids, weights, view, partial, work, stream);
+        if (cpu_share) { // the CPU share is added after the whole partial: one call
+            gguf_partial(x, ids, weights, view, partial, work, stream);
+        } else {
+            gguf_partial_grouped(x, ids, weights, view, partial, work, stream);
+        }
         if (ring) { gguf_ring_done(0, layer, stream); }
         if (cpu_share) {
             mailbox_->accumulate(stream, layer, T, static_cast<float*>(partial.data));
@@ -2701,13 +2739,13 @@ void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& ban
             if (owner_->gguf_ring_copy(1, layer, stream)) {
                 view.slot_table = Tensor(const_cast<std::int32_t*>(row), DType::I32, {kExperts});
                 view.slots      = owner_->gguf_stream_slots();
-                gguf_partial(x, ids, weights, view, partial, work, stream);
+                gguf_partial_grouped(x, ids, weights, view, partial, work, stream);
                 owner_->gguf_ring_done(1, layer, stream);
                 return;
             }
             view.host_table = row;
         }
-        gguf_partial(x, ids, weights, view, partial, work, stream);
+        gguf_partial_grouped(x, ids, weights, view, partial, work, stream);
         return;
     }
     const float* divisors =
