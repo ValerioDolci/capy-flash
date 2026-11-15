@@ -26,10 +26,20 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
-    // Text only (no media item): what the disk tier saves and resumes.
+    // Text only (no media item).
     [[nodiscard]] bool text_only() const noexcept {
         return vision_items_.empty() && std::all_of(token_types_.begin(), token_types_.end(),
                                                     [](std::uint8_t type) { return type == 0; });
+    }
+
+    // The disk tier derives the identity of the Vision placeholders from these
+    // (storage/disk_kv.cpp).
+    [[nodiscard]] std::span<const std::uint8_t> token_types() const noexcept {
+        return token_types_;
+    }
+
+    [[nodiscard]] const std::vector<VisionItem>& vision_items() const noexcept {
+        return vision_items_;
     }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;

@@ -1390,7 +1390,9 @@ such as a system prompt another conversation left, made the long conversation pr
 - Each file carries a validity key: artifact and executable (path, size, modification time), tensor
   parallel width, KV dtype, speculative mode and the KV/state layouts; files with another key are
   ignored. A new build or artifact starts with an empty disk tier.
-- Text prompts only (no images); without speculation or with MTP (DFlash2 turns the disk tier
+- Text and image prompts (an image's placeholder tokens are named on disk by the
+  item's content digest, grid and offset, so another picture never resumes a saved one; a checkpoint
+  never splits an item); without speculation or with MTP (DFlash2 turns the disk tier
   off). Pinned memory: about 320 MiB plus one StateImage. Space, Qwen3.8-27B with INT8 KV (one GPU or
   both halves at `--tp 2`): about 36 KB per token of context plus 147 MiB per saved state.
 - Measured on two RTX 5070 Ti, Qwen3.8-27B GSQ-3, `--profile 27b`, page cache dropped: time to first

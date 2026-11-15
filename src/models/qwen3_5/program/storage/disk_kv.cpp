@@ -47,6 +47,7 @@ constexpr std::uint32_t kDiskBlockTokens = kDiskBlockPages * 64U;
 // otherwise resuming at the rewrite checkpoint and recomputing the reply is cheap.
 constexpr std::uint32_t kDiskEndpointMinimumGain = 2048;
 constexpr std::uint64_t kSeedA = 0x6e6964b10cU, kSeedB = 0x9f2c55a1e37dU, kSeedS = 0x51a7e1U;
+constexpr std::uint64_t kSeedV = 0x7669736e6f6eU;
 
 std::string layout_key(const HostKVPageLayout& layout) {
     std::string out = std::to_string(layout.page_stride) + "/" + std::to_string(layout.replicas) +
@@ -177,18 +178,19 @@ void ProgramImpl::initialize_disk_cache() {
 
 namespace {
 
+bool splits_vision(const std::vector<VisionItem>& items, std::size_t frontier);
+
 // The checkpoints of a retained conversation the disk can hold, and their largest frontier.
 template <class Program>
 std::uint32_t disk_checkpoints(const Program& program, const SequenceState& sequence,
                                std::vector<DiskCheckpointPlan>& out) {
     out.clear();
-    if (!sequence.kv || sequence.rope_delta != 0 || !sequence.prefix_identity.text_only()) {
-        return 0;
-    }
-    const bool mtp = program.speculative_backend == SpeculativeBackend::Mtp;
+    if (!sequence.kv) { return 0; }
+    const std::vector<VisionItem>& items = sequence.prefix_identity.vision_items();
+    const bool mtp                       = program.speculative_backend == SpeculativeBackend::Mtp;
     const auto add = [&](std::uint32_t frontier, std::uint32_t kind, StateImageHandle state) {
         if (frontier == 0 || frontier > sequence.text_kv_valid ||
-            frontier > sequence.ledger.size()) {
+            frontier > sequence.ledger.size() || splits_vision(items, frontier)) {
             return;
         }
         if (mtp && (!sequence.kv->backend || frontier - 1U > sequence.mtp_kv_valid)) { return; }
@@ -245,6 +247,71 @@ DiskKVBlobId disk_state_id(std::span<const TokenId> tokens, std::uint32_t fronti
     const std::size_t bytes = static_cast<std::size_t>(frontier) * sizeof(TokenId);
     return DiskKVBlobId{xxh64(tokens.data(), bytes, key ^ kSeedS),
                         xxh64(tokens.data(), bytes, (key ^ kSeedS) * 0x9E3779B97F4A7C15ULL)};
+}
+
+// True when `frontier` falls strictly inside the token spans of a Vision item: a checkpoint there
+// would hold half a picture, which neither the disk nor the in-memory cache can resume from.
+bool splits_vision(const std::vector<VisionItem>& items, std::size_t frontier) {
+    for (const VisionItem& item : items) {
+        if (item.token_spans.empty()) { return true; }
+        const std::size_t begin = item.token_spans.front().begin;
+        const std::size_t end   = item.token_spans.back().begin + item.token_spans.back().count;
+        if (begin < frontier && frontier < end) { return true; }
+    }
+    return false;
+}
+
+// The token stream the disk tier names, hashes and compares. A Vision placeholder token says
+// nothing about its picture, so every token of an item's spans becomes a negative id derived from
+// the item (modality, grid, patches, content digest, timestamps) and the token's offset in it; real
+// token ids are non-negative and never equal one. Text tokens are kept as they are, so a text-only
+// conversation has the same identity, blocks and files as before media support. The positions
+// (M-RoPE, rope_delta) follow from the tokens and the grids, which the identity binds. Returns
+// false when the token types and the items disagree or an item crosses the end of `tokens`.
+bool disk_identity(std::span<const TokenId> tokens, std::span<const std::uint8_t> types,
+                   const std::vector<VisionItem>& items, std::vector<TokenId>& out) {
+    out.assign(tokens.begin(), tokens.end());
+    std::vector<std::uint8_t> covered(tokens.size(), 0);
+    for (const VisionItem& item : items) {
+        if (item.token_spans.empty()) { return false; }
+        if (item.token_spans.front().begin >= tokens.size()) { continue; }
+        Xxh64Stream base(kSeedV);
+        const std::uint64_t fields[] = {static_cast<std::uint64_t>(item.modality),
+                                        static_cast<std::uint64_t>(item.grid.temporal),
+                                        static_cast<std::uint64_t>(item.grid.height),
+                                        static_cast<std::uint64_t>(item.grid.width),
+                                        item.patch_begin,
+                                        item.patch_count,
+                                        item.timestamps.size(),
+                                        item.token_spans.size()};
+        base.update(fields, sizeof(fields));
+        base.update(item.content_digest.data(), item.content_digest.size());
+        if (!item.timestamps.empty()) {
+            base.update(item.timestamps.data(), item.timestamps.size() * sizeof(double));
+        }
+        const std::uint64_t item_digest = base.digest();
+        std::uint64_t offset            = 0;
+        for (const TokenSpan& span : item.token_spans) {
+            if (span.begin > tokens.size() || span.count > tokens.size() - span.begin) {
+                return false;
+            }
+            for (std::size_t k = 0; k < span.count; ++k, ++offset) {
+                const std::size_t index = span.begin + k;
+                if (covered[index] != 0 || index >= types.size() || types[index] == 0) {
+                    return false;
+                }
+                covered[index]              = 1;
+                const std::uint64_t pair[2] = {item_digest, offset};
+                const std::uint64_t value   = xxh64(pair, sizeof(pair), kSeedV) & 0x3fffffffU;
+                out[index]                  = -1 - static_cast<TokenId>(value);
+            }
+        }
+    }
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const std::uint8_t type = index < types.size() ? types[index] : 0;
+        if ((type != 0) != (covered[index] != 0)) { return false; }
+    }
+    return true;
 }
 
 } // namespace
@@ -450,7 +517,17 @@ DiskCacheSave ProgramImpl::disk_cache_save(std::uint32_t slot, const std::functi
         backend_pages > block_pages ? backend_pages - block_pages : 0U;
     const StateImageHostLayout& state_layout = state_images->host_layout();
     const std::size_t image_bytes            = state_layout.image_bytes;
-    const std::span<const TokenId> ledger(sequence.ledger.data(), frontier);
+    std::vector<TokenId> identity;
+    if (!disk_identity(std::span<const TokenId>(sequence.ledger.data(), frontier),
+                       sequence.prefix_identity.token_types(),
+                       sequence.prefix_identity.vision_items(), identity)) {
+        std::fprintf(stderr,
+                     "[disk-kv] save skipped: the %u-token conversation's media identity "
+                     "does not match its tokens\n",
+                     frontier);
+        return DiskCacheSave::Failed;
+    }
+    const std::span<const TokenId> ledger(identity);
 
     std::vector<DiskKVBlobId> ids = disk_block_ids(ledger, blocks, disk_kv->key_hash());
     for (const DiskCheckpointPlan& plan : plans) {
@@ -622,34 +699,47 @@ DiskCacheSave ProgramImpl::disk_cache_save(std::uint32_t slot, const std::functi
 // in-memory match.
 std::uint32_t ProgramImpl::disk_resume_tokens(const PreparedPromptData& prompt) {
     const std::size_t tokens = prompt.token_ids.size();
-    if (!disk_kv || prompt.has_media() || prompt.rope_delta != 0 || tokens <= kDiskMinimumTokens ||
-        tokens > std::numeric_limits<std::uint32_t>::max() ||
-        !std::all_of(prompt.token_types.begin(), prompt.token_types.end(),
-                     [](std::uint8_t type) { return type == 0; })) {
+    if (!disk_kv || tokens <= kDiskMinimumTokens ||
+        tokens > std::numeric_limits<std::uint32_t>::max()) {
         return 0;
     }
-    return disk_kv->longest_indexed_frontier(
-        std::span<const TokenId>(prompt.token_ids.data(), tokens),
-        static_cast<std::uint32_t>(tokens) - 1U);
+    std::vector<TokenId> identity;
+    if (!disk_identity(std::span<const TokenId>(prompt.token_ids.data(), tokens),
+                       prompt.token_types, prompt.vision_items, identity)) {
+        return 0;
+    }
+    const std::uint32_t frontier =
+        disk_kv->longest_indexed_frontier(identity, static_cast<std::uint32_t>(tokens) - 1U);
+    return splits_vision(prompt.vision_items, frontier) ? 0 : frontier;
 }
 
 std::uint32_t ProgramImpl::disk_cache_resume(SequenceState& sequence, RequestControl& request) {
     RequestControl::Prefill& staged = *request.prefill;
     staged.disk_attempted           = true;
     if (!disk_kv || staged.reuse != ReusePath::Root || staged.cursor != 0 || staged.base != 0 ||
-        staged.vision || staged.prompt.has_media() || staged.prompt.rope_delta != 0 ||
         staged.prompt_tokens <= kDiskMinimumTokens || !sequence.kv ||
-        staged.prompt.token_ids.size() < staged.prompt_tokens ||
-        !std::all_of(staged.prompt.token_types.begin(), staged.prompt.token_types.end(),
-                     [](std::uint8_t type) { return type == 0; })) {
+        staged.prompt.token_ids.size() < staged.prompt_tokens) {
+        return 0;
+    }
+    // Media prompts resume like text ones: the identity names the pictures, the loaded KV already
+    // holds the items before the frontier, and the Vision session skips every item that ends there.
+    std::vector<TokenId> identity;
+    if (!disk_identity(
+            std::span<const TokenId>(staged.prompt.token_ids.data(), staged.prompt_tokens),
+            staged.prompt.token_types, staged.prompt.vision_items, identity)) {
         return 0;
     }
     const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
     if (mtp && (!staged.prepare_mtp || !sequence.kv->backend)) { return 0; }
     const auto started = Clock::now();
-    const std::span<const TokenId> prompt(staged.prompt.token_ids.data(), staged.prompt_tokens);
+    const std::span<const TokenId> prompt(identity);
     std::optional<DiskKVCache::Match> match = disk_kv->find(prompt, staged.prompt_tokens - 1U);
     if (!match) { return 0; }
+    if (splits_vision(staged.prompt.vision_items, match->checkpoint.frontier)) {
+        std::fprintf(stderr, "[disk-kv] checkpoint %u splits a Vision item; prefilling\n",
+                     match->checkpoint.frontier);
+        return 0;
+    }
     const double find_ms              = milliseconds_since(started);
     const DiskKVRecordHeader& header  = match->manifest.header();
     const DiskKVCheckpoint checkpoint = match->checkpoint;
