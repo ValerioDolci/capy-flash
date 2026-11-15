@@ -340,6 +340,41 @@ void assign_text_positions(PreparedPromptData& prompt) {
     prompt.rope_delta = 0;
 }
 
+// Appends text tokens to a prompt with Vision items. The M-RoPE positions are axis-major
+// ([3][length]); a text token after the media sits at index + rope_delta on every axis, exactly
+// where decoding would place a generated token, so the continuation reads the same positions the
+// first reply was sampled at. The prompt must end with text (the chat template's "<think>\n").
+void append_text_positions(PreparedPromptData& prompt, std::span<const TokenId> appended) {
+    const std::size_t old_count = prompt.token_ids.size();
+    if (old_count == 0 || prompt.positions.size() != old_count * 3 ||
+        prompt.token_types.size() != old_count) {
+        throw std::logic_error("media continuation: prompt positions do not match its tokens");
+    }
+    const auto last = static_cast<std::int64_t>(old_count - 1) + prompt.rope_delta;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (prompt.token_types.back() != 0 ||
+            prompt.positions[axis * old_count + old_count - 1] != last) {
+            throw std::logic_error("media continuation: the prompt does not end with text");
+        }
+    }
+    const std::size_t count = old_count + appended.size();
+    if (static_cast<std::int64_t>(count - 1) + prompt.rope_delta >
+        std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("prepared prompt position exceeds int32 range");
+    }
+    std::vector<std::int32_t> positions(count * 3);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * old_count),
+                    old_count, positions.begin() + static_cast<std::ptrdiff_t>(axis * count));
+        for (std::size_t index = old_count; index < count; ++index) {
+            positions[axis * count + index] = static_cast<std::int32_t>(index) + prompt.rope_delta;
+        }
+    }
+    prompt.positions = std::move(positions);
+    prompt.token_ids.insert(prompt.token_ids.end(), appended.begin(), appended.end());
+    prompt.token_types.resize(count, 0);
+}
+
 VisionItem convert_vision_item(fi::VisionItem item) {
     VisionItem result;
     result.modality =
@@ -926,9 +961,6 @@ PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const
                                               const PreparationControl& control) const {
     PreparedPrompt prompt    = prepare(std::move(input), control);
     PreparedPromptData& data = *prompt.data_;
-    if (data.has_media()) {
-        throw std::invalid_argument("reasoning continuation does not support media prompts");
-    }
     if (!data.starts_in_reasoning) {
         throw std::invalid_argument(
             "reasoning continuation requires a prompt that starts in thinking");
@@ -943,8 +975,12 @@ PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const
                                     std::to_string(token));
         }
     }
-    data.token_ids.insert(data.token_ids.end(), appended.begin(), appended.end());
-    assign_text_positions(data);
+    if (data.has_media()) {
+        append_text_positions(data, appended);
+    } else {
+        data.token_ids.insert(data.token_ids.end(), appended.begin(), appended.end());
+        assign_text_positions(data);
+    }
     (void)checked_token_count(data.token_ids.size());
     // A continuation must not register the chat prompt's capture points as reuse candidates: they
     // sit mid-conversation here, and a conversation has no sampling hidden at a mid-prompt

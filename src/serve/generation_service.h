@@ -134,7 +134,8 @@ struct PreparedRequest {
     bool speculation_detail = false;
     std::vector<ninfer::TokenId> prompt_token_ids;
     std::shared_ptr<RequestLifetime> lifetime;
-    // --reasoning-close-retry on a text-only prompt that starts in thinking; null otherwise.
+    // --reasoning-close-retry on a prompt that starts in thinking (with or without media); null
+    // otherwise.
     std::shared_ptr<ReasoningRetryContext> reasoning_retry;
 };
 

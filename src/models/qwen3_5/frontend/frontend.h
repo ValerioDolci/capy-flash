@@ -78,7 +78,8 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     // prepare(input) followed by `appended` tokens; the result continues in content (see
-    // Engine::prepare_continuation). Requires a text-only prompt that starts in thinking.
+    // Engine::prepare_continuation). Requires a prompt that starts in thinking; a media prompt
+    // keeps its M-RoPE positions and the appended text follows at index + rope_delta.
     [[nodiscard]] PreparedPrompt prepare_continuation(PromptInput input,
                                                       std::span<const TokenId> appended,
                                                       const PreparationControl& control = {}) const;
