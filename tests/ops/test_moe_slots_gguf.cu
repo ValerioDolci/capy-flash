@@ -905,6 +905,36 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
     }
 }
 
+// Per-expert assignment counts at the tile edges (rig fork, 10. 11. 2026: the grouped kernels map
+// the two token halves of a tile to warps 0-3 / 4-7 and skip the m16 sub-tiles past the tile's
+// tokens): resident expert j gets exactly counts[j] tokens, in two passes since a token routes at
+// most 10 experts.
+void grouped_edge_counts(const Bank& b, Gpu& g, Placement& blob, std::mt19937_64& rng) {
+    const std::vector<std::vector<int>> passes = {{1, 8, 15, 16, 17, 31, 32, 33, 63, 64},
+                                                  {65, 129, 16, 48}};
+    for (std::size_t pass = 0; pass < passes.size(); ++pass) {
+        const std::vector<int>& counts = passes[pass];
+        const int T                    = *std::max_element(counts.begin(), counts.end());
+        Routing R;
+        R.x.resize(std::size_t(T) * kH);
+        R.ids.assign(std::size_t(T) * kK, -1);
+        R.w.resize(std::size_t(T) * kK);
+        std::normal_distribution<float> nd(0.F, 0.7F);
+        std::uniform_real_distribution<float> wd(0.02F, 0.3F);
+        for (auto& v : R.x) v = f32_to_bf16(nd(rng));
+        for (auto& v : R.w) v = wd(rng);
+        for (int t = 0; t < T; ++t) {
+            int k = 0;
+            for (std::size_t j = 0; j < counts.size() && k < kK; ++j)
+                if (t < counts[j]) R.ids[std::size_t(t) * kK + std::size_t(k++)] = b.ids[j];
+        }
+        const std::string tag = b.name + " grouped edge counts pass " + std::to_string(pass + 1);
+        const std::vector<Ref> refs = oracle(b, R, T, true);
+        const auto out              = run_grouped(g, blob.layer, upload(R, 0, T));
+        check_numeric(tag, out, refs, T, kGroupedTol);
+    }
+}
+
 // --------------------------------------------------------------------------- grouped cases
 void grouped_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Placement& planar,
                    std::mt19937_64& rng) {
@@ -1066,20 +1096,223 @@ void run_bank(Bank& b, Gpu& g, std::mt19937_64& rng, bool bench) {
     decode_cases(b, R, g, *blob, *planar, rng);
     round_bank_bf16(b);
     grouped_cases(b, R, g, *blob, *planar, rng);
+    grouped_edge_counts(b, g, *blob, rng);
     b.wgu.clear();
     b.wdn.clear();
+}
+
+// ----------------------------------------------------------------------------- probe bench
+// --probe FILE --layer L [--rank R] [--group G] [--reps N] [--dump OUT] (with a bank directory):
+// times moe_grouped_gguf on real prefill routing (NINFER_QWEN4_MOE_PROBE captures: per call I32 T,
+// x BF16 [2560,T], ids I32 [10,T], weights FP32 [10,T]) of real layer L, as rank R of tp 2 runs it:
+// every expert of the layer in a blob pool, the slot table keeping the experts with id % 2 == R
+// (the parity partition), calls cut into G-column groups as the T62 exchange does (default 2048).
+// Prints per group size the time, the useful TFLOPS (assignments of the partition x 2 x (1280 x
+// 2560 + 2560 x 640)) and the per-expert assignment histogram;
+// --dump appends every output (FP32 [2560, columns]) for bit comparisons between kernel builds.
+struct ProbeCall {
+    int T = 0;
+    std::vector<std::uint16_t> x;
+    std::vector<std::int32_t> ids;
+    std::vector<float> w;
+};
+
+std::vector<ProbeCall> read_probe(const std::string& path, int min_t) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open probe " + path);
+    std::vector<ProbeCall> calls;
+    for (;;) {
+        std::int32_t T = 0;
+        if (!in.read(reinterpret_cast<char*>(&T), 4)) break;
+        ProbeCall c;
+        c.T = T;
+        c.x.resize(std::size_t(T) * kH);
+        c.ids.resize(std::size_t(T) * kK);
+        c.w.resize(std::size_t(T) * kK);
+        in.read(reinterpret_cast<char*>(c.x.data()), std::streamsize(c.x.size() * 2));
+        in.read(reinterpret_cast<char*>(c.ids.data()), std::streamsize(c.ids.size() * 4));
+        in.read(reinterpret_cast<char*>(c.w.data()), std::streamsize(c.w.size() * 4));
+        if (!in) throw std::runtime_error("short probe record in " + path);
+        if (T >= min_t) calls.push_back(std::move(c));
+    }
+    return calls;
+}
+
+int probe_bench(const std::string& dir, const std::string& probe, int layer, int rank, int group,
+                int reps, const char* dump) {
+    const RealLayer* found              = nullptr;
+    const std::vector<RealLayer> layers = real_layers(dir);
+    for (const RealLayer& r : layers)
+        if (r.layer == layer) found = &r;
+    if (found == nullptr)
+        throw std::runtime_error("layer " + std::to_string(layer) + " not in " + dir);
+    Bank b;
+    b.name =
+        "layer " + std::to_string(layer) + " " + fmt_name(found->gu) + "+" + fmt_name(found->dn);
+    b.gu = found->gu;
+    b.dn = found->dn;
+    init_geometry(b);
+    const auto experts = static_cast<int>(std::filesystem::file_size(found->gu_path) / b.gu_bytes);
+    std::vector<std::uint8_t> gu(std::size_t(experts) * b.gu_bytes),
+        dn(std::size_t(experts) * b.dn_bytes);
+    {
+        std::ifstream g(found->gu_path, std::ios::binary), d(found->dn_path, std::ios::binary);
+        g.read(reinterpret_cast<char*>(gu.data()), std::streamsize(gu.size()));
+        d.read(reinterpret_cast<char*>(dn.data()), std::streamsize(dn.size()));
+        if (!g || !d) throw std::runtime_error("short bank read");
+    }
+    // Blob pool: slot s = expert 2s + rank (gate|up then down), 256-byte aligned feet.
+    const int slots         = experts / 2;
+    const std::int64_t foot = (b.expert_bytes + 255) / 256 * 256;
+    std::vector<std::int64_t> offsets(static_cast<std::size_t>(slots));
+    std::vector<std::int32_t> table(static_cast<std::size_t>(experts), -1);
+    DeviceBuffer pool(static_cast<std::size_t>(foot * slots));
+    for (int s = 0; s < slots; ++s) {
+        const int e             = 2 * s + rank;
+        offsets[std::size_t(s)] = s * foot;
+        table[std::size_t(e)]   = s;
+        pool.copy_from_host(gu.data() + std::size_t(e) * b.gu_bytes, std::size_t(b.gu_bytes),
+                            std::size_t(s * foot));
+        pool.copy_from_host(dn.data() + std::size_t(e) * b.dn_bytes, std::size_t(b.dn_bytes),
+                            std::size_t(s * foot + b.gu_bytes));
+    }
+    DeviceBuffer table_d = to_device(table), offsets_d = to_device(offsets);
+    ops::MoeGgufLayer L;
+    L.slot_table     = Tensor(table_d.p, DType::I32, {experts});
+    L.slots          = slots;
+    L.slot_offset    = static_cast<const std::int64_t*>(offsets_d.p);
+    L.base           = static_cast<const std::byte*>(pool.p);
+    L.gate_up_format = b.gu;
+    L.down_format    = b.dn;
+
+    const std::vector<ProbeCall> calls = read_probe(probe, 2048);
+    std::printf("%s, rank %d, %zu prefill calls, group %d columns\n", b.name.c_str(), rank,
+                calls.size(), group);
+    Gpu g;
+    cuda_check(cudaStreamCreateWithFlags(&g.stream, cudaStreamNonBlocking), "stream");
+    g.ws = std::make_unique<DeviceArena>(ops::moe_grouped_gguf_workspace_bytes(group) + 4096);
+    std::FILE* out_file = dump != nullptr ? std::fopen(dump, "wb") : nullptr;
+    if (dump != nullptr && out_file == nullptr)
+        throw std::runtime_error(std::string("cannot write ") + dump);
+    cudaEvent_t e0, e1;
+    cuda_check(cudaEventCreate(&e0), "event");
+    cuda_check(cudaEventCreate(&e1), "event");
+    double total_ms = 0, total_flop = 0;
+    std::vector<long> hist(8, 0); // assignments per expert per group: 0, 1-15, 16-31, 32-63,
+                                  // 64-127, 128-255, 256+, (unused)
+    long tiles64 = 0, rows64 = 0, assigned = 0;
+    for (const ProbeCall& c : calls) {
+        for (int first = 0; first < c.T; first += group) {
+            const int n = std::min(group, c.T - first);
+            Inputs in;
+            in.T = n;
+            in.x =
+                to_device(std::vector<std::uint16_t>(c.x.begin() + std::ptrdiff_t(first) * kH,
+                                                     c.x.begin() + std::ptrdiff_t(first + n) * kH));
+            in.ids = to_device(
+                std::vector<std::int32_t>(c.ids.begin() + std::ptrdiff_t(first) * kK,
+                                          c.ids.begin() + std::ptrdiff_t(first + n) * kK));
+            in.w = to_device(std::vector<float>(c.w.begin() + std::ptrdiff_t(first) * kK,
+                                                c.w.begin() + std::ptrdiff_t(first + n) * kK));
+            std::vector<int> per(static_cast<std::size_t>(experts), 0);
+            for (int i = first * kK; i < (first + n) * kK; ++i) {
+                const int e = c.ids[std::size_t(i)];
+                if (e >= 0 && e < experts && table[std::size_t(e)] >= 0) ++per[std::size_t(e)];
+            }
+            long a = 0;
+            for (int e = rank; e < experts; e += 2) {
+                const int k = per[std::size_t(e)];
+                a += k;
+                tiles64 += (k + 63) / 64;
+                rows64 += (k + 63) / 64 * 64;
+                hist[k == 0    ? 0
+                     : k < 16  ? 1
+                     : k < 32  ? 2
+                     : k < 64  ? 3
+                     : k < 128 ? 4
+                     : k < 256 ? 5
+                               : 6] += 1;
+            }
+            assigned += a;
+            DeviceBuffer out(std::size_t(n) * kH * 4);
+            call_grouped(g, L, in, out); // warm-up
+            cuda_check(cudaEventRecord(e0, g.stream), "record");
+            for (int r = 0; r < reps; ++r) call_grouped(g, L, in, out);
+            cuda_check(cudaEventRecord(e1, g.stream), "record");
+            cuda_synchronize(g.stream);
+            float ms = 0;
+            cuda_check(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+            total_ms += ms / reps;
+            total_flop += double(a) * 2.0 * (double(kGU) * kH + double(kH) * kI);
+            if (out_file != nullptr) {
+                const auto host = from_device<float>(out, std::size_t(n) * kH);
+                std::fwrite(host.data(), 4, host.size(), out_file);
+            }
+        }
+    }
+    if (out_file != nullptr) std::fclose(out_file);
+    std::printf("  groups total %.3f ms, useful %.1f TFLOPS, %ld assignments, 64-row tiles %ld "
+                "(fill %.1f %%)\n",
+                total_ms, total_flop / (total_ms * 1e-3) / 1e12, assigned, tiles64,
+                100.0 * double(assigned) / double(std::max(rows64, 1L)));
+    std::printf("  experts per group by assignments: 0: %ld, 1-15: %ld, 16-31: %ld, 32-63: %ld, "
+                "64-127: %ld, "
+                "128-255: %ld, 256+: %ld\n",
+                hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6]);
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    g.ws.reset();
+    cudaStreamDestroy(g.stream);
+    return 0;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    bool bench      = false;
-    const char* dir = std::getenv("NINFER_GGUF_BANKS");
+    bool bench        = false;
+    const char* dir   = std::getenv("NINFER_GGUF_BANKS");
+    const char* probe = nullptr;
+    const char* dump  = nullptr;
+    int probe_layer = -1, rank = 0, group = 2048, reps = 5, device = -1;
     for (int i = 1; i < argc; ++i) {
+        const auto value = [&](const char* name) {
+            if (i + 1 >= argc) throw std::runtime_error(std::string(name) + " needs a value");
+            return argv[++i];
+        };
         if (std::strcmp(argv[i], "--bench") == 0)
             bench = true;
+        else if (std::strcmp(argv[i], "--probe") == 0)
+            probe = value("--probe");
+        else if (std::strcmp(argv[i], "--layer") == 0)
+            probe_layer = std::atoi(value("--layer"));
+        else if (std::strcmp(argv[i], "--rank") == 0)
+            rank = std::atoi(value("--rank"));
+        else if (std::strcmp(argv[i], "--group") == 0)
+            group = std::atoi(value("--group"));
+        else if (std::strcmp(argv[i], "--reps") == 0)
+            reps = std::atoi(value("--reps"));
+        else if (std::strcmp(argv[i], "--dump") == 0)
+            dump = value("--dump");
+        else if (std::strcmp(argv[i], "--device") == 0)
+            device = std::atoi(value("--device"));
         else
             dir = argv[i];
+    }
+    if (device >= 0) cuda_check(cudaSetDevice(device), "cudaSetDevice");
+    if (probe != nullptr) {
+        try {
+            if (dir == nullptr || probe_layer < 0)
+                throw std::runtime_error("--probe needs a bank directory and --layer");
+            cudaDeviceProp p{};
+            int d = 0;
+            cuda_check(cudaGetDevice(&d), "cudaGetDevice");
+            cuda_check(cudaGetDeviceProperties(&p, d), "props");
+            std::printf("device %d: %s\n", d, p.name);
+            return probe_bench(dir, probe, probe_layer, rank, group, reps, dump);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAIL: %s\n", e.what());
+            return 1;
+        }
     }
     try {
         if (cuda_unavailable()) {

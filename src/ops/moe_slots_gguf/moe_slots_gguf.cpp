@@ -155,13 +155,13 @@ void moe_slots_gguf(const Tensor& x, const Tensor& routed_ids, const Tensor& rou
     call.experts    = experts_of(layer);
     call.accumulate = mode == MoeSlotsOutput::Accumulate;
     call.out_f32    = out.dtype == DType::FP32 ? static_cast<float*>(out.data) : nullptr;
-    call.out_bf16 = out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
+    call.out_bf16   = out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
     detail::gguf_decode_launch(call, ws, stream);
 }
 
 std::size_t moe_grouped_gguf_workspace_bytes(std::int32_t max_tokens) {
     require(max_tokens >= 1, "moe_grouped_gguf", "max_tokens must be positive");
-    return detail::gguf_grouped_layout(std::min(max_tokens, detail::kGgufGroupedChunkColumns))
+    return detail::gguf_grouped_layout(std::min(max_tokens, detail::gguf_grouped_chunk_columns()))
         .total;
 }
 
@@ -176,7 +176,7 @@ void moe_grouped_gguf(const Tensor& x, const Tensor& routed_ids, const Tensor& r
     require_columns(out, kMoeSlotsHidden, tokens, kOp, "out");
     require(aligned16(out.data), kOp, "out must be 16-byte aligned");
 
-    const std::int32_t chunk         = std::min(tokens, detail::kGgufGroupedChunkColumns);
+    const std::int32_t chunk          = std::min(tokens, detail::gguf_grouped_chunk_columns());
     const detail::GgufGroupedLayout l = detail::gguf_grouped_layout(chunk);
     require_workspace(workspace, l.total, kOp);
     require_no_overlap(out, x, routed_ids, routed_weights, layer, workspace, kOp);

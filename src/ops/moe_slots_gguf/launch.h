@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 
@@ -74,7 +75,25 @@ void gguf_decode_launch(const GgufDecodeCall& call, const GgufDecodeWorkspace& w
 inline constexpr std::int32_t kGgufGroupedMaxExperts = 1024;
 // Columns of one piece (the FP32 per-assignment outputs bound the workspace).
 inline constexpr std::int32_t kGgufGroupedChunkColumns = 2048;
-inline constexpr std::int32_t kGgufGroupedTileTokens   = 64;
+
+// NINFER_GGUF_GROUPED_COLUMNS sets the piece width (a multiple of 2048 up to 16384; the
+// default 2048). Every expert's weights are dequantized once per piece and tile, so a wider piece
+// spreads that fixed cost over more tokens (real routing, RTX 5080 / 5070 Ti: 4096 -20 %, 8192 -32
+// % of the expert kernels' time, the same bits) for kGgufGroupedChunkColumns-proportional workspace
+// (FP32 per assignment: 210 MB per 2048). With the T62 exchange the call width is its group: set
+// NINFER_TP_AR_GROUP to the same value.
+inline std::int32_t gguf_grouped_chunk_columns() {
+    static const std::int32_t value = [] {
+        const char* v = std::getenv("NINFER_GGUF_GROUPED_COLUMNS");
+        const int n   = v != nullptr ? std::atoi(v) : 0;
+        return n >= kGgufGroupedChunkColumns && n <= 16384 && n % kGgufGroupedChunkColumns == 0
+                   ? std::int32_t(n)
+                   : kGgufGroupedChunkColumns;
+    }();
+    return value;
+}
+
+inline constexpr std::int32_t kGgufGroupedTileTokens = 64;
 
 [[nodiscard]] constexpr std::int32_t gguf_grouped_max_tiles(std::int32_t columns,
                                                             std::int32_t experts) {
