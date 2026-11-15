@@ -15,6 +15,7 @@
 // the zero-copy one, and against the FP64 oracle (fixture decode, unquantized activations) the
 // device share stays within moe_slots' W4A4 bound (relative L2 0.18, test_moe_slots kW4A4), the
 // host share within 0.05 (W4A8 measured 0.011-0.013; 4x margin) and their sum within 0.18.
+#include <thread>
 #include "host_moe_fixture.h"
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -724,6 +725,87 @@ void cost_fit() {
 
 } // namespace
 
+// Deep idle: after a quiet second the service polls every 10 ms (so the CPU package reaches its
+// idle states). The first graph after it must still be served at once, also when the window before
+// it was aborted: the expected slot is then idle and layer 0 must be found by a rescan, not after
+// the 1024-poll resync (~10 s at 10 ms polls, ~60 ms at 50 us polls).
+void idle_wake(const HostMoeMailboxConfig& cfg, const std::vector<HostExpertLayer>& layers,
+               const std::vector<std::uint16_t>& x, std::mt19937_64& rng) {
+    constexpr int T = 4, K = 10, H = 2560;
+    const int L = cfg.layers, E = layers[0].experts;
+    const std::size_t nx = static_cast<std::size_t>(L) * T * H,
+                      nr = static_cast<std::size_t>(L) * T * K;
+    __nv_bfloat16 *dx = nullptr, *dy = nullptr;
+    float* dalpha      = nullptr;
+    std::int32_t *dids = nullptr, *dslot = nullptr;
+    CK(cudaMalloc(&dx, nx * 2));
+    CK(cudaMalloc(&dy, nx * 2));
+    CK(cudaMalloc(&dalpha, nr * 4));
+    CK(cudaMalloc(&dids, nr * 4));
+    CK(cudaMalloc(&dslot, nr * 4));
+    CK(cudaMemcpy(dx, x.data(), nx * 2, cudaMemcpyHostToDevice));
+    const Routing r = route(L, T, K, E, rng, false);
+    CK(cudaMemcpy(dids, r.ids.data(), nr * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dslot, r.slot.data(), nr * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dalpha, r.alpha.data(), nr * 4, cudaMemcpyHostToDevice));
+    CK(cudaDeviceSynchronize());
+    {
+        HostMoeMailbox mailbox(cfg, layers);
+        cudaStream_t s;
+        CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+        auto capture = [&](int n_layers) {
+            cudaGraph_t g;
+            cudaGraphExec_t e;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < n_layers; ++l) {
+                const std::size_t ox  = static_cast<std::size_t>(l) * T * H,
+                                  orr = static_cast<std::size_t>(l) * T * K;
+                mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, dslot + orr);
+                mailbox.accumulate(s, l, T, dy + ox);
+            }
+            CK(cudaStreamEndCapture(s, &g));
+            CK(cudaGraphInstantiate(&e, g, 0));
+            CK(cudaGraphDestroy(g));
+            return e;
+        };
+        const cudaGraphExec_t full = capture(L), partial = capture(L / 2);
+        auto run_ms = [&](cudaGraphExec_t e) {
+            const auto t0 = std::chrono::steady_clock::now();
+            CK(cudaGraphLaunch(e, s));
+            CK(cudaStreamSynchronize(s));
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+        };
+        run_ms(full);
+        double hot = 1e9;
+        for (int i = 0; i < 5; ++i) hot = std::min(hot, run_ms(full));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        const double cold = run_ms(full);
+        run_ms(partial); // an aborted window: the service now expects layer L / 2
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        const double aborted = run_ms(full);
+        expect(!mailbox.failed(), "idle: mailbox failed: " + mailbox.error());
+        expect(cold - hot < 15.0, "idle: the first graph after a quiet second took " +
+                                      std::to_string(cold) + " ms (hot " + std::to_string(hot) +
+                                      " ms)");
+        expect(aborted - hot < 15.0, "idle: the first graph after an aborted window and a quiet "
+                                     "second took " +
+                                         std::to_string(aborted) + " ms (hot " +
+                                         std::to_string(hot) + " ms)");
+        std::printf("idle wake: hot %.2f ms, after 1.5 s quiet %.2f ms, after an aborted window "
+                    "and 1.5 s quiet %.2f ms\n",
+                    hot, cold, aborted);
+        CK(cudaGraphExecDestroy(full));
+        CK(cudaGraphExecDestroy(partial));
+        CK(cudaStreamDestroy(s));
+    }
+    CK(cudaFree(dx));
+    CK(cudaFree(dy));
+    CK(cudaFree(dalpha));
+    CK(cudaFree(dids));
+    CK(cudaFree(dslot));
+}
+
 int main() {
     cost_fit();
     int devices = 0;
@@ -873,6 +955,7 @@ int main() {
     // After the first mailbox stopped (its service thread spins on the same cpus).
     table_and_slices(cfg, layers, x, y0f, ref_cpus, rng);
     split_shares(cfg, a, ref_cpus, rng);
+    idle_wake(cfg, layers, x, rng);
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     return g_failures ? 1 : 0;
 }
