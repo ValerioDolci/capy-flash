@@ -25,11 +25,11 @@ public:
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
+
     // Text only (no media item): what the disk tier saves and resumes.
     [[nodiscard]] bool text_only() const noexcept {
-        return vision_items_.empty() &&
-               std::all_of(token_types_.begin(), token_types_.end(),
-                           [](std::uint8_t type) { return type == 0; });
+        return vision_items_.empty() && std::all_of(token_types_.begin(), token_types_.end(),
+                                                    [](std::uint8_t type) { return type == 0; });
     }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
