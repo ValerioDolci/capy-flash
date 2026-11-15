@@ -12,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -809,6 +810,15 @@ private:
     std::string pointer_;
     RequestErrorSource source_;
 };
+
+// The message of ContextLengthExceeded, in the form Anthropic uses ("prompt is too long: N tokens >
+// M maximum"): clients such as Claude Code read it to compact the conversation. at_least: counting
+// stopped at N, the prompt is longer.
+[[nodiscard]] inline std::string
+context_length_message(std::size_t prompt_tokens, std::size_t max_context, bool at_least = false) {
+    return std::string("prompt is too long: ") + (at_least ? "at least " : "") +
+           std::to_string(prompt_tokens) + " tokens > " + std::to_string(max_context) + " maximum";
+}
 
 struct PromptSummary {
     bool starts_in_reasoning    = false;

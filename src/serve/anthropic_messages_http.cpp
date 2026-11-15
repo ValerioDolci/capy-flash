@@ -97,7 +97,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& exception) {
-        write_anthropic_error(res, exception.error(), request_id);
+        reply_anthropic_error(req, res, exception.error(), request_id);
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
             "anthropic_count_tokens",
@@ -117,7 +117,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                                    request_limits_);
         client  = parse_client_label(req);
     } catch (const ApiException& exception) {
-        write_anthropic_error(res, exception.error(), request_id);
+        reply_anthropic_error(req, res, exception.error(), request_id);
         return;
     } catch (const std::exception& exception) {
         operational_log_.http_failure(

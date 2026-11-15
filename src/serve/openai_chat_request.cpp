@@ -221,13 +221,10 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             if (!value.at("detail").is_string()) {
                 bad_request("image_url.detail must be a string", "messages");
             }
+            // The Vision frontend has one preprocessing profile, so every detail level gets it.
             const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
-                bad_request(
-                    "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that NInfer's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
-                    "messages", "image_detail_not_supported");
+            if (detail != "auto" && detail != "low" && detail != "high") {
+                bad_request("image_url.detail must be 'auto', 'low' or 'high'", "messages");
             }
         }
     } else {

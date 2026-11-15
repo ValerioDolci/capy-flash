@@ -91,7 +91,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         validate_openai_model(request.model, public_model_id_);
         client = parse_client_label(req);
     } catch (const ApiException& exception) {
-        write_openai_error(res, exception.error());
+        reply_openai_error(req, res, exception.error());
         return;
     }
 

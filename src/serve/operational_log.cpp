@@ -283,6 +283,7 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
     }
     if (context.media_item_count != 0) {
         append_counted_clause(out, "media", context.media_item_count);
+        if (context.media_omitted) { out << " omitted (no Vision)"; }
         if (context.preparation.seconds > 0.0) {
             out << ", prepared " << product::format_pretty_duration(context.preparation.seconds);
         }
@@ -543,14 +544,25 @@ void OperationalLog::throughput(const ThroughputReport& report) const {
     write(render_throughput(report));
 }
 
-void OperationalLog::http_failure(std::string_view endpoint, const RequestFailure& failure,
-                                  std::string_view request_id) const {
+OperationalRecord render_http_failure(std::string_view endpoint, const RequestFailure& failure,
+                                      std::string_view request_id) {
     std::ostringstream out;
-    out << "HTTP request failed during " << phase_name(failure.phase) << " | "
-        << protocol_name(endpoint);
+    const bool client = failure.classification == RequestFailureClass::ClientInput;
+    out << "HTTP request " << (client ? "rejected" : "failed") << " during "
+        << phase_name(failure.phase) << " | " << protocol_name(endpoint);
     if (!request_id.empty()) { out << " | request " << product::format_pretty_text(request_id); }
     append_failure_fields(out, failure);
-    write({.severity = failure_severity(failure.classification), .message = out.str()});
+    // The top-level field the server did not accept. Only its name: the message and any path into
+    // the client's own data (a schema property, for example) stay out of this log.
+    const std::string_view field =
+        std::string_view(failure.param).substr(0, failure.param.find_first_of("./["));
+    if (client && !field.empty()) { out << " | field " << product::format_pretty_text(field); }
+    return {.severity = failure_severity(failure.classification), .message = out.str()};
+}
+
+void OperationalLog::http_failure(std::string_view endpoint, const RequestFailure& failure,
+                                  std::string_view request_id) const {
+    write(render_http_failure(endpoint, failure, request_id));
 }
 
 void OperationalLog::engine_capacity(const GenerationService& service) const {

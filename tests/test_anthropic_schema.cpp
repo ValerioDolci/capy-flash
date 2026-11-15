@@ -576,6 +576,9 @@ int test_thinking_and_count_tokens() {
                       "display:omitted was not parsed as hidden adaptive Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "summarized"}};
     failures += check(!parse(body).hide_thinking, "display:summarized hid the Thinking text");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "updates"}};
+    failures += check(api_param([&] { (void)parse(body); }).empty() && !parse(body).hide_thinking,
+                      "display:updates (Claude Code 2.1) was rejected or hid the Thinking text");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking display was accepted");
@@ -685,8 +688,22 @@ int test_content_and_cache_hints() {
                       "Files image source was flattened or ignored");
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "document"}, {"source", Json::object()}}});
-    failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "document citation semantics were silently discarded");
+    {
+        const GenerationRequest document = parse(body).generation;
+        failures += check(document.messages[0].content.size() == 1 &&
+                              document.messages[0].content[0].kind == ContentKind::Text &&
+                              document.messages[0].content[0].text.find("cannot read documents") !=
+                                  std::string::npos,
+                          "a document block did not become a text placeholder");
+    }
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "search_result"},
+                          {"source", "https://example.test/a"},
+                          {"title", "A"},
+                          {"content", Json::array({Json{{"type", "text"}, {"text", "alpha"}}})}}});
+    failures += check(parse(body).generation.messages[0].content[0].text ==
+                          "Search result: A (https://example.test/a)\nalpha",
+                      "a search_result block did not become its text");
     return failures;
 }
 

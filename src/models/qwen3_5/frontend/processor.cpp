@@ -3,6 +3,7 @@
 #include "media/decode/decode.h"
 #include "models/qwen3_5/frontend/digest.h"
 #include "models/qwen3_5/frontend/media_cache.h"
+#include "ninfer/types.h"
 
 #include <algorithm>
 #include <array>
@@ -947,9 +948,17 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             std::chrono::duration<double>(Clock::now() - preliminary_started).count();
         check_preparation_control(control, "tokenization");
         if (preliminary_tokens > maximum_prompt_tokens) {
-            throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                                 "prepared prompt exceeds Engine max_context " +
-                                     std::to_string(maximum_prompt_tokens));
+            // Tokenization stopped past the limit: count on, up to four times it, for the message.
+            const std::size_t bound = maximum_prompt_tokens * 4U;
+            const std::size_t counted =
+                tokenizer_
+                    .encode_with_boundaries(rendered.text, {},
+                                            EncodeOptions{.max_tokens = bound + 1U},
+                                            rendered.literal_spans)
+                    .input_ids.size();
+            throw ProcessorError(
+                ProcessorErrorKind::ContextLengthExceeded,
+                ninfer::context_length_message(counted, maximum_prompt_tokens, counted > bound));
         }
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
@@ -1077,9 +1086,13 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
     if (encoded.input_ids.size() > maximum_prompt_tokens) {
-        throw ProcessorError(ProcessorErrorKind::ContextLengthExceeded,
-                             "prepared prompt exceeds Engine max_context " +
-                                 std::to_string(maximum_prompt_tokens));
+        // Tokenization stopped past the limit: count on, up to four times it, for the message.
+        const std::size_t bound = maximum_prompt_tokens * 4U;
+        const std::size_t counted =
+            encode_rendered_chat(tokenizer_, rendered, bound + 1U).input_ids.size();
+        throw ProcessorError(
+            ProcessorErrorKind::ContextLengthExceeded,
+            ninfer::context_length_message(counted, maximum_prompt_tokens, counted > bound));
     }
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.input_ids                   = std::move(encoded.input_ids);

@@ -549,9 +549,7 @@ std::string serve_usage_text(const char* argv0) {
            "Defaults and thinking:\n"
            "  --default-max-tokens <N>\n"
            "    Default output limit per request when omitted.\n"
-           "    default: " +
-           std::to_string(kDefaultMaxTokens) +
-           "\n"
+           "    default: the context left after the prompt\n"
            "  --default-thinking-budget <N>\n"
            "    Cap model-origin thinking for enabled requests; control tokens count toward the "
            "request output limit.\n"
@@ -1202,6 +1200,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     return options;
+}
+
+int resolve_default_max_tokens(const ServeOptions& options, std::uint32_t max_context) {
+    if (options.default_max_tokens > 0) { return options.default_max_tokens; }
+    return static_cast<int>(std::min<std::uint32_t>(max_context, std::numeric_limits<int>::max()));
 }
 
 std::string resolve_public_model_id(const ServeOptions& options,

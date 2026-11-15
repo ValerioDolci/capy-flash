@@ -161,6 +161,31 @@ ContentPart text_part(std::string value,
     return part;
 }
 
+// A document block (a PDF Claude Code's Read tool attaches, for example) has no prompt form here: a
+// line of text says so to the model, instead of a 400 that every later turn of the conversation
+// would repeat.
+ContentPart document_placeholder(const Json& block) {
+    return text_part("[A document was attached here, but this server cannot read documents.]",
+                     cache_boundary(block, "messages"));
+}
+
+// A search_result block is text by definition: its title, source and text blocks, as text.
+ContentPart search_result_text(const Json& block) {
+    std::string text =
+        "Search result: " + require_string(block, "title", "messages", "search_result block") +
+        " (" + require_string(block, "source", "messages", "search_result block") + ")";
+    if (!block.contains("content") || !block.at("content").is_array()) {
+        bad_request("search_result block must contain a content array", "messages");
+    }
+    for (const Json& part : block.at("content")) {
+        if (require_block_type(part, "messages") != "text") {
+            bad_request("search_result content must be text blocks", "messages");
+        }
+        text += "\n" + require_string(part, "text", "messages", "text block");
+    }
+    return text_part(std::move(text), cache_boundary(block, "messages"));
+}
+
 bool is_server_tool_block(std::string_view type) {
     return type == "server_tool_use" || type == "mcp_tool_use" || type == "mcp_tool_result" ||
            type == "container_upload" || type == "tool_reference" ||
@@ -241,6 +266,10 @@ std::vector<ContentPart> parse_tool_result_content(const Json& block) {
         } else if (type == "tool_reference") {
             // Names a deferred tool for lower_tools; renders nothing into the prompt.
             validate_tool_reference(part);
+        } else if (type == "document") {
+            result.push_back(document_placeholder(part));
+        } else if (type == "search_result") {
+            result.push_back(search_result_text(part));
         } else {
             bad_request("unsupported tool_result content block: " + type, "messages",
                         "content_block_not_supported");
@@ -288,13 +317,9 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         } else if (type == "tool_result") {
             result.emplace_back(parse_tool_result(block));
         } else if (type == "document") {
-            bad_request("document blocks require document and citation semantics that NInfer does "
-                        "not provide",
-                        "messages", "documents_not_supported");
+            result.emplace_back(document_placeholder(block));
         } else if (type == "search_result") {
-            bad_request("search_result blocks require source and citation semantics that NInfer "
-                        "does not provide",
-                        "messages", "search_results_not_supported");
+            result.emplace_back(search_result_text(block));
         } else if (is_server_tool_block(type)) {
             bad_request("server tool result blocks require an executor that NInfer does not "
                         "provide",
@@ -931,11 +956,14 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
         if (!thinking.at("display").is_string()) {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+            bad_request("thinking.display must be 'summarized', 'updates' or 'omitted'",
+                        "thinking");
         }
+        // "updates" (Claude Code 2.1) shows the reasoning as "summarized" does.
         const std::string display = thinking.at("display").get<std::string>();
-        if (display != "summarized" && display != "omitted") {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+        if (display != "summarized" && display != "updates" && display != "omitted") {
+            bad_request("thinking.display must be 'summarized', 'updates' or 'omitted'",
+                        "thinking");
         }
         if (type == "disabled") {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",

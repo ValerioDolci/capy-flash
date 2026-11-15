@@ -253,8 +253,11 @@ falling back to its architecture name when no name is stored. An explicit `--mod
 HTTP alias override and does not select or alter model execution.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
-`--vision` when the server must accept image or video input. Speculative residency is likewise
+allocated, and each image or video of a request reaches the model as a line of text saying that one
+was attached and that the model cannot see it (the request's log line reads `media N omitted (no
+Vision)`), so a conversation that holds one keeps working. Add `--vision` when the server must read
+image or video input. Anthropic `document` blocks become the same kind of line, and `search_result`
+blocks their title, source and text. Speculative residency is likewise
 frozen by `--spec mtp|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend, and `--spec off` (after a `--profile`) removes the profile's backend, draft window and proposal head.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; it accelerates generated-text decode after multimodal prefill, while Vision encode
@@ -290,7 +293,10 @@ systemd, or llama-swap, which reloads the model on the next request — instead 
 `/health`, which supervisors usually probe only while the model loads.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
-error responses. Anthropic endpoints use their separate `request-id` contract.
+error responses. Anthropic endpoints use their separate `request-id` contract. Every error answer
+(4xx and 5xx, a wrong API key included) also writes one line to the server log with that id, the
+status, the error code and, for a client error, the top-level field the server did not accept (never
+the message or the request's content), so a client integration can be followed from the log.
 
 An unexpected server failure is HTTP 500 with error type `server_error` on the OpenAI endpoints
 (Chat Completions, Responses, models) and `api_error` on the Anthropic endpoints.
@@ -325,7 +331,7 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image detail `auto`, `low` or `high` (one preprocessing profile for all);
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
@@ -350,7 +356,7 @@ The endpoint supports:
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
+`parallel_tool_calls:false` with enabled tools, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 The constrained-decoding spellings of other servers (`guided_json`, `guided_regex`, `guided_choice`,
@@ -592,8 +598,10 @@ not invalidate a request reference, and live bytes are returned only when the fi
 released. A request-level preparation gate derived from the live limit prevents concurrent partial
 builds from deadlocking the memory account.
 
-An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
+An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded` with the
+message `prompt is too long: N tokens > M maximum`, the form Anthropic uses and Claude Code reads to
+compact the conversation (on every protocol; past four times the context the count stops and reads
+`at least N`). A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
@@ -668,7 +676,7 @@ wire response contains typed `output` Items.
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
-| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
+| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` (by default the context left after the prompt) but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
 | `temperature` | finite number in `[0,2]` |
@@ -706,7 +714,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail `auto`, `low` or `high` (one preprocessing profile); requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -734,7 +742,7 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+`input_file`, `input_audio`, image `file_id`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -945,7 +953,8 @@ positional: a string-form System value, a later array block, or an inline System
 same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
 is consumed with it rather than moved to adjacent content.
 
-`max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
+`max_tokens` is optional for local clients and otherwise uses `--default-max-tokens` (by default the
+context left after the prompt); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
 `stop_sequences` enter Engine execution. A matched custom stop is returned as
@@ -959,7 +968,8 @@ before closing the block. Request lowering reconstructs the local prompt from th
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
 remains usable across serve restarts.
 
-`thinking.display:"omitted"`, which current Claude Code sends on every request, returns each
+`thinking.display:"updates"`, which Claude Code 2.1 sends, shows the reasoning as `summarized` does.
+`thinking.display:"omitted"`, which earlier Claude Code versions sent on every request, returns each
 Thinking block with an empty `thinking` string and no `thinking_delta` events. Its `signature`
 (`signature_delta` when streaming) is `ninfer-reasoning.v1:` followed by the Base64 reasoning text,
 so the reasoning stays out of the visible transcript but comes back with the block the client
@@ -1276,7 +1286,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144) and rotates as Hugging Face's `rope_type: "yarn"` does (the same inverse frequencies, cos and sin multiplied by 0.1 ln F + 1). It covers every text RoPE on every GPU: attention at one and two GPUs, text after an image (MRoPE), the Flash-Next QSA indexer and the MTP layer; the Vision tower and the DFlash2 drafter keep their RoPE. `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental: its quality past the native window is not measured. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
 | `--rope-original-max-position N` | the native window YaRN scales from (Hugging Face `original_max_position_embeddings`), used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
+| `--default-max-tokens N` | output limit when omitted by a request | the context left after the prompt |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-vision` | turn Vision off, also dropping a profile's `--vision-device` and `--max-vision-tokens` (the 27B profiles turn Vision on) | Vision off unless `--vision` |

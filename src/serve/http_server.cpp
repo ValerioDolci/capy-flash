@@ -640,7 +640,19 @@ void HttpServer::stop_stats_reporter() {
 
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
-        return handle_unrendered_http_error(options_, request, response);
+        // httplib's own errors (no route, body over the limit, a malformed request) come here with
+        // no body; the handlers' error answers already have theirs and were logged where written.
+        const bool unrendered = response.body.empty();
+        const auto handled    = handle_unrendered_http_error(options_, request, response);
+        if (unrendered) {
+            ApiError error;
+            error.status = response.status;
+            error.code   = response.status == 413   ? "request_too_large"
+                           : response.status == 404 ? "not_found"
+                                                    : "";
+            log_error_answer(request, response, error);
+        }
+        return handled;
     });
     if (options_.enable_cors) {
         server_.set_default_headers(
@@ -674,6 +686,7 @@ void HttpServer::register_routes() {
                 error.message = "refused a cross-origin or non-local request; bind a non-loopback "
                                 "address or pass --cors to allow browser clients";
                 write_route_error(req, res, error);
+                log_error_answer(req, res, error);
                 return httplib::Server::HandlerResponse::Handled;
             }
             if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
@@ -693,38 +706,38 @@ void HttpServer::register_routes() {
                 error.code    = "invalid_api_key";
                 error.message = "missing or invalid API key";
                 write_route_error(req, res, error);
+                log_error_answer(req, res, error);
                 return httplib::Server::HandlerResponse::Handled;
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
-    server_.set_exception_handler(
-        [this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
-            ensure_openai_request_id(req, res);
-            try {
-                std::rethrow_exception(ep);
-            } catch (const ApiException& e) {
-                if (e.error().status >= 500) {
-                    operational_log_.http_failure(
-                        endpoint_name(req.path),
-                        make_request_failure(RequestFailurePhase::Http, e.error()),
-                        response_request_id(res));
-                }
-                write_route_error(req, res, e.error());
-            } catch (const std::exception& e) {
-                operational_log_.http_failure(
-                    endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http, e.what()),
-                    response_request_id(res));
-                write_route_error(req, res, internal_error(e.what()));
-            } catch (...) {
-                operational_log_.http_failure(
-                    endpoint_name(req.path),
-                    make_internal_request_failure(RequestFailurePhase::Http, "unknown error"),
-                    response_request_id(res));
-                write_route_error(req, res, internal_error("unknown error"));
-            }
-        });
+    server_.set_exception_handler([this](const httplib::Request& req, httplib::Response& res,
+                                         std::exception_ptr ep) {
+        ensure_openai_request_id(req, res);
+        try {
+            std::rethrow_exception(ep);
+        } catch (const ApiException& e) {
+            // Every error answer gets a log line, client errors included (a field the server
+            // does not accept, an unknown model), so an integration is diagnosed from the log.
+            operational_log_.http_failure(
+                endpoint_name(req.path), make_request_failure(RequestFailurePhase::Http, e.error()),
+                response_request_id(res));
+            write_route_error(req, res, e.error());
+        } catch (const std::exception& e) {
+            operational_log_.http_failure(
+                endpoint_name(req.path),
+                make_internal_request_failure(RequestFailurePhase::Http, e.what()),
+                response_request_id(res));
+            write_route_error(req, res, internal_error(e.what()));
+        } catch (...) {
+            operational_log_.http_failure(
+                endpoint_name(req.path),
+                make_internal_request_failure(RequestFailurePhase::Http, "unknown error"),
+                response_request_id(res));
+            write_route_error(req, res, internal_error("unknown error"));
+        }
+    });
 
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
@@ -778,6 +791,25 @@ void HttpServer::register_routes() {
     });
 }
 
+void HttpServer::log_error_answer(const httplib::Request& req, const httplib::Response& res,
+                                  const ApiError& error, std::string_view request_id) const {
+    operational_log_.http_failure(
+        endpoint_name(req.path), make_request_failure(RequestFailurePhase::Http, error),
+        request_id.empty() ? response_request_id(res) : std::string(request_id));
+}
+
+void HttpServer::reply_openai_error(const httplib::Request& req, httplib::Response& res,
+                                    const ApiError& error) const {
+    log_error_answer(req, res, error);
+    write_openai_error(res, error);
+}
+
+void HttpServer::reply_anthropic_error(const httplib::Request& req, httplib::Response& res,
+                                       const ApiError& error, const std::string& request_id) const {
+    log_error_answer(req, res, error, request_id);
+    write_anthropic_error(res, error, request_id);
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
@@ -791,7 +823,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         error.type    = "invalid_request_error";
         error.code    = "model_not_found";
         error.message = "model '" + id + "' not found";
-        write_openai_error(res, error);
+        reply_openai_error(req, res, error);
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
@@ -806,7 +838,11 @@ void HttpServer::attach(GenerationService& service) {
     }
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_name);
-    service_                       = &service;
+    // Before listen(): no request reads the limits yet.
+    request_limits_.default_max_tokens =
+        resolve_default_max_tokens(options_, service.engine_options().max_context);
+    options_.default_max_tokens = request_limits_.default_max_tokens;
+    service_                    = &service;
     if (request_jsonl_.enabled() && options_.log_stats_interval_ms != 0) {
         const ninfer::EngineOptions& engine = service.engine_options();
         const std::vector<int> devices =

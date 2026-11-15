@@ -33,6 +33,9 @@ struct OperationalRecord {
 render_tool_call_parse(const RequestLogContext& context, const GenerationOutcome& outcome);
 [[nodiscard]] OperationalRecord render_request_failure(const RequestLogContext& context,
                                                        const RequestFailure& failure);
+[[nodiscard]] OperationalRecord render_http_failure(std::string_view endpoint,
+                                                    const RequestFailure& failure,
+                                                    std::string_view request_id = {});
 [[nodiscard]] OperationalRecord render_response_failure(std::uint64_t request_id,
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);

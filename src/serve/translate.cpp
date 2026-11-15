@@ -13,6 +13,24 @@
 #include <vector>
 
 namespace ninfer::serve {
+
+GenerationRequest media_as_text(GenerationRequest req) {
+    for (ChatTurn& message : req.messages) {
+        for (ContentPart& part : message.content) {
+            if (part.kind != ContentKind::Image && part.kind != ContentKind::Video) { continue; }
+            ContentPart text;
+            text.kind                 = ContentKind::Text;
+            text.type_raw             = "text";
+            text.text                 = part.kind == ContentKind::Image
+                                            ? "[An image was attached here, but this model cannot see images.]"
+                                            : "[A video was attached here, but this model cannot see videos.]";
+            text.cache_boundary_after = part.cache_boundary_after;
+            part                      = std::move(text);
+        }
+    }
+    return req;
+}
+
 namespace {
 
 std::uint64_t random_seed() {

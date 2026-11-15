@@ -168,6 +168,15 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
+    // An error answer a handler writes itself (client errors included) gets one log line with the
+    // id the client receives; the request lifecycle and the exception handler log the others.
+    void log_error_answer(const httplib::Request& req, const httplib::Response& res,
+                          const ApiError& error, std::string_view request_id = {}) const;
+    void reply_openai_error(const httplib::Request& req, httplib::Response& res,
+                            const ApiError& error) const;
+    void reply_anthropic_error(const httplib::Request& req, httplib::Response& res,
+                               const ApiError& error, const std::string& request_id) const;
+
     void record_request_start(const RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);

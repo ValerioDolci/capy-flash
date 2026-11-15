@@ -468,25 +468,24 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 }
 
 PreparedRequest GenerationService::prepare_impl(
-    const GenerationRequest& request, GenerationConsumerMode consumer_mode,
+    const GenerationRequest& original, GenerationConsumerMode consumer_mode,
     ninfer::GenerationObservationOptions observation, std::function<bool()> is_cancelled,
     ContextCacheHints context_cache, CacheParticipation cache_participation,
     DeadlinePolicy deadline_policy, bool speculation_detail) const {
     PreparedRequest prepared;
+    prepared.media_omitted = original.media_item_count() != 0 && !options_.enable_vision;
+    const GenerationRequest without_media =
+        prepared.media_omitted ? media_as_text(original) : GenerationRequest{};
+    const GenerationRequest& request        = prepared.media_omitted ? without_media : original;
     prepared.speculation_detail             = speculation_detail;
     prepared.constraint_param               = request.constraint_param;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.thinking_budget     = request_options.execution.thinking.budget;
-    prepared.reasoning_effort    = semantics.reasoning_effort;
-    prepared.preserve_thinking   = semantics.preserve_thinking;
-    const bool request_has_media = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
-        const std::invalid_argument error("Vision is disabled for this server");
-        throw_invalid_input(error, "vision_disabled");
-    }
-    prepared.lifetime = acquire_request_lifetime(deadline_policy);
+    prepared.thinking_budget   = request_options.execution.thinking.budget;
+    prepared.reasoning_effort  = semantics.reasoning_effort;
+    prepared.preserve_thinking = semantics.preserve_thinking;
+    prepared.lifetime          = acquire_request_lifetime(deadline_policy);
 
     try {
         const auto acquisition_started = Clock::now();
@@ -518,8 +517,8 @@ PreparedRequest GenerationService::prepare_impl(
         std::shared_ptr<ReasoningRetryContext> retry;
         // A constrained request is never retried: the continuation would run without the
         // grammar state of the first reply.
-        if (options_.reasoning_close_retry && !request_has_media && !request.constraint &&
-            cache_participation == CacheParticipation::ReadWrite) {
+        if (options_.reasoning_close_retry && request.media_item_count() == 0 &&
+            !request.constraint && cache_participation == CacheParticipation::ReadWrite) {
             retry                = std::make_shared<ReasoningRetryContext>();
             retry->input         = input;
             retry->consumer_mode = consumer_mode;
@@ -559,13 +558,12 @@ PreparedRequest GenerationService::prepare_impl(
     return prepared;
 }
 
-int GenerationService::count_prompt_tokens(const GenerationRequest& request,
+int GenerationService::count_prompt_tokens(const GenerationRequest& original,
                                            std::function<bool()> is_cancelled) const {
-    const bool request_has_media = request.media_item_count() != 0;
-    if (request_has_media && !options_.enable_vision) {
-        const std::invalid_argument error("Vision is disabled for this server");
-        throw_invalid_input(error, "vision_disabled");
-    }
+    const bool omit_media = original.media_item_count() != 0 && !options_.enable_vision;
+    const GenerationRequest without_media =
+        omit_media ? media_as_text(original) : GenerationRequest{};
+    const GenerationRequest& request = omit_media ? without_media : original;
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);

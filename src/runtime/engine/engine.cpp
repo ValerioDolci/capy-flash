@@ -52,8 +52,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
 }
 
 std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
-    return "prepared prompt has " + std::to_string(prompt_tokens) +
-           " tokens, exceeding Engine max_context " + std::to_string(max_context);
+    return context_length_message(prompt_tokens, max_context);
 }
 
 } // namespace

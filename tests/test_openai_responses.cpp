@@ -1404,8 +1404,39 @@ int test_constrained_decoding() {
 
 } // namespace
 
+// Codex's view_image returns the picture as an input_image with detail "high" inside a
+// function_call_output: every OpenAI detail level is accepted (one preprocessing profile).
+int test_input_image_detail() {
+    int failures   = 0;
+    const auto run = [&](const char* detail) {
+        return api_error([&] {
+            const Json input = Json::array(
+                {Json{{"type", "function_call"},
+                      {"call_id", "call_1"},
+                      {"name", "view_image"},
+                      {"arguments", R"({"path":"a.png"})"}},
+                 Json{{"type", "function_call_output"},
+                      {"call_id", "call_1"},
+                      {"output", Json::array({Json{{"type", "input_image"},
+                                                   {"image_url", "data:image/png;base64,AA=="},
+                                                   {"detail", detail}}})}}});
+            (void)parse_openai_responses_create_request(Json{{"model", "m"}, {"input", input}},
+                                                        limits());
+        });
+    };
+    for (const char* detail : {"auto", "low", "high"}) {
+        const ApiError error = run(detail);
+        failures +=
+            check(error.message == "no exception",
+                  std::string("input_image detail '") + detail + "' rejected: " + error.message);
+    }
+    failures += check(run("huge").param == "input", "unknown input_image detail accepted");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_input_image_detail();
     failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();

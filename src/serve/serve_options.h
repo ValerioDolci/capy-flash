@@ -110,7 +110,7 @@ struct ServeOptions {
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
-    int default_max_tokens = kDefaultMaxTokens;
+    int default_max_tokens = 0;     // --default-max-tokens; 0 = the context left after the prompt
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
@@ -137,6 +137,10 @@ struct ServeOptions {
 ServeOptions parse_serve_options(int argc, char** argv);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
+// The output limit of a request that sets none: --default-max-tokens when given, otherwise the
+// Engine's max_context, which the Engine lowers to the context left after the prompt.
+[[nodiscard]] int resolve_default_max_tokens(const ServeOptions& options,
+                                             std::uint32_t max_context);
 // --turn-anchors when given, otherwise the model's default: 0 for Qwen4ExpForCausalLM (each prefill
 // pass reads the non-resident experts from host RAM), 1 for every other architecture.
 [[nodiscard]] std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,

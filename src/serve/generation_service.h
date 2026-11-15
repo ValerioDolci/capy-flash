@@ -123,6 +123,8 @@ struct PreparedRequest {
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
     bool enable_thinking = true;
+    // Vision off: the request's image and video parts went to the model as a text placeholder.
+    bool media_omitted = false;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;

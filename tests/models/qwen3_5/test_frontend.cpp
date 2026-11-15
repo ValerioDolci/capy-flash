@@ -408,7 +408,10 @@ bool throws_context_length(Callable&& callable) {
     try {
         callable();
     } catch (const ninfer::RequestError& error) {
-        return error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        // The Anthropic form clients read to compact: "prompt is too long: N tokens > M maximum".
+        const std::string_view message = error.what();
+        return error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded &&
+               message.starts_with("prompt is too long: ") && message.ends_with(" maximum");
     }
     return false;
 }

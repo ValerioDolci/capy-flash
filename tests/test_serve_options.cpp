@@ -860,5 +860,18 @@ int main() {
     }
 
     if (failures == 0) { std::cout << "ok\n"; }
+    {
+        // Without --default-max-tokens a request that sets no output limit gets the Engine's
+        // max_context (the Engine lowers it to the context left after the prompt).
+        const ServeOptions unset = parse({"ninfer-serve", "model.ninfer"});
+        failures += check(unset.default_max_tokens == 0 &&
+                              resolve_default_max_tokens(unset, 262144) == 262144,
+                          "default output limit is not the rest of the context");
+        const ServeOptions set =
+            parse({"ninfer-serve", "model.ninfer", "--default-max-tokens", "4096"});
+        failures += check(resolve_default_max_tokens(set, 262144) == 4096,
+                          "--default-max-tokens is not kept");
+    }
+
     return failures == 0 ? 0 : 1;
 }

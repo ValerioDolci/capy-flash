@@ -25,6 +25,11 @@ struct ResolvedPromptSemantics {
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
                                                  const ServeOptions& server);
 
+// For a server without Vision: the request with every image and video part replaced by a line of
+// text for the model, so a conversation that holds one (a pasted screenshot, a picture a tool
+// read) still runs instead of failing on every later turn.
+GenerationRequest media_as_text(GenerationRequest req);
+
 ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);

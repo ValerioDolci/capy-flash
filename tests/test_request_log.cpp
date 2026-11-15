@@ -458,6 +458,22 @@ int main() {
     failures +=
         check(render_request_rejected(overload_context).severity == OperationalSeverity::Warning,
               "operational overload rejection is not warning severity");
+    // A 400 from parsing (a field the server does not accept) gets a line with the request id and
+    // the top-level field, never the message or a path into the client's data.
+    const OperationalRecord field_rejection = render_http_failure(
+        "/v1/messages",
+        make_request_failure(RequestFailurePhase::Http,
+                             ApiError{.status  = 400,
+                                      .message = "sentinel-client-value",
+                                      .param   = "thinking.sentinel-client-path"}),
+        "req_abc");
+    failures +=
+        check(field_rejection.severity == OperationalSeverity::Info &&
+                  field_rejection.message.find("HTTP request rejected") != std::string::npos &&
+                  field_rejection.message.find("req_abc") != std::string::npos &&
+                  field_rejection.message.find("field thinking") != std::string::npos &&
+                  field_rejection.message.find("sentinel-client") == std::string::npos,
+              "a client error answer is not logged with its id and field, or leaks client data");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;

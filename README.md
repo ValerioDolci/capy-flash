@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.13.1**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.13.2**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -353,6 +353,13 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.13.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.2))
+- Coding agents run without error answers (checked with Claude Code 2.1, OpenCode 1.19 and Codex CLI 0.169): an image
+  or a PDF sent to a model without Vision reaches it as a line of text instead of a 400 that blocked the
+  conversation; image `detail` `low`/`high` and Claude Code's `thinking.display: "updates"` are accepted; a request
+  with no output limit gets the rest of the context (it was 8,192 tokens); a context overflow reads `prompt is too
+  long: N tokens > M maximum`; every error answer gets a log line with its request id. Same tokens.
 
 **v0.13.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.1))
 - Faster prefill for the 64 GB edition, same tokens: the grouped GGUF expert kernels use all four warp schedulers and

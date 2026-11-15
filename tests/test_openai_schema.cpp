@@ -713,10 +713,20 @@ int test_messages_and_media() {
                           media.messages[0].content[0].kind == ContentKind::Image &&
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
+    const GenerationRequest omitted = media_as_text(media);
+    failures += check(
+        omitted.media_item_count() == 0 &&
+            omitted.messages[0].content[0].kind == ContentKind::Text &&
+            omitted.messages[0].content[0].text.find("cannot see images") != std::string::npos &&
+            omitted.messages[0].content[1].text.find("cannot see videos") != std::string::npos,
+        "media_as_text left a media part or lost its placeholder");
 
     body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
-    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+    failures += check(parse(body).generation.media_item_count() == 2,
+                      "low/high image detail accepted (one preprocessing profile)");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "huge";
+    failures += check(api_error([&] { (void)parse(body); }).param == "messages",
+                      "unknown image detail rejected");
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();

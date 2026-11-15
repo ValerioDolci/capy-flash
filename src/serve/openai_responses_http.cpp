@@ -315,7 +315,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
     } catch (const ApiException& exception) {
-        write_openai_error(res, responses_error(exception.error()));
+        reply_openai_error(req, res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
@@ -350,7 +350,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
             resolved.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_openai_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
-        write_openai_error(res, responses_error(exception.error()));
+        reply_openai_error(req, res, responses_error(exception.error()));
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
             "openai_responses_input_tokens",
@@ -363,13 +363,13 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
     try {
         validate_retrieve_query(req);
     } catch (const ApiException& exception) {
-        write_openai_error(res, exception.error());
+        reply_openai_error(req, res, exception.error());
         return;
     }
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_openai_error(res, response_not_found(id));
+        reply_openai_error(req, res, response_not_found(id));
         return;
     }
     res.set_content(stored->response.dump(), "application/json");
@@ -378,7 +378,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.erase(id)) {
-        write_openai_error(res, response_not_found(id));
+        reply_openai_error(req, res, response_not_found(id));
         return;
     }
     res.set_content(Json{{"id", id}, {"object", "response.deleted"}, {"deleted", true}}.dump(),
@@ -389,18 +389,18 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
     const std::string id                                     = path_response_id(req);
     const std::shared_ptr<const StoredOpenAIResponse> stored = openai_responses_store_.get(id);
     if (!stored) {
-        write_openai_error(res, response_not_found(id));
+        reply_openai_error(req, res, response_not_found(id));
         return;
     }
     try {
         res.set_content(paginated_input_items(req, stored->input_items).dump(), "application/json");
-    } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
+    } catch (const ApiException& exception) { reply_openai_error(req, res, exception.error()); }
 }
 
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!openai_responses_store_.get(id)) {
-        write_openai_error(res, response_not_found(id));
+        reply_openai_error(req, res, response_not_found(id));
         return;
     }
     ApiError error;
@@ -409,17 +409,17 @@ void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Re
     error.code    = "background_not_supported";
     error.message = "only background responses can be cancelled; NInfer does not support "
                     "background execution";
-    write_openai_error(res, error);
+    reply_openai_error(req, res, error);
 }
 
-void HttpServer::handle_response_compact(const httplib::Request&, httplib::Response& res) {
+void HttpServer::handle_response_compact(const httplib::Request& req, httplib::Response& res) {
     ApiError error;
     error.status  = 400;
     error.type    = "invalid_request_error";
     error.param   = "context_management";
     error.code    = "compaction_not_supported";
     error.message = "Responses compaction is not supported";
-    write_openai_error(res, error);
+    reply_openai_error(req, res, error);
 }
 
 } // namespace ninfer::serve
