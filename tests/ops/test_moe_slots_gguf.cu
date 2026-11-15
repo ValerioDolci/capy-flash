@@ -78,12 +78,12 @@ namespace {
 using Fmt = ops::MoeGgufFormat;
 
 constexpr int kH = 2560, kI = 640, kK = 10, kGU = 2 * kI;
-constexpr int kNE        = 16;   // test experts per bank
-constexpr int kResident  = 12;   // test experts j < 12 are resident
-constexpr int kOutOfPool = 14;   // test expert mapped to a slot >= layer.slots
-constexpr int kDecodeT   = 8;
-constexpr int kGroupedT  = 300;  // oracle columns of the grouped checks
-constexpr int kWideT     = 2100; // two grouped pieces
+constexpr int kNE           = 16; // test experts per bank
+constexpr int kResident     = 12; // test experts j < 12 are resident
+constexpr int kOutOfPool    = 14; // test expert mapped to a slot >= layer.slots
+constexpr int kDecodeT      = 8;
+constexpr int kGroupedT     = 300;  // oracle columns of the grouped checks
+constexpr int kWideT        = 2100; // two grouped pieces
 constexpr double kDecodeTol = 1e-3, kGroupedTol = 1e-3;
 constexpr double kEpsDp4a = 2e-6, kEpsMma = 4e-6, kEpsSilu = 4e-6;
 
@@ -95,7 +95,8 @@ void fail(const std::string& what) {
 }
 
 void parallel_for(int n, const std::function<void(int)>& fn) {
-    const int cores   = static_cast<int>(std::max(1U, std::min(16U, std::thread::hardware_concurrency())));
+    const int cores =
+        static_cast<int>(std::max(1U, std::min(16U, std::thread::hardware_concurrency())));
     const int workers = std::max(1, std::min(n, cores));
     std::vector<std::thread> pool;
     std::vector<std::exception_ptr> errors(static_cast<std::size_t>(workers));
@@ -114,12 +115,18 @@ void parallel_for(int n, const std::function<void(int)>& fn) {
 // ------------------------------------------------------------------------------- formats
 const char* fmt_name(Fmt f) {
     switch (f) {
-    case Fmt::IQ2_S: return "iq2_s";
-    case Fmt::IQ3_XXS: return "iq3_xxs";
-    case Fmt::IQ3_S: return "iq3_s";
-    case Fmt::IQ4_XS: return "iq4_xs";
-    case Fmt::IQ4_NL: return "iq4_nl";
-    case Fmt::Q2_0: return "q2_0";
+    case Fmt::IQ2_S:
+        return "iq2_s";
+    case Fmt::IQ3_XXS:
+        return "iq3_xxs";
+    case Fmt::IQ3_S:
+        return "iq3_s";
+    case Fmt::IQ4_XS:
+        return "iq4_xs";
+    case Fmt::IQ4_NL:
+        return "iq4_nl";
+    case Fmt::Q2_0:
+        return "q2_0";
     }
     return "?";
 }
@@ -138,14 +145,24 @@ int block_elems(Fmt f) { return f == Fmt::IQ4_NL ? 32 : f == Fmt::Q2_0 ? 64 : 25
 
 void dequant_row(Fmt f, const std::uint8_t* row, float* y, int k) {
     switch (f) {
-    case Fmt::IQ2_S: dequantize_row_iq2_s(reinterpret_cast<const block_iq2_s*>(row), y, k); return;
+    case Fmt::IQ2_S:
+        dequantize_row_iq2_s(reinterpret_cast<const block_iq2_s*>(row), y, k);
+        return;
     case Fmt::IQ3_XXS:
         dequantize_row_iq3_xxs(reinterpret_cast<const block_iq3_xxs*>(row), y, k);
         return;
-    case Fmt::IQ3_S: dequantize_row_iq3_s(reinterpret_cast<const block_iq3_s*>(row), y, k); return;
-    case Fmt::IQ4_XS: dequantize_row_iq4_xs(reinterpret_cast<const block_iq4_xs*>(row), y, k); return;
-    case Fmt::IQ4_NL: dequantize_row_iq4_nl(reinterpret_cast<const block_iq4_nl*>(row), y, k); return;
-    case Fmt::Q2_0: dequantize_row_q2_0(reinterpret_cast<const block_q2_0*>(row), y, k); return;
+    case Fmt::IQ3_S:
+        dequantize_row_iq3_s(reinterpret_cast<const block_iq3_s*>(row), y, k);
+        return;
+    case Fmt::IQ4_XS:
+        dequantize_row_iq4_xs(reinterpret_cast<const block_iq4_xs*>(row), y, k);
+        return;
+    case Fmt::IQ4_NL:
+        dequantize_row_iq4_nl(reinterpret_cast<const block_iq4_nl*>(row), y, k);
+        return;
+    case Fmt::Q2_0:
+        dequantize_row_q2_0(reinterpret_cast<const block_q2_0*>(row), y, k);
+        return;
     }
     throw std::runtime_error("dequant_row: unknown format");
 }
@@ -188,8 +205,8 @@ void finish_ids(Bank& b) {
 void fill_rows(std::uint8_t* p, std::int64_t rows, std::int64_t row_bytes, Fmt f, int k,
                std::mt19937_64& rng) {
     std::uniform_real_distribution<float> dd(5e-4F, 2e-2F);
-    const int nb            = k / block_elems(f);
-    const std::int64_t bb   = row_bytes / nb;
+    const int nb          = k / block_elems(f);
+    const std::int64_t bb = row_bytes / nb;
     for (std::int64_t i = 0; i < rows * row_bytes; ++i) p[i] = static_cast<std::uint8_t>(rng());
     for (std::int64_t r = 0; r < rows; ++r)
         for (int b = 0; b < nb; ++b) {
@@ -244,7 +261,8 @@ std::vector<RealLayer> real_layers(const std::string& dir) {
         fail("NINFER_GGUF_BANKS: no manifest.json in " + dir);
         return {};
     }
-    const std::string manifest((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string manifest((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
     std::vector<RealLayer> out;
     for (int l = 0; l < 100; ++l) {
         char gu_file[64], dn_file[64];
@@ -257,7 +275,8 @@ std::vector<RealLayer> real_layers(const std::string& dir) {
         if (!std::filesystem::exists(r.gu_path) || !std::filesystem::exists(r.dn_path)) continue;
         if (!fmt_of_name(manifest_format(manifest, gu_file), &r.gu) ||
             !fmt_of_name(manifest_format(manifest, dn_file), &r.dn)) {
-            fail(std::string("manifest.json: no supported format for ") + gu_file + " / " + dn_file);
+            fail(std::string("manifest.json: no supported format for ") + gu_file + " / " +
+                 dn_file);
             continue;
         }
         out.push_back(r);
@@ -271,8 +290,8 @@ bool load_real_bank(const RealLayer& r, std::mt19937_64& rng, Bank& b) {
     b.gu   = r.gu;
     b.dn   = r.dn;
     init_geometry(b);
-    const auto gsize = static_cast<std::int64_t>(std::filesystem::file_size(r.gu_path));
-    const auto dsize = static_cast<std::int64_t>(std::filesystem::file_size(r.dn_path));
+    const auto gsize           = static_cast<std::int64_t>(std::filesystem::file_size(r.gu_path));
+    const auto dsize           = static_cast<std::int64_t>(std::filesystem::file_size(r.dn_path));
     const std::int64_t experts = gsize / b.gu_bytes;
     if (gsize % b.gu_bytes != 0 || dsize != experts * b.dn_bytes || experts < kNE) {
         fail(b.name + ": bank sizes do not match the manifest formats");
@@ -327,7 +346,7 @@ void round_bank_bf16(Bank& b) {
 
 // -------------------------------------------------------------------------------- routing
 struct Routing {
-    std::vector<std::uint16_t> x; // [T][2560] BF16
+    std::vector<std::uint16_t> x;  // [T][2560] BF16
     std::vector<std::int32_t> ids; // [T][10]
     std::vector<float> w;          // [T][10]
 };
@@ -359,15 +378,16 @@ Routing make_routing(const Bank& b, int tokens, std::mt19937_64& rng) {
             row[to]         = row[from];
         }
     }
-    // Token 0: expert 0 three times, a zero weight, an absent expert, -1, an id >= E, a slot >= slots.
-    const std::int32_t t0[kK] = {id(0), id(0), id(1), id(12), -1, id(2), id(0), id(3),
-                                 b.table_size + 7, id(kOutOfPool)};
+    // Token 0: expert 0 three times, a zero weight, an absent expert, -1, an id >= E, a slot >=
+    // slots.
+    const std::int32_t t0[kK] = {id(0), id(0), id(1), id(12),           -1,
+                                 id(2), id(0), id(3), b.table_size + 7, id(kOutOfPool)};
     std::copy(t0, t0 + kK, R.ids.begin());
     R.w[5] = 0.F;
     // Token 2: no resident expert.
     if (tokens > 2) {
-        const std::int32_t t2[kK] = {id(12), id(13), id(kOutOfPool), id(15), -1, b.table_size + 7,
-                                     id(12), id(13), id(15), -1};
+        const std::int32_t t2[kK] = {id(12),           id(13), id(kOutOfPool), id(15), -1,
+                                     b.table_size + 7, id(12), id(13),         id(15), -1};
         std::copy(t2, t2 + kK, R.ids.begin() + 2 * kK);
     }
     return R;
@@ -391,11 +411,12 @@ void codec_q8_interval(const double* h, const double* e, double* hq, double* dev
         amax_lo  = std::max(amax_lo, std::fabs(h[i]) - e[i]);
         amax_hi  = std::max(amax_hi, std::fabs(h[i]) + e[i]);
     }
-    const float d_ref  = amax_ref / 127.0F;
-    const double d_lo  = amax_lo / 127.0, d_hi = amax_hi / 127.0;
+    const float d_ref = amax_ref / 127.0F;
+    const double d_lo = amax_lo / 127.0, d_hi = amax_hi / 127.0;
     for (int i = 0; i < 32; ++i) {
         const double q_ref =
-            amax_ref == 0.F ? 0.0 : static_cast<double>(std::round(static_cast<float>(h[i]) / d_ref));
+            amax_ref == 0.F ? 0.0
+                            : static_cast<double>(std::round(static_cast<float>(h[i]) / d_ref));
         hq[i]  = q_ref * static_cast<double>(d_ref);
         dev[i] = 0.0;
         if (!(d_lo > 0.0)) {
@@ -424,9 +445,9 @@ void codec_q8_interval(const double* h, const double* e, double* hq, double* dev
 
 // BF16 rounding of h with the values reachable from [h - e, h + e].
 void codec_bf16_interval(double h, double e, double& hb, double& dev, int& uncertain) {
-    hb             = bf16r(static_cast<float>(h));
+    hb              = bf16r(static_cast<float>(h));
     const double lo = bf16r(static_cast<float>(h - e)), hi = bf16r(static_cast<float>(h + e));
-    dev            = 0.0;
+    dev = 0.0;
     if (lo == hb && hi == hb) return;
     ++uncertain;
     dev = std::max(std::fabs(lo - hb), std::fabs(hi - hb));
@@ -442,8 +463,9 @@ void codec_x(const std::uint16_t* x, double* xq) {
         }
         const float d = amax / 127.0F;
         for (int i = 0; i < 32; ++i)
-            xq[b + i] = amax == 0.F ? 0.0
-                                    : static_cast<double>(std::round(v[i] / d)) * static_cast<double>(d);
+            xq[b + i] = amax == 0.F
+                            ? 0.0
+                            : static_cast<double>(std::round(v[i] / d)) * static_cast<double>(d);
     }
 }
 
@@ -509,7 +531,8 @@ Ref oracle_token(const Bank& b, const Routing& R, int t, bool grouped) {
         for (int r = 0; r < kH; ++r) {
             const float* row = D + std::size_t(r) * kI;
             double s = 0.0, a = 0.0;
-            for (int i = 0; i < kI; ++i) s += static_cast<double>(row[i]) * hq[static_cast<std::size_t>(i)];
+            for (int i = 0; i < kI; ++i)
+                s += static_cast<double>(row[i]) * hq[static_cast<std::size_t>(i)];
             for (int i : unsure)
                 a += dev[static_cast<std::size_t>(i)] * std::fabs(static_cast<double>(row[i]));
             ref.out[static_cast<std::size_t>(r)] += alpha * s;
@@ -521,7 +544,8 @@ Ref oracle_token(const Bank& b, const Routing& R, int t, bool grouped) {
 
 std::vector<Ref> oracle(const Bank& b, const Routing& R, int tokens, bool grouped) {
     std::vector<Ref> refs(static_cast<std::size_t>(tokens));
-    parallel_for(tokens, [&](int t) { refs[static_cast<std::size_t>(t)] = oracle_token(b, R, t, grouped); });
+    parallel_for(
+        tokens, [&](int t) { refs[static_cast<std::size_t>(t)] = oracle_token(b, R, t, grouped); });
     return refs;
 }
 
@@ -536,7 +560,8 @@ void check_numeric(const std::string& label, const std::vector<float>& out,
         if (!R.any) {
             for (int r = 0; r < kH; ++r)
                 if (o[r] != 0.F) {
-                    fail(label + ": token " + std::to_string(t) + " without a resident expert is not 0");
+                    fail(label + ": token " + std::to_string(t) +
+                         " without a resident expert is not 0");
                     break;
                 }
             continue;
@@ -566,7 +591,9 @@ void check_numeric(const std::string& label, const std::vector<float>& out,
         fail(label + ": error " + std::to_string(worst) + " rms exceeds " + std::to_string(tol));
 }
 
-bool same_bits(const void* a, const void* b, std::size_t bytes) { return std::memcmp(a, b, bytes) == 0; }
+bool same_bits(const void* a, const void* b, std::size_t bytes) {
+    return std::memcmp(a, b, bytes) == 0;
+}
 
 // ------------------------------------------------------------------------------------ GPU
 struct Gpu {
@@ -585,14 +612,17 @@ struct Placement {
 };
 
 // Test experts j < resident get slot perm[j]; j = kOutOfPool gets a slot >= slots; others -1.
-std::vector<std::int32_t> table_for(const Bank& b, const std::vector<int>& perm, int slots, int resident) {
+std::vector<std::int32_t> table_for(const Bank& b, const std::vector<int>& perm, int slots,
+                                    int resident) {
     std::vector<std::int32_t> t(static_cast<std::size_t>(b.table_size), -1);
-    for (int j = 0; j < resident; ++j) t[static_cast<std::size_t>(b.ids[j])] = perm[static_cast<std::size_t>(j)];
+    for (int j = 0; j < resident; ++j)
+        t[static_cast<std::size_t>(b.ids[j])] = perm[static_cast<std::size_t>(j)];
     t[static_cast<std::size_t>(b.ids[kOutOfPool])] = slots + 5;
     return t;
 }
 
-std::unique_ptr<Placement> make_blob(const Bank& b, std::mt19937_64& rng, int resident = kResident) {
+std::unique_ptr<Placement> make_blob(const Bank& b, std::mt19937_64& rng,
+                                     int resident = kResident) {
     auto P          = std::make_unique<Placement>();
     const int slots = kResident + 2; // two slots hold garbage
     std::vector<int> perm(static_cast<std::size_t>(slots)), phys(static_cast<std::size_t>(slots));
@@ -612,12 +642,13 @@ std::unique_ptr<Placement> make_blob(const Bank& b, std::mt19937_64& rng, int re
     for (auto& v : garbage) v = static_cast<std::uint8_t>(rng());
     P->pool.copy_from_host(garbage.data(), garbage.size());
     for (int j = 0; j < resident; ++j)
-        P->pool.copy_from_host(b.blob[static_cast<std::size_t>(j)].data(),
-                               static_cast<std::size_t>(b.expert_bytes),
-                               static_cast<std::size_t>(P->offsets_host[static_cast<std::size_t>(perm[static_cast<std::size_t>(j)])]));
-    P->table_host = table_for(b, perm, slots, resident);
-    P->table      = to_device(P->table_host);
-    P->offsets    = to_device(P->offsets_host);
+        P->pool.copy_from_host(
+            b.blob[static_cast<std::size_t>(j)].data(), static_cast<std::size_t>(b.expert_bytes),
+            static_cast<std::size_t>(
+                P->offsets_host[static_cast<std::size_t>(perm[static_cast<std::size_t>(j)])]));
+    P->table_host           = table_for(b, perm, slots, resident);
+    P->table                = to_device(P->table_host);
+    P->offsets              = to_device(P->offsets_host);
     P->layer.slot_table     = Tensor(P->table.p, DType::I32, {b.table_size});
     P->layer.slots          = slots;
     P->layer.slot_offset    = static_cast<const std::int64_t*>(P->offsets.p);
@@ -633,17 +664,20 @@ std::unique_ptr<Placement> make_planar(const Bank& b, std::mt19937_64& rng) {
     std::vector<int> perm(static_cast<std::size_t>(slots));
     std::iota(perm.begin(), perm.end(), 0);
     std::shuffle(perm.begin(), perm.end(), rng);
-    P->planar_gu = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(slots * b.gu_bytes), HostMapping::Yes);
-    P->planar_dn = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(slots * b.dn_bytes), HostMapping::Yes);
-    auto* gu = static_cast<std::uint8_t*>(P->planar_gu->data());
-    auto* dn = static_cast<std::uint8_t*>(P->planar_dn->data());
+    P->planar_gu = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(slots * b.gu_bytes),
+                                                      HostMapping::Yes);
+    P->planar_dn = std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(slots * b.dn_bytes),
+                                                      HostMapping::Yes);
+    auto* gu     = static_cast<std::uint8_t*>(P->planar_gu->data());
+    auto* dn     = static_cast<std::uint8_t*>(P->planar_dn->data());
     std::memset(gu, 0xA5, P->planar_gu->size());
     std::memset(dn, 0x5A, P->planar_dn->size());
     for (int j = 0; j < kResident; ++j) {
-        const auto& e     = b.blob[static_cast<std::size_t>(j)];
-        const auto s      = static_cast<std::int64_t>(perm[static_cast<std::size_t>(j)]);
+        const auto& e = b.blob[static_cast<std::size_t>(j)];
+        const auto s  = static_cast<std::int64_t>(perm[static_cast<std::size_t>(j)]);
         std::memcpy(gu + s * b.gu_bytes, e.data(), static_cast<std::size_t>(b.gu_bytes));
-        std::memcpy(dn + s * b.dn_bytes, e.data() + b.gu_bytes, static_cast<std::size_t>(b.dn_bytes));
+        std::memcpy(dn + s * b.dn_bytes, e.data() + b.gu_bytes,
+                    static_cast<std::size_t>(b.dn_bytes));
     }
     P->table_host           = table_for(b, perm, slots, kResident);
     P->table                = to_device(P->table_host);
@@ -663,13 +697,13 @@ struct Inputs {
 
 Inputs upload(const Routing& R, int first, int T) {
     Inputs in;
-    in.T = T;
-    in.x = to_device(std::vector<std::uint16_t>(R.x.begin() + std::ptrdiff_t(first) * kH,
-                                                R.x.begin() + std::ptrdiff_t(first + T) * kH));
+    in.T   = T;
+    in.x   = to_device(std::vector<std::uint16_t>(R.x.begin() + std::ptrdiff_t(first) * kH,
+                                                  R.x.begin() + std::ptrdiff_t(first + T) * kH));
     in.ids = to_device(std::vector<std::int32_t>(R.ids.begin() + std::ptrdiff_t(first) * kK,
                                                  R.ids.begin() + std::ptrdiff_t(first + T) * kK));
-    in.w = to_device(std::vector<float>(R.w.begin() + std::ptrdiff_t(first) * kK,
-                                        R.w.begin() + std::ptrdiff_t(first + T) * kK));
+    in.w   = to_device(std::vector<float>(R.w.begin() + std::ptrdiff_t(first) * kK,
+                                          R.w.begin() + std::ptrdiff_t(first + T) * kK));
     return in;
 }
 
@@ -704,14 +738,17 @@ std::vector<float> run_decode(Gpu& g, const ops::MoeGgufLayer& layer, const Inpu
                               ops::MoeSlotsOutput mode, const std::vector<float>* init = nullptr) {
     const std::size_t n = std::size_t(in.T) * kH;
     DeviceBuffer out(n * 4);
-    if (init != nullptr) out.copy_from_host(init->data(), n * 4);
-    else cuda_check(cudaMemsetAsync(out.p, 0xFF, n * 4, g.stream), "memset");
+    if (init != nullptr)
+        out.copy_from_host(init->data(), n * 4);
+    else
+        cuda_check(cudaMemsetAsync(out.p, 0xFF, n * 4, g.stream), "memset");
     call_decode(g, layer, in, mode, out, DType::FP32);
     cuda_synchronize(g.stream);
     return from_device<float>(out, n);
 }
 
-std::vector<std::uint16_t> run_decode_bf16(Gpu& g, const ops::MoeGgufLayer& layer, const Inputs& in) {
+std::vector<std::uint16_t> run_decode_bf16(Gpu& g, const ops::MoeGgufLayer& layer,
+                                           const Inputs& in) {
     const std::size_t n = std::size_t(in.T) * kH;
     DeviceBuffer out(n * 2);
     cuda_check(cudaMemsetAsync(out.p, 0xFF, n * 2, g.stream), "memset");
@@ -732,6 +769,7 @@ std::vector<float> run_grouped(Gpu& g, const ops::MoeGgufLayer& layer, const Inp
 struct Graph {
     cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
+
     ~Graph() {
         if (exec != nullptr) cudaGraphExecDestroy(exec);
         if (graph != nullptr) cudaGraphDestroy(graph);
@@ -761,7 +799,8 @@ void reshuffle_blob(Placement& P, const Bank& b, std::mt19937_64& rng) {
     std::shuffle(sigma.begin(), sigma.end(), rng);
     std::vector<std::int64_t> off(static_cast<std::size_t>(slots));
     for (int s = 0; s < slots; ++s)
-        off[static_cast<std::size_t>(sigma[static_cast<std::size_t>(s)])] = P.offsets_host[static_cast<std::size_t>(s)];
+        off[static_cast<std::size_t>(sigma[static_cast<std::size_t>(s)])] =
+            P.offsets_host[static_cast<std::size_t>(s)];
     std::vector<std::int32_t> table = P.table_host;
     for (auto& v : table)
         if (v >= 0 && v < slots) v = sigma[static_cast<std::size_t>(v)];
@@ -790,7 +829,8 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
         const auto s2 = run_decode(g, blob.layer, in, ops::MoeSlotsOutput::Store);
         if (!same_bits(s1.data(), s2.data(), n * 4)) fail(tag + ": repeated calls differ");
         const auto p = run_decode(g, planar.layer, in, ops::MoeSlotsOutput::Store);
-        if (!same_bits(s1.data(), p.data(), n * 4)) fail(tag + ": blob and planar placements differ");
+        if (!same_bits(s1.data(), p.data(), n * 4))
+            fail(tag + ": blob and planar placements differ");
         std::vector<float> old(n), expect(n);
         for (std::size_t i = 0; i < n; ++i) {
             old[i]    = nd(rng);
@@ -813,13 +853,14 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
                                    stores[kDecodeT].data() + std::size_t(t) * kH, kH * 4)
                              ? 0
                              : 1;
-    std::printf("  %-52s token results equal across call widths: %s (%d of 28 differ; informational)\n",
-                (b.name + " decode").c_str(), differing == 0 ? "yes" : "no", differing);
+    std::printf(
+        "  %-52s token results equal across call widths: %s (%d of 28 differ; informational)\n",
+        (b.name + " decode").c_str(), differing == 0 ? "yes" : "no", differing);
 
     // slots = 0: nothing is resident.
     {
-        const Inputs in     = upload(R, 0, 4);
-        const std::size_t n = std::size_t(4) * kH;
+        const Inputs in        = upload(R, 0, 4);
+        const std::size_t n    = std::size_t(4) * kH;
         ops::MoeGgufLayer none = blob.layer;
         none.slots             = 0;
         const auto z           = run_decode(g, none, in, ops::MoeSlotsOutput::Store);
@@ -831,7 +872,8 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
         std::vector<float> old(n);
         for (auto& v : old) v = nd(rng);
         const auto keep = run_decode(g, none, in, ops::MoeSlotsOutput::Accumulate, &old);
-        if (!same_bits(keep.data(), old.data(), n * 4)) fail(b.name + " decode slots=0: Accumulate changed out");
+        if (!same_bits(keep.data(), old.data(), n * 4))
+            fail(b.name + " decode slots=0: Accumulate changed out");
     }
 
     // CUDA graph: captured once, replayed before and after inputs, slot table and offsets change.
@@ -844,8 +886,11 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
         cuda_synchronize(g.stream);
         const auto eager_a = from_device<float>(out, n);
         Graph G;
-        capture(g, G, [&] { call_decode(g, blob.layer, in, ops::MoeSlotsOutput::Store, out, DType::FP32); });
-        if (!same_bits(replay(g, G, out, n).data(), eager_a.data(), n * 4)) fail(tag + ": replay != eager");
+        capture(g, G, [&] {
+            call_decode(g, blob.layer, in, ops::MoeSlotsOutput::Store, out, DType::FP32);
+        });
+        if (!same_bits(replay(g, G, out, n).data(), eager_a.data(), n * 4))
+            fail(tag + ": replay != eager");
         rewrite(in, R, kDecodeT);
         reshuffle_blob(blob, b, rng);
         cuda_check(cudaMemsetAsync(out.p, 0xFF, n * 4, g.stream), "memset");
@@ -854,7 +899,8 @@ void decode_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Plac
         const auto eager_b = from_device<float>(out, n);
         if (!same_bits(replay(g, G, out, n).data(), eager_b.data(), n * 4))
             fail(tag + ": replay after the inputs changed != eager");
-        if (same_bits(eager_a.data(), eager_b.data(), n * 4)) fail(tag + ": the replay check is vacuous");
+        if (same_bits(eager_a.data(), eager_b.data(), n * 4))
+            fail(tag + ": the replay check is vacuous");
         restore(blob);
     }
 }
@@ -873,7 +919,8 @@ void grouped_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Pla
         const auto s2 = run_grouped(g, blob.layer, in);
         if (!same_bits(s1.data(), s2.data(), n * 4)) fail(tag + ": repeated calls differ");
         const auto p = run_grouped(g, planar.layer, in);
-        if (!same_bits(s1.data(), p.data(), n * 4)) fail(tag + ": blob and planar placements differ");
+        if (!same_bits(s1.data(), p.data(), n * 4))
+            fail(tag + ": blob and planar placements differ");
         {
             // capy-flash zero-copy prefill: every other blob-resident expert dropped from the slot
             // table and read in place from the host bank through host_table (same bits).
@@ -890,11 +937,13 @@ void grouped_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Pla
             hy.gate_up_base      = planar.layer.gate_up_base;
             hy.down_base         = planar.layer.down_base;
             const auto hv        = run_grouped(g, hy, in);
-            if (!same_bits(s1.data(), hv.data(), n * 4)) fail(tag + ": hybrid (blob + host) differs");
+            if (!same_bits(s1.data(), hv.data(), n * 4))
+                fail(tag + ": hybrid (blob + host) differs");
         }
         if (T == kGroupedT) narrow = s1;
     }
-    // Two pieces: columns [0, 300) as in the 300-column call, [2048, 2100) as in a call of their own.
+    // Two pieces: columns [0, 300) as in the 300-column call, [2048, 2100) as in a call of their
+    // own.
     {
         const std::string tag = b.name + " grouped T=" + std::to_string(kWideT);
         const auto wide       = run_grouped(g, blob.layer, upload(R, 0, kWideT));
@@ -916,7 +965,8 @@ void grouped_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Pla
         const auto eager_a = from_device<float>(out, n);
         Graph G;
         capture(g, G, [&] { call_grouped(g, blob.layer, in, out); });
-        if (!same_bits(replay(g, G, out, n).data(), eager_a.data(), n * 4)) fail(tag + ": replay != eager");
+        if (!same_bits(replay(g, G, out, n).data(), eager_a.data(), n * 4))
+            fail(tag + ": replay != eager");
         rewrite(in, R, T);
         reshuffle_blob(blob, b, rng);
         call_grouped(g, blob.layer, in, out);
@@ -924,7 +974,8 @@ void grouped_cases(const Bank& b, const Routing& R, Gpu& g, Placement& blob, Pla
         const auto eager_b = from_device<float>(out, n);
         if (!same_bits(replay(g, G, out, n).data(), eager_b.data(), n * 4))
             fail(tag + ": replay after the inputs changed != eager");
-        if (same_bits(eager_a.data(), eager_b.data(), n * 4)) fail(tag + ": the replay check is vacuous");
+        if (same_bits(eager_a.data(), eager_b.data(), n * 4))
+            fail(tag + ": the replay check is vacuous");
         restore(blob);
     }
 }
@@ -942,7 +993,9 @@ Routing bench_routing(const Bank& b, int tokens, std::mt19937_64& rng) {
     for (int t = 0; t < tokens; ++t) {
         std::iota(js.begin(), js.end(), 0);
         std::shuffle(js.begin(), js.end(), rng);
-        for (int k = 0; k < kK; ++k) R.ids[std::size_t(t) * kK + k] = b.ids[static_cast<std::size_t>(js[static_cast<std::size_t>(k)])];
+        for (int k = 0; k < kK; ++k)
+            R.ids[std::size_t(t) * kK + k] =
+                b.ids[static_cast<std::size_t>(js[static_cast<std::size_t>(k)])];
     }
     return R;
 }
@@ -965,19 +1018,23 @@ double time_us(Gpu& g, int iters, const std::function<void()>& body) {
 void bench_bank(const Bank& b, Gpu& g, std::mt19937_64& rng) {
     auto P = make_blob(b, rng, kK);
     for (int T : {1, 4}) {
-        const Routing R     = bench_routing(b, T, rng);
-        const Inputs in     = upload(R, 0, T);
+        const Routing R = bench_routing(b, T, rng);
+        const Inputs in = upload(R, 0, T);
         DeviceBuffer out(std::size_t(T) * kH * 4);
-        const auto call     = [&] { call_decode(g, P->layer, in, ops::MoeSlotsOutput::Store, out, DType::FP32); };
+        const auto call = [&] {
+            call_decode(g, P->layer, in, ops::MoeSlotsOutput::Store, out, DType::FP32);
+        };
         for (int i = 0; i < 20; ++i) call();
         cuda_synchronize(g.stream);
         const double eager = time_us(g, 500, call);
         Graph G;
         capture(g, G, call);
         for (int i = 0; i < 20; ++i) cuda_check(cudaGraphLaunch(G.exec, g.stream), "graph launch");
-        const double graph = time_us(g, 500, [&] { cuda_check(cudaGraphLaunch(G.exec, g.stream), "graph launch"); });
-        const double gbs   = double(kK) * double(b.expert_bytes) / (graph * 1e3);
-        std::printf("  %-34s decode T=%d   eager %8.1f us   graph %8.1f us   (%.0f GB/s of expert weights)\n",
+        const double graph =
+            time_us(g, 500, [&] { cuda_check(cudaGraphLaunch(G.exec, g.stream), "graph launch"); });
+        const double gbs = double(kK) * double(b.expert_bytes) / (graph * 1e3);
+        std::printf("  %-34s decode T=%d   eager %8.1f us   graph %8.1f us   (%.0f GB/s of expert "
+                    "weights)\n",
                     b.name.c_str(), T, eager, graph, gbs);
     }
     {
@@ -988,8 +1045,8 @@ void bench_bank(const Bank& b, Gpu& g, std::mt19937_64& rng) {
         const auto call = [&] { call_grouped(g, P->layer, in, out); };
         for (int i = 0; i < 3; ++i) call();
         cuda_synchronize(g.stream);
-        const double us     = time_us(g, 20, call);
-        const double flops  = 2.0 * T * kK * (double(kGU) * kH + double(kH) * kI);
+        const double us    = time_us(g, 20, call);
+        const double flops = 2.0 * T * kK * (double(kGU) * kH + double(kH) * kI);
         std::printf("  %-34s grouped T=%d  %10.1f us   (%.1f TFLOP/s)\n", b.name.c_str(), T, us,
                     flops / (us * 1e6));
     }
@@ -1019,8 +1076,10 @@ int main(int argc, char** argv) {
     bool bench      = false;
     const char* dir = std::getenv("NINFER_GGUF_BANKS");
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--bench") == 0) bench = true;
-        else dir = argv[i];
+        if (std::strcmp(argv[i], "--bench") == 0)
+            bench = true;
+        else
+            dir = argv[i];
     }
     try {
         if (cuda_unavailable()) {
@@ -1032,18 +1091,19 @@ int main(int argc, char** argv) {
         cuda_check(cudaGetDevice(&device), "cudaGetDevice");
         cuda_check(cudaGetDeviceProperties(&prop, device), "cudaGetDeviceProperties");
         if (prop.major != 12) {
-            std::printf("SKIP: the build targets sm_120a, device is sm_%d%d\n", prop.major, prop.minor);
+            std::printf("SKIP: the build targets sm_120a, device is sm_%d%d\n", prop.major,
+                        prop.minor);
             return 77;
         }
         Gpu g;
         cuda_check(cudaStreamCreateWithFlags(&g.stream, cudaStreamNonBlocking), "stream");
         const std::size_t ws = std::max(ops::moe_slots_gguf_workspace_bytes(kDecodeT),
                                         ops::moe_grouped_gguf_workspace_bytes(kWideT));
-        g.ws = std::make_unique<DeviceArena>(ws + 4096);
+        g.ws                 = std::make_unique<DeviceArena>(ws + 4096);
         std::mt19937_64 rng(20261019);
-        const std::pair<Fmt, Fmt> pairs[] = {{Fmt::IQ2_S, Fmt::Q2_0},    {Fmt::IQ2_S, Fmt::IQ4_NL},
-                                             {Fmt::IQ3_XXS, Fmt::IQ4_NL}, {Fmt::IQ3_S, Fmt::Q2_0},
-                                             {Fmt::IQ4_XS, Fmt::IQ4_NL},  {Fmt::IQ4_NL, Fmt::IQ4_NL}};
+        const std::pair<Fmt, Fmt> pairs[] = {
+            {Fmt::IQ2_S, Fmt::Q2_0}, {Fmt::IQ2_S, Fmt::IQ4_NL},  {Fmt::IQ3_XXS, Fmt::IQ4_NL},
+            {Fmt::IQ3_S, Fmt::Q2_0}, {Fmt::IQ4_XS, Fmt::IQ4_NL}, {Fmt::IQ4_NL, Fmt::IQ4_NL}};
         for (const auto& [gu, dn] : pairs) {
             Bank b = synthetic_bank(gu, dn, rng);
             run_bank(b, g, rng, bench);
