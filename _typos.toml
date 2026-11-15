@@ -27,6 +27,8 @@ ser = "ser"
 mis = "mis"        # mis-sized
 thi = "thi"        # truncated tag in a parser test
 thw = "thw"        # temporal, height, width of a Vision grid (image_grid_thw)
+# names
+Collet = "Collet"  # Yann Collet, author of xxHash
 
 [default.extend-identifiers]
 cudaMemcpy3DParms = "cudaMemcpy3DParms"  # CUDA API
