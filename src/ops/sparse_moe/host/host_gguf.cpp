@@ -152,14 +152,15 @@ namespace {
 
 #define NINFER_GGUF_KERNELS(ISA, NS)                                                               \
     HostGgufKernels {                                                                              \
-        ISA, detail::NS::decode_rows, detail::NS::pack_act_q8_K, detail::NS::pack_act_q8_0,        \
-            detail::NS::quantize_pack_bf16, detail::NS::quantize_pack_f32,                         \
-            detail::NS::quantize_pack_bf16_q8k_g32, detail::NS::quantize_pack_bf16_q8f32,          \
-            detail::NS::quantize_pack_f32_q8f32, detail::NS::quantize_pack_q8_0_half_q8f32,        \
-            detail::NS::quantize_pack_q8_0_half, detail::NS::gemm_decoded,                         \
-            detail::NS::decode_rows_bf16, detail::NS::gemm_bf16, detail::NS::silu_mul,             \
-            detail::NS::quantize_row_q8_K_bf16, detail::NS::quantize_row_q8_K_f32,                 \
-            detail::NS::quantize_row_q8_0_bf16, detail::NS::quantize_row_q8_0_f32                  \
+        ISA, detail::NS::decode_rows, detail::NS::decode_rows_big, detail::NS::pack_act_q8_K,      \
+            detail::NS::pack_act_q8_0, detail::NS::quantize_pack_bf16,                             \
+            detail::NS::quantize_pack_f32, detail::NS::quantize_pack_bf16_q8k_g32,                 \
+            detail::NS::quantize_pack_bf16_q8f32, detail::NS::quantize_pack_f32_q8f32,             \
+            detail::NS::quantize_pack_q8_0_half_q8f32, detail::NS::quantize_pack_q8_0_half,        \
+            detail::NS::gemm_decoded, detail::NS::decode_rows_bf16, detail::NS::gemm_bf16,         \
+            detail::NS::silu_mul, detail::NS::quantize_row_q8_K_bf16,                              \
+            detail::NS::quantize_row_q8_K_f32, detail::NS::quantize_row_q8_0_bf16,                 \
+            detail::NS::quantize_row_q8_0_f32                                                      \
     }
 
 constexpr HostGgufKernels kAvx512Kernels = NINFER_GGUF_KERNELS(HostIsa::Avx512Vnni, avx512);

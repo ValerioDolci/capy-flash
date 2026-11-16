@@ -88,7 +88,9 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   of RAM) available (`NINFER_HOST_TIER_RAM_GUARD=0` skips that check).
 - **Page-locked limit (Windows WDDM / WSL2).** When the system grants less pinned memory than the experts need, the
   banks of the least used layers stay in pageable RAM: the CPU reads them in place and the GPUs copy them through a
-  pinned staging ring (no prefill streaming for those layers). Same tokens as fully pinned, slower where pageable.
+  pinned staging ring (no prefill streaming for those layers). Slower where pageable, and on prompts long enough to
+  stream experts the tokens can differ from a fully pinned run: the experts of those layers that are not on a GPU are
+  computed by the CPU instead of being streamed (same weights, the CPU's arithmetic).
   `--host-pinned-max-gib G` (or `NINFER_HOST_PINNED_MAX_GIB`) sets the cap by hand.
   The value must be a complete, finite positive number of GiB representing at least one byte
   and less than 16 EiB. Fractional bytes are truncated; invalid values are rejected.
@@ -1295,7 +1297,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus) | mailbox on without P2P |
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
-| `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); same tokens, slower where pageable. Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit (the weights keep the rest page-locked). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
+| `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); slower where pageable, and on long prompts the tokens can differ from a fully pinned run (the CPU computes those layers' experts instead of streaming them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit (the weights keep the rest page-locked). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`, `--profile flash-next`: `8`) |
@@ -1390,7 +1392,9 @@ such as a system prompt another conversation left, made the long conversation pr
 - Each file carries a validity key: artifact and executable (path, size, modification time), tensor
   parallel width, KV dtype, speculative mode and the KV/state layouts; files with another key are
   ignored. A new build or artifact starts with an empty disk tier.
-- Text prompts only (no images); without speculation or with MTP (DFlash2 turns the disk tier
+- Text and image prompts (an image's placeholder tokens are named on disk by the
+  item's content digest, grid and offset, so another picture never resumes a saved one; a checkpoint
+  never splits an item); without speculation or with MTP (DFlash2 turns the disk tier
   off). Pinned memory: about 320 MiB plus one StateImage. Space, Qwen3.8-27B with INT8 KV (one GPU or
   both halves at `--tp 2`): about 36 KB per token of context plus 147 MiB per saved state.
 - Measured on two RTX 5070 Ti, Qwen3.8-27B GSQ-3, `--profile 27b`, page cache dropped: time to first

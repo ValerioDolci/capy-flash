@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.13.2**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.13.3**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -52,7 +52,8 @@ users report other setups. Not affiliated with Qwen or NVIDIA.
   64 GB edition), and `--profile flash-next` also keeps the token embedding and up to 4 GiB of idle conversations in
   RAM. The server checks this at startup and refuses with the numbers when it does not fit (`NINFER_RAM_GUARD=0`
   starts anyway). On Windows/WSL2, which limit page-locked memory to about half the RAM, the layers that do not fit
-  stay in pageable RAM (same tokens, slower). With the 64 GB edition on a 64 GB machine that also runs a desktop,
+  stay in pageable RAM (slower; on prompts long enough to stream experts the tokens can differ from a fully
+  page-locked run, because the CPU computes those layers' experts). With the 64 GB edition on a 64 GB machine that also runs a desktop,
   `NINFER_QWEN4_EXCLUSIVE_LAYERS=20` keeps no RAM copy of the experts the GPUs already hold in the first 20 layers
   (7.7 GiB less on two GPUs; the tokens change, and decode is about 2-3 % slower).
 
@@ -353,6 +354,16 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.13.3** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.3)), five pull requests by @Mici81, same tokens
+- Two-GPU prefill of the 64 GB edition +3-5 %: each 8192-column group of a prompt chunk goes to the other GPU as soon
+  as it is enqueued ([PR #80](https://github.com/ValerioDolci/capy-flash/pull/80)).
+- With a model loaded and idle, the CPU expert service checks for work every 10 ms after a quiet second, so the CPU can
+  rest (package 31 W to 23 W on a Ryzen 9 9900X) ([PR #84](https://github.com/ValerioDolci/capy-flash/pull/84)).
+- The disk tier saves and resumes conversations with images ([PR #82](https://github.com/ValerioDolci/capy-flash/pull/82)),
+  and `--reasoning-close-retry` works on prompts with images ([PR #83](https://github.com/ValerioDolci/capy-flash/pull/83)).
+- Opt-in IQ3 decoder for hybrid Intel CPUs without AVX-512 ([PR #85](https://github.com/ValerioDolci/capy-flash/pull/85)).
+- `--host-pinned-max-gib` (and the WSL2 fallback) can change the tokens on long prompts; the docs said otherwise ([#81](https://github.com/ValerioDolci/capy-flash/issues/81)).
 
 **v0.13.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.2))
 - Coding agents run without error answers (checked with Claude Code 2.1, OpenCode 1.19 and Codex CLI 0.169): an image

@@ -1228,6 +1228,39 @@ int test_reasoning_continuation(const Frontend& frontend) {
             check(FrontendFactory::inspect(continued_marked).context_cache.opportunities.empty(),
                   "a continuation still registers the chat prompt's capture points");
     }
+
+    // A prompt with an image keeps its M-RoPE positions and Vision items; the appended text
+    // continues at index + rope_delta on every axis, where decoding would have placed it.
+    {
+        const auto media_base  = frontend.prepare(image_text_input(gradient_ppm(), "x", "g.ppm"));
+        const auto& base_media = FrontendFactory::inspect(media_base);
+        const auto continued_media =
+            frontend.prepare_continuation(image_text_input(gradient_ppm(), "x", "g.ppm"), appended);
+        const auto& media           = FrontendFactory::inspect(continued_media);
+        const std::size_t old_count = base_media.token_ids.size();
+        const std::size_t count     = old_count + appended.size();
+        bool positions_ok           = media.token_ids.size() == count &&
+                            media.positions.size() == count * 3 &&
+                            media.token_types.size() == count;
+        for (int axis = 0; positions_ok && axis < 3; ++axis) {
+            const auto base_axis = base_media.position_axis(axis);
+            const auto axis_view = media.position_axis(axis);
+            positions_ok = std::equal(base_axis.begin(), base_axis.end(), axis_view.begin());
+            for (std::size_t index = old_count; positions_ok && index < count; ++index) {
+                positions_ok =
+                    axis_view[index] == static_cast<std::int32_t>(index) + base_media.rope_delta &&
+                    media.token_types[index] == 0;
+            }
+        }
+        failures += check(base_media.has_media() && base_media.starts_in_reasoning &&
+                              base_media.rope_delta != 0 && media.has_media() &&
+                              media.vision_items.size() == base_media.vision_items.size() &&
+                              media.rope_delta == base_media.rope_delta &&
+                              !media.starts_in_reasoning && positions_ok &&
+                              std::equal(base_media.token_ids.begin(), base_media.token_ids.end(),
+                                         media.token_ids.begin()),
+                          "media reasoning continuation broke the M-RoPE positions or the prompt");
+    }
     return failures;
 }
 

@@ -516,9 +516,10 @@ PreparedRequest GenerationService::prepare_impl(
         };
         std::shared_ptr<ReasoningRetryContext> retry;
         // A constrained request is never retried: the continuation would run without the
-        // grammar state of the first reply.
-        if (options_.reasoning_close_retry && request.media_item_count() == 0 &&
-            !request.constraint && cache_participation == CacheParticipation::ReadWrite) {
+        // grammar state of the first reply. Media prompts are: the continuation
+        // keeps their M-RoPE positions.
+        if (options_.reasoning_close_retry && !request.constraint &&
+            cache_participation == CacheParticipation::ReadWrite) {
             retry                = std::make_shared<ReasoningRetryContext>();
             retry->input         = input;
             retry->consumer_mode = consumer_mode;

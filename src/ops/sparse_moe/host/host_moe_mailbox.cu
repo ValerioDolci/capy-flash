@@ -37,8 +37,9 @@ namespace {
 
 using Residency = HostMoeResidency;
 
-constexpr std::size_t kLine = 64;
-constexpr auto kResyncAfter = std::chrono::milliseconds(1);
+constexpr std::size_t kLine   = 64;
+constexpr auto kResyncAfter   = std::chrono::milliseconds(1);
+constexpr auto kDeepIdleAfter = std::chrono::seconds(1);
 
 std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
 
@@ -439,6 +440,12 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     : config_(std::move(config)), layers_(std::move(layers)) {
     if (const char* v = std::getenv("NINFER_HOST_MOE_A4"); v != nullptr && *v != 0) {
         config_.executor.a4 = std::atoi(v) != 0; // CPU with the GPU's W4A4 activation codec
+    }
+    if (const char* v = std::getenv("NINFER_HOST_GGUF_BIG_GATHER"); v != nullptr && *v != 0) {
+        config_.executor.gguf_big_gather = std::atoi(v) != 0; // hybrid Intel, AVX2
+    }
+    if (const char* v = std::getenv("NINFER_HOST_GGUF_ECORE_TAIL"); v != nullptr && *v != 0) {
+        config_.executor.gguf_ecore_tail = std::max(std::atoi(v), 0); // with BIG_GATHER
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_CPUS"); v != nullptr && *v != 0) {
         // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
@@ -1104,6 +1111,7 @@ void HostMoeMailbox::service() {
         auto last           = clock::now();
         const auto idle_for = std::chrono::duration<double, std::milli>(config_.idle_ms);
         bool sleeping       = false;
+        bool deep           = false;
         std::int32_t served = -1;
         for (std::uint32_t polls = 1; !stop_.load(std::memory_order_acquire); ++polls) {
             std::int32_t found = -1;
@@ -1111,7 +1119,7 @@ void HostMoeMailbox::service() {
                 found = layer;
             } else if (served >= 0 && load_acquire(slot(served).ready) != 0) {
                 found = served; // the next slice of the same layer
-            } else if ((polls & 1023U) == 0 && clock::now() - last > kResyncAfter) {
+            } else if ((deep || (polls & 1023U) == 0) && clock::now() - last > kResyncAfter) {
                 // Only after a quiet millisecond: every slot line read costs a cache miss on memory
                 // the GPU wrote (a scan of 48 slots on every 256 polls cost ~10 us of doorbell
                 // latency). A window aborted between layers leaves the expected slot idle.
@@ -1119,9 +1127,18 @@ void HostMoeMailbox::service() {
                     if (load_acquire(slot(l).ready) != 0) found = l;
                 }
                 if (found < 0 && !sleeping && clock::now() - last > idle_for) sleeping = true;
+                if (found < 0 && sleeping && clock::now() - last > kDeepIdleAfter) deep = true;
             }
             if (found < 0) {
-                if (sleeping) {
+                if (deep) {
+                    // 100 wakeups/s instead of ~10-20k: the service cpu can reach C6 and the CPU
+                    // package its idle states (i9-14900KF: package 33 W -> 10 W at idle; 1
+                    // and 2 ms polls still kept the cpu in C1, 5 ms gave 12 W). Costs at most ~10
+                    // ms on the first layer after a quiet second; while deep, every poll rescans
+                    // all slots, as a slot left idle by an aborted window would otherwise wait 1024
+                    // polls.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                } else if (sleeping) {
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                 } else {
                     _mm_pause();
@@ -1133,6 +1150,7 @@ void HostMoeMailbox::service() {
             layer    = (found + 1) % config_.layers;
             last     = clock::now();
             sleeping = false;
+            deep     = false;
         }
     } catch (const std::exception& e) {
         {

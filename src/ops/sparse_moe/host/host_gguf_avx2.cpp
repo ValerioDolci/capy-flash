@@ -287,6 +287,74 @@ void dec_iq3_s(const block_iq3_s& x, uint8_t* dst) {
     }
 }
 
+// ---- big-core decoders (decode_rows_big): the IQ3 grid lookups by vpgatherdd, same bytes as the
+// decoders above (P-core decode-only, 15. 11. 2026: IQ3_XXS 151 -> 129, IQ3_S 200 -> 135 us per
+// expert; on an E-core ~2x slower; IQ2_S by vpgatherqq was 10-21 % slower and keeps dec_iq2_s).
+
+// Byte C of every dword of v, as dwords (the grid index of lane i when v holds bytes 4i..4i+3).
+template <int C>
+inline __m256i byte_of_dwords(__m256i v) {
+    return _mm256_and_si256(_mm256_srli_epi32(v, 8 * C), _mm256_set1_epi32(0xFF));
+}
+
+void dec_iq3_xxs_g(const block_iq3_xxs& x, uint8_t* dst) {
+    const float d     = fp16(x.d) * 0.25f;
+    const __m256i aux = ld(x.qs + QK_K / 4);
+    alignas(32) uint8_t signs[32];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(signs), iq3xxs_signs(aux));
+    const auto* grid = reinterpret_cast<const int*>(iq3xxs_grid);
+    for (int h = 0; h < 2; ++h) {
+        const __m256i field = bcast16(signs + 16 * h);
+        // Lane i of chunk c reads index 32h + 4i + c: byte c of dword i of the half's indices.
+        const __m256i qv    = ld(x.qs + 32 * h);
+        const __m256i ix[4] = {byte_of_dwords<0>(qv), byte_of_dwords<1>(qv), byte_of_dwords<2>(qv),
+                               byte_of_dwords<3>(qv)};
+        for (int c = 0; c < 4; ++c) {
+            const __m256i g = _mm256_i32gather_epi32(grid, ix[c], 4);
+            st(dst + kChunk * c + 32 * h, bias_sign(g, sign_mask(field, c)));
+        }
+        const __m256i ls =
+            _mm256_srli_epi32(_mm256_permutevar8x32_epi32(
+                                  aux, _mm256_add_epi32(_mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3),
+                                                        _mm256_set1_epi32(4 * h))),
+                              28);
+        stf(dst + 4 * kChunk + 32 * h, lane_scale(odd_of(ls), d));
+    }
+}
+
+void dec_iq3_s_g(const block_iq3_s& x, uint8_t* dst) {
+    const float d     = fp16(x.d);
+    const uint64_t qh = load_u64(x.qh);
+    const auto* grid  = reinterpret_cast<const int*>(iq3s_grid);
+    const __m256i sh4 = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    const __m256i one = _mm256_set1_epi32(1);
+    for (int h = 0; h < 2; ++h) {
+        const __m256i field = bcast16(x.signs + 16 * h);
+        // Lane i of chunk c reads index 32h + 4i + c: byte c of dword i of the half's qs, bit
+        // 4i + c of the half's 32 qh bits.
+        const __m256i qv = ld(x.qs + 32 * h);
+        const __m256i hv =
+            _mm256_set1_epi32(static_cast<int>(static_cast<uint32_t>(qh >> (32 * h))));
+        const __m256i lo[4] = {byte_of_dwords<0>(qv), byte_of_dwords<1>(qv), byte_of_dwords<2>(qv),
+                               byte_of_dwords<3>(qv)};
+        for (int c = 0; c < 4; ++c) {
+            const __m256i hb = _mm256_and_si256(
+                _mm256_srlv_epi32(hv, _mm256_add_epi32(sh4, _mm256_set1_epi32(c))), one);
+            const __m256i g =
+                _mm256_i32gather_epi32(grid, _mm256_or_si256(lo[c], _mm256_slli_epi32(hb, 8)), 4);
+            st(dst + kChunk * c + 32 * h, bias_sign(g, sign_mask(field, c)));
+        }
+        const __m256i s = _mm256_and_si256(
+            _mm256_srlv_epi32(
+                bytes4_lanes(load_u32(x.scales),
+                             _mm256_add_epi32(_mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1),
+                                              _mm256_set1_epi32(2 * h))),
+                _mm256_setr_epi32(0, 0, 4, 4, 0, 0, 4, 4)),
+            _mm256_set1_epi32(15));
+        stf(dst + 4 * kChunk + 32 * h, lane_scale(odd_of(s), d));
+    }
+}
+
 void dec_iq4_xs(const block_iq4_xs& x, uint8_t* dst) {
     const float d     = fp16(x.d);
     const __m256i tbl = _mm256_load_si256(reinterpret_cast<const __m256i*>(kIq4Biased.v));
@@ -889,6 +957,24 @@ void gemm_decoded(WeightFormat fmt, const void* wdec, int32_t nrows, int32_t k,
         gemm_impl<4>(w, ws, nrows, ap, T, G, out, ldo);
     else
         gemm_impl<1>(w, ws, nrows, ap, T, G, out, ldo);
+}
+
+void decode_rows_big(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
+                     int32_t k, void* dst_v) {
+    check_k(fmt, k);
+    auto* dst      = static_cast<uint8_t*>(dst_v);
+    const int nblk = k / format_info(fmt).block_elems;
+    switch (fmt) {
+    case WeightFormat::IQ3_XXS:
+        decode_rows_q8k<block_iq3_xxs, dec_iq3_xxs_g>(rows, row_bytes, nrows, nblk, dst);
+        return;
+    case WeightFormat::IQ3_S:
+        decode_rows_q8k<block_iq3_s, dec_iq3_s_g>(rows, row_bytes, nrows, nblk, dst);
+        return;
+    default:
+        ::ninfer::ops::host::gguf::detail::avx2::decode_rows(fmt, rows, row_bytes, nrows, k, dst_v);
+        return;
+    }
 }
 
 // BF16 = RNE(float(w) * F) of the decoded layout, in natural element order (as the AVX-512 form).

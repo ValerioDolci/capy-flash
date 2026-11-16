@@ -84,6 +84,12 @@ struct HostGgufKernels {
     HostIsa isa;
     void (*decode_rows)(WeightFormat fmt, const void* rows, std::size_t row_bytes, int32_t nrows,
                         int32_t k, void* dst);
+    // decode_rows for threads on big cores of a hybrid CPU: the same bytes; the
+    // AVX2 form looks the IQ3_XXS / IQ3_S grids up by vpgatherdd, fast on Golden / Raptor Cove and
+    // ~1.5x slower than decode_rows on Gracemont (bench_host_gguf, 15. 11. 2026). AVX-512:
+    // decode_rows.
+    void (*decode_rows_big)(WeightFormat fmt, const void* rows, std::size_t row_bytes,
+                            int32_t nrows, int32_t k, void* dst);
     void (*pack_act_q8_K)(const block_q8_K* x, int32_t k, void* dst);
     void (*pack_act_q8_0)(const block_q8_0* x, int32_t k, void* dst);
     void (*quantize_pack_bf16)(ActFormat act, const uint16_t* x, int32_t k, void* dst);
