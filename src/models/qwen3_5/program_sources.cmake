@@ -13,6 +13,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/checkpoint_recovery.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/materialization.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/context.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/storage/disk_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/disk_kv.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/storage/qwen4_elastic.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"

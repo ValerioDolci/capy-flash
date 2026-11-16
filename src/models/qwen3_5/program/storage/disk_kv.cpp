@@ -11,6 +11,7 @@
 // A checkpoint at F needs Text KV [0, F), MTP KV [0, F-1) and its StateImage (context.cpp).
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/storage/disk_identity.h"
 #include "core/device.h"
 #include "core/device_scope.h"
 
@@ -47,7 +48,6 @@ constexpr std::uint32_t kDiskBlockTokens = kDiskBlockPages * 64U;
 // otherwise resuming at the rewrite checkpoint and recomputing the reply is cheap.
 constexpr std::uint32_t kDiskEndpointMinimumGain = 2048;
 constexpr std::uint64_t kSeedA = 0x6e6964b10cU, kSeedB = 0x9f2c55a1e37dU, kSeedS = 0x51a7e1U;
-constexpr std::uint64_t kSeedV = 0x7669736e6f6eU;
 
 std::string layout_key(const HostKVPageLayout& layout) {
     std::string out = std::to_string(layout.page_stride) + "/" + std::to_string(layout.replicas) +
@@ -178,8 +178,6 @@ void ProgramImpl::initialize_disk_cache() {
 
 namespace {
 
-bool splits_vision(const std::vector<VisionItem>& items, std::size_t frontier);
-
 // The checkpoints of a retained conversation the disk can hold, and their largest frontier.
 template <class Program>
 std::uint32_t disk_checkpoints(const Program& program, const SequenceState& sequence,
@@ -247,71 +245,6 @@ DiskKVBlobId disk_state_id(std::span<const TokenId> tokens, std::uint32_t fronti
     const std::size_t bytes = static_cast<std::size_t>(frontier) * sizeof(TokenId);
     return DiskKVBlobId{xxh64(tokens.data(), bytes, key ^ kSeedS),
                         xxh64(tokens.data(), bytes, (key ^ kSeedS) * 0x9E3779B97F4A7C15ULL)};
-}
-
-// True when `frontier` falls strictly inside the token spans of a Vision item: a checkpoint there
-// would hold half a picture, which neither the disk nor the in-memory cache can resume from.
-bool splits_vision(const std::vector<VisionItem>& items, std::size_t frontier) {
-    for (const VisionItem& item : items) {
-        if (item.token_spans.empty()) { return true; }
-        const std::size_t begin = item.token_spans.front().begin;
-        const std::size_t end   = item.token_spans.back().begin + item.token_spans.back().count;
-        if (begin < frontier && frontier < end) { return true; }
-    }
-    return false;
-}
-
-// The token stream the disk tier names, hashes and compares. A Vision placeholder token says
-// nothing about its picture, so every token of an item's spans becomes a negative id derived from
-// the item (modality, grid, patches, content digest, timestamps) and the token's offset in it; real
-// token ids are non-negative and never equal one. Text tokens are kept as they are, so a text-only
-// conversation has the same identity, blocks and files as before media support. The positions
-// (M-RoPE, rope_delta) follow from the tokens and the grids, which the identity binds. Returns
-// false when the token types and the items disagree or an item crosses the end of `tokens`.
-bool disk_identity(std::span<const TokenId> tokens, std::span<const std::uint8_t> types,
-                   const std::vector<VisionItem>& items, std::vector<TokenId>& out) {
-    out.assign(tokens.begin(), tokens.end());
-    std::vector<std::uint8_t> covered(tokens.size(), 0);
-    for (const VisionItem& item : items) {
-        if (item.token_spans.empty()) { return false; }
-        if (item.token_spans.front().begin >= tokens.size()) { continue; }
-        Xxh64Stream base(kSeedV);
-        const std::uint64_t fields[] = {static_cast<std::uint64_t>(item.modality),
-                                        static_cast<std::uint64_t>(item.grid.temporal),
-                                        static_cast<std::uint64_t>(item.grid.height),
-                                        static_cast<std::uint64_t>(item.grid.width),
-                                        item.patch_begin,
-                                        item.patch_count,
-                                        item.timestamps.size(),
-                                        item.token_spans.size()};
-        base.update(fields, sizeof(fields));
-        base.update(item.content_digest.data(), item.content_digest.size());
-        if (!item.timestamps.empty()) {
-            base.update(item.timestamps.data(), item.timestamps.size() * sizeof(double));
-        }
-        const std::uint64_t item_digest = base.digest();
-        std::uint64_t offset            = 0;
-        for (const TokenSpan& span : item.token_spans) {
-            if (span.begin > tokens.size() || span.count > tokens.size() - span.begin) {
-                return false;
-            }
-            for (std::size_t k = 0; k < span.count; ++k, ++offset) {
-                const std::size_t index = span.begin + k;
-                if (covered[index] != 0 || index >= types.size() || types[index] == 0) {
-                    return false;
-                }
-                covered[index]              = 1;
-                const std::uint64_t pair[2] = {item_digest, offset};
-                const std::uint64_t value   = xxh64(pair, sizeof(pair), kSeedV) & 0x3fffffffU;
-                out[index]                  = -1 - static_cast<TokenId>(value);
-            }
-        }
-    }
-    for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const std::uint8_t type = index < types.size() ? types[index] : 0;
-        if ((type != 0) != (covered[index] != 0)) { return false; }
-    }
-    return true;
 }
 
 } // namespace

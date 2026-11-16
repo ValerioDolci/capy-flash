@@ -37,6 +37,12 @@ ninfer_add_test(ninfer_qwen4_offload_experts_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_offload_experts.cpp"
   LIBRARIES ninfer_model_runtime)
 
+# The disk tier's token identity: pictures of the same size, text-only prompts, frontiers inside
+# a Vision item (CPU only).
+ninfer_add_test(ninfer_qwen3_5_disk_identity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_disk_identity.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 ninfer_add_test(ninfer_qwen4_draft_head_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_draft_head.cpp"
   LIBRARIES ninfer_model_runtime)
