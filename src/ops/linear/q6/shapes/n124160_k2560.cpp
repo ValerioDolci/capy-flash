@@ -7,6 +7,9 @@ namespace ninfer::ops::detail {
 // [248320,2048] head (the nearest hidden width), untuned on the RTX 5070 Ti.
 Q6Launch select_q6_n124160_k2560(std::int32_t tokens) {
     if (tokens <= 1) return launch_q6_a16_gemv_r4_w2_g16;
+    // An MTP verification (2..8 columns) on an 8-token tile: the 16-token tile's K split and MMA
+    // order, so the same bits, without its padding columns.
+    if (tokens <= 8) return launch_q6_a16_sliced_r32_t8_w4_s2;
     if (tokens <= 16) return launch_q6_a16_sliced_r32_t16_w4_s2;
     if (tokens <= 32) return launch_q6_a16_sliced_r32_t32_w4_s1;
     if (tokens <= 40) return launch_q6_a16_mma_r64_t40_k128;

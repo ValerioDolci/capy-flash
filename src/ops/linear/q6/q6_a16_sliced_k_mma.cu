@@ -4,6 +4,14 @@
 
 namespace ninfer::ops::detail {
 
+void launch_q6_a16_sliced_r32_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
+                                       cudaStream_t stream) {
+    launch_q6_a16_sliced_k_mma<q6_instances::SlicedR32T8W4S2>(
+        q6_linear_operands(x, weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, LinearIdentityEpilogue{},
+        stream);
+}
+
 void launch_q6_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream) {
     launch_q6_a16_sliced_k_mma<q6_instances::SlicedR16T8W4S2>(
