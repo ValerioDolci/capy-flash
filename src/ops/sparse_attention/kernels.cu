@@ -368,28 +368,15 @@ __global__ void __launch_bounds__(32) qsa_publish_block_kernel(AppendArgs a, Ind
 // ---------------------------------------------------------------------------------------------
 // Selection: score kernel
 
-constexpr int kTileColumns    = 8;  // maximum columns of one lane per score CTA
-constexpr int kScoreBlocks    = 64; // blocks per score iteration (one thread per block/column)
-constexpr int kScoreKeyStride = kIndexDim / 2 + 1; // bf16x2 words per staged key, padded
-constexpr int kScoreKeyBytes  = kScoreBlocks * kScoreKeyStride * 4;
-// A full tile (prefill) scores four blocks of an iteration per thread (j, j + 16, ...) for one
-// column, so one load of the prepared query feeds four dots (the kernel was bound by shared-memory
-// loads: one key word and four query pairs per eight FMAs). A narrower tile (decode) keeps one
-// block per thread: it has few columns, so it needs the threads. Every dot keeps its FMA order: the
-// same bits.
-constexpr int kScoreRegBlocksFull = 4;
-static_assert(kScoreBlocks % kScoreRegBlocksFull == 0 && (kIndexDim / 2) % 2 == 0);
-
-[[nodiscard]] __host__ __device__ constexpr int score_reg_blocks(int tile_columns) {
-    return tile_columns >= kTileColumns ? kScoreRegBlocksFull : 1;
-}
-
-// Threads of a score CTA: kScoreBlocks / reg_blocks per column, at least one warp (the query
-// preparation runs per warp).
-__host__ __device__ constexpr int score_threads(int tile_columns) {
-    const int lanes = kScoreBlocks / score_reg_blocks(tile_columns);
-    return lanes * tile_columns < 32 ? 32 : lanes * tile_columns;
-}
+constexpr int kTileColumns = 8; // maximum columns of one lane per score CTA
+// A score CTA: kScoreWarps warps, warp w scoring blocks [16 w, 16 w + 16) of each kScoreBlocks
+// staged blocks for every column of its tile.
+constexpr int kScoreWarps     = 4;
+constexpr int kScoreThreads   = kScoreWarps * 32;
+constexpr int kScoreBlocks    = kScoreWarps * 16;
+constexpr int kScoreRowWords  = kIndexDim / 2 + 4; // 16-bit pairs per staged row, padded
+constexpr int kScoreQueryRows = kTileColumns * kMaxIndexHead;
+static_assert(kIndexDim % 16 == 0 && kScoreQueryRows % 8 == 0);
 
 constexpr int kScoreTargetCtas = 512;
 constexpr int kPassTiles       = 32;
@@ -440,21 +427,43 @@ __device__ __forceinline__ TileColumn tile_column(const SelectArgs& a, std::int3
     return out;
 }
 
-// CTA (x, y): pass tile y, blocks [x * chunk_blocks, +chunk_blocks). Thread (j, c) of the
-// kScoreBlocks x tile_columns grid scores block j of the current iteration for tile column c.
-template <int kScoreRegBlocks, bool Yarn>
-__global__ void __launch_bounds__((kScoreBlocks / kScoreRegBlocks) * kTileColumns)
-    qsa_score_kernel(SelectArgs a, IndexGeometry g) {
-    constexpr int kScoreLanes = kScoreBlocks / kScoreRegBlocks; // threads per column
-    // Dynamic: staged keys, then the prepared queries of this launch's tile_columns only, so a
-    // narrow decode tile keeps several CTAs per SM.
-    extern __shared__ __align__(16) std::uint8_t raw_shared[];
-    auto* keys  = reinterpret_cast<std::uint32_t*>(raw_shared);
-    auto* query = reinterpret_cast<float*>(raw_shared + kScoreKeyBytes);
+// mma.m16n8k16 with FP32 accumulation: A = 16 staged block keys x 16 features, B = 16 features x 8
+// query rows (n = column * kMaxIndexHead + head), over the 128 features in k order. Queries are
+// prepared in FP32 (offset RMSNorm, RoPE) and rounded to FP16; BF16 keys convert to FP16 exactly
+// within its normal range. A score depends only on its column's query and its block's key, so a
+// column gets the same bits at any tile width (prefill, verification, decode).
+__device__ __forceinline__ void mma_f16_16816(float (&d)[4], const std::uint32_t (&a)[4],
+                                              std::uint32_t b0, std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ std::uint32_t bf16x2_to_f16x2(std::uint32_t w) {
+    const __half2 h =
+        __float22half2_rn(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w)));
+    return *reinterpret_cast<const std::uint32_t*>(&h);
+}
+
+// 16 bytes global -> shared, zero-filled when `valid` is false.
+__device__ __forceinline__ void cp_async_16(std::uint32_t* dst, const void* src, bool valid) {
+    const unsigned saddr = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    const int bytes      = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(saddr), "l"(src),
+                 "r"(bytes));
+}
+
+// CTA (x, y): pass tile y, blocks [x * chunk_blocks, +chunk_blocks). The keys of the next
+// kScoreBlocks blocks load (cp.async) while the current ones are scored. A thread's accumulators
+// hold heads (0, 1) or (2, 3) of one column for two blocks; one shuffle adds the four ReLU terms.
+template <bool Yarn>
+__global__ void __launch_bounds__(kScoreThreads) qsa_score_kernel(SelectArgs a, IndexGeometry g) {
+    __shared__ __align__(16) std::uint32_t keys[2][kScoreBlocks * kScoreRowWords];
+    __shared__ __align__(16) std::uint32_t queries[kScoreQueryRows * kScoreRowWords];
     __shared__ std::int32_t block_count[kTileColumns];
 
     const int tid           = static_cast<int>(threadIdx.x);
-    const int threads       = static_cast<int>(blockDim.x);
     const int warp          = tid >> 5;
     const int lane_id       = tid & 31;
     const std::int32_t tile = a.tile_begin + static_cast<std::int32_t>(blockIdx.y);
@@ -469,108 +478,126 @@ __global__ void __launch_bounds__((kScoreBlocks / kScoreRegBlocks) * kTileColumn
     }
     __syncthreads();
     std::int32_t tile_blocks = 0;
-    for (int c = 0; c < a.tile_columns; ++c) { tile_blocks = max(tile_blocks, block_count[c]); }
+    for (int c = 0; c < kTileColumns; ++c) { tile_blocks = max(tile_blocks, block_count[c]); }
     const std::int32_t first = static_cast<std::int32_t>(blockIdx.x) * a.chunk_blocks;
     const std::int32_t last  = min(tile_blocks, first + a.chunk_blocks);
     if (first >= last) { return; }
 
-    // Prepared queries: offset RMSNorm then RoPE at the query position, one warp per (c, head).
-    const int warps = threads >> 5;
-    for (int item = warp; item < a.tile_columns * g.index_heads; item += warps) {
-        const int c = item / g.index_heads;
-        const int h = item % g.index_heads;
-        if (block_count[c] == 0) { continue; }
-        const TileColumn col      = tile_column(a, tile, c, g.ratio);
-        const std::int64_t tokens = static_cast<std::int64_t>(a.width) * a.lanes;
-        std::int32_t qpos[3];
+    constexpr int kKeyVectors = kIndexDim * 2 / 16;
+    const auto stage          = [&](int buffer, std::int32_t base) {
 #pragma unroll
-        for (int axis = 0; axis < 3; ++axis) {
-            qpos[axis] = a.query_positions[(a.query_axes == 3 ? axis : 0) * tokens + col.column];
+        for (int item = tid; item < kScoreBlocks * kKeyVectors; item += kScoreThreads) {
+            const int b      = item / kKeyVectors;
+            const int v      = item % kKeyVectors;
+            const bool valid = base + b < last;
+            const uint4* src = reinterpret_cast<const uint4*>(a.block_keys);
+            if (valid) {
+                src = reinterpret_cast<const uint4*>(a.block_keys +
+                                                     block_key_offset(table, base + b, g.ratio)) +
+                      v;
+            }
+            cp_async_16(keys[buffer] + b * kScoreRowWords + 4 * v, src, valid);
         }
-        const __nv_bfloat16* raw =
-            a.index_query + (static_cast<std::int64_t>(col.column) * g.index_heads + h) * kIndexDim;
-        float x[4];
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    stage(0, first); // the first keys load while the queries are prepared
+
+    // Prepared queries: offset RMSNorm then RoPE at the query position, one warp per (c, head);
+    // absent heads and unscored columns are zero rows.
+    for (int item = warp; item < kScoreQueryRows; item += kScoreWarps) {
+        const int c = item / kMaxIndexHead;
+        const int h = item % kMaxIndexHead;
+        float x[4]  = {0.0F, 0.0F, 0.0F, 0.0F};
+        if (h < g.index_heads && block_count[c] != 0) {
+            const TileColumn col      = tile_column(a, tile, c, g.ratio);
+            const std::int64_t tokens = static_cast<std::int64_t>(a.width) * a.lanes;
+            std::int32_t qpos[3];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) { x[r] = __bfloat162float(raw[4 * lane_id + r]); }
-        offset_rmsnorm_row(x, a.query_norm, g.rms_norm_eps, lane_id);
-        rope_row<Yarn>(x, g, qpos, lane_id);
+            for (int axis = 0; axis < 3; ++axis) {
+                qpos[axis] =
+                    a.query_positions[(a.query_axes == 3 ? axis : 0) * tokens + col.column];
+            }
+            const __nv_bfloat16* raw =
+                a.index_query +
+                (static_cast<std::int64_t>(col.column) * g.index_heads + h) * kIndexDim;
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            query[(c * kMaxIndexHead + h) * kIndexDim + 4 * lane_id + r] = x[r];
+            for (int r = 0; r < 4; ++r) { x[r] = __bfloat162float(raw[4 * lane_id + r]); }
+            offset_rmsnorm_row(x, a.query_norm, g.rms_norm_eps, lane_id);
+            rope_row<Yarn>(x, g, qpos, lane_id);
         }
+        const __half2 lo   = __floats2half2_rn(x[0], x[1]);
+        const __half2 hi   = __floats2half2_rn(x[2], x[3]);
+        std::uint32_t* out = queries + item * kScoreRowWords + 2 * lane_id;
+        out[0]             = *reinterpret_cast<const std::uint32_t*>(&lo);
+        out[1]             = *reinterpret_cast<const std::uint32_t*>(&hi);
+    }
+    __syncthreads();
+
+    const int gq = lane_id >> 2; // A row / B column of this thread
+    const int tq = lane_id & 3;
+    std::uint32_t bf[kIndexDim / 16][kScoreQueryRows / 8][2];
+#pragma unroll
+    for (int ks = 0; ks < kIndexDim / 16; ++ks)
+#pragma unroll
+        for (int nt = 0; nt < kScoreQueryRows / 8; ++nt) {
+            const std::uint32_t* row = queries + (nt * 8 + gq) * kScoreRowWords + ks * 8;
+            bf[ks][nt][0]            = row[tq];
+            bf[ks][nt][1]            = row[tq + 4];
+        }
+    // The column a thread writes for n-tile nt (even tq): nt * 2 + tq / 2.
+    std::int32_t limit[kScoreQueryRows / 8];
+#pragma unroll
+    for (int nt = 0; nt < kScoreQueryRows / 8; ++nt) {
+        limit[nt] = min(last, block_count[nt * 2 + (tq >> 1)]);
     }
 
-    const int j = tid % kScoreLanes;
-    const int c = min(tid / kScoreLanes, kTileColumns - 1); // threads past the tile: staging only
-    const float* qc   = query + c * kMaxIndexHead * kIndexDim;
     const float scale = rsqrtf(static_cast<float>(kIndexDim));
-    float* scores_row =
-        a.scores + (static_cast<std::int64_t>(blockIdx.y) * kTileColumns + c) * a.max_blocks;
-    const std::int32_t my_blocks = tid / kScoreLanes < kTileColumns ? block_count[c] : 0;
-    for (std::int32_t base = first; base < last; base += kScoreBlocks) {
-        __syncthreads(); // queries ready / previous keys consumed
-        // Stage up to 64 pooled keys, 16-byte vectors coalesced per 256-byte key.
-        constexpr int kKeyVectors = kIndexDim * 2 / 16;
-#pragma unroll 4
-        for (int item = tid; item < kScoreBlocks * kKeyVectors; item += threads) {
-            const int b = item / kKeyVectors;
-            const int v = item % kKeyVectors;
-            uint4 value = make_uint4(0, 0, 0, 0);
-            if (base + b < last) {
-                value = reinterpret_cast<const uint4*>(
-                    a.block_keys + block_key_offset(table, base + b, g.ratio))[v];
-            }
-            std::uint32_t* staged = keys + b * kScoreKeyStride + 4 * v;
-            staged[0]             = value.x;
-            staged[1]             = value.y;
-            staged[2]             = value.z;
-            staged[3]             = value.w;
+    float* scores_tile =
+        a.scores + static_cast<std::int64_t>(blockIdx.y) * kTileColumns * a.max_blocks;
+    int buffer = 0;
+    for (std::int32_t base = first; base < last; base += kScoreBlocks, buffer ^= 1) {
+        if (base + kScoreBlocks < last) {
+            stage(buffer ^ 1, base + kScoreBlocks);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
         }
-        __syncthreads();
-        const std::int32_t limit = min(last, my_blocks);
-        if (base + j >= limit) {
-            continue;
-        } // its later blocks (j + kScoreLanes r) are past the limit too
-        float dot[kScoreRegBlocks][kMaxIndexHead];
+        __syncthreads(); // this iteration's keys are visible to every warp
+        const std::int32_t row_block = base + warp * 16;
+        if (row_block < last) {
+            float acc[kScoreQueryRows / 8][4];
 #pragma unroll
-        for (int r = 0; r < kScoreRegBlocks; ++r)
+            for (int nt = 0; nt < kScoreQueryRows / 8; ++nt)
 #pragma unroll
-            for (int h = 0; h < kMaxIndexHead; ++h) { dot[r][h] = 0.0F; }
-#pragma unroll 4
-        for (int d2 = 0; d2 < kIndexDim / 2; d2 += 2) {
-            float2 k0[kScoreRegBlocks], k1[kScoreRegBlocks];
+                for (int i = 0; i < 4; ++i) { acc[nt][i] = 0.0F; }
+            const std::uint32_t* k0 = keys[buffer] + (warp * 16 + gq) * kScoreRowWords;
+            const std::uint32_t* k8 = k0 + 8 * kScoreRowWords;
 #pragma unroll
-            for (int r = 0; r < kScoreRegBlocks; ++r) {
-                const std::uint32_t* key = keys + (j + r * kScoreLanes) * kScoreKeyStride;
-                const std::uint32_t w0 = key[d2], w1 = key[d2 + 1];
-                k0[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w0));
-                k1[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w1));
+            for (int ks = 0; ks < kIndexDim / 16; ++ks) {
+                const std::uint32_t af[4] = {
+                    bf16x2_to_f16x2(k0[ks * 8 + tq]), bf16x2_to_f16x2(k8[ks * 8 + tq]),
+                    bf16x2_to_f16x2(k0[ks * 8 + tq + 4]), bf16x2_to_f16x2(k8[ks * 8 + tq + 4])};
+#pragma unroll
+                for (int nt = 0; nt < kScoreQueryRows / 8; ++nt) {
+                    mma_f16_16816(acc[nt], af, bf[ks][nt][0], bf[ks][nt][1]);
+                }
             }
 #pragma unroll
-            for (int h = 0; h < kMaxIndexHead; ++h) {
-                if (h < g.index_heads) {
-                    const float4 qq = *reinterpret_cast<const float4*>(qc + h * kIndexDim + 2 * d2);
-#pragma unroll
-                    for (int r = 0; r < kScoreRegBlocks; ++r) {
-                        dot[r][h] = fmaf(qq.x, k0[r].x, dot[r][h]);
-                        dot[r][h] = fmaf(qq.y, k0[r].y, dot[r][h]);
-                        dot[r][h] = fmaf(qq.z, k1[r].x, dot[r][h]);
-                        dot[r][h] = fmaf(qq.w, k1[r].y, dot[r][h]);
-                    }
+            for (int nt = 0; nt < kScoreQueryRows / 8; ++nt) {
+                float s0 = fmaxf(acc[nt][0], 0.0F) + fmaxf(acc[nt][1], 0.0F);
+                float s8 = fmaxf(acc[nt][2], 0.0F) + fmaxf(acc[nt][3], 0.0F);
+                s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+                s8 += __shfl_xor_sync(0xffffffffu, s8, 1);
+                if ((tq & 1) == 0) {
+                    float* row =
+                        scores_tile + static_cast<std::int64_t>(nt * 2 + (tq >> 1)) * a.max_blocks;
+                    const std::int32_t b0 = row_block + gq;
+                    if (b0 < limit[nt]) { row[b0] = s0 * scale; }
+                    if (b0 + 8 < limit[nt]) { row[b0 + 8] = s8 * scale; }
                 }
             }
         }
-#pragma unroll
-        for (int r = 0; r < kScoreRegBlocks; ++r) {
-            const std::int32_t block = base + j + r * kScoreLanes;
-            if (block >= limit) { continue; }
-            float score = 0.0F;
-#pragma unroll
-            for (int h = 0; h < kMaxIndexHead; ++h) {
-                if (h < g.index_heads) { score += fmaxf(dot[r][h], 0.0F); }
-            }
-            scores_row[block] = score * scale;
-        }
+        __syncthreads(); // every warp is done with keys[buffer] before it is staged again
     }
 }
 
@@ -1479,13 +1506,7 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
     args.max_blocks          = plan.max_blocks;
     const TextRopeYarn* yarn = text_rope_yarn(geometry.rotary_dim, geometry.rope_theta);
     const IndexGeometry g    = index_geometry(geometry, yarn);
-    const bool full_tiles    = score_reg_blocks(plan.tile_columns) == kScoreRegBlocksFull;
-    auto* score =
-        full_tiles ? qsa_score_kernel<kScoreRegBlocksFull, false> : qsa_score_kernel<1, false>;
-    if (yarn != nullptr) {
-        score =
-            full_tiles ? qsa_score_kernel<kScoreRegBlocksFull, true> : qsa_score_kernel<1, true>;
-    }
+    auto* score              = yarn != nullptr ? qsa_score_kernel<true> : qsa_score_kernel<false>;
 
     // Kernel attributes are per device: both tensor-parallel ranks launch this kernel.
     static FuncAttrPerDevice topk_attribute;
@@ -1504,11 +1525,8 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
         const std::int32_t per_cta    = std::max(1, (iterations + wanted - 1) / wanted);
         args.chunk_blocks             = per_cta * kScoreBlocks;
         const std::int32_t chunks = (plan.max_blocks + args.chunk_blocks - 1) / args.chunk_blocks;
-        const std::size_t score_shared =
-            kScoreKeyBytes +
-            static_cast<std::size_t>(plan.tile_columns) * kMaxIndexHead * kIndexDim * sizeof(float);
         const dim3 score_grid(static_cast<unsigned>(chunks), static_cast<unsigned>(pass));
-        score<<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
+        score<<<score_grid, kScoreThreads, 0, stream>>>(args, g);
         CUDA_CHECK(cudaGetLastError());
         const std::size_t staged =
             static_cast<std::size_t>(std::min(plan.max_blocks, kStagedBlocks));

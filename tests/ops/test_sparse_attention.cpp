@@ -54,7 +54,7 @@ constexpr std::int32_t kRotary     = 64;
 constexpr double kEps              = 1.0e-6;
 constexpr std::int32_t kPage       = kPagedKVPageSize;
 // A selection may differ from the oracle only at a near tie of the cut. The device scores use
-// FP32 prepared queries and FP32 accumulation over the same BF16 block keys the oracle rounds to;
+// FP16 prepared queries and FP32 accumulation over the same BF16 block keys the oracle rounds to;
 // a one-ulp BF16 disagreement of a key element moves a score by ~4e-4 of its scale.
 constexpr double kNearTie = 2.0e-3; // relative to the largest block score
 
