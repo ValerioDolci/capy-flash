@@ -86,9 +86,32 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::AllowA4Decode:
         return;
     }
     throw std::invalid_argument("attn_input_proj: invalid compute policy");
+}
+
+// The registered single-parent problem: the q|k|gate|v parent [14336,5120] of 24 query / 4 KV
+// heads of 256 over hidden 5120, in Q3, BF16, NVFP4 and FP8.
+constexpr std::int32_t kParentQueryRows = 6144;
+constexpr std::int32_t kParentKeyRows   = 1024;
+constexpr std::int32_t kParentRows      = detail::Nvfp4N14336K5120::kOutputRows;
+constexpr std::int32_t kParentHidden    = detail::Nvfp4N14336K5120::kInputRows;
+static_assert(2 * (kParentQueryRows + kParentKeyRows) == kParentRows &&
+              detail::Fp8N14336K5120::kOutputRows == kParentRows &&
+              detail::Fp8N14336K5120::kInputRows == kParentHidden);
+
+bool parent_problem(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    switch (qtype) {
+    case QType::Q3_G128_FP16:
+    case QType::BF16:
+    case QType::NVFP4:
+    case QType::FP8_E4M3FN_ROW_BF16:
+        return parent_rows == kParentRows && input_rows == kParentHidden;
+    default:
+        return false;
+    }
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -190,6 +213,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
 
 } // namespace
 
+bool attn_input_proj_registered(QType parent_qtype, std::int32_t query_rows, std::int32_t key_rows,
+                                std::int32_t input_rows) {
+    return query_rows == kParentQueryRows && key_rows == kParentKeyRows &&
+           parent_problem(parent_qtype, 2 * (query_rows + key_rows), input_rows);
+}
+
 std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
                                                      std::int32_t input_rows, LinearPolicy policy,
                                                      std::int32_t min_tokens,
@@ -201,24 +230,22 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 
     switch (parent_qtype) {
     case QType::Q3_G128_FP16:
-        if (parent_rows != 14336 || input_rows != 5120) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q3 profile");
         }
         return detail::q3_workspace_bytes(input_rows, max_tokens);
     case QType::BF16:
-        if (parent_rows != 14336 || input_rows != 5120) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;
     case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4N14336K5120::kOutputRows ||
-            input_rows != detail::Nvfp4N14336K5120::kInputRows) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16:
-        if (parent_rows != detail::Fp8N14336K5120::kOutputRows ||
-            input_rows != detail::Fp8N14336K5120::kInputRows) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -288,17 +315,19 @@ namespace {
 
 // One rank of the column-parallel form: an FP8 or NVFP4 [7168,5120] head-local shard of the fused
 // parent.
+static_assert(detail::Fp8N7168K5120::kOutputRows == detail::Nvfp4N7168K5120::kOutputRows &&
+              detail::Fp8N7168K5120::kInputRows == detail::Nvfp4N7168K5120::kInputRows);
+constexpr std::int32_t kHidden = detail::Fp8N7168K5120::kInputRows;
+constexpr std::int32_t kQRows  = 3072;
+constexpr std::int32_t kKvRows = 512;
+constexpr std::int32_t kRows   = detail::Fp8N7168K5120::kOutputRows;
+static_assert(2 * (kQRows + kKvRows) == kRows);
+
 void validate_column_parallel_rank(const Tensor& x, const Weight& weight, const Tensor& q,
                                    const Tensor& gate, const Tensor& k, const Tensor& v,
                                    LinearPolicy policy) {
     validate_policy(policy);
-    static_assert(detail::Fp8N7168K5120::kOutputRows == detail::Nvfp4N7168K5120::kOutputRows &&
-                  detail::Fp8N7168K5120::kInputRows == detail::Nvfp4N7168K5120::kInputRows);
-    constexpr std::int32_t kHidden = detail::Fp8N7168K5120::kInputRows;
-    constexpr std::int32_t kQRows  = 3072;
-    constexpr std::int32_t kKvRows = 512;
-    constexpr std::int32_t kRows   = detail::Fp8N7168K5120::kOutputRows;
-    const std::int32_t cols        = x.ne[1];
+    const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
@@ -332,6 +361,12 @@ void validate_column_parallel_rank(const Tensor& x, const Weight& weight, const 
 }
 
 } // namespace
+
+bool attn_input_proj_column_parallel_registered(QType shard_qtype, std::int32_t query_rows,
+                                                std::int32_t key_rows, std::int32_t input_rows) {
+    return (shard_qtype == QType::FP8_E4M3FN_ROW_BF16 || shard_qtype == QType::NVFP4) &&
+           query_rows == kQRows && key_rows == kKvRows && input_rows == kHidden;
+}
 
 std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType shard_qtype,
                                                                      LinearPolicy policy,

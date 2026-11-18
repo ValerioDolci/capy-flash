@@ -64,7 +64,7 @@ off. Flash-Next loads no tower unless `--vision` is given with the Vision artifa
 
 Clients: Claude Code with `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`; Codex CLI, OpenCode and other OpenAI clients
 with base URL `http://127.0.0.1:8080/v1` and the model id above (Codex: a custom provider with the `responses` wire
-API). Details: `docs/serving.md` in the source repository, section "capy-flash serving".
+API). Details: `docs/serving/capy-flash.md` in the source repository.
 
 `GET /health` answers 200 while the Engine accepts work and 503 after an Engine-wide failure; the
 server then exits with status 2, so run it under a supervisor that restarts on a non-zero exit

@@ -6,10 +6,15 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
+#include "ops/attn_input_proj/tp2/nvfp4_attn_input_shard.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+
+// One small-T launcher source for the [14336,5120] parent and its [7168,5120] two-device shard (one
+// instance per q|k|gate|v section output).
 
 namespace ninfer::ops::detail {
 namespace {
@@ -34,7 +39,7 @@ struct Nvfp4AttentionSmallTProductionSchedule {
                              Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 };
 
-template <int ActiveTokens>
+template <class Output, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                   Tensor& v, cudaStream_t stream) {
     using Geometry = Nvfp4N14336K5120;
@@ -42,24 +47,31 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate
     launch_nvfp4_a16_simt<
         Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         nvfp4_a16_operands(x, weight),
-        Nvfp4AttentionInputOutput{
-            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
-            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
+        Output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+               static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)},
         LinearIdentityEpilogue{}, stream);
 }
 
-template <std::size_t... Offsets>
+template <class Output, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<Launch, sizeof...(Offsets)>{&launch_exact<2 + static_cast<int>(Offsets)>...};
+    return std::array<Launch, sizeof...(Offsets)>{
+        &launch_exact<Output, 2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<2 - 2 + 1>{});
+template <class Output>
+constexpr auto kLaunchers = make_launchers<Output>(std::make_index_sequence<2 - 2 + 1>{});
 
 } // namespace
 
 void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    kLaunchers[x.ne[1] - 2](x, weight, q, gate, k, v, stream);
+    kLaunchers<Nvfp4AttentionInputOutput>[x.ne[1] - 2](x, weight, q, gate, k, v, stream);
+}
+
+void nvfp4_attn_input_shard_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                           Tensor& gate, Tensor& k, Tensor& v,
+                                           cudaStream_t stream) {
+    kLaunchers<Nvfp4AttnInputShardOutput>[x.ne[1] - 2](x, weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

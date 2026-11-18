@@ -2,9 +2,9 @@
 """Documentation guard: what the code accepts must be in the user docs.
 
   - every `ninfer-serve` flag parsed in src/serve/serve_options.cpp appears in the option tables of
-    docs/serving.md (a table row naming it in backticks);
+    the serving guide, docs/serving.md and docs/serving/*.md (a table row naming it in backticks);
   - every NINFER_* environment variable read with getenv() under src/ appears in
-    docs/capy-flash/diagnostics.md or docs/serving.md;
+    docs/capy-flash/diagnostics.md or the serving guide;
   - every conversion recipe in tools/convert/official_recipes.py appears in docs/weight-conversion.md.
 
 Usage: check_docs.py [repository root]. Exit 1 with the list of what is missing.
@@ -21,11 +21,12 @@ sources = [
 ]
 missing = []
 
-serving = read("docs/serving.md")
+serving_pages = ["docs/serving.md"] + sorted(str(p.relative_to(root)) for p in (root / "docs/serving").glob("*.md"))
+serving = "\n".join(read(p) for p in serving_pages)
 table_rows = "\n".join(l for l in serving.splitlines() if l.startswith("|"))
 flags = sorted(set(re.findall(r'arg == "(--[a-z0-9-]+)"', read("src/serve/serve_options.cpp"))))
 missing += [
-    f"serve flag {f} not in a docs/serving.md option table"
+    f"serve flag {f} not in an option table of docs/serving.md or docs/serving/"
     for f in flags
     if f"`{f}`" not in table_rows and f"`{f} " not in table_rows
 ]
@@ -33,7 +34,7 @@ missing += [
 env_docs = read("docs/capy-flash/diagnostics.md") + serving
 envs = sorted({m for p in sources for m in re.findall(r'getenv\("(NINFER_[A-Z0-9_]+)"', p.read_text(errors="replace"))})
 missing += [
-    f"environment variable {e} not in docs/capy-flash/diagnostics.md or docs/serving.md"
+    f"environment variable {e} not in docs/capy-flash/diagnostics.md, docs/serving.md or docs/serving/"
     for e in envs
     if not re.search(rf"`{e}`", env_docs)
 ]

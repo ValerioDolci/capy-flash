@@ -119,6 +119,8 @@ struct PleConfig {
 };
 
 struct TextConfig {
+    // The registry row the checkpoint's names resolved to; `architecture` is its implementation.
+    const RegisteredModel* registered     = nullptr;
     Architecture architecture             = Architecture::Qwen3_5;
     std::uint32_t hidden_size             = 0;
     std::uint32_t vocab_size              = 0;

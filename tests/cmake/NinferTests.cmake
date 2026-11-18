@@ -6,7 +6,7 @@ function(ninfer_test_includes target)
 endfunction()
 
 function(ninfer_add_test name)
-  cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES")
+  cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES;ARGS")
   add_executable(${name} ${arg_SOURCES})
   ninfer_test_includes(${name})
   target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
@@ -15,7 +15,7 @@ function(ninfer_add_test name)
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
-  add_test(NAME ${name} COMMAND ${name})
+  add_test(NAME ${name} COMMAND ${name} ${arg_ARGS})
 endfunction()
 
 # Apply these to the translation unit containing the oracle, including shared

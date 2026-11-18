@@ -45,7 +45,7 @@ struct ExecutionCore {
     const TpExecution* tp                     = nullptr;
     const DecodeGraphPeerBridge* graph_bridge = nullptr;
     // Qwen4Exp only: the Program's expert backend, PLE states and staging.
-    const Qwen4Runtime* qwen4 = nullptr;
+    const ForwardRuntime* qwen4 = nullptr;
 };
 
 struct PrefillContext {

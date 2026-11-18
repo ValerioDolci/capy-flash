@@ -71,6 +71,7 @@ for tp in ${TPS:-1 2}; do
     esac > "$dump.log" 2>&1
     rc=$?
     [ $rc = 0 ] || { echo "$(basename "$dump") run FAIL rc=$rc" | tee -a "$out/summary.txt"; failed=1; continue; }
+    [ $run = score ] && echo "tp$tp $(grep -m1 '^projection routes' "$dump.log")" | tee -a "$out/summary.txt"
     add_tokens "$dump"
     if [ $run = decmtp ]; then
       # MTP rounds are not forced: the reference follows the engine's own sequence.

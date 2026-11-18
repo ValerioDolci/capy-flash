@@ -53,6 +53,19 @@ constraints and launch kernels, and Output/Epilogue define output mapping and fu
 Each semantic Op selects its own production instances. A template's availability neither registers
 a public shape nor implies that production dispatch uses it.
 
+An NVFP4 Linear problem that runs another problem's measured selection is an instance of that
+selection's family in
+[nvfp4_shape_families.cuh](../../src/ops/linear/nvfp4/nvfp4_shape_families.cuh): one line in its
+own shape file, plus its registration (`nvfp4_shapes.h`, `kShapes` in `nvfp4_dispatch.cpp`,
+`sources.cmake`). A problem measured on its own gets its own selection. Every NVFP4 route, per
+registered problem, policy and width, is listed in `tests/ops/nvfp4_routes.txt`;
+`ninfer_decode_policy_routes_test` fails when the selections no longer match it and writes the
+current list, which a commit that changes a route carries as the reviewed difference. FP8 Linear
+problems follow the same rule with
+[fp8_shape_families.cuh](../../src/ops/linear/fp8/fp8_shape_families.cuh): an inherited shape
+instantiates its family's `launch_a16` and `launch_a8` and keeps its own A8 floor and split-K
+reserve, which depend on its row tiles.
+
 CTA-local sliced-K reduces partial sums within a block. Cross-CTA split-K requires caller-owned
 workspace and a final reduction; apply the epilogue once, after the complete reduction.
 New configuration/epilogue combinations receive development qualification; permanent tests cover

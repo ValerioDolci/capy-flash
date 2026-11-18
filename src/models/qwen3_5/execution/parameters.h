@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -302,8 +303,18 @@ public:
     // replicated router, indexer, PLE and hyper-connection mixers, the shared expert of its blocks,
     // and the one host-mapped copy of the routed experts that both ranks read.
     std::optional<Qwen4Parameters> qwen4;
+    // The same blocks for the columns after the prefill (decoding and speculative verification):
+    // every projection under ops::decode_policy(), the same weights. The Text forward reads them
+    // when its columns are not a prefill (TextForward::qwen4()).
+    std::optional<Qwen4Parameters> qwen4_decode;
     // Qwen4Exp MTP layer, when the artifact's MTP component is loaded.
     std::optional<Qwen4MtpParameters> qwen4_mtp;
 };
+
+// The Text layers' projection routes for the startup log: per fused Op of Qwen4FusedRoutes, how
+// many blocks run it and how many keep the generic chain, e.g. "64 text layers | gdn_input fused
+// 48 | gdn_gating fused 48 | attn_input fused 16 | swiglu fused 64". Ops no block has (a routed
+// FFN's swiglu) are left out; empty without the Text forward's blocks.
+[[nodiscard]] std::string projection_routes(const Parameters& parameters);
 
 } // namespace ninfer::models::qwen3_5::execution

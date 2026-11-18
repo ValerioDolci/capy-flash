@@ -19,8 +19,8 @@
 //      layer (or on a synthetic one without NINFER_HOST_NVFP4_BANKS).
 // ISAs the CPU lacks are skipped (on a CPU without AVX-512 the test compares AVX2 to the model).
 #include "host_moe_fixture.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
-#include "ops/sparse_moe/host/host_nvfp4_isa.h"
+#include "ops/host_moe/host_moe_executor.h"
+#include "ops/host_moe/host_nvfp4_isa.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>

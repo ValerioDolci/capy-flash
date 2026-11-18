@@ -16,7 +16,8 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Replace the chat template embedded in an artifact (weights unchanged; writes a new artifact directory) | [`replace_chat_template.py`](replace_chat_template.py), with positional `ENTRY.ninfer TEMPLATE.jinja OUT_DIR`; maintained templates in [`chat_templates/`](chat_templates/) |
-| Check that every `ninfer-serve` flag, `NINFER_*` variable and conversion recipe of the sources is in the user docs (ctest `ninfer_docs_guard_test`) | [`check_docs.py`](check_docs.py) |
+| Check that every `ninfer-serve` flag, `NINFER_*` variable and conversion recipe of the sources is in the user docs (pre-commit hook `docs`) | [`check_docs.py`](check_docs.py) |
+| Keep the per-file counts of what is being phased out from rising (`getenv`, source includes, history in comments, direct `stderr`; pre-commit hook `ratchets`) | [`check_ratchets.py`](check_ratchets.py), lists in [`ratchets/`](ratchets/) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Bake the `ninfer_bench` token corpus | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |

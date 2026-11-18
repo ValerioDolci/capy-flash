@@ -1,0 +1,31 @@
+# getenv: behaviour is selected by documented flags; validation hooks are listed in docs/capy-flash/diagnostics.md.
+# <count> <path>; counts may only go down (tools/check_ratchets.py).
+2 src/artifact/materializer.cpp
+1 src/core/device.cu
+3 src/core/expert_cache.cu
+1 src/models/qwen3_5/execution/parameters.cpp
+3 src/models/qwen3_5/execution/qwen4_experts.cpp
+1 src/models/qwen3_5/execution/text_forward/moe.h
+1 src/models/qwen3_5/execution/text_forward/qsa.h
+1 src/models/qwen3_5/execution/text_forward_context.cpp
+15 src/models/qwen3_5/execution/qwen4_tfdump.cpp
+1 src/models/qwen3_5/execution/vision.cpp
+1 src/models/qwen3_5/load/sharding.cpp
+1 src/models/qwen3_5/program/grammar_masks.cpp
+1 src/models/qwen3_5/program/graphs.cpp
+3 src/models/qwen3_5/program/planning/startup.cpp
+1 src/models/qwen3_5/program/program_impl.cpp
+7 src/models/qwen3_5/program/qwen4_routed_expert_runtime.cpp
+1 src/models/qwen3_5/program/storage/context.cpp
+4 src/models/qwen3_5/program/tp2/program_impl_tp2.inc
+1 src/models/qwen3_5/program/tp2/target_verification_tp2.inc
+9 src/models/qwen3_5/program/validation_hooks.cpp
+1 src/models/qwen3_5/qwen4_layer_profile.h
+1 src/ops/common/allreduce.cu
+1 src/ops/hyper_connection/hyper_connection.cpp
+1 src/ops/linear/q3/q3_linear.cu
+1 src/ops/linear/q8/q8_a8.cu
+1 src/ops/softmax_attention/dense/causal_cache/int8/plan.cpp
+6 src/ops/host_moe/host_moe_mailbox.cu
+1 src/ops/host_moe/host_nvfp4.cpp
+1 src/serve/serve_options.cpp

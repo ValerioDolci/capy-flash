@@ -8,7 +8,6 @@
 #include "ops/linear/q3/q3_arena.h"
 #include "ops/linear/q3/q3_linear.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
-#include "ops/linear_swiglu/nvfp4/ffn14336/linear_swiglu_ffn14336.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
@@ -16,6 +15,7 @@
 #include "ninfer/ops/tp2/linear_swiglu.h"
 #include "ops/common/split_launch.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -33,52 +33,63 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::AllowA4Decode:
         return;
     }
     throw std::invalid_argument("linear_swiglu: invalid compute policy");
 }
 
-// The NVFP4 and FP8 gate/up problems: the single-device [34816,5120] and its two-device
-// output-row half [17408,5120]. Both formats register the same two geometries.
-constexpr std::int32_t kGateUpRows      = detail::Nvfp4N34816K5120::kOutputRows;
-constexpr std::int32_t kShardGateUpRows = detail::Nvfp4N17408K5120::kOutputRows;
-constexpr std::int32_t kGateUpInputRows = detail::Nvfp4N34816K5120::kInputRows;
+// The gate|up problems, all with K = 5120: the single-device [34816,5120] and its two-device
+// output-row half [17408,5120], and the dense FFN-14336 gate|up [28672,5120] and its half
+// [14336,5120].
+constexpr std::int32_t kGateUpRows              = detail::Nvfp4N34816K5120::kOutputRows;
+constexpr std::int32_t kShardGateUpRows         = detail::Nvfp4N17408K5120::kOutputRows;
+constexpr std::int32_t kFfn14336GateUpRows      = detail::Nvfp4N28672K5120::kOutputRows;
+constexpr std::int32_t kFfn14336ShardGateUpRows = detail::Nvfp4N14336K5120::kOutputRows;
+constexpr std::int32_t kGateUpInputRows         = detail::Nvfp4N34816K5120::kInputRows;
 static_assert(detail::Fp8N34816K5120::kOutputRows == kGateUpRows &&
               detail::Fp8N17408K5120::kOutputRows == kShardGateUpRows &&
               detail::Fp8N34816K5120::kInputRows == kGateUpInputRows &&
               detail::Fp8N17408K5120::kInputRows == kGateUpInputRows &&
-              detail::Nvfp4N17408K5120::kInputRows == kGateUpInputRows);
+              detail::Nvfp4N17408K5120::kInputRows == kGateUpInputRows &&
+              detail::Nvfp4N28672K5120::kInputRows == kGateUpInputRows &&
+              detail::Nvfp4N14336K5120::kInputRows == kGateUpInputRows);
 
-bool fused_gate_up_problem(std::int32_t gate_up_rows, std::int32_t input_rows) {
-    return (gate_up_rows == kGateUpRows || gate_up_rows == kShardGateUpRows) &&
-           input_rows == kGateUpInputRows;
-}
+// The registry, read by registration, workspace sizing and validation: which format runs which
+// gate|up problem. NVFP4 runs every one on its one plan (nvfp4/nvfp4_linear_swiglu_plan.h, the
+// launchers read the output rows from the weight); FP8 and Q3 the [34816,5120] pair; Q4 and Q8
+// the single-device problem.
+struct GateUpProblem {
+    QType qtype;
+    std::int32_t gate_up_rows;
+};
 
-// NVFP4 only: the dense FFN-14336 gate|up [28672,5120] and its two-device half [14336,5120]
-// (nvfp4/ffn14336/linear_swiglu_ffn14336.h).
-bool ffn14336_gate_up_problem(std::int32_t gate_up_rows, std::int32_t input_rows) {
-    return (gate_up_rows == detail::kLinearSwiGluFfn14336Rows ||
-            gate_up_rows == detail::kLinearSwiGluFfn14336HalfRows) &&
-           input_rows == kGateUpInputRows;
+constexpr std::array kGateUpProblems{
+    GateUpProblem{QType::Q4_G64_FP16, kGateUpRows},
+    GateUpProblem{QType::Q8_G32_FP16, kGateUpRows},
+    GateUpProblem{QType::NVFP4, kGateUpRows},
+    GateUpProblem{QType::NVFP4, kShardGateUpRows},
+    GateUpProblem{QType::NVFP4, kFfn14336GateUpRows},
+    GateUpProblem{QType::NVFP4, kFfn14336ShardGateUpRows},
+    GateUpProblem{QType::FP8_E4M3FN_ROW_BF16, kGateUpRows},
+    GateUpProblem{QType::FP8_E4M3FN_ROW_BF16, kShardGateUpRows},
+    GateUpProblem{QType::Q3_G128_FP16, kGateUpRows},
+    GateUpProblem{QType::Q3_G128_FP16, kShardGateUpRows},
+};
+
+bool gate_up_problem(std::int32_t gate_up_rows, std::int32_t input_rows) {
+    return input_rows == kGateUpInputRows &&
+           std::any_of(kGateUpProblems.begin(), kGateUpProblems.end(),
+                       [&](const GateUpProblem& p) { return p.gate_up_rows == gate_up_rows; });
 }
 
 } // namespace
 
 bool linear_swiglu_registered(QType qtype, std::int32_t gate_up_rows, std::int32_t input_rows) {
-    const bool large = gate_up_rows == kGateUpRows && input_rows == kGateUpInputRows;
-    const bool fused = fused_gate_up_problem(gate_up_rows, input_rows);
-    switch (qtype) {
-    case QType::Q4_G64_FP16:
-    case QType::Q8_G32_FP16:
-        return large;
-    case QType::NVFP4:
-        return fused || ffn14336_gate_up_problem(gate_up_rows, input_rows);
-    case QType::FP8_E4M3FN_ROW_BF16:
-    case QType::Q3_G128_FP16:
-        return fused;
-    default:
-        return false;
-    }
+    return input_rows == kGateUpInputRows &&
+           std::any_of(kGateUpProblems.begin(), kGateUpProblems.end(), [&](const GateUpProblem& p) {
+               return p.qtype == qtype && p.gate_up_rows == gate_up_rows;
+           });
 }
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -106,17 +117,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
     }
-    if (qtype == QType::NVFP4 && fused_gate_up_problem(gate_up_rows, input_rows)) {
+    if (qtype == QType::NVFP4 && linear_swiglu_registered(qtype, gate_up_rows, input_rows)) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (qtype == QType::NVFP4 && ffn14336_gate_up_problem(gate_up_rows, input_rows)) {
-        return gate_up_rows == detail::kLinearSwiGluFfn14336Rows
-                   ? detail::nvfp4_linear_swiglu_n28672_workspace_capacity_bytes(policy, min_tokens,
-                                                                                 max_tokens)
-                   : detail::nvfp4_linear_swiglu_n14336_workspace_capacity_bytes(policy, min_tokens,
-                                                                                 max_tokens);
-    }
-    if (qtype == QType::FP8_E4M3FN_ROW_BF16 && fused_gate_up_problem(gate_up_rows, input_rows)) {
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+        linear_swiglu_registered(qtype, gate_up_rows, input_rows)) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
@@ -146,17 +151,11 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
-    const std::int32_t t   = x.ne[1];
-    const bool large_shape = matches_problem(x, gate_up_weight, out, kGateUpRows, kGateUpInputRows);
-    const bool shard_shape =
-        matches_problem(x, gate_up_weight, out, kShardGateUpRows, kGateUpInputRows);
-    const bool ffn14336_shape =
-        matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336Rows,
-                        kGateUpInputRows) ||
-        matches_problem(x, gate_up_weight, out, detail::kLinearSwiGluFfn14336HalfRows,
-                        kGateUpInputRows);
+    const std::int32_t t = x.ne[1];
+    const bool shape     = gate_up_problem(gate_up_weight.n, kGateUpInputRows) &&
+                       matches_problem(x, gate_up_weight, out, gate_up_weight.n, kGateUpInputRows);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !shard_shape && !ffn14336_shape)) {
+        out.ne[3] != 1 || !shape) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -172,19 +171,20 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
+    // The weight's format registers this problem (kGateUpProblems).
+    const bool registered =
+        linear_swiglu_registered(gate_up_weight.qtype, gate_up_weight.n, gate_up_weight.k);
+    const bool q4_weight = registered && gate_up_weight.qtype == QType::Q4_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool q8_weight = large_shape && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
+    const bool q8_weight = registered && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    const bool fused_shape = large_shape || shard_shape;
-    const bool nvfp4_weight =
-        (fused_shape || ffn14336_shape) && gate_up_weight.qtype == QType::NVFP4;
-    const bool fp8_weight = fused_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    const bool nvfp4_weight = registered && gate_up_weight.qtype == QType::NVFP4;
+    const bool fp8_weight   = registered && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     // The GSQ-3 gate|up parent [34816,5120] (and its [17408,5120] half).
-    const bool q3_weight = fused_shape && gate_up_weight.qtype == QType::Q3_G128_FP16;
+    const bool q3_weight = registered && gate_up_weight.qtype == QType::Q3_G128_FP16;
     if (q3_weight) {
         detail::validate_q3_weight(gate_up_weight, "linear_swiglu");
         return;
@@ -219,25 +219,14 @@ void dispatch_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tenso
         return;
     }
     case QType::FP8_E4M3FN_ROW_BF16:
-        if (gate_up_weight.n == kShardGateUpRows) {
-            return detail::fp8_linear_swiglu_half_dispatch(x, gate_up_weight, out, policy, ws,
-                                                           stream);
-        }
-        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy,
+                                           gate_up_weight.n == kShardGateUpRows
+                                               ? detail::kFp8LinearSwiGluHalfA16Launchers
+                                               : detail::kFp8LinearSwiGluA16Launchers,
+                                           ws, stream);
         return;
     case QType::NVFP4:
-        if (gate_up_weight.n == kShardGateUpRows) {
-            return detail::nvfp4_linear_swiglu_half_dispatch(x, gate_up_weight, out, policy, ws,
-                                                             stream);
-        }
-        if (gate_up_weight.n == detail::kLinearSwiGluFfn14336Rows) {
-            return detail::nvfp4_linear_swiglu_n28672_dispatch(x, gate_up_weight, out, policy, ws,
-                                                               stream);
-        }
-        if (gate_up_weight.n == detail::kLinearSwiGluFfn14336HalfRows) {
-            return detail::nvfp4_linear_swiglu_n14336_dispatch(x, gate_up_weight, out, policy, ws,
-                                                               stream);
-        }
+        // Every NVFP4 problem of kGateUpProblems (validated above).
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;
     case QType::Q8_G32_FP16:

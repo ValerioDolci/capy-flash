@@ -6,7 +6,7 @@
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1; one id = one GPU, 64 GB edition)  NINFER_MAX_CONTEXT (262144)
 #   NINFER_MODEL_ID (capy-flash: the `model` name requests must use)
 # Extra flags are appended and win over the profile. Run it under a supervisor that restarts on a
-# non-zero exit: ninfer-serve exits with status 2 once the Engine fails (docs/serving.md).
+# non-zero exit: ninfer-serve exits with status 2 once the Engine fails (docs/serving/endpoints.md).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 1 ] || { echo "usage: $0 <artifact.ninfer> [ninfer-serve flags...]" >&2; exit 2; }

@@ -273,9 +273,25 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::AllowA4Decode:
         return;
     }
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
+}
+
+// The registered single-parent problem: the Q|K|V|Z parent [16384,5120] in Q3, NVFP4 and FP8.
+bool parent_problem(QType qtype, std::int32_t parent_rows, std::int32_t input_rows) {
+    static_assert(detail::Nvfp4N16384K5120::kOutputRows == detail::Fp8N16384K5120::kOutputRows &&
+                  detail::Nvfp4N16384K5120::kInputRows == detail::Fp8N16384K5120::kInputRows);
+    switch (qtype) {
+    case QType::Q3_G128_FP16:
+    case QType::NVFP4:
+    case QType::FP8_E4M3FN_ROW_BF16:
+        return parent_rows == detail::Nvfp4N16384K5120::kOutputRows &&
+               input_rows == detail::Nvfp4N16384K5120::kInputRows;
+    default:
+        return false;
+    }
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -688,6 +704,11 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
 
 } // namespace
 
+bool gdn_input_proj_registered(QType parent_qtype, std::int32_t parent_rows,
+                               std::int32_t input_rows) {
+    return parent_problem(parent_qtype, parent_rows, input_rows);
+}
+
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
     constexpr std::int32_t kHidden     = 5120;
@@ -716,21 +737,19 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
     if (parent_qtype == QType::Q3_G128_FP16) {
-        if (parent_rows != 16384 || input_rows != 5120) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported Q3 profile");
         }
         return detail::q3_workspace_bytes(input_rows, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
-        if (parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
-            input_rows != detail::Nvfp4N16384K5120::kInputRows) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16) {
-        if (parent_rows != detail::Fp8N16384K5120::kOutputRows ||
-            input_rows != detail::Fp8N16384K5120::kInputRows) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -783,7 +802,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::Q3_G128_FP16) {
-        if (parent_rows != 16384 || input_rows != 5120) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument(
                 "gdn_input_proj_conv_snapshot workspace: unsupported Q3 profile");
         }
@@ -792,13 +811,11 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
             detail::q3_workspace_bytes(input_rows, batch_size * max_width));
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
-        parent_rows == detail::Fp8N16384K5120::kOutputRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
+        parent_problem(parent_qtype, parent_rows, input_rows)) {
         return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                  max_width);
     }
-    if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
-        input_rows != detail::Nvfp4N16384K5120::kInputRows) {
+    if (parent_qtype != QType::NVFP4 || !parent_problem(parent_qtype, parent_rows, input_rows)) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_snapshot workspace: unsupported single-parent profile");
     }
@@ -834,20 +851,18 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (parent_qtype == QType::Q3_G128_FP16) {
-        if (parent_rows != 16384 || input_rows != 5120) {
+        if (!parent_problem(parent_qtype, parent_rows, input_rows)) {
             throw std::invalid_argument(
                 "gdn_input_proj_conv_record workspace: unsupported Q3 profile");
         }
         return detail::q3_workspace_bytes(input_rows, batch_size * max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16 &&
-        parent_rows == detail::Fp8N16384K5120::kOutputRows &&
-        input_rows == detail::Fp8N16384K5120::kInputRows) {
+        parent_problem(parent_qtype, parent_rows, input_rows)) {
         return detail::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                max_width);
     }
-    if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4N16384K5120::kOutputRows ||
-        input_rows != detail::Nvfp4N16384K5120::kInputRows) {
+    if (parent_qtype != QType::NVFP4 || !parent_problem(parent_qtype, parent_rows, input_rows)) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
     }
@@ -860,8 +875,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
-                                                                std::max(min_width, 4), max_width);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, min_width,
+                                                                max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
                                                             batch_size * max_width);
@@ -1096,11 +1111,15 @@ static_assert(kShardRows == detail::Fp8N8192K5120::kOutputRows &&
 static_assert(kShardHidden == detail::Fp8N8192K5120::kInputRows &&
               kShardHidden == detail::Nvfp4N8192K5120::kInputRows);
 
+bool shard_profile(QType qtype, std::int32_t rows, std::int32_t input_rows) {
+    return (qtype == QType::FP8_E4M3FN_ROW_BF16 || qtype == QType::NVFP4 ||
+            qtype == QType::Q3_G128_FP16) &&
+           rows == kShardRows && input_rows == kShardHidden;
+}
+
 void require_shard_profile(QType qtype, std::int32_t rows, std::int32_t input_rows,
                            const char* operation) {
-    if ((qtype != QType::FP8_E4M3FN_ROW_BF16 && qtype != QType::NVFP4 &&
-         qtype != QType::Q3_G128_FP16) ||
-        rows != kShardRows || input_rows != kShardHidden) {
+    if (!shard_profile(qtype, rows, input_rows)) {
         throw std::invalid_argument(std::string(operation) + ": unsupported shard profile");
     }
 }
@@ -1200,6 +1219,11 @@ std::size_t conv_shard_projection_bytes(QType qtype, LinearPolicy policy, std::i
 }
 
 } // namespace
+
+bool gdn_input_proj_column_parallel_registered(QType shard_qtype, std::int32_t shard_rows,
+                                               std::int32_t input_rows) {
+    return shard_profile(shard_qtype, shard_rows, input_rows);
+}
 
 std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(
     QType shard_qtype, std::int32_t shard_rows, std::int32_t input_rows, LinearPolicy policy,

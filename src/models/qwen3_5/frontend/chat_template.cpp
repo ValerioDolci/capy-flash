@@ -421,6 +421,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             result.rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = begin};
     }
+    // The checkpoint moves to the first execution boundary at or after it: every later prompt
+    // splits its prefill there too, so a turn resumed from the checkpoint runs the passes of its
+    // cold prefill.
+    if (result.rewrite_checkpoint) {
+        const auto& bounds = layout.execution_boundaries;
+        const auto at =
+            std::lower_bound(bounds.begin(), bounds.end(), result.rewrite_checkpoint->offset);
+        if (at != bounds.end()) result.rewrite_checkpoint->offset = *at;
+    }
     for (std::size_t i = 0; i < options.cache_markers.size(); ++i) {
         const auto& marker = options.cache_markers[i];
         switch (marker.location) {

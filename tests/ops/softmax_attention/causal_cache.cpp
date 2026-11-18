@@ -2660,7 +2660,7 @@ int run_int8_pv_half_acc_cases() {
     constexpr auto storage = KvCacheStorage::Int8Group64;
     int failures           = 0;
     const std::array<int, 5> prefill_queries{0, 63, 64, 511, 999};
-    ops::detail::int8_kv_pv_half_acc_for_test(1);
+    ops::detail::int8_kv_pv_half_acc_force(1);
     for (const Geometry& geometry : {kGeometries[0], kTensorParallelGeometry}) {
         // 1000 columns: the last 64-row query tile is partial.
         failures += run_a1_case(geometry, storage, {1000, 8191, 16384, 1901u},
@@ -2668,7 +2668,7 @@ int run_int8_pv_half_acc_cases() {
         failures += run_a3_case(geometry, storage, {1000, 4096, 8192, 1902u},
                                 MappingPattern::Offset, prefill_queries);
     }
-    ops::detail::int8_kv_pv_half_acc_for_test(-1);
+    ops::detail::int8_kv_pv_half_acc_force(-1);
     std::cout << (failures ? "FAIL" : "PASS") << " INT8 PV FP16 accumulation\n";
     return failures;
 }
@@ -2687,10 +2687,10 @@ int run_int8_pv_half_acc_range_cases() {
     const std::array<int, 5> queries{0, 63, 64, 511, 999};
     int failures   = 0;
     const auto run = [&](AttentionCase test_case, int pv_half_acc) {
-        ops::detail::int8_kv_pv_half_acc_for_test(pv_half_acc);
+        ops::detail::int8_kv_pv_half_acc_force(pv_half_acc);
         const int result =
             run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented, queries);
-        ops::detail::int8_kv_pv_half_acc_for_test(-1);
+        ops::detail::int8_kv_pv_half_acc_force(-1);
         return result;
     };
     for (const float amplitude : {1.0f, 64.0f, 256.0f, 1000.0f}) {

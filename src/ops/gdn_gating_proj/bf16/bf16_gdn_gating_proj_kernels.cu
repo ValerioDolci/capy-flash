@@ -35,7 +35,7 @@ static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 // Two-device column shard: each rank owns 24 of the 48 value heads, rows [24r,24r+24) of both A
 // and B. The MMA route tiles rows by kBf16GdnBlockM = 16, which does not divide 24, so the shard
 // uses the row-generic GEMV kernel at T=1 and the split-10 small-T kernel, which has no upper T
-// bound, at every T>=2.
+// bound, at every T>=2; under AllowA4Decode at T=1 too (bf16_gdn_gating_shard_route).
 constexpr int kShardN = 24;
 // Through this T the shard runs the single-launch split-10 kernel (verify and draft blocks); above
 // it, prefill keeps the two-kernel form, whose partial grid has one CTA per four rows and slice.
@@ -527,8 +527,8 @@ void bf16_gdn_gating_proj_small_t_fused_shard_launch(const Tensor& x, const Weig
     require_shard_shape(a_weight, "a_weight");
     require_shard_shape(b_weight, "b_weight");
     const std::int32_t t = x.ne[1];
-    if (t < 2 || t > kShardFusedMaxTokens) {
-        throw std::invalid_argument("gdn_gating_proj column-parallel: fused small-T needs T=2..32");
+    if (t < 1 || t > kShardFusedMaxTokens) {
+        throw std::invalid_argument("gdn_gating_proj column-parallel: fused small-T needs T=1..32");
     }
     constexpr int kRowsPerCta = 2;
     const dim3 grid(2 * kShardN / kRowsPerCta, div_up(t, kSmallTMax));
@@ -542,22 +542,32 @@ void bf16_gdn_gating_proj_small_t_fused_shard_launch(const Tensor& x, const Weig
     CUDA_CHECK(cudaGetLastError());
 }
 
+Bf16GdnGatingShardRoute bf16_gdn_gating_shard_route(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens == 1 && policy != LinearPolicy::AllowA4Decode) {
+        return Bf16GdnGatingShardRoute::Gemv;
+    }
+    if (tokens <= kShardFusedMaxTokens) { return Bf16GdnGatingShardRoute::FusedSplit10; }
+    return Bf16GdnGatingShardRoute::Split10;
+}
+
 void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                                     const Tensor& A_log, const Tensor& dt_bias, void* workspace,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
-                                    cudaStream_t stream) {
-    if (x.ne[1] == 1) {
+                                    LinearPolicy policy, cudaStream_t stream) {
+    switch (bf16_gdn_gating_shard_route(policy, x.ne[1])) {
+    case Bf16GdnGatingShardRoute::Gemv:
         bf16_gdn_gating_proj_gemv_shard_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                                stream);
         return;
-    }
-    if (x.ne[1] <= kShardFusedMaxTokens) {
+    case Bf16GdnGatingShardRoute::FusedSplit10:
         bf16_gdn_gating_proj_small_t_fused_shard_launch(x, a_weight, b_weight, A_log, dt_bias, g,
                                                         beta, stream);
         return;
+    case Bf16GdnGatingShardRoute::Split10:
+        bf16_gdn_gating_proj_small_t_split10_shard_launch(
+            x, a_weight, b_weight, A_log, dt_bias, workspace, workspace_bytes, g, beta, stream);
+        return;
     }
-    bf16_gdn_gating_proj_small_t_split10_shard_launch(x, a_weight, b_weight, A_log, dt_bias,
-                                                      workspace, workspace_bytes, g, beta, stream);
 }
 
 std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens) {

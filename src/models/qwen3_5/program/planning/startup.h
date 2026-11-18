@@ -190,6 +190,9 @@ struct SequencePlanningInputs {
     // Elastic KV <-> expert slots (EngineOptions::elastic_kv).
     ElasticKvOptions elastic_kv;
     bool kv_ram_active = false; // EngineOptions::kv_ram_active
+    // EngineOptions::kv_ram_region_tokens / kv_ram_cache_blocks (0: environment or default).
+    std::uint32_t kv_ram_region_tokens = 0;
+    std::uint32_t kv_ram_cache_blocks  = 0;
     // Qwen4Exp MTP: the draft shortlist split (execution::split_draft_shortlist): the
     // output-head prefix [0, draft_prefix) and the other shortlist IDs ascending. Both empty =
     // full-vocabulary proposals.
@@ -205,36 +208,16 @@ struct SequencePlanningInputs {
 namespace ninfer::models::qwen3_5::detail {
 
 struct SequencePlanImpl {
-    const execution::Parameters* parameters        = nullptr;
-    const execution::Parameters* vision_parameters = nullptr;
-    const execution::Parameters* peer_parameters   = nullptr;
-    std::uint32_t max_vision_item_tokens           = 0;
-    std::uint32_t capacity                         = 0;
-    std::uint32_t kv_capacity                      = 0;
-    std::uint32_t main_page_groups                 = 0;
-    std::uint32_t max_concurrency                  = 1;
-    std::uint32_t prefill_chunk                    = 0;
+    // The options the plan was built from, unchanged.
+    SequencePlanningInputs inputs;
+    std::uint32_t kv_capacity      = 0;
+    std::uint32_t main_page_groups = 0;
+    // The prompt chunk: inputs.prefill_chunk, or wider when Qwen4Exp prompt chunks run on lent
+    // workspace (qwen4_base_chunk).
+    std::uint32_t prefill_chunk = 0;
     // > 0 when Qwen4Exp prompt chunks wider than this run on lent workspace: the general
     // arena and prefill_hidden are planned for this width, prefill_chunk is the prompt chunk.
-    std::uint32_t qwen4_base_chunk         = 0;
-    std::uint32_t kv_lease_window_tokens   = 0; // 0: whole max_tokens reserved at admission
-    std::uint32_t draft_window             = 0;
-    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
-    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head             = ProposalHead::Full;
-    models::LoadOptions features;
-    bool use_cuda_graph = true;
-    bool causal_scoring = false;
-    int device          = 0;
-    int tp              = 1;
-    bool tp_mailbox     = true;
-    ContextCacheOptions context_cache;
-    RoutedExpertOptions qwen4_experts;
-    ElasticKvOptions elastic_kv;
-    bool kv_ram_active        = false; // EngineOptions::kv_ram_active
-    std::int32_t draft_prefix = 0;     // see SequencePlanningInputs
-    std::vector<std::int32_t> draft_extras;
-    bool draft_split = false;
+    std::uint32_t qwen4_base_chunk = 0;
     // Rank 0's persistent layout, and at tp 2 rank 1's: the same layout without the masked
     // drafter's state (DFlashPersistentLayout and the StateImage DFlash local slots).
     PersistentLayout persistent;
@@ -248,7 +231,7 @@ struct SequencePlanImpl {
     // Bytes of device_reservation_bytes that `rank` does not allocate: at tp 2 with Vision, the
     // encode workspace of the rank without the tower.
     [[nodiscard]] std::size_t unallocated_reservation_bytes(int rank) const noexcept {
-        return workspace.capacity - workspace.rank_capacity(rank, features.vision_rank);
+        return workspace.capacity - workspace.rank_capacity(rank, inputs.features.vision_rank);
     }
 };
 

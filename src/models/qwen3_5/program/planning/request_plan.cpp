@@ -509,7 +509,10 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
                 throw std::logic_error("catalog endpoint summary disagrees with Program state");
             }
-            if (!qwen3_5::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+            // --no-endpoint-reuse: the endpoint's reply KV and state came from the decode; the
+            // request resumes from an earlier prefill checkpoint, as it would without the endpoint.
+            if (!context_cache.resume_session_endpoints ||
+                !qwen3_5::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                                  selected.frontier)) {
                 return std::nullopt;
             }

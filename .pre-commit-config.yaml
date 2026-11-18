@@ -27,3 +27,17 @@ repos:
     rev: v1.51.1
     hooks:
       - id: typos
+  - repo: local
+    hooks:
+      - id: ratchets
+        name: ratchets (per-file counts that may only go down)
+        entry: python3 -B tools/check_ratchets.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: docs
+        name: docs (links, references, documented options)
+        entry: python3 -B tools/check_docs.py .
+        language: system
+        pass_filenames: false
+        always_run: true

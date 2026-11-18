@@ -44,6 +44,10 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+Every test carries one CTest label: `cpu` for the tests that run without a GPU (parsers, protocols,
+planners, host kernels; the list is in `tests/cmake/TestLabels.cmake`), `gpu` for the others. On a
+machine without CUDA devices run `ctest --test-dir build -L cpu`; with a GPU, run everything.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
@@ -218,6 +222,22 @@ and `dflash2`, requiring an artifact with the selected component. Batch defaults
 `NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash2 K=7 block. The DFlash2-specific
 integration executable also accepts all five KV names as its fifth positional argument and rejects
 unknown names.
+
+The Qwen4Exp (Qwen3.8-Flash-Next) loading and Engine tests run on synthetic artifacts of the real
+per-layer geometry that the build does not generate (a random checkpoint of about 11 GB, from the
+config and tokenizer of a real Qwen3.8-Flash-Next checkpoint, converted on the CPU into about 8 GB):
+write them once with `tools/capy_flash/make_test_artifact.sh` (and `--vision`) and configure their
+paths, after which CTest runs `ninfer_qwen4_(tp2_)?loading`, `ninfer_qwen4_(tp2|mtp)_engine` and
+`ninfer_qwen4_vision_engine` with them:
+
+```bash
+cmake -B build -DNINFER_TEST_QWEN4_ARTIFACT=$PWD/out/fn4.ninfer \
+  -DNINFER_TEST_QWEN4_VISION_ARTIFACT=$PWD/out/fn4v.ninfer
+```
+
+Unconfigured, the Engine tests read the shell variables of the same names and skip without them.
+`ninfer_qwen4_loading_interop_test` writes its own tiny checkpoint and artifacts (a few MB, seconds
+on the CPU) and needs only torch and safetensors in `Python3_EXECUTABLE`.
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
 

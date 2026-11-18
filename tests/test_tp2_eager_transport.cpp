@@ -19,17 +19,18 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
-// The HostExchange rule, written independently: without peer access or with elastic KV, unless
-// NINFER_TP_HOST_EXCHANGE decides.
+// The HostExchange rule, written independently: without peer access or with elastic KV, or
+// forced by NINFER_TP_HOST_EXCHANGE=1.
 bool reference_host_exchange(bool peer_access, bool elastic_kv, std::string_view forced) {
-    const bool host_exchange_auto = !peer_access || elastic_kv;
-    return forced != "0" && (forced == "1" || host_exchange_auto);
+    return forced == "1" || !peer_access || elastic_kv;
 }
 
 } // namespace
 
 int main() {
-    int failures                          = 0;
+    int failures = 0;
+    // Only "1" (HostExchange) and "force" (lanes) mean something; any other value decides as
+    // unset.
     const std::string_view host_envs[]    = {"", "0", "1", "2", "on"};
     const std::string_view overlap_envs[] = {"", "0", "1", "auto", "force", "FORCE"};
     for (const bool peer : {false, true}) {
@@ -52,12 +53,12 @@ int main() {
                     // 3. Lanes are direct exactly when there is peer access.
                     failures += check(t.peer_lanes_direct == (t.peer_lanes && peer),
                                       label + ": direct flag");
-                    // 4. force always attaches them; =0 never (unless force).
+                    // 4. force always attaches them; otherwise P2P without a HostExchange does.
                     if (overlap == "force") {
                         failures += check(t.peer_lanes, label + ": force without lanes");
-                    }
-                    if (overlap == "0") {
-                        failures += check(!t.peer_lanes, label + ": =0 with lanes");
+                    } else {
+                        failures += check(t.peer_lanes == (peer && !t.host_exchange),
+                                          label + ": lanes differ from the P2P rule");
                     }
                     // 5. Outside force, lanes never coexist with a HostExchange (the host lanes
                     //    keep serving the split-phase sums wherever there is one).

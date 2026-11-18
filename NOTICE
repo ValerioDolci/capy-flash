@@ -47,7 +47,7 @@ licensed under the Apache License, Version 2.0:
 
 Host expert path: prior work
 ----------------------------
-src/ops/sparse_moe/host/ (host_nvfp4, host_moe_executor, host_moe_mailbox) derives
+src/ops/host_moe/ (host_nvfp4, host_moe_executor, host_moe_mailbox) derives
 from the following works, each licensed under the Apache License, Version 2.0:
 
   * FreeToken authors (FlashML-org) -- https://github.com/FlashML-org/FreeToken
@@ -61,7 +61,7 @@ from the following works, each licensed under the Apache License, Version 2.0:
     mapped mailbox with cuStreamWriteValue32/cuStreamWaitValue32 inside the
     captured graph, here ported to NVFP4 W4A8 with a pinned pool.
 
-src/ops/sparse_moe/host/host_nvfp4_avx2.cpp (the AVX2 forms of the NVFP4 dots)
+src/ops/host_moe/host_nvfp4_avx2.cpp (the AVX2 forms of the NVFP4 dots)
 follows the AVX2 NVFP4 row kernel of the following project, licensed under the
 MIT License:
 
@@ -195,7 +195,7 @@ reference quantizers and the generic dot products) from ggml commit
   * The ggml authors -- https://github.com/ggml-org/llama.cpp
     Copyright (c) 2023-2026 The ggml authors. MIT License (third_party/ggml-iq/LICENSE).
 
-src/ops/sparse_moe/host/host_gguf.{h,cpp} and host_q8.{h,cpp} derive from:
+src/ops/host_moe/host_gguf.{h,cpp} and host_q8.{h,cpp} derive from:
   * satellitedown -- https://github.com/satellitedown/fngine (commit c20a885)
     Licensed under the Apache License, Version 2.0; its CPU i-quant kernel files
     (src/cpu/iq_cpu.{h,cpp}, here host_gguf.{h,cpp}) are SPDX MIT as derivatives of

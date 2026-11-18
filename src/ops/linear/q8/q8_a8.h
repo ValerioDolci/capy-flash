@@ -25,9 +25,10 @@ namespace ninfer::ops::detail {
 
 enum class Q8A8Mode : int { Off = 0, G32 = 32, G128 = 128 };
 
-// NINFER_Q8_A8: unset or 0 = Off; 1 or 32 = G32; 128 = G128. Read once (or the test override).
+// NINFER_Q8_A8: unset or 0 = Off; 1 or 32 = G32; 128 = G128. Read once; q8_a8_force_mode
+// (EngineOptions::lossy_prefill, tests) wins over it for the calls made afterwards.
 Q8A8Mode q8_a8_mode();
-void q8_a8_force_mode_for_test(Q8A8Mode mode);
+void q8_a8_force_mode(Q8A8Mode mode);
 
 // The shapes the route takes (one rank's shard of the Qwen3.8 Flash dense projections at tp 2):
 // 8192 x 2560, 6656 x 2560, 1280 x 2560 and 2560 x 3072.

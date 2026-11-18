@@ -37,7 +37,7 @@
 #include "core/weight_view.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/parameters.h"
-#include "models/qwen3_5/execution/qwen4_runtime.h"
+#include "models/qwen3_5/execution/forward_runtime.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/tp.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
@@ -536,7 +536,7 @@ struct RankStorage {
     std::optional<WorkspaceArena> work;
     Tensor prefill_hidden;
     // The Text forward's Program runtime: empty for a dense model without PLE or experts.
-    exec::Qwen4Runtime qwen4_runtime;
+    exec::ForwardRuntime forward_runtime;
 
     RankStorage(const DeviceContext& device, const qwen::TextConfig& config,
                 std::uint32_t logit_rows, KvCacheStorage storage, std::size_t workspace_bytes,
@@ -626,7 +626,7 @@ public:
                                    qwen::PagedKVCacheView{}, *storage0_.state, *storage0_.round,
                                    storage0_.prefill_hidden, chunk_, base, {},
                                    &storage0_.decoder->text_kv, nullptr, tp_, rope_delta);
-            card.set_qwen4_runtime(&storage0_.qwen4_runtime);
+            card.set_forward_runtime(&storage0_.forward_runtime);
             const auto result = card.prefill_chunk(
                 prompt, base, static_cast<std::uint32_t>(prompt.size()) - base, true);
             require(result.processed_tokens != 0, "prefill made no progress");
@@ -666,7 +666,7 @@ public:
                                qwen::PagedKVCacheView{}, *storage0_.state, *storage0_.round,
                                storage0_.prefill_hidden, chunk_, 0, {}, &storage0_.decoder->text_kv,
                                nullptr, tp_);
-        card.set_qwen4_runtime(&storage0_.qwen4_runtime);
+        card.set_forward_runtime(&storage0_.forward_runtime);
         auto& frame        = *storage0_.round->ordinary;
         Tensor hidden      = frame.hidden.slice(1, 0, 1);
         Tensor out         = frame.logits.slice(1, 0, 1);
@@ -720,7 +720,7 @@ struct PeerBinding {
                                .text_kv_table_row = storage.round->text_kv_table_row,
                                .rope_delta        = storage.round->rope_delta,
                                .ordinary          = &frame,
-                               .qwen4             = &storage.qwen4_runtime};
+                               .qwen4             = &storage.forward_runtime};
     }
 
     PeerBinding(const PeerBinding&)            = delete;
@@ -848,7 +848,7 @@ void failed_slice_closes_lanes(ExecutionContext& execution, const qwen::Model& s
                                const exec::Parameters& rank0, const exec::Parameters& rank1) {
     constexpr std::uint32_t kTokens = 512;
     require(exec::prefill_overlap_split(kTokens) == 0 &&
-                exec::prefill_slice_plan(kTokens, 0).count == 4,
+                exec::prefill_slice_plan(kTokens).count == 4,
             "the chunk no longer runs as four slices");
     ops::PeerEvents events(execution);
     ops::HostExchange exchange(execution);

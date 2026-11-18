@@ -31,6 +31,16 @@ namespace ninfer::ops {
                                                               std::int32_t max_tokens);
 
 /**
+ * Whether linear_add() registers the format and the `[output_rows,input_rows]` weight (the
+ * profiles below; Q3_G128_FP16 at any K that is a multiple of 128), so that the capacity query
+ * above accepts it for every positive T. linear_add_row_parallel() runs it at the shard shape on
+ * rank 0. A caller that holds only the weight format and shape chooses with it between this Op and
+ * a Linear + residual add. It reports no workspace and launches nothing.
+ */
+[[nodiscard]] bool linear_add_registered(QType qtype, std::int32_t output_rows,
+                                         std::int32_t input_rows);
+
+/**
  * Op: linear_add
  *
  * Math / indexing:

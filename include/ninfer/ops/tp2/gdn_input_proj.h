@@ -35,6 +35,12 @@ namespace ninfer::ops {
 // `ec.dev[r]->stream`. Inputs staged on a device's legacy default stream must be retired before
 // the call; the call does not synchronize and preserves the current device.
 
+/// Whether the column-parallel forms below (projection, conv snapshot, conv record) register the
+/// shard format and one rank's Q|K|V|Z shard `[shard_rows,input_rows]`. It launches nothing.
+[[nodiscard]] bool gdn_input_proj_column_parallel_registered(QType shard_qtype,
+                                                             std::int32_t shard_rows,
+                                                             std::int32_t input_rows);
+
 /// Per-rank transient capacity of gdn_input_proj_column_parallel for a shard profile.
 [[nodiscard]] std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(
     QType shard_qtype, std::int32_t shard_rows, std::int32_t input_rows, LinearPolicy policy,

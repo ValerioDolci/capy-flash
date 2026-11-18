@@ -6,13 +6,12 @@
 //
 //   host_exchange  the pinned-host HostExchange carries every eager all-reduce
 //                  (and its split-phase lanes): without peer access or with elastic KV (whose VMM
-//                  workspace a peer pull cannot read), unless NINFER_TP_HOST_EXCHANGE=0; always
-//                  with NINFER_TP_HOST_EXCHANGE=1.
+//                  workspace a peer pull cannot read); always with NINFER_TP_HOST_EXCHANGE=1.
 //   peer_lanes     ops::PeerLanes carry the split-phase sums of the 27B prefill
-//                  overlap over the direct peer copy: with peer access and no HostExchange, unless
-//                  NINFER_TP_PEER_OVERLAP=0. NINFER_TP_PEER_OVERLAP=force attaches them whatever
-//                  the pair (next to a HostExchange, which keeps every other eager call): a
-//                  correctness test of the lane path on boards without P2P.
+//                  overlap over the direct peer copy: with peer access and no HostExchange.
+//                  NINFER_TP_PEER_OVERLAP=force attaches them whatever the pair (next to a
+//                  HostExchange, which keeps every other eager call): a correctness test of the
+//                  lane path on boards without P2P.
 //   peer_lanes_direct  the lanes' copies are direct (peer access); false only under force
 //                  without P2P (PeerLanes(direct = false): driver-staged, host-ordered, slow).
 //
@@ -34,10 +33,10 @@ tp2_eager_transport(bool peer_access, bool elastic_kv, std::string_view host_exc
                     std::string_view peer_overlap_env) noexcept {
     Tp2EagerTransport t;
     const bool host_exchange_auto = !peer_access || elastic_kv;
-    t.host_exchange = host_exchange_env != "0" && (host_exchange_env == "1" || host_exchange_auto);
-    const bool forced   = peer_overlap_env == "force";
-    t.peer_lanes        = forced || (peer_overlap_env != "0" && peer_access && !t.host_exchange);
-    t.peer_lanes_direct = t.peer_lanes && peer_access;
+    t.host_exchange               = host_exchange_env == "1" || host_exchange_auto;
+    const bool forced             = peer_overlap_env == "force";
+    t.peer_lanes                  = forced || (peer_access && !t.host_exchange);
+    t.peer_lanes_direct           = t.peer_lanes && peer_access;
     return t;
 }
 

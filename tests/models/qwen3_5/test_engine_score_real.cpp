@@ -2,7 +2,7 @@
 // result shape, finite log-probabilities and fresh State/KV per window. With the argument "tp2" the
 // Engine scores on two devices (INT8 KV, as ninfer-perplexity --tp 2), which covers the
 // causal-score planning of a model without hyper-connections and, with the 1024-token prefill
-// chunks of scoring, the half-chunk prefill overlap of Qwen4Forward::run_plain. Returns 77 without
+// chunks of scoring, the half-chunk prefill overlap of TextForward::run_plain. Returns 77 without
 // the artifact, for tp2 without two devices, and at tp 1 when the artifact does not fit one device.
 
 #include "ninfer/engine.h"

@@ -261,9 +261,9 @@ int run_dispatch_cases() {
             ++failures;
         }
     };
-    ops::detail::q8_a8_force_mode_for_test(Q8A8Mode::Off);
+    ops::detail::q8_a8_force_mode(Q8A8Mode::Off);
     expect(false, ops::detail::q8_a8_try_dispatch(xt, weight, outt, &big, nullptr), "switched off");
-    ops::detail::q8_a8_force_mode_for_test(Q8A8Mode::G128);
+    ops::detail::q8_a8_force_mode(Q8A8Mode::G128);
     expect(false, ops::detail::q8_a8_try_dispatch(x63, weight, out63, &big, nullptr), "T = 63");
     expect(false, ops::detail::q8_a8_try_dispatch(xt, weight, outt, nullptr, nullptr),
            "no workspace");
@@ -285,7 +285,7 @@ int run_dispatch_cases() {
         std::cerr << "q8 a8 dispatch: the workspace scope was not released\n";
         ++failures;
     }
-    ops::detail::q8_a8_force_mode_for_test(Q8A8Mode::Off);
+    ops::detail::q8_a8_force_mode(Q8A8Mode::Off);
     std::cout << "q8 a8 dispatch admission and fallbacks: " << (failures ? "FAIL" : "ok") << '\n';
     return failures;
 }

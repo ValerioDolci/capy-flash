@@ -1,13 +1,13 @@
-// The [7168,5120] two-device shard's copy of nvfp4/nvfp4_attn_input_a4.cu: the same
-// source, compiled with the shard's section output and entry points (nvfp4_attn_input_shard.h),
-// behind one shard-only route choice.
-#include "ops/attn_input_proj/tp2/nvfp4_attn_input_shard_prelude.h"
+// The [7168,5120] two-device shard's A4 launcher: the parent's (nvfp4/nvfp4_attn_input_a4.cu, at
+// the shard's section output) behind one shard-only route choice (nvfp4_attn_input_shard.h).
+#include "ops/attn_input_proj/tp2/nvfp4_attn_input_shard.h"
 #include "core/tp2/device_tuning.h"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_operands.h"
 
-#include "ops/attn_input_proj/tp2/nvfp4_attn_input_shard_names.h"
-#undef nvfp4_attn_input_a4_launch
-#define nvfp4_attn_input_a4_launch nvfp4_attn_input_shard_a4_launch_upstream
-#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_a4.cu"
+#include <cuda_bf16.h>
+
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 

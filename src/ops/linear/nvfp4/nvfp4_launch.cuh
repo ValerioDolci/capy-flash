@@ -8,17 +8,6 @@
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 namespace ninfer::ops::detail {
-using Nvfp4A4Launch = void (*)(const Weight&, Tensor&, Nvfp4A4Workspace, std::int32_t,
-                               cudaStream_t);
-
-// A selected A4 route: the GEMM to run, and the activation-scale layout that GEMM reads. They
-// travel together because the quantizer writes the plane before the GEMM runs and the two must
-// agree; a shape selects a route rather than selecting the two halves separately.
-struct Nvfp4A4Route {
-    Nvfp4A4Launch launch;
-    Nvfp4ScaleLayout scales;
-};
-
 template <class Geometry, class Schedule>
 void nvfp4_linear_a16_gemv(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
@@ -73,13 +62,5 @@ constexpr Nvfp4A4Route nvfp4_a4_tma_route() {
 template <class Geometry, class Schedule>
 constexpr Nvfp4A4Route nvfp4_a4_mma_route() {
     return {nvfp4_linear_a4_mma<Geometry, Schedule>, Nvfp4ScaleLayout::RowMajor};
-}
-
-template <Nvfp4A4Route (*Select)(std::int32_t)>
-void launch_nvfp4_a4(const Tensor& x, const Weight& weight, Tensor& out, Nvfp4A4Workspace scratch,
-                     cudaStream_t stream) {
-    const Nvfp4A4Route route = Select(x.ne[1]);
-    launch_nvfp4_a4_quantize(x, weight, scratch, route.scales, stream);
-    route.launch(weight, out, scratch, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

@@ -325,6 +325,9 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
             load.host_mapped_objects - load.host_pageable_objects, load.host_mapped_objects,
             format_pretty_bytes(load.host_pageable_bytes), load.host_pageable_objects, why);
     }
+    if (!load.projection_routes.empty()) {
+        impl_->logger->info("projection routes | {}", load.projection_routes);
+    }
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
         "objects {} | host objects {}",

@@ -72,6 +72,16 @@ attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent
                                          std::int32_t input_rows, LinearPolicy policy,
                                          std::int32_t min_tokens, std::int32_t max_tokens);
 
+/**
+ * Whether the single-parent attn_input_proj() registers the format and the q|k|gate|v parent of
+ * `query_rows` query/gate and `key_rows` key/value rows over `input_rows` (the forms above, and
+ * Q3_G128_FP16 at the same shape). A caller that holds only the weight format and its attention
+ * geometry chooses with it between this Op and a Linear + row split. It reports no workspace and
+ * launches nothing.
+ */
+[[nodiscard]] bool attn_input_proj_registered(QType parent_qtype, std::int32_t query_rows,
+                                              std::int32_t key_rows, std::int32_t input_rows);
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
                      WorkspaceArena& workspace, cudaStream_t stream);

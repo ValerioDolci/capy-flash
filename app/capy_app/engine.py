@@ -23,7 +23,7 @@ from .downloads import DownloadError
 from .installer import Installer
 from .store import write_json_atomic
 
-RESTART_EXIT = 2  # ninfer-serve exits with 2 when the Engine fails: restart it (docs/serving.md)
+RESTART_EXIT = 2  # ninfer-serve exits with 2 when the Engine fails: restart it (docs/serving/endpoints.md)
 MAX_RESTARTS = 3
 RESTART_WINDOW = 600.0
 SETTLE_SECONDS = 12.0  # after stopping an engine: how long its VRAM, RAM and port may take to be free again

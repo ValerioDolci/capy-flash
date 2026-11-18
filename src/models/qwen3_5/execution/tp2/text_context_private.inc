@@ -4,7 +4,7 @@
 
 private:
 // --- tp == 2 -------------------------------------------------------------------------------
-// The Text layers run in the Qwen4 forward on both ranks (qwen4_text.cpp); these members hold
+// The Text layers run in the Text forward on both ranks (text_forward_context.cpp); these members hold
 // rank 1's bindings and the Qwen3.5 MTP head's split schedule. Rank r's work is issued on
 // ExecutionContext::dev[r]'s stream; only the collectives order the two streams.
 [[nodiscard]] bool tp2() const noexcept { return tp_ != nullptr; }

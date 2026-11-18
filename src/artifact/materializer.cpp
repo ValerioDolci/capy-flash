@@ -750,8 +750,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 backing.parent = WeightParent{geometry, base, divisor};
                 if (tail_of[i] != nullptr) { out.host_tails_->parent_tail[base] = tail_of[i]; }
                 backing.shard = {ShardAxis::HostMapped, {}, geometry.shape};
-                if (!in_pageable) {
-                    out.stats_.per_device_host_mapped_bytes[device] += placement.bytes;
+                if (!in_pageable) { // exclusive tier: without the tail, with the spare room
+                    out.stats_.per_device_host_mapped_bytes[device] +=
+                        placement.bytes + placement.spare_bytes - placement.tail_bytes;
                 }
             }
         }

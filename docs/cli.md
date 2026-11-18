@@ -210,8 +210,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--vision-device N` | CUDA device that holds the Vision tower and encodes; equal to `--device` on one GPU, one of `--devices` at `--tp 2` | `--device` |
 | `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus). Without it the mailbox is probed once at startup and dropped by itself when the probe times out or exceeds 50 ms (`NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback); an exchange that hangs in a decode graph's first launch moves the MTP draft phase, then everything, to the copies (`NINFER_TP_MAILBOX_DRAFT=copies` starts with the draft phase there; `NINFER_TP_MAILBOX_FAULT=draft\|any` simulates the hang); with `--spec mtp --lm-head-draft` the optimized proposal head is split by vocabulary across the two GPUs, and `NINFER_TP_DRAFT_HEAD=primary` keeps it whole on the first (slower, same results) | mailbox on without P2P, probed at startup |
-| `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU; frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B), identical results ([serving guide](serving.md#two-gpus)) | off |
+| `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus). Without it the mailbox is probed once at startup and dropped by itself when the probe times out or exceeds 50 ms (`NINFER_TP_MAILBOX_PROBE=off` skips the probe, `=fail` forces the fallback); an exchange that hangs in a decode graph's first launch moves the MTP draft phase, then everything, to the copies (`NINFER_TP_MAILBOX_FAULT=draft\|any` simulates the hang); with `--spec mtp --lm-head-draft` the optimized proposal head is split by vocabulary across the two GPUs | mailbox on without P2P, probed at startup |
+| `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU; frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B), identical results ([serving guide](serving/options.md#two-gpus)) | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
@@ -295,8 +295,8 @@ All weight, sequence, workspace, and graph allocations are released when the Eng
 
 `--tp 2 --devices A,B` splits an artifact across two GPUs of the same compute capability, for
 models whose weights do not fit one device (Qwen3.8-27B NVFP4 on two 16 GB boards; Qwen3.8-Flash-Next
-also runs at `--tp 2`, but it is served with `ninfer-serve --profile flash-next`, see
-[HTTP serving](serving.md#capy-flash-serving)):
+also runs at `--tp 2`, but it is served with `ninfer-serve --profile flash-next`, or `--profile flash-next-multi`
+for several clients at once, see [HTTP serving](serving/capy-flash.md#profiles)):
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --tp 2 --devices 0,1 \

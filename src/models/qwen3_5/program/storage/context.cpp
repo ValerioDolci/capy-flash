@@ -1864,7 +1864,7 @@ ProgramImpl::demote_retained_shared_kv_for_lease(const SharedPrefixHandle& share
 }
 
 bool ProgramImpl::idle_device_kv_offload() const noexcept {
-    return qwen4_elastic != nullptr && host_kv_extents != nullptr;
+    return qwen4_routed.elastic != nullptr && host_kv_extents != nullptr;
 }
 
 std::optional<std::size_t>
@@ -1901,7 +1901,7 @@ DeviceKVCompaction ProgramImpl::compact_device_kv() {
         }
     }
     out.ran            = true;
-    out.columns_before = qwen4_elastic->stats().columns;
+    out.columns_before = qwen4_routed.elastic->stats().columns;
     // Physical moves only: every copy is ordered on the compute streams before any later launch,
     // and the execution rows of the active addresses name the new pages before it.
     out.moved_pages = text_kv_pages->compact_device_replicas(device.stream);
@@ -1912,15 +1912,15 @@ DeviceKVCompaction ProgramImpl::compact_device_kv() {
         text_kv_addresses->republish_active(device.stream);
         if (backend_kv_addresses) { backend_kv_addresses->republish_active(device.stream); }
     }
-    if (qwen4_elastic->shrinkable()) {
+    if (qwen4_routed.elastic->shrinkable()) {
         // The released granules held pages read by the copies above.
         synchronize_devices();
-        qwen4_elastic->shrink_to_live();
+        qwen4_routed.elastic->shrink_to_live();
     }
     // Active KV in RAM: the Host planes' RAM follows the packed extent.
     decoder->text_kv.page_pool().trim_host_backing();
     if (qwen3_5::PagedKVCache* mtp = decoder->mtp_cache()) { mtp->page_pool().trim_host_backing(); }
-    out.columns_after = qwen4_elastic->stats().columns;
+    out.columns_after = qwen4_routed.elastic->stats().columns;
     return out;
 }
 

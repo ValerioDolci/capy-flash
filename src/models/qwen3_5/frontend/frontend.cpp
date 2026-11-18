@@ -584,6 +584,43 @@ PreparedContextCache prepare_context_cache(
     return out;
 }
 
+// Capture points sit on content frontiers, where every prompt that contains them splits its
+// prefill, so a request resumed at one runs the passes of its cold prefill. The leading
+// instructions (system messages, tools) end on such a frontier for every request that shares
+// them; a later capture point moves to the first execution frontier at or after it (the prefix up
+// to there is history in every later turn), or is dropped when the prompt has none.
+void place_capture_points(PreparedPromptData& prompt, std::optional<std::uint32_t> leading_end) {
+    auto& frontiers          = prompt.identity.rewrite_execution_frontiers;
+    const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+    std::vector<PreparedCacheOpportunity> placed;
+    placed.reserve(prompt.context_cache.opportunities.size());
+    for (PreparedCacheOpportunity opportunity : prompt.context_cache.opportunities) {
+        if (leading_end && opportunity.frontier <= *leading_end) {
+            const auto at =
+                std::lower_bound(frontiers.begin(), frontiers.end(), opportunity.frontier);
+            if (opportunity.frontier < prompt_tokens &&
+                (at == frontiers.end() || *at != opportunity.frontier)) {
+                frontiers.insert(at, opportunity.frontier);
+            }
+        } else if (opportunity.frontier != prompt_tokens) {
+            const auto at =
+                std::lower_bound(frontiers.begin(), frontiers.end(), opportunity.frontier);
+            if (at == frontiers.end()) { continue; }
+            opportunity.frontier = *at;
+        }
+        const auto same = std::find_if(placed.begin(), placed.end(), [&](const auto& existing) {
+            return existing.kind == opportunity.kind && existing.frontier == opportunity.frontier;
+        });
+        if (same == placed.end()) {
+            placed.push_back(opportunity);
+        } else {
+            same->evidence |= opportunity.evidence;
+            same->input_order = std::min(same->input_order, opportunity.input_order);
+        }
+    }
+    prompt.context_cache.opportunities = std::move(placed);
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling() {
@@ -877,10 +914,25 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable = true;
-    result.context_cache     = prepare_context_cache(
+    std::optional<std::uint32_t> leading_end;
+    if (leading_boundary && *leading_boundary < message_boundaries.size() &&
+        message_boundaries[*leading_boundary]) {
+        leading_end = *message_boundaries[*leading_boundary];
+    }
+    for (std::size_t index = 0; index < rendered_markers.size() && index < cache_boundaries.size();
+         ++index) {
+        const auto location = rendered_markers[index].location;
+        if ((location == PromptCacheMarkerLocation::ToolBoundary ||
+             location == PromptCacheMarkerLocation::LeadingInstructionBoundary) &&
+            cache_boundaries[index]) {
+            leading_end = std::max(leading_end.value_or(0U), *cache_boundaries[index]);
+        }
+    }
+    result.context_cache = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()));
+    place_capture_points(result, leading_end);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

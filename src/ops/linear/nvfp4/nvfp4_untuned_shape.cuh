@@ -3,13 +3,11 @@
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
-#include <stdexcept>
-#include <string>
-
 namespace ninfer::ops::detail::nvfp4_untuned {
 
 // A16-only selection of the Qwen3.8-Flash-Next NVFP4 shapes without a measurement of their own:
-// the Gemv and SIMT tile of n14336_k5120.cu (WideRows) or n5120_k3072.cu (NarrowRows), no A4 route.
+// the Gemv and SIMT tile of nvfp4_attn_qkgv (WideRows, nvfp4_shape_families.cuh) or
+// n5120_k3072.cu (NarrowRows), no A4 route.
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 using WideRows   = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
@@ -31,20 +29,9 @@ Nvfp4Launch select_a16(int tokens) {
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
-template <int N, int K, class Simt>
-void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
-    select_a16<N, K, Simt>(x.ne[1])(x, w, y, stream);
-}
-
-template <int N, int K>
-void no_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::invalid_argument("nvfp4 linear [" + std::to_string(N) + "," + std::to_string(K) +
-                                "]: no A4 route");
-}
-
 inline bool uses_a4(std::int32_t, std::int32_t) { return false; }
 
 template <int N, int K, class Simt>
-constexpr Nvfp4LinearShape shape{N, K, launch_a16<N, K, Simt>, no_a4<N, K>, uses_a4};
+constexpr Nvfp4LinearShape shape{N, K, select_a16<N, K, Simt>, nullptr, uses_a4};
 
 } // namespace ninfer::ops::detail::nvfp4_untuned

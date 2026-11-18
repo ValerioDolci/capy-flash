@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::ops::detail {
@@ -96,6 +97,16 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
         launch_sliced_k<Nvfp4SlicedInstance<32, 4, 2>>(x, weight, out, stream);
     else
         launch_a16_mma(x, weight, out, stream);
+}
+
+void nvfp4_linear_swiglu_sliced_k_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                         cudaStream_t stream) {
+    if (x.ne[1] <= 4)
+        launch_sliced_k<SlicedK<8, 4, 1, 4>, 4>(x, weight, out, stream);
+    else if (x.ne[1] <= 8)
+        launch_sliced_k<SlicedK<8, 2, 2, 8>>(x, weight, out, stream);
+    else
+        throw std::invalid_argument("nvfp4 linear_swiglu sliced-K: T must be at most 8");
 }
 
 } // namespace ninfer::ops::detail

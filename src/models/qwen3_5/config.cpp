@@ -233,9 +233,10 @@ TextConfig text(const Json& value, bool mtp) {
                      "seed",
                      "eos_token_id"},
                     "text config");
+    const auto model_type = artifact::require_id(value.at("model_type"), "model_type");
     TextConfig out;
-    out.architecture = resolve_architecture(
-        architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
+    out.registered              = &resolve_model(architecture(value), model_type);
+    out.architecture            = out.registered->architecture;
     out.hidden_size             = dimension(value, "hidden_size");
     out.vocab_size              = dimension(value, "vocab_size");
     out.num_hidden_layers       = dimension(value, "num_hidden_layers");
@@ -318,8 +319,8 @@ VisionConfig vision(const Json& value) {
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
                      "num_position_embeddings"},
                     {}, "vision config");
-    if (value.at("model_type") != "qwen3_5_vision" &&
-        value.at("model_type") != "qwen4_exp_vision") {
+    if (!value.at("model_type").is_string() ||
+        !registered_vision(value.at("model_type").get_ref<const std::string&>())) {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;

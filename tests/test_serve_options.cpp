@@ -470,17 +470,31 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(!defaults.turn_anchors.has_value(),
                       "turn anchors are not left to the model by default");
-    failures += check(resolve_turn_anchors(std::nullopt, "Qwen4ExpForCausalLM") == 0 &&
-                          resolve_turn_anchors(std::nullopt, "Qwen3_5ForCausalLM") == 1 &&
-                          resolve_turn_anchors(2U, "Qwen4ExpForCausalLM") == 2 &&
-                          resolve_turn_anchors(0U, "Qwen3_5ForCausalLM") == 0,
-                      "turn anchors model default (Qwen4Exp 0, others 1) not resolved");
+    failures +=
+        check(resolve_turn_anchors(std::nullopt, 0U, 1) == 0 &&
+                  resolve_turn_anchors(std::nullopt, 1U, 1) == 1 &&
+                  resolve_turn_anchors(std::nullopt, 1U, 2) == 0 &&
+                  resolve_turn_anchors(std::nullopt, 0U, 2) == 0 &&
+                  resolve_turn_anchors(1U, 1U, 2) == 1 && resolve_turn_anchors(2U, 0U, 1) == 2 &&
+                  resolve_turn_anchors(0U, 1U, 1) == 0,
+              "turn anchors: the model default at tp 1, 0 at tp 2, the flag over both");
     failures +=
         check(parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "0"}).turn_anchors == 0 &&
                   parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "3"}).turn_anchors == 3,
               "--turn-anchors did not reach serving options");
     failures += check(serve_usage_text("ninfer-serve").find("--turn-anchors") != std::string::npos,
                       "serve help omits --turn-anchors");
+    {
+        const auto off = parse({"ninfer-serve", "model.ninfer", "--no-endpoint-reuse"});
+        failures +=
+            check(defaults.context_cache.resume_session_endpoints &&
+                      !off.context_cache.resume_session_endpoints && off.context_cache.enabled,
+                  "--no-endpoint-reuse: endpoints resumed by default, not with the "
+                  "flag, cache kept on");
+    }
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--no-endpoint-reuse") != std::string::npos,
+              "serve help omits --no-endpoint-reuse");
     // Qwen4Exp product options.
     failures += check(!defaults.elastic_kv.enabled && !defaults.miss_split.has_value(),
                       "elastic KV or miss split on by default");
@@ -524,6 +538,78 @@ int main() {
                 serve_usage_text("ninfer-serve").find("--stream-min-tokens") != std::string::npos &&
                 serve_usage_text("ninfer-serve").find("--kv-ram-active") != std::string::npos,
             "serve help omits the Qwen4Exp product options");
+    }
+    // Hardware knobs (each also set by its NINFER_* variable when the flag is absent).
+    {
+        failures += check(defaults.expert_cpus.empty() && !defaults.expert_exclusive_layers &&
+                              !defaults.gguf_hybrid_cost && defaults.kv_ram_region_tokens == 0 &&
+                              defaults.kv_ram_cache_blocks == 0,
+                          "a hardware knob is set by default");
+        const auto h = parse({"ninfer-serve", "model.ninfer", "--expert-cpus", "0-3,8",
+                              "--expert-exclusive-layers", "20", "--gguf-hybrid-cost", "30,2.5,80",
+                              "--kv-ram-region-tokens", "131072", "--kv-ram-cache-blocks", "8192"});
+        failures += check(h.expert_cpus == std::vector<int>{0, 1, 2, 3, 8},
+                          "--expert-cpus did not reach serving options");
+        failures += check(h.expert_exclusive_layers == 20U,
+                          "--expert-exclusive-layers did not reach serving options");
+        failures += check(h.gguf_hybrid_cost && (*h.gguf_hybrid_cost)[0] == 30.0 &&
+                              (*h.gguf_hybrid_cost)[1] == 2.5 && (*h.gguf_hybrid_cost)[2] == 80.0,
+                          "--gguf-hybrid-cost did not reach serving options");
+        failures += check(h.kv_ram_region_tokens == 131072U && h.kv_ram_cache_blocks == 8192U,
+                          "--kv-ram-region-tokens/--kv-ram-cache-blocks did not reach serving "
+                          "options");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-exclusive-layers", "0"})
+                                  .expert_exclusive_layers == 0U,
+                          "--expert-exclusive-layers 0 is not an explicit off");
+        int rejected = 0;
+        for (const auto& bad : {std::vector<std::string>{"--expert-cpus", "1-"},
+                                std::vector<std::string>{"--expert-cpus", "x"},
+                                std::vector<std::string>{"--expert-exclusive-layers", "-1"},
+                                std::vector<std::string>{"--gguf-hybrid-cost", "35,3.6"},
+                                std::vector<std::string>{"--gguf-hybrid-cost", "35,3.6,0"},
+                                std::vector<std::string>{"--gguf-hybrid-cost", "35,3.6,100,"},
+                                std::vector<std::string>{"--kv-ram-region-tokens", "0"},
+                                std::vector<std::string>{"--kv-ram-cache-blocks", "0"}}) {
+            std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+            args.insert(args.end(), bad.begin(), bad.end());
+            try {
+                (void)parse(args);
+            } catch (const std::invalid_argument&) { ++rejected; }
+        }
+        failures += check(rejected == 8, "an invalid hardware knob was accepted");
+    }
+    // Lossy prefill switches: off unless asked (each also set by its NINFER_* variable).
+    {
+        failures +=
+            check(defaults.lossy_prefill.q8_a8 == 0 && !defaults.lossy_prefill.attn_pv_f16acc &&
+                      !defaults.lossy_prefill.tp_ar_payload_int8,
+                  "a lossy prefill switch is on by default");
+        const auto l = parse({"ninfer-serve", "model.ninfer", "--q8-a8", "128", "--attn-pv-f16acc",
+                              "--tp-ar-payload", "int8"});
+        failures += check(l.lossy_prefill.q8_a8 == 128 && l.lossy_prefill.attn_pv_f16acc &&
+                              l.lossy_prefill.tp_ar_payload_int8,
+                          "the lossy prefill switches did not reach serving options");
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer", "--q8-a8", "32"}).lossy_prefill.q8_a8 == 32 &&
+                !parse({"ninfer-serve", "model.ninfer", "--tp-ar-payload", "fp16"})
+                     .lossy_prefill.tp_ar_payload_int8,
+            "--q8-a8 32 / --tp-ar-payload fp16 misread");
+        int rejected = 0;
+        for (const auto& bad :
+             {std::vector<std::string>{"--q8-a8", "1"}, std::vector<std::string>{"--q8-a8", "0"},
+              std::vector<std::string>{"--tp-ar-payload", "bf16"}}) {
+            std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+            args.insert(args.end(), bad.begin(), bad.end());
+            try {
+                (void)parse(args);
+            } catch (const std::invalid_argument&) { ++rejected; }
+        }
+        failures += check(rejected == 3, "an invalid lossy prefill switch was accepted");
+        const std::string help = serve_usage_text("ninfer-serve");
+        failures += check(help.find("--q8-a8") != std::string::npos &&
+                              help.find("--attn-pv-f16acc") != std::string::npos &&
+                              help.find("--tp-ar-payload") != std::string::npos,
+                          "serve help omits a lossy prefill switch");
     }
     // Prompt streaming threshold.
     failures += check(!defaults.stream_min_tokens.has_value(),
@@ -781,6 +867,50 @@ int main() {
             fn1.embedding_host && fn1.context_cache.host_state_slots == 8 &&
             fn1.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
         "--profile flash-next-1gpu does not apply the one-GPU Flash-Next configuration");
+    // flash-next-multi = flash-next with the flags the multi-agent measurement used, nothing else.
+    const ServeOptions multi =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next-multi"});
+    const ServeOptions by_hand =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next", "--kv-ram-active",
+               "--max-concurrency", "3", "--kv-capacity", "786432", "--draft-tokens", "1"});
+    failures += check(
+        multi.tp == 2 && multi.devices == std::vector<int>{0, 1} &&
+            multi.kv_cache == ninfer::KvCacheStorage::Int8Group64 && multi.elastic_kv.enabled &&
+            multi.max_context == 262144 && multi.kv_capacity.explicit_tokens == 786432 &&
+            multi.max_concurrency == 3 && multi.kv_ram_active &&
+            multi.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+            multi.speculative.draft_tokens == 1 && multi.pending_timeout_ms == 600000 &&
+            multi.embedding_host && multi.context_cache.host_state_slots == 8 &&
+            multi.context_cache.host_kv_capacity_bytes == (4096ULL << 20) && !multi.enable_vision,
+        "--profile flash-next-multi does not apply the multi-request Flash-Next configuration");
+    failures += check(
+        by_hand.tp == multi.tp && by_hand.devices == multi.devices &&
+            by_hand.kv_cache == multi.kv_cache &&
+            by_hand.elastic_kv.enabled == multi.elastic_kv.enabled &&
+            by_hand.max_context == multi.max_context &&
+            by_hand.kv_capacity.explicit_tokens == multi.kv_capacity.explicit_tokens &&
+            by_hand.max_concurrency == multi.max_concurrency &&
+            by_hand.kv_ram_active == multi.kv_ram_active &&
+            by_hand.speculative.backend == multi.speculative.backend &&
+            by_hand.speculative.draft_tokens == multi.speculative.draft_tokens &&
+            by_hand.pending_timeout_ms == multi.pending_timeout_ms &&
+            by_hand.embedding_host == multi.embedding_host &&
+            by_hand.context_cache.host_state_slots == multi.context_cache.host_state_slots &&
+            by_hand.context_cache.host_kv_capacity_bytes ==
+                multi.context_cache.host_kv_capacity_bytes,
+        "--profile flash-next-multi differs from --profile flash-next with the measured flags");
+    const ServeOptions multi_one = parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "1",
+                                          "--profile", "flash-next-multi", "--draft-tokens", "3"});
+    failures +=
+        check(multi_one.max_concurrency == 1 && multi_one.speculative.draft_tokens == 3 &&
+                  multi_one.kv_ram_active && multi_one.kv_capacity.explicit_tokens == 786432,
+              "an explicit flag does not override its --profile flash-next-multi value");
+    // The launcher puts --profile flash-next first; an extra --profile flash-next-multi wins.
+    const ServeOptions launcher = parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next",
+                                         "--devices", "0,1", "--profile", "flash-next-multi"});
+    failures += check(launcher.max_concurrency == 3 && launcher.speculative.draft_tokens == 1 &&
+                          launcher.kv_ram_active && launcher.kv_capacity.explicit_tokens == 786432,
+                      "--profile flash-next-multi after --profile flash-next does not win");
     const ServeOptions single = parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb"});
     failures += check(
         single.tp == 1 && single.device == 0 && single.max_context == 65536 &&

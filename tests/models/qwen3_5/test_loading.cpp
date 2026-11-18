@@ -176,6 +176,8 @@ void logical_data_and_instances() {
     require(plan.config().text.architecture == Architecture::Qwen3_5 &&
                 plan.config().text.hidden_size == 128,
             "binding chose a checkpoint-specific geometry");
+    require(plan.config().text.registered == &resolve_model("Qwen3_5ForCausalLM", "qwen3_5_text"),
+            "the config does not carry its registry row");
     require(plan.resources().public_token_count == 265 &&
                 plan.resources().tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
             "tokenizer_config added tokens were not included in the public domain");
@@ -321,8 +323,33 @@ void invalid_model_data() {
 
 } // namespace
 
+// The registry rows the served models resolve to: Qwen3.8-27B keeps one turn anchor at tp 1,
+// Qwen4Exp (Flash-Next and the dense proxy) none.
+void registered_models() {
+    const auto& qwen3_5 = resolve_model("Qwen3_5ForCausalLM", "qwen3_5_text");
+    require(qwen3_5.architecture == Architecture::Qwen3_5 && qwen3_5.mtp == "Qwen3_5MTP" &&
+                qwen3_5.turn_anchors == 1,
+            "Qwen3.5 registry row changed");
+    const auto& qwen4 = resolve_model("Qwen4ExpForCausalLM", "qwen4_exp_text");
+    require(qwen4.architecture == Architecture::Qwen4Exp && qwen4.mtp == "Qwen4ExpMTP" &&
+                qwen4.turn_anchors == 0,
+            "Qwen4Exp registry row changed");
+    require(mtp_architecture("Qwen4ExpForCausalLM") == "Qwen4ExpMTP" &&
+                mtp_architecture("SomeFutureForCausalLM").empty(),
+            "MTP component architecture not paired by the registry");
+    require(registered_vision("qwen3_5_vision") && registered_vision("qwen4_exp_vision") &&
+                !registered_vision("qwen3_5_text"),
+            "Vision model_type not resolved by the registry");
+    require(architecture_name(Architecture::Qwen4Exp) == "Qwen4ExpForCausalLM",
+            "canonical architecture name changed");
+    rejects<std::invalid_argument>(
+        [] { (void)resolve_model("Qwen4ExpForCausalLM", "qwen3_5_text"); },
+        "mismatched architecture and model_type were accepted");
+}
+
 int main() {
     try {
+        registered_models();
         logical_data_and_instances();
         native_uses();
         invalid_model_data();

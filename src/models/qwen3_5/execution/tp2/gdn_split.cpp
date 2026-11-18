@@ -77,13 +77,16 @@ void gdn_control_split(const std::array<Tensor, 2>& hidden,
     const GdnParameters& p1 = *parameters[1];
     const std::array<Tensor, 2> a_log{p0.a_log, p1.a_log};
     const std::array<Tensor, 2> dt_bias{p0.dt_bias, p1.dt_bias};
+    // The gating follows the phase of its layer's GDN input projection (Parameters::qwen4_decode).
+    const auto policy =
+        split_policy(split_projections(parameters), "tensor-parallel GDN control projection");
     auto scope0         = workspace[0]->scope();
     auto scope1         = workspace[1]->scope();
     const auto* single0 = std::get_if<LinearParameters>(&p0.control);
     const auto* single1 = std::get_if<LinearParameters>(&p1.control);
     if (single0 != nullptr && single1 != nullptr) {
         ops::gdn_gating_proj_column_parallel(hidden, {single0->weight, single1->weight}, a_log,
-                                             dt_bias, workspace, g, beta, execution);
+                                             dt_bias, workspace, g, beta, policy, execution);
         return;
     }
     const auto* pair0 = std::get_if<ops::PairedProjectionWeights>(&p0.control);
@@ -93,7 +96,7 @@ void gdn_control_split(const std::array<Tensor, 2>& hidden,
     }
     ops::gdn_gating_proj_column_parallel(hidden, {pair0->first, pair1->first},
                                          {pair0->second, pair1->second}, a_log, dt_bias, workspace,
-                                         g, beta, execution);
+                                         g, beta, policy, execution);
 }
 
 void gdn_projection_split(const std::array<Tensor, 2>& hidden,

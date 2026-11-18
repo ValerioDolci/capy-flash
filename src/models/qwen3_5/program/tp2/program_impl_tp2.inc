@@ -5,7 +5,6 @@
 // bind_tensor_parallel_execution() at its tp 2 steps. Not a header.
 
 #include "models/qwen3_5/execution/tp2/workspace_split.h"
-#include "models/qwen3_5/execution/tp2/prefill_slices.h"
 #include "models/qwen3_5/program/tp2/eager_transport.h"
 
 #include <chrono>
@@ -25,9 +24,9 @@ namespace {
 // batch of `max_concurrency` requests, so the batched rounds stay on the mailbox instead of the
 // staged copies inside the same graph: without P2P the mailbox beats the staged copies at these
 // widths (tools/tp2/mailbox_probe.cu). Returns the wide slot's bytes, 0 for none.
-std::size_t tp2_mailbox_wide_slot_bytes(std::size_t request_bytes, std::uint32_t max_concurrency,
-                                        bool batch) {
-    return batch && max_concurrency > 1 ? request_bytes * max_concurrency : 0;
+std::size_t tp2_mailbox_wide_slot_bytes(std::size_t request_bytes,
+                                        std::uint32_t max_concurrency) {
+    return max_concurrency > 1 ? request_bytes * max_concurrency : 0;
 }
 
 // Bytes of the next GEMM's weights one decode exchange prefetches into L2 (PeerMailbox,
@@ -61,7 +60,7 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     : device(peer_device),
       elastic_arena(make_elastic_arena(plan, layout(plan), peer_device.device)),
       persistent(layout(plan).bytes, ZeroFill::Yes),
-      workspace_storage(plan.workspace.rank_capacity(1, plan.features.vision_rank), ZeroFill::Yes),
+      workspace_storage(plan.workspace.rank_capacity(1, plan.inputs.features.vision_rank), ZeroFill::Yes),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}) {
     const PersistentLayout& own = layout(plan);
     const DeviceSpan backing    = persistent.alloc_bytes(own.bytes, 256);
@@ -129,7 +128,7 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     // A scoring Program decodes nothing: its round state has no decode frame.
     if (static_cast<int>(io.ordinary.has_value()) + static_cast<int>(io.mtp_decode.has_value()) +
             static_cast<int>(io.dflash_decode.has_value()) !=
-        (plan.causal_scoring ? 0 : 1)) {
+        (plan.inputs.causal_scoring ? 0 : 1)) {
         throw std::logic_error("tensor-parallel rank 1 needs exactly one of the ordinary, MTP and "
                                "DFlash decode frames");
     }
@@ -139,19 +138,19 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
 void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                                             ExecutionContext* execution_in,
                                             const execution::Parameters* peer_parameters_in) {
-    if (plan.tp != 1 && plan.tp != execution::kTensorParallelWidth) {
+    if (plan.inputs.tp != 1 && plan.inputs.tp != execution::kTensorParallelWidth) {
         throw std::invalid_argument("Qwen3.5 Program tensor-parallel width must be 1 or 2");
     }
-    if ((plan.tp == execution::kTensorParallelWidth) !=
+    if ((plan.inputs.tp == execution::kTensorParallelWidth) !=
             (execution_in != nullptr && peer_parameters_in != nullptr) ||
-        (execution_in != nullptr && execution_in->tp != plan.tp)) {
+        (execution_in != nullptr && execution_in->tp != plan.inputs.tp)) {
         throw std::invalid_argument(
             "Qwen3.5 Program execution context does not match the sequence plan width");
     }
     if (execution_in != nullptr) {
         if (!execution_in->dev[0] || !execution_in->dev[1] || &*execution_in->dev[0] != &device ||
             &peer_parameters_in->model != &parameters.model || peer_parameters_in->device != 1 ||
-            parameters.device != 0 || parameters.model.device_count() != plan.tp) {
+            parameters.device != 0 || parameters.model.device_count() != plan.inputs.tp) {
             throw std::invalid_argument(
                 "tensor-parallel Program requires rank 0 and rank 1 Parameters of one two-device "
                 "Model on its ExecutionContext");
@@ -190,18 +189,17 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             // faster than two host hops (more than twice the prefill throughput on a P2P board).
             // So with P2P the direct copy stays, except with elastic KV, whose
             // lent workspace is VMM memory the peer pull cannot read (startup.cpp keeps
-            // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=0 / =1 force either way.
+            // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=1 forces it on.
             // enable_peer_access() only reports here: the Engine enabled it already, idempotently.
             // With peer access and no HostExchange, the 27B prefill overlap's split-phase sums take
-            // ops::PeerLanes (the direct copy on a side stream per rank) instead of falling back
-            // to one call per chunk; NINFER_TP_PEER_OVERLAP=0 keeps the one-call schedule, =force
-            // attaches the lanes without P2P too (correctness test).
+            // ops::PeerLanes (the direct copy on a side stream per rank);
+            // NINFER_TP_PEER_OVERLAP=force attaches the lanes without P2P too (correctness test).
             // The decision table is eager_transport.h (unit-tested on the host).
             const char* host_exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
             const char* peer_overlap_env  = std::getenv("NINFER_TP_PEER_OVERLAP");
             const bool peer_access        = ops::enable_peer_access(*execution_context);
             const Tp2EagerTransport eager = tp2_eager_transport(
-                peer_access, plan.elastic_kv.enabled, host_exchange_env ? host_exchange_env : "",
+                peer_access, plan.inputs.elastic_kv.enabled, host_exchange_env ? host_exchange_env : "",
                 peer_overlap_env ? peer_overlap_env : "");
             if (eager.host_exchange) {
                 host_exchange.emplace(*execution_context);
@@ -211,37 +209,24 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                 peer_lanes.emplace(*execution_context, eager.peer_lanes_direct);
                 peer_events->attach_peer_lanes(&*peer_lanes);
             }
-            tp_transport_status.eager_transport = eager.host_exchange ? "pinned host exchange"
-                                                  : peer_access       ? "direct peer copies"
-                                                                      : "driver-staged copies";
+            tp_transport_status.eager_transport =
+                eager.host_exchange ? "pinned host exchange" : "direct peer copies";
             // The plain residual (dense Qwen3.5) overlaps each prefill chunk's exchanges
-            // (Qwen4Forward::run_plain); the hyper-connection residual does not.
+            // (TextForward::run_plain); the hyper-connection residual does not.
+            // Chunks the halves do not take run sliced on the same lanes.
             if (!parameters.model.config().text.hyper_connection) {
-                const bool overlap_off = !execution::prefill_overlap_enabled();
                 tp_transport_status.prefill_overlap =
-                    overlap_off ? "off (NINFER_TP_PREFILL_OVERLAP=0)"
-                    : eager.peer_lanes
-                        ? (eager.peer_lanes_direct ? "direct peer lanes"
-                                                   : "driver-staged peer lanes (test only)")
-                    : eager.host_exchange ? "pinned host lanes"
-                                          : "off (one call per chunk)";
-                // Whether chunks the halves do not take run sliced.
-                if (!overlap_off && (eager.peer_lanes || eager.host_exchange)) {
-                    const auto mode = execution::prefill_slices_mode_env();
-                    tp_transport_status.prefill_overlap +=
-                        mode == execution::PrefillSlicesMode::Force  ? " + slices (force)"
-                        : mode == execution::PrefillSlicesMode::Auto ? " + slices"
-                                                                     : " (slices off)";
-                }
+                    eager.peer_lanes ? (eager.peer_lanes_direct
+                                            ? "direct peer lanes + slices"
+                                            : "driver-staged peer lanes (test only) + slices")
+                                     : "pinned host lanes + slices";
             }
             if (use_cuda_graph) {
                 graph_bridge.emplace(execution_context->dev[0]->device,
                                      execution_context->dev[1]->device);
-                if (plan.tp_mailbox) {
+                if (plan.inputs.tp_mailbox) {
                     // One slot carries one request's widest exchange, the [hidden, K+1]
                     // verification activation; the wide slots a full batch's.
-                    // NINFER_TP_MAILBOX_SLOT=request leaves the wide slots out (the batched
-                    // exchanges then take the staged copies), for A/B runs on one binary.
                     // Qwen4Exp exchanges its MoE partials in FP32 (allreduce_sum_f32, one
                     // rounding after the sum): its slot carries [hidden, K+1] FP32.
                     const std::size_t element = parameters.model.config().text.qwen4()
@@ -250,10 +235,8 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                     const std::size_t slot_bytes =
                         static_cast<std::size_t>(parameters.model.config().text.hidden_size) *
                         (static_cast<std::size_t>(draft_window) + 1U) * element;
-                    const char* slot_env              = std::getenv("NINFER_TP_MAILBOX_SLOT");
-                    const std::size_t wide_slot_bytes = tp2_mailbox_wide_slot_bytes(
-                        slot_bytes, max_concurrency,
-                        slot_env == nullptr || std::string_view(slot_env) != "request");
+                    const std::size_t wide_slot_bytes =
+                        tp2_mailbox_wide_slot_bytes(slot_bytes, max_concurrency);
                     peer_mailbox.emplace(*execution_context, slot_bytes, 2, wide_slot_bytes);
                     // Qwen4Exp: the exchanges release the next hyper-connection mixer early
                     // (its Down launch streams its weights under the exchange).
@@ -327,11 +310,6 @@ void ProgramImpl::bind_tensor_parallel_execution() {
     });
     tp_execution->gdn_gating = gdn_gating_overlap ? &*gdn_gating_overlap : nullptr;
     if (peer->drafter) { tp_execution->dflash = &*peer->drafter; }
-    const char* draft_env = std::getenv("NINFER_TP_MAILBOX_DRAFT");
-    if (mtp && peer_mailbox && draft_env != nullptr && std::string_view(draft_env) == "copies") {
-        tp_execution->staged_draft_collectives = true;
-        tp_transport_status.transport          = "mailbox, MTP draft on copies";
-    }
 }
 
 void ProgramImpl::attach_tensor_parallel_mirrors() {

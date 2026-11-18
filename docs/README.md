@@ -7,7 +7,7 @@ benchmarks.
 
 | Document | Purpose |
 |---|---|
-| [capy-flash serving](serving.md#capy-flash-serving) | launchers, the four profiles in full, which `install.sh --model` runs which, RAM per GPU count, chat template, CPU expert threads, client setup (Claude Code, Codex CLI, OpenCode) |
+| [capy-flash serving](serving/capy-flash.md) | launchers, the four profiles in full, which `install.sh --model` runs which, RAM per GPU count, chat template, CPU expert threads, client setup (Claude Code, Codex CLI, OpenCode) |
 | [Environment variables](capy-flash/diagnostics.md) | production settings, A/B switches, dumps and validation aids of the engine |
 | [Release tarball](../tools/release/README-release.md) | contents of the prebuilt release, requirements, launcher commands |
 | [ninfer-tp2 README](https://github.com/ValerioDolci/capy-flash/blob/v0.4.9/README.md) | the historical README of ninfer-tp2 v0.4.x, at its last tag (not current usage) |

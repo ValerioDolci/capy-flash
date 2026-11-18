@@ -99,7 +99,7 @@ count drops by about one slot per layer, and the option pays only at long contex
 
 ## Staging Ops
 
-`qsa(...)` in [`qwen4_forward/qsa.h`](../../src/models/qwen3_5/execution/qwen4_forward/qsa.h) composes the
+`qsa(...)` in [`text_forward/qsa.h`](../../src/models/qwen3_5/execution/text_forward/qsa.h) composes the
 Ops for a pool that has a region; the Program (one lane) calls them per layer.
 
 * **Prefill: `qsa_stage_visible_pages`.** The call copies the visible pages of the lane's row

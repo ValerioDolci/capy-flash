@@ -103,20 +103,9 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         }
     }
 }
-} // namespace
 
-void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                 cudaStream_t stream) {
-    if (x.ne[1] == 1) {
-        nvfp4_linear_add_decode_launch(x, weight, residual, stream);
-        return;
-    }
-    const bool output_family =
-        weight.k == Nvfp4N5120K6144::kInputRows || weight.k == Nvfp4N5120K3072::kInputRows;
-    if (x.ne[1] <= (output_family ? 2 : 5)) {
-        nvfp4_linear_add_small_t_launch(x, weight, residual, stream);
-        return;
-    }
+void launch_matrix_for(const Tensor& x, const Weight& weight, Tensor& residual,
+                       cudaStream_t stream) {
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
         launch_matrix<Nvfp4N5120K6144::kInputRows>(x, weight, residual, stream);
@@ -137,5 +126,32 @@ void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
+}
+
+bool output_family(const Weight& weight) {
+    return weight.k == Nvfp4N5120K6144::kInputRows || weight.k == Nvfp4N5120K3072::kInputRows;
+}
+} // namespace
+
+void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                 cudaStream_t stream) {
+    if (x.ne[1] == 1) {
+        nvfp4_linear_add_decode_launch(x, weight, residual, stream);
+        return;
+    }
+    if (x.ne[1] <= (output_family(weight) ? 2 : 5)) {
+        nvfp4_linear_add_small_t_launch(x, weight, residual, stream);
+        return;
+    }
+    launch_matrix_for(x, weight, residual, stream);
+}
+
+void nvfp4_linear_add_a16_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                        cudaStream_t stream) {
+    if (output_family(weight)) {
+        launch_matrix_for(x, weight, residual, stream);
+        return;
+    }
+    nvfp4_linear_add_small_t_launch(x, weight, residual, stream);
 }
 } // namespace ninfer::ops::detail

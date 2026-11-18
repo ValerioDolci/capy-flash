@@ -19,13 +19,16 @@
 #                    arms: small-T route, general route (NINFER_QWEN4_HC_GENERAL=1)
 #   q4d-5120-nvfp4   q4d-5120 snapped onto the NVFP4 grid (snap_nvfp4.py), qwen4_nvfp4;
 #                    arms: fused routes, generic chain (NINFER_QWEN4_FUSED=0)
+# The dense check at the 27B geometry is the two presets q4d-5120 q4d-5120-nvfp4: BF16 and NVFP4
+# (fused and generic routes) at tp 1 and 2 with MTP. Each arm's summary carries the engine's
+# projection routes per tp (fused or generic per Op, as in the startup log).
 # PYTHON: an interpreter with numpy, safetensors, torch and transformers with qwen4_exp (versions in
 # tools/README.md; default python3). TPS and RUNS reach engine_check.sh.
 # PREPARE_ONLY=1 stops after the CPU steps (checkpoints, artifacts, references), before the GPUs.
 # Results: <work-dir>/check-<preset>[-<arm>]/summary.txt and one line per arm in <work-dir>/summary.txt.
 # Exit 0 when every arm of every preset passes.
 set -u
-[ $# -ge 4 ] || { sed -n 2,25p "$0"; exit 2; }
+[ $# -ge 4 ] || { sed -n 2,29p "$0"; exit 2; }
 build=$1 source=$2 tokens=$3 work=$4; shift 4
 presets=("${@:-q4d-2560 q4d-2560-nople q4d-2560-silu q4d-5120 q4d-5120-nople q4d-5120-hcq8 q4d-5120-nvfp4}")
 read -r -a presets <<< "${presets[*]}"
@@ -72,6 +75,7 @@ check() { # checkpoint artifact-name arm [env...]
     "$work/$c.floor.json" "$tokens" "$out" > "$out.log" 2>&1
   local rc=$?
   log "$a${arm:+ $arm}: $([ $rc = 0 ] && echo PASS || echo "FAIL rc=$rc") ($(grep -c PASS "$out/summary.txt" 2>/dev/null) PASS, $(grep -c FAIL "$out/summary.txt" 2>/dev/null) FAIL)"
+  grep 'projection routes' "$out/summary.txt" 2>/dev/null | sed 's/^/  /' | tee -a "$work/summary.txt"
   [ $rc = 0 ] || failed=1
 }
 for preset in "${presets[@]}"; do

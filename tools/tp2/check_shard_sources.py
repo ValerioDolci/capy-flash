@@ -3,7 +3,9 @@
 
 src/ops/*/tp2/*_{shard,half}_*.{cu,cpp} include a parent launcher or plan source after a names
 header of #defines (docs/maintainer/two-gpu-layer.md §2.4). Two things would turn that into a
-silent bug after a change to the parent source, and this script fails on both:
+silent bug after a change to the parent source, and this script fails on both (a shard translation
+unit that includes neither a parent source nor a names header is ordinary code and is skipped; one
+that includes only one of the two fails):
 
 1. A template, inline, constexpr, static or kernel definition OUTSIDE an anonymous namespace in an
    included parent source: it would be compiled with different bodies in the parent's and the
@@ -62,6 +64,8 @@ for unit in sorted(units):
     incs = included(unit)
     parents = [resolve(i) for i in incs if re.search(r"\.(cu|cpp)$", i)]
     names_hdr = [resolve(i) for i in incs if i.endswith("_names.h")]
+    if not parents and not names_hdr:
+        continue  # an ordinary translation unit of the shard (its own code, nothing renamed)
     if not parents or not names_hdr:
         problems.append(f"{unit}: no parent source or names header included")
         continue

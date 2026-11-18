@@ -1,31 +1,29 @@
 # Environment variables
 
 The engine (`ninfer-serve`, `ninfer`, and the library under `src/`) reads the environment variables below. Command-line
-flags are documented in [cli.md](../cli.md) and [serving.md](../serving.md). The environment covers three things:
+flags are documented in [cli.md](../cli.md) and [serving/options.md](../serving/options.md). The environment covers three things:
 the production settings, A/B switches kept so that a change can be measured again on one binary, and validation
 and diagnostic aids.
 
 No engine variable needs to be set in production: the release launchers start `ninfer-serve` with a `--profile`
-([serving.md](../serving.md#launchers-and-profiles)).
+([serving/capy-flash.md](../serving/capy-flash.md#launchers-and-profiles)).
 
-`NINFER_HOST_MOE_A4` is on by default (keep it on) and `NINFER_RAM_GUARD` stays at its default (on). Leave every
-other variable unset in a server.
+`NINFER_RAM_GUARD` stays at its default (on). Leave every other variable unset in a server.
 
 ## How to read the tables
 
 - **Class**: *production* (set or kept on in serving), *performance* (an adopted optimization with a switch back to
-  the old behaviour), *opt-in* (off by default: a faster path that changes the arithmetic), *legacy A/B*
-  (restores an older numerical path), *diagnostic* (dumps, logs, probes, self-tests),
-  *validation* (changes execution or tokens on purpose, for exactness checks), *benchmark* (kernel candidate
-  selection).
+  the old behaviour), *opt-in* (off by default: a faster path that changes the arithmetic), *diagnostic* (dumps,
+  logs, probes, self-tests), *validation* (changes execution or tokens on purpose, for exactness checks),
+  *benchmark* (kernel candidate selection).
 - **Results**: *numerics*: the arithmetic changes, so logits and possibly tokens change. *Same bits*: the code
   states, or a test checks, that outputs are bit-identical. *Timing*: only scheduling or placement changes.
   *Tokens*: generated tokens are replaced on purpose.
 
 **Timing and numerics are coupled in the expert offload backend.** Which experts are resident on the GPU depends on
-copy timing. Without A4, a resident expert (GPU, W4A4) and a missing one (CPU, W4A8) give different results, so any
-change of timing, including the extra synchronization of a dump, can change tokens. With A4
-(the default, `NINFER_HOST_MOE_A4`) both paths use the same activation codec. Runs are still not guaranteed to be bit-reproducible
+copy timing. A resident expert (GPU) and a missing one (CPU) use the same W4A4 activation codec and the same BF16
+roundings, but sum in a different order, so a change of timing, including the extra synchronization of a dump, can
+still change tokens. Runs are not guaranteed to be bit-reproducible
 from run to run (long prefills differ even with frozen residency). For exact A/B comparisons, freeze the
 residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 
@@ -33,15 +31,14 @@ residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 
 | variable | values (default) | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_HOST_MOE_A4` | `0` / unset (on) | The CPU expert path uses the GPU kernel's W4A4 activation codec and its BF16 roundings of gate/up and h, instead of int8 activations (W4A8). Removes the CPU/GPU mix that changed answers with residency. AVX-512 implementation at no measurable cost. **On by default; keep it on.** | production | numerics |
 | `NINFER_HOST_ISA` | `auto` (default), `avx2`, `avx512` | Instruction set of the CPU expert kernels: `auto` takes AVX-512 VNNI where the CPU has it, else AVX2 + FMA + F16C; `avx2` forces the AVX2 kernels on an AVX-512 CPU (to test them); a value the CPU cannot run stops the server at startup. The log line `qwen4 experts: host expert kernels …` names the choice. Both compute identical bits (`ninfer_host_nvfp4_isa_test`); only speed differs. | performance | timing |
-| `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. Without `--host-pinned-max-gib` it also caps the page-locked weights outside free CMA memory (#40, see serving.md «RAM»). `0` skips the check and the cap. | production | none |
+| `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. Without `--host-pinned-max-gib` it also caps the page-locked weights outside free CMA memory (#40, see serving/capy-flash.md «RAM»). `0` skips the check and the cap. | production | none |
 | `NINFER_HOST_TIER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked RAM tiers of the context cache (`--host-state-slots`, `--host-kv-mib`) + max(4 GiB, 5 % of MemTotal); otherwise the server stops with the sizes. `0` skips it. | production | none |
-| `NINFER_KVRAM_CACHE_BLOCKS` | blocks (unset = 4096) | With `--kv-ram-active`: 4-token blocks of the VRAM block cache per text attention layer. Raised automatically so the region also holds one layer of `--max-context` (the prefill staging); a larger value keeps more of the indexer's past selections on the GPU at the cost of VRAM ([cost per block](../maintainer/active-kv-in-ram.md#memory)). | tuning | none (same tokens) |
-| `NINFER_KVRAM_REGION_TOKENS` | tokens (unset = 262144) | With `--kv-ram-active`: the tokens of one layer the VRAM staging region holds for prompt chunks (capped at `--max-context`). A longer visible context stages the union of each chunk's selections, by column ranges, instead of whole pages. Lower it to save VRAM at long `--max-context` or to exercise that path |
+| `NINFER_KVRAM_CACHE_BLOCKS` | blocks (unset = 4096) | Same as `--kv-ram-cache-blocks` (the flag wins). With `--kv-ram-active`: 4-token blocks of the VRAM block cache per text attention layer. Raised automatically so the region also holds one layer of `--max-context` (the prefill staging); a larger value keeps more of the indexer's past selections on the GPU at the cost of VRAM ([cost per block](../maintainer/active-kv-in-ram.md#memory)). | tuning | none (same tokens) |
+| `NINFER_KVRAM_REGION_TOKENS` | tokens (unset = 262144) | Same as `--kv-ram-region-tokens` (the flag wins). With `--kv-ram-active`: the tokens of one layer the VRAM staging region holds for prompt chunks (capped at `--max-context`). A longer visible context stages the union of each chunk's selections, by column ranges, instead of whole pages. Lower it to save VRAM at long `--max-context` or to exercise that path |
 | `NINFER_KVRAM_STATS` | `1` / unset | With `--kv-ram-active`: count the block cache's outcomes (hits, blocks shared by the columns of an MTP window, misses, uncacheable tail blocks, collisions), the staged prefill pages, and how many distinct blocks a prompt chunk's selections touch out of the visible ones, and print them summed over the layers before each prompt (`active KV stats`). Synchronizes the GPU at each prompt; diagnostics only. | diagnostics | timing |
 | `NINFER_HOST_PINNED_MAX_GIB` | GiB, may be fractional (unset = no limit) | Same as `--host-pinned-max-gib` (the flag wins): at most this much of the host-mapped weights (Flash-Next expert banks) is page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit. A value that is not a positive number stops the server at startup. | production | numerics on prompts that stream experts (the CPU computes the pageable layers' experts); slower where pageable |
-| `NINFER_QWEN4_EXCLUSIVE_LAYERS` | layers (unset or `0` = off; any other text than a number stops the start) | 64 GB edition (ggml block expert banks) on a machine with 64 GB of RAM and a desktop beside the server: in the first N expert layers the experts the GPUs hold get no page-locked host copy (an evicted one is first written back to a free host slot), which saves several GiB of RAM; the startup log prints how much. N must stay below the first layer the prefill lends, otherwise the server refuses to start and names the limit. Decode is about 2-3 % slower, and the tokens differ from a run without it (the GPUs hold other experts, the CPU computes the rest); with it on, `NINFER_QWEN4_FILL_PUBLISH_LAG` defaults to `1` and `-1` is refused at startup, so the start-up warm-up request is greedy and two starts give the same greedy text. | production | residency (tokens change) |
+| `NINFER_QWEN4_EXCLUSIVE_LAYERS` | layers (unset or `0` = off; any other text than a number stops the start) | Same as `--expert-exclusive-layers` (the flag wins). 64 GB edition (ggml block expert banks) on a machine with 64 GB of RAM and a desktop beside the server: in the first N expert layers the experts the GPUs hold get no page-locked host copy (an evicted one is first written back to a free host slot), which saves several GiB of RAM; the startup log prints how much. N must stay below the first layer the prefill lends, otherwise the server refuses to start and names the limit. Decode is about 2-3 % slower, and the tokens differ from a run without it (the GPUs hold other experts, the CPU computes the rest); with it on, `NINFER_QWEN4_FILL_PUBLISH_LAG` defaults to `1` and `-1` is refused at startup, so the start-up warm-up request is greedy and two starts give the same greedy text. | production | residency (tokens change) |
 | `NINFER_HOST_STAGING_MIB` | MiB (128) | Size of the pinned staging ring per GPU that fills expert slots from pageable banks; only allocated when some bank is pageable or `NINFER_QWEN4_EXCLUSIVE_LAYERS` is set. At least one expert, at most the fill depth. If the allocation fails the server stops and suggests lowering `--host-pinned-max-gib` or this value. | performance | timing |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, `auto` | CUDA device synchronization schedule ([cli.md](../cli.md#cuda-synchronization)). | performance | timing (host CPU use) |
 
@@ -64,23 +61,19 @@ Expert cache and prompt streaming:
 
 | variable | values (default) | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_QWEN4_EARLY_RECLAIM` | `1` (default), `2`, `0` | Reclaim lent layers before a short tail chunk: `1` overlaps the refill with the chunk, `2` makes the chunk wait for it, `0` turns it off. | performance | timing (residency) |
-| `NINFER_GGUF_HYBRID` | `1` (default), `0` | GGUF (ggml block) expert banks on one GPU: prompt chunks of 256-2,047 tokens leave part of each layer's non-resident experts to the CPU executor (not copied, skipped by the grouped GGUF call, added after it) while the GPU copies the others; `0` copies them all. | performance | numerics (CPU/GPU split) |
-| `NINFER_GGUF_HYBRID_COST` | `35,3.6,100` (default) | The cost model of `NINFER_GGUF_HYBRID` in microseconds: CPU per expert, CPU per routed token of an expert, PCIe copy per expert (measured on a Ryzen 9 9900X with DDR5 and PCIe 5.0 x8; slower RAM or a faster link want a smaller CPU share). | performance | numerics (CPU/GPU split) |
+| `NINFER_GGUF_HYBRID_COST` | `35,3.6,100` (default) | Same as `--gguf-hybrid-cost` (the flag wins). The cost model of the hybrid prefill of GGUF (ggml block) expert banks on one GPU (prompt chunks of 256-2,047 tokens leave part of each layer's non-resident experts to the CPU executor while the GPU copies the others), in microseconds: CPU per expert, CPU per routed token of an expert, PCIe copy per expert (measured on a Ryzen 9 9900X with DDR5 and PCIe 5.0 x8; slower RAM or a faster link want a smaller CPU share). | performance | numerics (CPU/GPU split) |
 | `NINFER_QWEN4_PLE_TIMING` | off (default), `1` | Prints the duration of every prefill PLE gather and prefetch to stderr (`ple_timing ...`). | diagnostics | none |
-| `NINFER_QWEN4_DRAFT_SPLIT` | on (default), `0` | At TP2 the shortlist draft head is split across the ranks; `0` keeps it on rank 0. | performance | timing (drafts only) |
 
 CPU expert executor (all bit-identical by construction):
 
 | variable | values (default) | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_HOST_MOE_CPUS` | comma list of CPU numbers and ranges (`0-7,16`); unset = automatic | Replaces the automatic CPU list of the executor: one thread per listed CPU, pinned in that order (SMT siblings may be listed); the `routed experts: N CPU threads …` startup line still prints the automatic or requested count. Unset: `--expert-cpu-threads` threads, or the automatic count, each thread pinned to its own physical core among those the process may run on (`taskset`, cgroup cpuset), spread over their L3 domains. See [serving.md](../serving.md#cpu-expert-threads). | performance | timing |
+| `NINFER_HOST_MOE_CPUS` | comma list of CPU numbers and ranges (`0-7,16`); unset = automatic | Same as `--expert-cpus` (the flag wins). Replaces the automatic CPU list of the executor: one thread per listed CPU, pinned in that order (SMT siblings may be listed); the `routed experts: N CPU threads …` startup line still prints the automatic or requested count. Unset: `--expert-cpu-threads` threads, or the automatic count, each thread pinned to its own physical core among those the process may run on (`taskset`, cgroup cpuset), spread over their L3 domains. See [serving/capy-flash.md](../serving/capy-flash.md#cpu-expert-threads). | performance | timing |
 | `NINFER_HOST_GGUF_BIG_GATHER` | unset (off), `1` | 64 GB edition on a hybrid Intel CPU without AVX-512 (Alder Lake / Raptor Lake: P- and E-cores, `/sys/devices/cpu_core/cpus`): CPU expert threads on P-cores decode IQ3_XXS / IQ3_S rows with `vpgatherdd` grid lookups (on a P-core 15 / 33 % faster than the scalar lookups, on an E-core ~2x slower, so E-cores keep them); prints `GGUF big-core decoder on N of M threads`. No effect on AVX-512 or on CPUs without E-cores. | performance | same bits |
 | `NINFER_HOST_GGUF_ECORE_TAIL` | `0` (default, off), items | With `NINFER_HOST_GGUF_BIG_GATHER=1` on a hybrid CPU: E-core threads claim no gate/up or down item of a CPU expert call once fewer than N remain, so the end of each phase runs on P-cores (an E-core item takes ~3x a P-core one). i9-14900KF, 24 threads: 24 best of 16 / 24 / 32. | performance | same bits |
 | `NINFER_QWEN4_FILL_SM` | thread blocks (unset = off) | Expert cache fills are copied by a kernel of N blocks that reads the host bank in place, instead of the copy engine; bounds the reads in flight so small PCIe reads (TP exchange, CPU partials) do not wait behind a fill. | performance | same bits |
-| `NINFER_QWEN4_FILL_PUBLISH_LAG` | `-1` (default), `1`, `2`, `3` | When an expert cache copy is published. `-1`: at the first window after the copy completed, so which experts the GPU holds, and which ones the CPU computes with another rounding, follows copy speed. `1`: at the window fixed when the copy was issued (the next one for a copy issued inside a window, the one after for a copy issued between windows), which waits for it if needed, so the residency, and the greedy text, depend on the routing alone; `2`, `3` publish one or two windows later. With `1`..`3` the server's start-up warm-up request is greedy too, and the early reclaim of lent layers waits for its refill (as `NINFER_QWEN4_EARLY_RECLAIM=2`). | performance | residency (tokens may change) |
+| `NINFER_QWEN4_FILL_PUBLISH_LAG` | `-1` (default), `1`, `2`, `3` | When an expert cache copy is published. `-1`: at the first window after the copy completed, so which experts the GPU holds, and which ones the CPU computes with another rounding, follows copy speed. `1`: at the window fixed when the copy was issued (the next one for a copy issued inside a window, the one after for a copy issued between windows), which waits for it if needed, so the residency, and the greedy text, depend on the routing alone; `2`, `3` publish one or two windows later. With `1`..`3` the server's start-up warm-up request is greedy too, and the early reclaim of lent layers waits for its refill. | performance | residency (tokens may change) |
 | `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits |
-| `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits |
 | `NINFER_TP_XIN_KERNEL` | unset / `1` (on, default), `0` (off: the copy engine) | `--tp 2` on a pair without peer access: the receive leg of the prefill exchange (MoE output and mixer output projection) is read from the peer's pinned buffer by a 16-block kernel on a stream of the device's greatest priority instead of a host-to-device copy, so it does not queue behind streamed expert weights on the copy engine. Pieces that are not 16-byte aligned keep the copy; a pair with peer access keeps the copy. | performance | same bits |
 
 ### Opt-in, off by default
@@ -89,21 +82,19 @@ Faster paths that change the arithmetic (lossy, or a different summation order).
 
 | variable | values (default) | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_Q8_A8` | `32` (or `1`), `128`, unset / `0` (off) | Q8_G32 projections at prefill widths (64 tokens and more; the four dense shapes of one Flash-Next rank at tp 2) on int8 tensor cores: activations quantized per token and 32- or 128-value group into the optional linear workspace (A16 tiles when it has no room). It overrides the artifact's activation policy: the published Flash-Next artifacts declare these weights `A16Only`. Decode and verification calls stay below 64 columns and keep the A16 tiles. | opt-in | numerics |
-| `NINFER_ATTN_PV_F16ACC` | `1` / unset (off) | INT8-KV prefill attention (the tiled kernel, more than 256 columns): P x V of each 64-key tile accumulates in FP16 (GeForce Blackwell runs the FP32-accumulating FP16 MMA at half rate) and is added to the FP32 accumulator. Runs on the ping-pong kernel (`tiled_pp_mma.cuh`). A tile overflows once its sum of p x v exceeds 65504 (`ninfer_softmax_attention_test`: equal scores and V of about 1,080 and more). | opt-in | numerics |
+| `NINFER_Q8_A8` | `32` (or `1`), `128`, unset / `0` (off) | Same as `--q8-a8` (the flag wins). Q8_G32 projections at prefill widths (64 tokens and more; the four dense shapes of one Flash-Next rank at tp 2) on int8 tensor cores: activations quantized per token and 32- or 128-value group into the optional linear workspace (A16 tiles when it has no room). It overrides the artifact's activation policy: the published Flash-Next artifacts declare these weights `A16Only`. Decode and verification calls stay below 64 columns and keep the A16 tiles. Prefill +7-8 % on 2x RTX 5070 Ti, perplexity +0.21 % (NVFP4), +0.004 % (64 GB edition). | opt-in | numerics |
+| `NINFER_ATTN_PV_F16ACC` | `1` / unset (off) | Same as `--attn-pv-f16acc`. INT8-KV prefill attention (the tiled kernel, more than 256 columns): P x V of each 64-key tile accumulates in FP16 (GeForce Blackwell runs the FP32-accumulating FP16 MMA at half rate) and is added to the FP32 accumulator. Runs on the ping-pong kernel (`tiled_pp_mma.cuh`). A tile overflows once its sum of p x v exceeds 65504 (`ninfer_softmax_attention_test`: equal scores and V of about 1,080 and more). | opt-in | numerics |
 
-## 4. Numerical paths of the TP2 exchanges (legacy A/B)
+## 4. Numerical paths of the TP2 exchanges
 
-Defaults are the adopted values. The other values restore earlier, slightly less precise paths, or select
-equivalent transports.
+Defaults are the adopted values. `int8` is an opt-in, less precise payload; the other values select equivalent
+transports.
 
 | variable | values (default) | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_TP_AR_PAYLOAD` | `fp16` (default), `int8` | Payload of the TP2 prefill MoE exchange (column groups of 2,048 that overlap the expert GEMM; the FP16 payload carries v·2^-2, saturated to the FP16 range, rescaled exactly on receipt). Decode MoE exchanges are always FP32. `int8` (opt-in, lossy): 32-row blocks of int8 codes with binary16 scales, 2,720 instead of 5,120 bytes per 2,560-row column, also for the mixer output projection; columns whose rows are not a multiple of 32 use FP16. `int8` applies to Flash-Next only: the 27B has no MoE exchange and its mixer output projections are not Q8/MXFP8, so the value has no effect there. | opt-in | numerics |
-| `NINFER_TP_HOST_EXCHANGE` | auto (default), `0`, `1` | Eager (prefill) exchanges go through pinned host buffers asynchronously. Auto: on without P2P or with `--elastic`, off with P2P (direct peer copy, faster); `0` / `1` force it. `0` brings back the driver-staged peer pull, which blocks per call and is unstable on closely spaced calls. With `--elastic` at TP2, `0` also turns off prompt-workspace borrowing, and from the code path the grouped/narrow exchange is not used. | legacy A/B | timing; prefill exchange precision |
-| `NINFER_TP_PEER_OVERLAP` | auto (default), `0`, `force` | Transport of the 27B prefill overlap's split-phase all-reduces on P2P boards: `ops::PeerLanes` pull the peer's operand device-to-device on a side stream per rank, so the pull overlaps the remaining compute (attached with P2P when no HostExchange is). `0` keeps one call per chunk (the no-overlap A/B arm); `force` attaches the lanes without P2P too, driver-staged and host-ordered (a bit test, no overlap). | performance | same bits |
-| `NINFER_TP_PREFILL_SLICES` | auto (default), `0`, `force` | Prefill chunks the half-chunk overlap cannot take (under 768 tokens, multimodal, batched-feature taps) run their row-parallel all-reduces in up to eight column slices, slice s on lane s of the split transport (HostExchange or PeerLanes), so each slice's exchange overlaps the later slices' compute. `0` off; `force` slices every chunk (bit test). `NINFER_TP_PREFILL_SLICE_TOKENS` fixes the width (a multiple of 128). `NINFER_TP_PREFILL_OVERLAP=0` turns off both overlaps. | performance | same bits |
-| `NINFER_QWEN4_REWRITE_SPLITS` | `1` / unset (off) | `1` splits the prefill at every rewrite frontier, not only at capture frontiers: much slower on multi-turn prompts. | legacy A/B | numerics (chunking) and timing |
+| `NINFER_TP_AR_PAYLOAD` | `fp16` (default), `int8` | Same as `--tp-ar-payload`. Payload of the TP2 prefill MoE exchange (column groups of 2,048 that overlap the expert GEMM; the FP16 payload carries v·2^-2, saturated to the FP16 range, rescaled exactly on receipt). Decode MoE exchanges are always FP32. `int8` (opt-in, lossy): 32-row blocks of int8 codes with binary16 scales, 2,720 instead of 5,120 bytes per 2,560-row column, also for the mixer output projection; columns whose rows are not a multiple of 32 use FP16. `int8` applies to Flash-Next only: the 27B has no MoE exchange and its mixer output projections are not Q8/MXFP8, so the value has no effect there. | opt-in | numerics |
+| `NINFER_TP_HOST_EXCHANGE` | auto (default), `1` | Eager (prefill) exchanges go through pinned host buffers asynchronously. Auto: on without P2P or with `--elastic`, off with P2P (direct peer copy, faster); `1` forces it on (a board whose P2P is faulty). | production | timing; prefill exchange precision |
+| `NINFER_TP_PEER_OVERLAP` | auto (default), `force` | Transport of the 27B prefill overlap's split-phase all-reduces on P2P boards: `ops::PeerLanes` pull the peer's operand device-to-device on a side stream per rank, so the pull overlaps the remaining compute (attached with P2P when no HostExchange is). `force` attaches the lanes without P2P too, driver-staged and host-ordered (a bit test of the P2P path, no overlap). | diagnostic (test) | same bits |
 
 ## 5. Diagnostics: observation (dumps, logs, probes)
 
@@ -116,7 +107,7 @@ note above). Variables marked *eager* need `--no-cuda-graph`.
 | `NINFER_QWEN4_ROUTING_DUMP` | file | The routing of every observed layer (binary). |
 | `NINFER_CONSTRAINT_MASK_STATS` | `1` / unset | Structured output: every 256 host mask fills, the fills, positions per fill and microseconds per fill and per position on stderr (`[constraint] ...`). |
 | `NINFER_QWEN4_ROUND_LOG` | file | One line per decode round: extent, accepted drafts, round time, host gap, misses, CPU and GPU-share experts, fill wait. |
-| `NINFER_QWEN4_MTP_CALIB` | file | One line per verified MTP round: extent, accepted, and the proposals' own log-probabilities. |
+| `NINFER_QWEN4_MTP_CALIB` | file | One line per verified MTP round: extent, accepted, and the proposals' own log-probabilities. At `--tp 2` a draft shortlist head stays on rank 0 (the split head has no log-probabilities). |
 | `NINFER_QWEN4_TOP2` | file | The target's top-2 logits for every decoded or committed verification column. |
 | `NINFER_QWEN4_MTP_PROBE` | file (eager; throws under graphs) | The inputs of every MTP-layer expert call. |
 | `NINFER_QWEN4_TFDUMP` | directory | tfdump/1 files: logits per scored or decoded position, plus the wide residual after each layer in eager prefill. |
@@ -154,17 +145,31 @@ These variables change execution on purpose so that runs can be compared exactly
 | `NINFER_QWEN4_TFDUMP_FORCE` | IDs file (gated) | Teacher-forced decode of the given sequence, prompt included. | tokens |
 | `NINFER_QWEN4_REPLAY` | file (gated) | Deterministic replay of a recorded run: forced tokens and recorded MTP drafts and extents (fast bench). | tokens |
 | `NINFER_QWEN4_REPLAY_MODEL_DRAFTS` | `1` | With `REPLAY`: where no window is recorded, keep the model's own drafts (forced targets with realistic rejections). | tokens |
-| `NINFER_QWEN4_MTP_NO_DRAFTS` | `1` | Every MTP round verifies the anchor alone: the no-draft control of an MTP run. | same tokens (greedy) |
+| `NINFER_QWEN4_MTP_NO_DRAFTS` | `1` | Every MTP round verifies the anchor alone: the no-draft control of an MTP run. On a routed-expert model (Flash-Next) compare with `NINFER_QWEN4_EXPERT_FREEZE=1` and `NINFER_QWEN4_FREEZE_FLUSH` in both runs: otherwise the different windows change the residency, and with it the tokens. | same tokens (greedy; frozen residency on Flash-Next) |
 | `NINFER_QWEN4_MTP_ORACLE` | file | Drafts are taken from whole reference sequences, so rounds are fully accepted. | same tokens (greedy) |
 | `NINFER_QWEN4_MTP_EXTENT_CAP` | k | Verify at most k proposals per round in the K-wide window (measures the cost of a column). | same tokens (greedy) |
 | `NINFER_QWEN4_HC_GENERAL` | `1` | Q8/NVFP4 hyper-connection mixers take the general (non-fused) route, to separate route from weight format. | may change rounding |
 | `NINFER_QWEN4_FUSED` | `0` / unset (on) | Every Qwen4Exp block takes the generic chain (Linear, row copies, elementwise Ops) instead of the fused Ops registered for its geometry (hidden 5120: GDN input projection and gating, QSA input projection, SwiGLU). Flash-Next (hidden 2560) has none; a dense Qwen3.5 model's blocks always take their fused Ops. | numerics |
 
-## 7. Benchmark kernel selectors
+## 7. Precision defaults: speed against distance from BF16
+
+Each default below is a chosen trade-off, not a kernel selector: it runs faster than the exact path at the price of a
+small distance from BF16 activations. The alternative stays available for comparisons.
 
 | variable | values (default) | effect | results |
 |---|---|---|---|
-| `NINFER_Q3_A8` | `1` / unset (A8, prefill ~3.5x), `0` (A16, exact BF16 activations) | 3-bit 27B prefill route for T ≥ 64 (perplexity within 0.5 % of A16). T < 64 is always A16. | `0` changes rounding |
+| `NINFER_Q3_A8` | `1` / unset (A8, default), `0` (A16) | Activations of the 3-bit Qwen3.8-27B prefill projections at T ≥ 64 (T < 64 is always A16). Default A8: int8 activations in 64-column tiles, prefill about 3.5x faster than A16, perplexity within 0.5 % of A16; the route of `--profile 27b-16gb`. `0` = A16: exact BF16 activations, the closest to BF16, with the slower prefill. | `0` changes rounding |
+
+The other precision defaults have no switch of their own:
+
+- Qwen3.8-27B NVFP4: where the artifact declares a weight `AllowA4`, its projection runs with NVFP4 activations (A4)
+  at the token widths its shape's route table selects, otherwise with BF16 activations (A16); `A16Only` weights
+  always run A16. The artifact's activation policy chooses ([weight-conversion.md](../weight-conversion.md)); no
+  measurement of the distance is recorded in these documents.
+- Qwen3.8-Flash-Next: the routed experts run W4A4 (NVFP4 activations with the calibrated per-layer divisor) on the
+  GPU and on the CPU alike (section «Timing and numerics are coupled» above); the dense Q8 projections run with BF16
+  activations (A16), and `NINFER_Q8_A8` (section 3, opt-in) trades +7-8 % prefill for perplexity +0.21 % (NVFP4) /
+  +0.004 % (64 GB edition).
 
 ## 8. Two-GPU transport
 
@@ -172,23 +177,14 @@ The defaults are right; these are for A/B runs and tests:
 
 | variable | values | effect | class | results |
 |---|---|---|---|---|
-| `NINFER_TP_MAILBOX_SLOT` | `request` | No wide mailbox slots; batched exchanges use staged copies. | legacy A/B | timing |
 | `NINFER_TP_MAILBOX_PROBE` | `off`, `fail` | Skip the startup mailbox probe, or force the fallback to copies. | diagnostic | timing |
 | `NINFER_TP_MAILBOX_FAULT` | `draft`, `any` | Simulates a mailbox hang to test the degradation path. | diagnostic (test) | timing |
-| `NINFER_TP_MAILBOX_DRAFT` | `copies` | Starts with the MTP draft exchanges on copies instead of the mailbox. | performance A/B | timing |
 
 For `--spec dflash2` only (the Qwen3.8-27B DFlash2 drafter; the `--profile` configurations draft with MTP):
 
 | variable | values | effect |
 |---|---|---|
-| `NINFER_TP_DRAFT_HEAD` | `primary` | Proposal head whole on rank 0 instead of split. |
-| `NINFER_TP_DRAFTER` | `primary` | Whole DFlash2 drafter on rank 0. |
-| `NINFER_TP_SELECTOR` | `primary` | DFlash2 candidate selector on rank 0. |
-
-Exists, but has no execution route:
-
-| variable | values | effect |
-|---|---|---|
+| `NINFER_TP_SELECTOR` | `primary` | DFlash2 candidate selector on rank 0 instead of rank 1: rounds about 0.2 % faster, 250 MB less free memory on rank 0, the rank that bounds the KV capacity. Same tokens. |
 
 ## 9. Read by tests and the validation driver only
 

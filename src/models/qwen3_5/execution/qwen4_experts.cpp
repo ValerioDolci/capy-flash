@@ -9,7 +9,7 @@
 #include "ninfer/ops/moe_grouped.h"
 #include "ninfer/ops/moe_slots.h"
 #include "ops/moe_slots_gguf/launch.h"
-#include "ops/sparse_moe/host/host_moe_mailbox.h"
+#include "ops/host_moe/host_moe_mailbox.h"
 
 #include <immintrin.h>
 
@@ -20,7 +20,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <string_view>
 #include <numeric>
 #include <thread>
 #include <cinttypes>
@@ -302,7 +301,8 @@ ops::host::HostMoeSplit host_miss_split(const MissSplitOptions& split) noexcept 
 }
 
 Qwen4OffloadOptions::Qwen4OffloadOptions(const RoutedExpertOptions& experts)
-    : cpu_threads(static_cast<std::int32_t>(experts.cpu_threads)),
+    : cpu_threads(static_cast<std::int32_t>(experts.cpu_threads)), cpus(experts.cpus),
+      exclusive_layers(experts.exclusive_layers), gguf_hybrid_cost(experts.gguf_hybrid_cost),
       insert_cap(static_cast<std::int32_t>(experts.insert_cap)),
       admit_threshold(experts.admit_threshold), half_life_tokens(experts.half_life_tokens),
       evict_tau_windows(experts.evict_tau_windows), split(host_miss_split(experts.miss_split)),
@@ -509,7 +509,7 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         options_.stream_ring_slots < kExperts) {
         throw std::invalid_argument("Qwen4Exp offload experts: invalid options");
     }
-    const std::int32_t exclusive = qwen4_exclusive_layers();
+    const std::int32_t exclusive = qwen4_exclusive_layers(options_.exclusive_layers);
     layer_base_ = layer_slot_profile(layers_, text_layers_, options_.slots_per_layer,
                                      options_.elastic_columns, partitions_, exclusive);
     layer_offset_.assign(static_cast<std::size_t>(layers_) + 1, 0);
@@ -521,7 +521,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     pool_slots_ = layers_ * (options_.slots_per_layer + options_.elastic_columns);
     if (!gguf_ && exclusive > 0) {
         throw std::invalid_argument(
-            "Qwen4Exp offload experts: NINFER_QWEN4_EXCLUSIVE_LAYERS needs ggml block banks (the "
+            "Qwen4Exp offload experts: exclusive layers (--expert-exclusive-layers, "
+            "NINFER_QWEN4_EXCLUSIVE_LAYERS) need ggml block banks (the "
             "64 GB edition)");
     }
     if (gguf_) {
@@ -574,7 +575,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             const std::int32_t limit = lend_first_ - workspace_layers_;
             if (exclusive > limit) {
                 throw std::invalid_argument(
-                    "Qwen4Exp offload experts: NINFER_QWEN4_EXCLUSIVE_LAYERS reaches the layers "
+                    "Qwen4Exp offload experts: exclusive layers (--expert-exclusive-layers, "
+                    "NINFER_QWEN4_EXCLUSIVE_LAYERS) reach the layers "
                     "the prefill lends, at most " +
                     std::to_string(limit));
             }
@@ -921,11 +923,13 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     config.device = device;
     config.layers = layers_;
     // Decode calls hand over <= 8 columns, prefill chunks their whole width in one call.
-    config.max_tokens       = std::max(options_.prompt_tokens, ops::kMoeSlotsMaxTokens);
-    config.top_k            = kTopK;
-    config.hidden           = kHidden;
-    config.intermediate     = kInter;
-    config.cpus             = ops::host::spread_cpus(options_.cpu_threads);
+    config.max_tokens   = std::max(options_.prompt_tokens, ops::kMoeSlotsMaxTokens);
+    config.top_k        = kTopK;
+    config.hidden       = kHidden;
+    config.intermediate = kInter;
+    config.cpus =
+        options_.cpus.empty() ? ops::host::spread_cpus(options_.cpu_threads) : options_.cpus;
+    config.cpus_explicit    = !options_.cpus.empty();
     config.route_log_tokens = log_tokens_;
     config.gpu_stamps       = tracing;
     // One record per publish: the Text layers once per window, every later (MTP) layer once per
@@ -936,9 +940,6 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                 : 0;
     mailbox_ =
         std::make_unique<ops::host::HostMoeMailbox>(std::move(config), std::move(host_layers));
-    if (const char* v = std::getenv("NINFER_QWEN4_EARLY_RECLAIM"); v != nullptr && *v != 0) {
-        options_.early_reclaim = std::atoi(v);
-    }
     // The validation aid decides the residency by the prompt windows.
     if (options_.freeze_after_prompt) { options_.keep_decode_residency = false; }
     served_at_begin_.assign(static_cast<std::size_t>(layers_), 0);
@@ -1090,37 +1091,44 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                      workspace_layers_);
         lent_profile_.assign(static_cast<std::size_t>(text_layers_), {});
     }
-    if (gguf_ && partitions_ == 1 && options_.gguf_stream_min_tokens > 0 &&
-        options_.gguf_cpu_hybrid) {
-        // Hybrid prefill (Qwen4OffloadOptions::gguf_cpu_hybrid).
-        const char* off  = std::getenv("NINFER_GGUF_HYBRID");
+    if (gguf_ && partitions_ == 1 && options_.gguf_stream_min_tokens > 0) {
+        // Hybrid prefill (Qwen4OffloadOptions::gguf_cpu_expert_us).
         const char* cost = std::getenv("NINFER_GGUF_HYBRID_COST");
-        double a = options_.gguf_cpu_expert_us, b = options_.gguf_cpu_route_us,
-               link = options_.gguf_link_us;
-        if (cost != nullptr && std::sscanf(cost, "%lf,%lf,%lf", &a, &b, &link) == 3 && a >= 0.0 &&
-            b >= 0.0 && link > 0.0) {
+        if (options_.gguf_hybrid_cost) {
+            const auto& c               = *options_.gguf_hybrid_cost;
+            options_.gguf_cpu_expert_us = c[0];
+            options_.gguf_cpu_route_us  = c[1];
+            options_.gguf_link_us       = c[2];
+        } else if (cost != nullptr && *cost != 0) {
+            // The same rule as --gguf-hybrid-cost: a malformed value is an error, not ignored.
+            double a = 0.0, b = 0.0, link = 0.0;
+            char tail = 0;
+            if (std::sscanf(cost, "%lf,%lf,%lf%c", &a, &b, &link, &tail) != 3 || !(a >= 0.0) ||
+                !(b >= 0.0) || !(link > 0.0) || !std::isfinite(a) || !std::isfinite(b) ||
+                !std::isfinite(link)) {
+                throw std::invalid_argument("NINFER_GGUF_HYBRID_COST must be A,B,C microseconds "
+                                            "(A, B >= 0, C > 0)");
+            }
             options_.gguf_cpu_expert_us = a;
             options_.gguf_cpu_route_us  = b;
             options_.gguf_link_us       = link;
         }
-        if (!(off != nullptr && std::string_view(off) == "0")) {
-            const ScopedCurrentDevice scope(device);
-            const std::size_t cells = static_cast<std::size_t>(text_layers_) * kExperts;
-            CUDA_CHECK(cudaMalloc(&gguf_cpu_tables_, sizeof(std::int32_t) * cells));
-            gguf_cpu_rows_.assign(cells, 0);
-            gguf_cpu_layers_.assign(static_cast<std::size_t>(text_layers_), 0);
-            if (prompt_counts_.empty()) {
-                prompt_counts_.assign(static_cast<std::size_t>(text_layers_),
-                                      std::vector<std::int32_t>(kExperts, 0));
-                prompt_counts_tokens_.assign(static_cast<std::size_t>(text_layers_), 0);
-            }
-            gguf_hybrid_ = true;
-            std::fprintf(stderr,
-                         "Qwen4Exp offload experts: ggml block banks: hybrid prefill (CPU share "
-                         "of each layer: %.1f + %.2f us per route, PCIe %.1f us per expert)\n",
-                         options_.gguf_cpu_expert_us, options_.gguf_cpu_route_us,
-                         options_.gguf_link_us);
+        const ScopedCurrentDevice scope(device);
+        const std::size_t cells = static_cast<std::size_t>(text_layers_) * kExperts;
+        CUDA_CHECK(cudaMalloc(&gguf_cpu_tables_, sizeof(std::int32_t) * cells));
+        gguf_cpu_rows_.assign(cells, 0);
+        gguf_cpu_layers_.assign(static_cast<std::size_t>(text_layers_), 0);
+        if (prompt_counts_.empty()) {
+            prompt_counts_.assign(static_cast<std::size_t>(text_layers_),
+                                  std::vector<std::int32_t>(kExperts, 0));
+            prompt_counts_tokens_.assign(static_cast<std::size_t>(text_layers_), 0);
         }
+        gguf_hybrid_ = true;
+        std::fprintf(stderr,
+                     "Qwen4Exp offload experts: ggml block banks: hybrid prefill (CPU share "
+                     "of each layer: %.1f + %.2f us per route, PCIe %.1f us per expert)\n",
+                     options_.gguf_cpu_expert_us, options_.gguf_cpu_route_us,
+                     options_.gguf_link_us);
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&enqueued_, cudaEventDisableTiming));
     CUDA_CHECK(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
@@ -1283,10 +1291,10 @@ Qwen4OffloadSplitCounters Qwen4OffloadExperts::split_counters() const noexcept {
 }
 
 bool Qwen4OffloadExperts::early_reclaim_waits() const noexcept {
-    // Deterministic publication waits as mode 2 does: with the refill overlapping the chunk (mode
-    // 1) and copies slowed down (NINFER_QWEN4_FILL_SM=2), the text of a 200k-token prompt still
-    // changed between runs; waiting first made it reproducible.
-    return options_.early_reclaim == 2 || (options_.early_reclaim > 0 && cache_->publish_lag() > 0);
+    // Deterministic publication waits for the refill: with the refill overlapping the chunk and
+    // copies slowed down (NINFER_QWEN4_FILL_SM=2), the text of a 200k-token prompt still changed
+    // between runs; waiting first made it reproducible.
+    return cache_->publish_lag() > 0;
 }
 
 void Qwen4OffloadExperts::snapshot_save_block() {
@@ -2329,11 +2337,11 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         const std::int32_t needed = wide       ? lend_first_ - chunk_workspace_layers_
                                     : streamed ? lend_first_
                                                : text_layers_;
-        if (cache_->lending() && options_.early_reclaim > 0 && cache_->lent_first() < needed) {
+        if (cache_->lending() && cache_->lent_first() < needed) {
             // Layers lent for an earlier, wider chunk that this one does not need (e.g. the
             // short tail of a prompt) go back now, so their refill overlaps this chunk instead of
-            // the first decode windows. Mode 2 waits for the refill first, so the chunk itself
-            // finds the layers filled (published below).
+            // the first decode windows. With deterministic publication the chunk waits for the
+            // refill first, so it finds the layers filled (published below).
             reclaim_lent(std::min(needed, text_layers_) - cache_->lent_first());
             if (early_reclaim_waits()) { cache_->flush(); }
         }
@@ -2350,7 +2358,7 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         const bool wide = prompt_columns_ > prompt_arena_columns();
         if (wide) { chunk_workspace_layers_ = workspace_layers_for(prompt_columns_); }
         const std::int32_t needed = wide ? lend_first_ - chunk_workspace_layers_ : text_layers_;
-        if (cache_->lending() && options_.early_reclaim > 0 && cache_->lent_first() < needed) {
+        if (cache_->lending() && cache_->lent_first() < needed) {
             reclaim_lent(std::min(needed, text_layers_) - cache_->lent_first());
             if (early_reclaim_waits()) { cache_->flush(); }
         }

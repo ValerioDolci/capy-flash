@@ -18,9 +18,9 @@ struct Int8KvCausalPlan {
 // NINFER_ATTN_PV_F16ACC=1 (opt-in): the tiled prefill runs on the ping-pong kernel
 // (tiled_pp_mma.cuh), which accumulates PV in FP16 per 64-key tile.
 bool int8_kv_pv_half_acc_enabled();
-// Test only: overrides NINFER_ATTN_PV_F16ACC (0 or 1; -1 keeps the environment). Not thread-safe;
-// applies to launches made afterwards.
-void int8_kv_pv_half_acc_for_test(int pv_half_acc) noexcept;
+// Overrides NINFER_ATTN_PV_F16ACC (0 or 1; -1 keeps the environment): EngineOptions::lossy_prefill
+// and tests. Not thread-safe; applies to launches made afterwards.
+void int8_kv_pv_half_acc_force(int pv_half_acc) noexcept;
 
 // sms is the launching device's SM count (causal_attention_sm_count()).
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,

@@ -19,6 +19,12 @@ namespace ninfer::ops {
                                                                    std::int32_t min_tokens,
                                                                    std::int32_t max_tokens);
 
+// Whether gdn_gating_proj() and gdn_norm_gating_proj() register the weight format and the
+// `[heads,input_rows]` A and B weights (BF16 `[48,5120]`). A caller that holds only the weight
+// format and shape chooses with it between these Ops and a Linear chain. It launches nothing.
+[[nodiscard]] bool gdn_gating_proj_registered(QType qtype, std::int32_t heads,
+                                              std::int32_t input_rows);
+
 // Transient capacity for the corresponding pre-normalized control Op. The query follows the same
 // interval rules and does not make the optimized route part of the semantic API.
 [[nodiscard]] std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,

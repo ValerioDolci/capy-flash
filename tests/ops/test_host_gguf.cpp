@@ -1,4 +1,4 @@
-// Host (CPU) GGUF routed-expert kernels (ops/sparse_moe/host/host_gguf.h, the fngine port) against
+// Host (CPU) GGUF routed-expert kernels (ops/host_moe/host_gguf.h, the fngine port) against
 // ggml's reference code (third_party/ggml-iq: dequantize_row_*, quantize_row_q8_{K,0}_ref,
 // ggml_vec_dot_*_generic).
 //
@@ -17,8 +17,8 @@
 //    element;
 //  - informative: relative L2 error of the kernel against FP64 products with the unquantized BF16
 //    activations (the cost of the Q8 activation codec), printed per format.
-#include "ops/sparse_moe/host/host_gguf.h"
-#include "ops/sparse_moe/host/host_q8.h"
+#include "ops/host_moe/host_gguf.h"
+#include "ops/host_moe/host_q8.h"
 
 #include "nlohmann/json.hpp"
 

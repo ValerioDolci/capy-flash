@@ -18,7 +18,7 @@
 //                and their max (the layer's MoE stage), for every g, with the fill stream on
 // One JSON object per line.
 #include "ninfer/ops/moe_slots.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include "core/arena.h"
 #include "core/device.h"

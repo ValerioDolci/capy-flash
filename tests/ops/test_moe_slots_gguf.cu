@@ -1106,8 +1106,9 @@ void run_bank(Bank& b, Gpu& g, std::mt19937_64& rng, bool bench) {
 
 // ----------------------------------------------------------------------------- probe bench
 // --probe FILE --layer L [--rank R] [--group G] [--reps N] [--dump OUT] (with a bank directory):
-// times moe_grouped_gguf on real prefill routing (NINFER_QWEN4_MOE_PROBE captures: per call I32 T,
-// x BF16 [2560,T], ids I32 [10,T], weights FP32 [10,T]) of real layer L, as rank R of tp 2 runs it:
+// times moe_grouped_gguf on real prefill routing (probe files, which no engine build writes: per
+// call I32 T, x BF16 [2560,T], ids I32 [10,T], weights FP32 [10,T]) of real layer L, as rank R of
+// tp 2 runs it:
 // every expert of the layer in a blob pool, the slot table keeping the experts with id % 2 == R
 // (the parity partition), calls cut into G-column groups as the T62 exchange does (default 2048).
 // Prints per group size the time, the useful TFLOPS (assignments of the partition x 2 x (1280 x

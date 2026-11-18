@@ -1,20 +1,16 @@
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
+#include "ops/linear/nvfp4/nvfp4_a4_tiles.h"
 
 namespace ninfer::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<5120, 6144>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
-using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
-using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+using C2 = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
@@ -30,22 +26,29 @@ Nvfp4Launch select_a16(int tokens) {
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
-void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
-    select_a16(x.ne[1])(x, w, y, stream);
+// AllowA4Decode at T=1..7: the eight-K-warp sliced-K schedule of T=3..8 at every width, instead of
+// the GEMV at T=1 and the SIMT kernel at T=2. Its reduction depends on the K-warp count only
+// (nvfp4_a16_sliced_k_mma.cuh), so every width gives a column the bits of T=4.
+// As over the two-device half (n5120_k3072.cu).
+Nvfp4Launch select_a16_decode(std::int32_t) {
+    return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
 }
 
 Nvfp4A4Route select_a4(std::int32_t tokens) {
-    if (tokens >= 1024) return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K6144>();
-    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T32R64>();
-    if (tokens <= 192) return nvfp4_a4_mma_route<Geometry, T64R128>();
-    if (tokens <= 384) return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
-    if (tokens <= 512) return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
-    return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
+    if (tokens >= kNvfp4OutputDownFamilyFirstTmaTokens)
+        return nvfp4_a4_tma_route<Nvfp4GeometryId::N5120K6144>();
+    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, Nvfp4A4T32R64>();
+    if (tokens <= 192) return nvfp4_a4_mma_route<Geometry, Nvfp4A4T64R128>();
+    if (tokens <= 384) return nvfp4_a4_mma_route<Geometry, Nvfp4A4T128R128Resident>();
+    if (tokens <= 512) return nvfp4_a4_mma_route<Geometry, Nvfp4A4T128R128Pipelined>();
+    return nvfp4_a4_mma_route<Geometry, Nvfp4A4T128R128Resident>();
 }
 
-bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
+bool uses_a4(std::int32_t, std::int32_t max_tokens) {
+    return max_tokens >= kNvfp4OutputFamilyFirstA4Tokens;
+}
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N5120K6144{5120, 6144, launch_a16, launch_nvfp4_a4<select_a4>,
-                                        uses_a4};
+const Nvfp4LinearShape kNvfp4N5120K6144{5120,      6144,    select_a16,
+                                        select_a4, uses_a4, select_a16_decode};
 } // namespace ninfer::ops::detail

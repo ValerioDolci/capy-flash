@@ -575,7 +575,7 @@ private:
             call.salvaged = true;
         } else if (is_filtered_out(call.name)) {
             // Declared but excluded for this turn (tool_choice.allowed_tools): falling back to text
-            // keeps the filter a restriction, as docs/serving.md promises.
+            // keeps the filter a restriction, as docs/serving/chat-completions.md promises.
             return FallbackReason::FilteredTool;
         } else if (find_tool_contract(contract_, call.name) == nullptr) {
             // Undeclared but request-legal name: keep the call. The client has no such tool and

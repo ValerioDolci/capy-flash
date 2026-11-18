@@ -2,7 +2,7 @@
 """Checks that no AVX / AVX2 / AVX-512 instruction runs outside the run-time-dispatched host kernels.
 
 The product targets baseline x86-64 and picks the expert kernels with cpuid (host_isa(),
-src/ops/sparse_moe/host/host_nvfp4.h), so a binary must start on a CPU without AVX-512 (Zen 2/3,
+src/ops/host_moe/host_nvfp4.h), so a binary must start on a CPU without AVX-512 (Zen 2/3,
 Intel client) and without AVX2. A VEX/EVEX instruction in any other function (a static initializer,
 a COMDAT copy of an inline/template function emitted by a file compiled with -mavx*, a probe)
 would raise SIGILL there. This scans the disassembly of the given object files / static archives /

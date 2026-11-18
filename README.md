@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.13.3**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.14.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -54,7 +54,7 @@ users report other setups. Not affiliated with Qwen or NVIDIA.
   starts anyway). On Windows/WSL2, which limit page-locked memory to about half the RAM, the layers that do not fit
   stay in pageable RAM (slower; on prompts long enough to stream experts the tokens can differ from a fully
   page-locked run, because the CPU computes those layers' experts). With the 64 GB edition on a 64 GB machine that also runs a desktop,
-  `NINFER_QWEN4_EXCLUSIVE_LAYERS=20` keeps no RAM copy of the experts the GPUs already hold in the first 20 layers
+  `--expert-exclusive-layers 20` (or `NINFER_QWEN4_EXCLUSIVE_LAYERS=20`) keeps no RAM copy of the experts the GPUs already hold in the first 20 layers
   (7.7 GiB less on two GPUs; the tokens change, and decode is about 2-3 % slower).
 
 ## Quick start
@@ -97,7 +97,7 @@ variable set the key without putting it on the command line.
   model id. It needs the chat template the launchers pass (`qwen3_8.jinja`), because Codex always sends `instructions`.
 - **OpenCode and other OpenAI clients:** base URL `http://127.0.0.1:8080/v1`, model `capy-flash` (or `qwen3.8-27b`).
 
-Details, including authentication and what each client sends: [docs/serving.md](docs/serving.md#connect-a-client).
+Details, including authentication and what each client sends: [docs/serving/capy-flash.md](docs/serving/capy-flash.md#connect-a-client).
 
 **Structured output.** `response_format` (`json_object`, `json_schema`) on Chat Completions, `text.format` on
 Responses, `output_config.format` on Messages, and the `structured_outputs` extension (`grammar`, `regex`, `choice`)
@@ -114,7 +114,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 Schemas and grammars come from the client, so they are bounded: size, nesting and item limits before compilation, a
 compilation timeout, and a time and memory budget while generating (`--constraint-*` flags). A request over a limit
 fails alone with a 400 that names the flag; the other requests keep their speed. Fields, errors, limits and cost:
-[docs/serving.md](docs/serving.md#structured-output).
+[docs/serving/structured-output.md](docs/serving/structured-output.md).
 
 ## The capy-flash app (alpha)
 
@@ -151,11 +151,12 @@ which has the three launchers ([tools/release](tools/release/README-release.md))
 
 ### Profiles
 `--profile NAME` applies the tested configuration of a model; flags given on the command line override it, in any
-order. `ninfer-serve --help` and [docs/serving.md](docs/serving.md#profiles) list the full expansions.
+order. `ninfer-serve --help` and [docs/serving/capy-flash.md](docs/serving/capy-flash.md#profiles) list the full expansions.
 
 | profile | for | in short |
 |---|---|---|
 | `flash-next` | Flash-Next on two GPUs (the launcher's default) | `--tp 2`, INT8 KV, elastic KV / expert slots, 262,144 tokens, MTP 3, 4 GiB of idle KV and 8 conversation states in RAM, embedding in RAM |
+| `flash-next-multi` | Flash-Next on two GPUs for 2-3 clients at once (agents) | `flash-next` with 3 requests at a time, the KV in RAM (`--kv-ram-active`) for 786,432 tokens in all, MTP 1 |
 | `flash-next-1gpu` | the 64 GB edition on one GPU (`NINFER_DEVICES=0`) | the same on one device, 1 GiB of idle KV and 8 states in RAM |
 | `27b` | Qwen3.8-27B NVFP4 on two GPUs | `--tp 2`, INT8 KV, 196,608 tokens, MTP 3, Vision, 8 GiB of context cache in RAM |
 | `27b-16gb` | Qwen3.8-27B 3-bit on one GPU | INT8 KV, 65,536 tokens, MTP 3, Vision, embedding in RAM (13.9 GB of VRAM) |
@@ -173,7 +174,7 @@ prefilled one at a time: a request waits at most `--pending-timeout-ms` (default
 Past the native 262,144 tokens, `--rope-yarn-factor F` (1 to 4) raises the accepted `--max-context` to 262,144 × F
 and applies YaRN as Hugging Face does (`rope_type: "yarn"`) to every text RoPE on every GPU, the Flash-Next QSA
 indexer and MTP layer included. Off by default; experimental: it costs perplexity, and its quality past the native
-window is not measured ([docs/serving.md](docs/serving.md)).
+window is not measured ([docs/serving/options.md](docs/serving/options.md)).
 
 ### Docker
 [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
@@ -208,23 +209,23 @@ Ready to serve on Hugging Face (`install.sh --model` downloads one of these; eac
   (17.4 GB, the 27B for two GPUs; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
 
 How the engine runs these models, every server flag, the RAM tiers, the chat template and the CPU threads:
-[docs/serving.md](docs/serving.md#capy-flash-serving). Environment variables and diagnostics:
+[docs/serving/capy-flash.md](docs/serving/capy-flash.md). Environment variables and diagnostics:
 [docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md). All documentation: [docs/README.md](docs/README.md).
 
 ### Optional speed switches (off by default)
 
-Three environment variables make prefill faster at the price of a small change in the numbers: two for Flash-Next,
-one for the 27B on long prompts. All three are **off by default**. Set them in the server's environment, e.g.
-`NINFER_ATTN_PV_F16ACC=1 ninfer-serve ...`.
+Three server options make prefill faster at the price of a small change in the numbers: two for Flash-Next,
+one for the 27B on long prompts. All three are **off by default**. Pass them to the server, e.g.
+`ninfer-serve ... --attn-pv-f16acc`; the environment variable in each row sets the same switch.
 
-| Variable | Applies to | What it changes | Prefill gain (2x RTX 5070 Ti, fresh prompts) | Loss, our measurements |
+| Option (variable) | Applies to | What it changes | Prefill gain (2x RTX 5070 Ti, fresh prompts) | Loss, our measurements |
 |---|---|---|---|---|
-| `NINFER_TP_AR_PAYLOAD=int8` | Flash-Next (no effect on the 27B) | the prefill exchange between the GPUs carries int8 codes with an FP16 scale per 32 rows instead of FP16 | +7-8 % | perplexity −0.22 % (NVFP4), −0.26 % (GSQ-RCO): within noise |
-| `NINFER_Q8_A8=128` (or `32`) | Flash-Next | the dense Q8 projections of the prefill run with int8 activations on the int8 tensor cores | +7-8 % | perplexity +0.21 % (NVFP4), +0.004 % (GSQ-RCO): within noise |
-| `NINFER_ATTN_PV_F16ACC=1` | the 27B (Flash-Next unchanged) | the INT8-KV prefill attention sums P x V of each 64-key tile in FP16 before adding it to the FP32 accumulator (GeForce Blackwell runs FP16 accumulation at twice the rate) | +6 % at 16k, +18 % at 64k, +25 % at 128k | perplexity +1.1 % on the full 64k corpus (p 0.29, all of it from one English domain); GSM8K (1,319) 0.9629 vs 0.9666 (p 0.23); MMLU-Pro (504) 0.8095 = 0.8095; long-context retrieval at 64k and 126k unchanged |
+| `--tp-ar-payload int8` (`NINFER_TP_AR_PAYLOAD=int8`) | Flash-Next (no effect on the 27B) | the prefill exchange between the GPUs carries int8 codes with an FP16 scale per 32 rows instead of FP16 | +7-8 % | perplexity −0.22 % (NVFP4), −0.26 % (GSQ-RCO): within noise |
+| `--q8-a8 128` or `32` (`NINFER_Q8_A8`) | Flash-Next | the dense Q8 projections of the prefill run with int8 activations on the int8 tensor cores | +7-8 % | perplexity +0.21 % (NVFP4), +0.004 % (GSQ-RCO): within noise |
+| `--attn-pv-f16acc` (`NINFER_ATTN_PV_F16ACC=1`) | the 27B (Flash-Next unchanged) | the INT8-KV prefill attention sums P x V of each 64-key tile in FP16 before adding it to the FP32 accumulator (GeForce Blackwell runs FP16 accumulation at twice the rate) | +6 % at 16k, +18 % at 64k, +25 % at 128k | perplexity +1.1 % on the full 64k corpus (p 0.29, all of it from one English domain); GSM8K (1,319) 0.9629 vs 0.9666 (p 0.23); MMLU-Pro (504) 0.8095 = 0.8095; long-context retrieval at 64k and 126k unchanged |
 
 The lossy switches change individual tokens, so they stay opt-in. On Flash-Next the loss is negligible in our tests;
-`NINFER_ATTN_PV_F16ACC` moves the 27B's perplexity more, but its answers and long-context retrieval held. The three
+`--attn-pv-f16acc` moves the 27B's perplexity more, but its answers and long-context retrieval held. The three
 Flash-Next switches together on Flash-Next NVFP4: prefill +28-29 % over the default; GSM8K (1,319 questions) 0.9788, against 0.9811
 for vLLM on a GB300 (McNemar p 0.38); MMLU-Pro (504 questions) 0.8472, against 0.8492 for the default under the same
 conditions (paired, p 1.0). Details in [docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md).
@@ -354,6 +355,18 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.14.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.14.0)), a cleanup release; same speed, greedy text can differ from v0.13.3
+- Two-GPU 27B keeps the active conversation in its context cache: coding-agent replay 303-337 s → 109 s, prefix reuse
+  53-58 % → 90 %.
+- Greedy text no longer depends on the cache's history; the 27B with MTP gives the same text at any `--draft-tokens`
+  (1-5) and with `--spec off`.
+- `--profile flash-next-multi` for two or three clients at once; `--no-endpoint-reuse`.
+- Environment variables become options (`--expert-cpus`, `--expert-exclusive-layers`, `--gguf-hybrid-cost`,
+  `--kv-ram-region-tokens`, `--kv-ram-cache-blocks`, `--q8-a8`, `--attn-pv-f16acc`, `--tp-ar-payload`); twelve variables
+  that selected internal alternatives are gone (ignored without a warning, list in the release notes).
+- The code every model runs is reorganised (Text forward, kernel route families, CPU experts in `src/ops/host_moe`);
+  `ctest -L cpu` runs the tests that need no GPU.
 
 **v0.13.3** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.13.3)), five pull requests by @Mici81, same tokens
 - Two-GPU prefill of the 64 GB edition +3-5 %: each 8192-column group of a prompt chunk goes to the other GPU as soon

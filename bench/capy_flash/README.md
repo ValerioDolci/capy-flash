@@ -10,7 +10,7 @@ total time.
 # 1. start the server under test (capy-flash below, see the main README for the build and the artifact)
 CUDA_VISIBLE_DEVICES=0,1 build/apps/ninfer-serve <artifact>.ninfer --profile flash-next --host 127.0.0.1 \
   --port 8098 --model-id capy-flash --greedy --request-log-jsonl reqlog.jsonl
-#    (one GPU, 64 GB edition: --profile flash-next-1gpu; the profiles are listed in docs/serving.md#profiles)
+#    (one GPU, 64 GB edition: --profile flash-next-1gpu; the profiles are listed in docs/serving/capy-flash.md#profiles)
 # 2. replay, then summarize
 python3 bench/capy_flash/replay.py http://127.0.0.1:8098 capy-flash bench/capy_flash/sessions.json out.jsonl 256
 python3 bench/capy_flash/summarize.py out.jsonl --ninfer-request-log reqlog.jsonl

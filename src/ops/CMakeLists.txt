@@ -35,7 +35,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/ple/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_attention/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/host_moe/sources.cmake")
 
 # GGUF routed-expert Op geometry helpers (the Op kernels: moe_slots_gguf/sources.cmake).
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/moe_slots_gguf/moe_gguf_format.cpp")

@@ -675,9 +675,9 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "ordinary decode logits");
-    qwen4_ordinary_decode(ids, cache_positions, rope_positions, kv_table_rows,
-                          linear_state_source_slots, linear_state_destination_slots, envelope,
-                          hidden, logits);
+    forward_ordinary_decode(ids, cache_positions, rope_positions, kv_table_rows,
+                            linear_state_source_slots, linear_state_destination_slots, envelope,
+                            hidden, logits);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -688,9 +688,9 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink* sink) {
     require_single_device("target verification");
-    // A drafter's feature sink rides along on the Qwen4 forward (plain residual only).
-    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                        linear_state_source_slots, envelope, hidden, logits, target_tokens, sink);
+    // A drafter's feature sink rides along on the Text forward (plain residual only).
+    forward_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                          linear_state_source_slots, envelope, hidden, logits, target_tokens, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -760,8 +760,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 // chunk's last prompt column taking the generated token; the MTP KV of every column, and on the
 // prompt's last chunk the first proposal and the autoregressive drafts into io_.mtp.
 // `alignment_ids` is the whole prompt (or the call's ids), `xf` the chunk's final-normed hidden,
-// `total` the call's token count. The Text forward's prefill (qwen4_text.cpp) calls it for a model
-// without a Qwen4 MTP layer.
+// `total` the call's token count. The Text forward's prefill (text_forward_context.cpp) calls it
+// for a model without a Qwen4 MTP layer.
 void TextContext::mtp_prompt_chunk(std::span<const int> alignment_ids,
                                    std::uint32_t alignment_begin, int len, int total, int base_i,
                                    bool is_last, const Tensor& xf, const Tensor& positions,
@@ -836,8 +836,8 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
     const TextPrefill text_prefill{full_ids, begin};
-    return qwen4_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
-                         finalize_at_end, sink);
+    return forward_prefill(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
+                           finalize_at_end, sink);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData& input,
@@ -850,8 +850,8 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     }
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
-    return qwen4_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
-                         finalize_at_end, sink);
+    return forward_prefill(tokens.subspan(begin, nominal_length), nullptr, &multimodal,
+                           finalize_at_end, sink);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

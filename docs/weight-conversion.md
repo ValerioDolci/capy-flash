@@ -57,6 +57,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_gsq3` | ISTA-DASLab 3-bit GSQ weights for one 16 GB GPU (the `27b-16gb` profile; published as `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`) | `quantized` |
+| `qwen3_8_27b_bf16_nvfp4_rtn` | From BF16 alone (RTN): MLP NVFP4 (`nvfp4_mse`, `A16Only`) in the first 7/8 of the layers, every other projection, head and embedding FP8 rows ([quantizing from BF16](maintainer/qwen4-exp-model.md#quantizing-from-bf16)) | None |
+| `qwen3_8_27b_bf16_nvfp4_rtn_all` | From BF16 alone (RTN): every projection NVFP4 (`nvfp4_mse`, `A16Only`), FP8 head and embedding (the QUASAR artifact's layout) | None |
 
 Qwen3.8-Flash-Next recipes. All keep the routed experts NVFP4 (imported from NVIDIA's checkpoint) and differ in the
 dense part; the published NVFP4 artifact uses `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8`.
@@ -94,6 +96,9 @@ the hyper-connection mixers in Q8 (the production mixer format), which runs the 
 `qwen4_nvfp4` is the same with the attention, GDN and MLP projections NVFP4 (`nvfp4_mse`, `A16Only`), the
 Qwen3.8-27B projection set: at hidden 5120 it exercises the fused routes of the Text forward
 ([fused routes](maintainer/qwen4-exp-model.md#the-text-forwards-options)).
+`qwen4_nvfp4_rtn_all` is the layout of `qwen3_8_27b_bf16_nvfp4_rtn_all` for a dense Qwen4 checkpoint: FP8
+head and embedding, and the projections outside `qwen4_nvfp4`'s set as `qwen4_nvfp4` stores them
+([quantizing from BF16](maintainer/qwen4-exp-model.md#quantizing-from-bf16)).
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -119,7 +124,7 @@ The DFlash2 drafter's MLP gate/up is stored as Q8 by the official recipes. A rec
 activations, the rest of the drafter still Q8): the artifact is 425 MiB smaller and the split drafter
 runs the fused NVFP4 SwiGLU; on two RTX 5070 Ti the C=1 decode is 1.5…2.4 % faster with the
 acceptance within ±1.2 points. Artifacts converted without it run exactly as before. The drafter's
-MLP down stays Q8: on one device (and with `NINFER_TP_DRAFTER=primary`) the drafter fuses it with
+MLP down stays Q8: on one device the drafter fuses it with
 the dynamic convolution's finish in an Op that takes Q8 weights only.
 
 The MTP layer is also stored as Q8 by the official recipes. A recipe that calls `_mtp_nvfp4_layer`

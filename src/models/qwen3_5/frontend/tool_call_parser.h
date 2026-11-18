@@ -84,8 +84,8 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time the region becomes structured calls when it parses, possibly after the
-// recoveries of docs/serving.md (undeclared or catalog-spelled names, closers at the model's stop,
-// stray closers, trailing prose); otherwise it is restored verbatim as content.
+// recoveries of docs/serving/chat-completions.md (undeclared or catalog-spelled names, closers at
+// the model's stop, stray closers, trailing prose); otherwise it is restored verbatim as content.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {

@@ -358,7 +358,7 @@ Q8A8Mode q8_a8_mode() {
     return mode;
 }
 
-void q8_a8_force_mode_for_test(Q8A8Mode mode) {
+void q8_a8_force_mode(Q8A8Mode mode) {
     g_forced.store(static_cast<int>(mode), std::memory_order_relaxed);
 }
 

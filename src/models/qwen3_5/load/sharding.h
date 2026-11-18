@@ -39,10 +39,9 @@ namespace ninfer::models::qwen3_5::loading {
 //            proposal/token_ids stays PrimaryOnly.
 //            Under DFlash2 the indexed head splits into ops::kLinearTopKSplitRows blocks and
 //            proposal/token_ids splits with it (the split top sixteen keys carry global IDs).
-//            NINFER_TP_DRAFT_HEAD=primary, and for DFlash2 NINFER_TP_DRAFTER=primary, keep them
-//            PrimaryOnly. At tp 2 the DFlash2 drafter itself splits (split_dflash2_drafter in
-//            sharding.cpp), with its candidate selector SingleDevice(1) (PrimaryOnly with Vision on
-//            rank 1, NINFER_TP_DRAFT_HEAD=primary or NINFER_TP_SELECTOR=primary).
+//            At tp 2 the DFlash2 drafter itself splits (split_dflash2_drafter in sharding.cpp),
+//            with its candidate selector SingleDevice(1) (PrimaryOnly with Vision on rank 1 or
+//            NINFER_TP_SELECTOR=primary).
 //
 // Qwen4Exp (Qwen3.8-Flash-Next) at tp 2, same contiguous head blocks:
 //

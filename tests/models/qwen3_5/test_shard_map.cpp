@@ -133,8 +133,8 @@ void logical_policy_27b() {
     {
         // Under MTP the indexed optimized proposal head splits by vocabulary rows and its token
         // IDs stay on rank 0. Under DFlash2 the head and its token IDs split by the same rows
-        // ([65536,5120] blocks for the split top sixteen). A head over the whole vocabulary,
-        // NINFER_TP_DRAFT_HEAD=primary and, for DFlash2, NINFER_TP_DRAFTER=primary stay on rank 0.
+        // ([65536,5120] blocks for the split top sixteen). A head over the whole vocabulary, or
+        // one whose rows do not split into those blocks, stays on rank 0.
         constexpr std::uint64_t proposal = 131072;
         const LoadOptions mtp{.speculative = SpeculativeBackend::Mtp, .tp = 2};
         const LoadOptions dflash2{.speculative = SpeculativeBackend::DFlash2, .tp = 2};
@@ -148,23 +148,12 @@ void logical_policy_27b() {
                {halves(proposal, 0), halves(proposal, 1)}, 0, dflash2);
         expect(config, "proposal/head", {vocab, h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
         expect(config, "proposal/head", {2 * proposal, h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        ::setenv("NINFER_TP_DRAFT_HEAD", "primary", 1);
-        expect(config, "proposal/head", {proposal, h}, ShardAxis::PrimaryOnly, {}, 0, mtp);
-        expect(config, "proposal/head", {proposal, h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        expect(config, "proposal/token_ids", {proposal}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        ::unsetenv("NINFER_TP_DRAFT_HEAD");
-        ::setenv("NINFER_TP_DRAFTER", "primary", 1);
-        expect(config, "proposal/head", {proposal, h}, ShardAxis::Rows,
-               {halves(proposal, 0), halves(proposal, 1)}, 0, mtp);
-        expect(config, "proposal/head", {proposal, h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        expect(config, "proposal/token_ids", {proposal}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        ::unsetenv("NINFER_TP_DRAFTER");
     }
     {
-        // The DFlash2 drafter splits under DFlash2 (NINFER_TP_DRAFTER=primary keeps it on rank 0):
+        // The DFlash2 drafter splits under DFlash2:
         // attention by its 32/8 heads, MLP rows and down columns, conv kernels, norms and the
         // feature projection replicated, the candidate selector on rank 1 (rank 0 with Vision on
-        // rank 1, NINFER_TP_DRAFT_HEAD=primary or NINFER_TP_SELECTOR=primary).
+        // rank 1 or NINFER_TP_SELECTOR=primary).
         auto drafted            = config;
         auto& draft             = drafted.draft.emplace();
         draft.attention         = qwen::AttentionConfig{32, 8, 128};
@@ -208,19 +197,13 @@ void logical_policy_27b() {
                     .speculative = SpeculativeBackend::DFlash2,
                     .tp          = 2,
                     .vision_rank = 1});
-            for (const auto* variable : {"NINFER_TP_SELECTOR", "NINFER_TP_DRAFT_HEAD"}) {
-                ::setenv(variable, "primary", 1);
-                expect(drafted, name, {vocab, 256}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-                ::unsetenv(variable);
-            }
+            ::setenv("NINFER_TP_SELECTOR", "primary", 1);
+            expect(drafted, name, {vocab, 256}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
+            ::unsetenv("NINFER_TP_SELECTOR");
         }
-        // Under MTP, or with NINFER_TP_DRAFTER=primary, the drafter stays whole on rank 0.
+        // Under MTP the drafter stays whole on rank 0.
         expect(drafted, d + "mlp/gate", {17408, h}, ShardAxis::PrimaryOnly, {}, 0,
                {.speculative = SpeculativeBackend::Mtp, .tp = 2});
-        ::setenv("NINFER_TP_DRAFTER", "primary", 1);
-        expect(drafted, d + "attention/query", {4096, h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        expect(drafted, "dflash2/feature_projection", {h}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
-        ::unsetenv("NINFER_TP_DRAFTER");
     }
     expect(config, "vision/layers/0/attention/query", {1152, 1152}, ShardAxis::SingleDevice, {}, 1,
            {.tp = 2, .vision_rank = 1});

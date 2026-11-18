@@ -9,6 +9,7 @@ include(cmake/ProductTests.cmake)
 include(cmake/BenchSupportTests.cmake)
 include(models/qwen3_5/tests.cmake)
 include(ops/tests.cmake)
+include(cmake/TestLabels.cmake)
 
 # One 16 GB board cannot hold two tests that each need most of it. Every test that loads a model
 # artifact (NINFER_TEST_ARTIFACT, NINFER_TEST_QWEN4_ARTIFACT, NINFER_TEST_QWEN4_VISION_ARTIFACT: several
@@ -19,6 +20,8 @@ set_tests_properties(
   ninfer_serve_engine_failure_real_test
   ninfer_serve_tp_transport_recovery_real_test
   ninfer_qwen3_5_prefix_real_test
+  ninfer_qwen4_loading_test
+  ninfer_qwen4_tp2_loading_test
   ninfer_qwen4_tp2_engine_test
   ninfer_qwen4_mtp_engine_test
   ninfer_qwen4_vision_engine_test

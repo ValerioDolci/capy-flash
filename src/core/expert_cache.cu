@@ -252,7 +252,7 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     }
     if (layout_.host_pool != nullptr && publish_lag_ < 0) {
         throw std::invalid_argument("NINFER_QWEN4_FILL_PUBLISH_LAG: the exclusive expert tier "
-                                    "(NINFER_QWEN4_EXCLUSIVE_LAYERS) needs a lag of 1..3");
+                                    "(--expert-exclusive-layers) needs a lag of 1..3");
     }
     if (const char* v = std::getenv("NINFER_QWEN4_FILL_SM"); v != nullptr && *v != 0) {
         sm_fill_ctas_ = std::clamp(std::atoi(v), 0, 1024);

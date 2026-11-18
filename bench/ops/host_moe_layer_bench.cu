@@ -17,7 +17,7 @@
 //
 // Stand-ins: a kernel holding every SM for a fixed time (globaltimer spin), for the dense part and
 // for the resident experts (~8.5 us + 3.37 us per expert at T=4).
-#include "ops/sparse_moe/host/host_moe_mailbox.h"
+#include "ops/host_moe/host_moe_mailbox.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>

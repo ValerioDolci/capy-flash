@@ -2,9 +2,7 @@
 
 // Phase allocations shared by actual execution and startup sizing. text_prefill_roots is startup
 // sizing only: the token ids, positions, rope positions and visual scatter indices a prompt chunk
-// allocates before the Text forward, plus a BF16 [H,T] `residual` that the prompt chunk does not
-// allocate (the forward allocates its residual in its own sized phase), so the reservation exceeds
-// the roots by that matrix.
+// allocates before the Text forward (the forward allocates its residual in its own sized phase).
 
 #include "core/arena.h"
 #include "core/layout.h"
@@ -28,19 +26,16 @@ struct TextPrefillRoots {
     Tensor ids;
     Tensor positions;
     Tensor rope_positions;
-    Tensor residual;
     Tensor scatter_indices;
 };
 
 template <class Allocator>
-TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& config,
-                                    std::int32_t tokens, std::int32_t rope_axes,
-                                    std::int32_t scatter_tokens) {
+TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
+                                    std::int32_t rope_axes, std::int32_t scatter_tokens) {
     TextPrefillRoots out;
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }

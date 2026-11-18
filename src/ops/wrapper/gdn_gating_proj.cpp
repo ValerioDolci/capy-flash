@@ -86,6 +86,10 @@ void require_execution(DeviceExecutionView execution, const char* op) {
 
 } // namespace
 
+bool gdn_gating_proj_registered(QType qtype, std::int32_t heads, std::int32_t input_rows) {
+    return qtype == QType::BF16 && detail::bf16_gdn_gating_admits({heads, input_rows, 1});
+}
+
 std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
@@ -219,7 +223,10 @@ void issue_shards(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& a
                   const std::array<Weight, 2>& b_weight, const std::array<Tensor, 2>& A_log,
                   const std::array<Tensor, 2>& dt_bias, const std::array<WorkspaceArena*, 2>& ws,
                   const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta,
-                  const ExecutionContext& ec) {
+                  LinearPolicy policy, const ExecutionContext& ec) {
+    if (!valid_linear_policy(policy)) {
+        throw std::invalid_argument("gdn_gating_proj column-parallel: invalid compute policy");
+    }
     for (int rank = 0; rank < 2; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
@@ -238,24 +245,29 @@ void issue_shards(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& a
         if (bytes == 0) {
             detail::bf16_gdn_gating_dispatch_shard(x[slot], a_weight[slot], b_weight[slot],
                                                    A_log[slot], dt_bias[slot], nullptr, 0, g_out,
-                                                   beta_out, stream);
+                                                   beta_out, policy, stream);
             return;
         }
         auto scope               = ws[slot]->scope();
         const DeviceSpan scratch = ws[slot]->alloc_bytes(bytes);
         detail::bf16_gdn_gating_dispatch_shard(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                                dt_bias[slot], scratch.data, scratch.bytes, g_out,
-                                               beta_out, stream);
+                                               beta_out, policy, stream);
     });
 }
 
 } // namespace
 
+bool gdn_gating_proj_column_parallel_registered(QType qtype, std::int32_t heads,
+                                                std::int32_t input_rows) {
+    return qtype == QType::BF16 && heads == kShardHeads && input_rows == kShardHidden;
+}
+
 std::size_t gdn_gating_proj_column_parallel_workspace_capacity_bytes(std::int32_t heads,
                                                                      std::int32_t input_rows,
                                                                      std::int32_t min_tokens,
                                                                      std::int32_t max_tokens) {
-    if (heads != kShardHeads || input_rows != kShardHidden) {
+    if (!gdn_gating_proj_column_parallel_registered(QType::BF16, heads, input_rows)) {
         throw std::invalid_argument(
             "gdn_gating_proj column-parallel workspace: unsupported shard profile");
     }
@@ -271,20 +283,21 @@ void gdn_gating_proj_column_parallel(
     const std::array<Tensor, 2>& x, const std::array<Weight, 2>& a_weight,
     const std::array<Weight, 2>& b_weight, const std::array<Tensor, 2>& A_log,
     const std::array<Tensor, 2>& dt_bias, const std::array<WorkspaceArena*, 2>& ws,
-    const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta, const ExecutionContext& ec) {
+    const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta, LinearPolicy policy,
+    const ExecutionContext& ec) {
     validate_shard_pair(x, ws, ec);
     for (std::size_t slot = 0; slot < 2; ++slot) {
         validate_shard_rank(x[slot], a_weight[slot], b_weight[slot], A_log[slot], dt_bias[slot],
                             g[slot], beta[slot]);
     }
-    issue_shards(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, ec);
+    issue_shards(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, policy, ec);
 }
 
 void gdn_gating_proj_column_parallel(
     const std::array<Tensor, 2>& x, const std::array<Weight, 2>& ab_weight,
     const std::array<Tensor, 2>& A_log, const std::array<Tensor, 2>& dt_bias,
     const std::array<WorkspaceArena*, 2>& ws, const std::array<Tensor, 2>& g,
-    const std::array<Tensor, 2>& beta, const ExecutionContext& ec) {
+    const std::array<Tensor, 2>& beta, LinearPolicy policy, const ExecutionContext& ec) {
     validate_shard_pair(x, ws, ec);
     std::array<Weight, 2> a_weight{};
     std::array<Weight, 2> b_weight{};
@@ -295,7 +308,7 @@ void gdn_gating_proj_column_parallel(
         validate_shard_rank(x[slot], a_weight[slot], b_weight[slot], A_log[slot], dt_bias[slot],
                             g[slot], beta[slot]);
     }
-    issue_shards(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, ec);
+    issue_shards(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, policy, ec);
 }
 
 } // namespace ninfer::ops

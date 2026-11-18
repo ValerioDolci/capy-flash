@@ -6,19 +6,41 @@ ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
 
+# The synthetic Qwen4Exp artifacts of the loading and Engine tests below. They are not generated
+# by the build: tools/capy_flash/make_test_artifact.sh writes a random checkpoint of the real
+# per-layer geometry (512 experts, about 11 GB) from the config and tokenizer of a real
+# Qwen3.8-Flash-Next checkpoint and converts it on the CPU into an artifact of about 8 GB, which is
+# too much to download or write on every build. Generate them once and give their paths here;
+# CTest then runs the tests with them, in place of the shell variables of the same names the
+# Engine tests read. Left empty, the loading tests skip (77) and the Engine tests read the shell
+# variables, skipping without them.
+set(NINFER_TEST_QWEN4_ARTIFACT "" CACHE FILEPATH
+  "Synthetic Qwen4Exp artifact with MTP (make_test_artifact.sh) for the Qwen4 loading and Engine tests")
+set(NINFER_TEST_QWEN4_VISION_ARTIFACT "" CACHE FILEPATH
+  "Synthetic Qwen4Exp artifact with Vision and MTP (make_test_artifact.sh --vision) for ninfer_qwen4_vision_engine_test")
+set(qwen4_artifact_args)
+if(NINFER_TEST_QWEN4_ARTIFACT)
+  set(qwen4_artifact_args --artifact "${NINFER_TEST_QWEN4_ARTIFACT}" --mtp)
+endif()
+
 # Qwen4Exp (Qwen3.8-Flash-Next): synthetic ModelOpt checkpoint -> both Flash-Next recipes -> load.
-# The executable alone skips (77); the interop driver supplies artifacts and expectations.
+# The interop driver below supplies tiny artifacts and expectations; on its own the test plans and
+# materializes NINFER_TEST_QWEN4_ARTIFACT (real per-layer geometry) and skips (77) without it.
 ninfer_add_test(ninfer_qwen4_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_qwen4.cpp"
-  LIBRARIES ninfer_model_loading)
+  LIBRARIES ninfer_model_loading
+  ARGS ${qwen4_artifact_args})
 
 # Qwen4Exp at tp 2: placement of every parameter of a real-geometry artifact, per-rank
-# bytes, and (two devices) every device parent byte-compared with the host-applied slice. Skips
-# (77) without --artifact.
+# bytes, and (two devices) every device parent byte-compared with the host-applied slice. Runs on
+# NINFER_TEST_QWEN4_ARTIFACT; skips (77) without it or below two devices.
 ninfer_add_test(ninfer_qwen4_tp2_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_qwen4_tp2.cpp"
-  LIBRARIES ninfer_model_loading)
+  LIBRARIES ninfer_model_loading
+  ARGS ${qwen4_artifact_args})
 
+# Needs torch and safetensors in Python3_EXECUTABLE (it writes the checkpoint and converts it,
+# a few MB and seconds on the CPU); skips (77) without them.
 add_test(NAME ninfer_qwen4_loading_interop_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/qwen4_load_interop.py"
     $<TARGET_FILE:ninfer_qwen4_loading_test>)
@@ -35,6 +57,12 @@ set_tests_properties(
 # protocol's error paths (CPU only).
 ninfer_add_test(ninfer_qwen4_offload_experts_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_offload_experts.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+# The disk tier's token identity: pictures of the same size, text-only prompts, frontiers inside
+# a Vision item (CPU only).
+ninfer_add_test(ninfer_qwen3_5_disk_identity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_disk_identity.cpp"
   LIBRARIES ninfer_model_runtime)
 
 ninfer_add_test(ninfer_qwen4_draft_head_test
@@ -113,6 +141,15 @@ ninfer_add_test(ninfer_qwen4_vision_engine_test
 set_tests_properties(
   ninfer_qwen4_vision_engine_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+if(NINFER_TEST_QWEN4_ARTIFACT)
+  set_tests_properties(ninfer_qwen4_tp2_engine_test ninfer_qwen4_mtp_engine_test PROPERTIES
+    ENVIRONMENT "NINFER_TEST_QWEN4_ARTIFACT=${NINFER_TEST_QWEN4_ARTIFACT}")
+endif()
+if(NINFER_TEST_QWEN4_VISION_ARTIFACT)
+  set_tests_properties(ninfer_qwen4_vision_engine_test PROPERTIES
+    ENVIRONMENT "NINFER_TEST_QWEN4_VISION_ARTIFACT=${NINFER_TEST_QWEN4_VISION_ARTIFACT}")
+endif()
 
 ninfer_add_test(ninfer_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"

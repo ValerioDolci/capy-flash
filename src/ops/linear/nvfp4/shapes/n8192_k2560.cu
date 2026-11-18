@@ -1,12 +1,11 @@
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
-#include <stdexcept>
 
 namespace ninfer::ops::detail {
 // Qwen3.8-Flash-Next: GDN in_proj qkv+z, one TP2 rank (10240/2 + 6144/2). A16 only (decode);
-// schedules inherited from n14336_k5120.cu, not re-measured at this shape. No A4 route: uses_a4 is
-// always false.
+// schedules inherited from nvfp4_attn_qkgv (nvfp4_shape_families.cuh), not re-measured at this
+// shape. No A4 route: uses_a4 is always false.
 namespace {
 using Geometry = Nvfp4Geometry<8192, 2560>;
 using Gemv =
@@ -28,16 +27,8 @@ Nvfp4Launch select_a16(int tokens) {
     return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
 }
 
-void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
-    select_a16(x.ne[1])(x, w, y, stream);
-}
-
-void no_a4(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t) {
-    throw std::invalid_argument("nvfp4 linear [8192,2560]: no A4 route");
-}
-
 bool uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
-const Nvfp4LinearShape kNvfp4N8192K2560{8192, 2560, launch_a16, no_a4, uses_a4};
+const Nvfp4LinearShape kNvfp4N8192K2560{8192, 2560, select_a16, nullptr, uses_a4};
 } // namespace ninfer::ops::detail

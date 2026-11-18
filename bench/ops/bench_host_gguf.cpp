@@ -19,9 +19,9 @@
 //    distinct missing experts per call, the decode pattern (~1.5 tokens per expert), T = 1 and 4;
 //    NVFP4 through the engine's HostMoeExecutor, GGUF through an executor of the same two-phase
 //    Static shape written here (gate/up in 32-row slices, barrier, down in 32-row output slices).
-#include "ops/sparse_moe/host/host_gguf.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
-#include "ops/sparse_moe/host/host_nvfp4.h"
+#include "ops/host_moe/host_gguf.h"
+#include "ops/host_moe/host_moe_executor.h"
+#include "ops/host_moe/host_nvfp4.h"
 
 #include "nlohmann/json.hpp"
 

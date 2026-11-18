@@ -244,8 +244,8 @@ public:
         std::optional<Choice> choice;
     };
 
-    // `reclaim_private_for_capture` is for Programs without a Host StateImage tier (Engine: tp 2
-    // only); see reclaim_private_owners_for_capture().
+    // `reclaim_private_for_capture` is for Programs whose prefill captures may find every
+    // StateImage pool full (Engine: tp 2); see reclaim_private_owners_for_capture().
     ResourceManager(std::uint32_t lane_count, std::uint32_t private_catalog_capacity,
                     std::uint32_t shared_catalog_capacity, bool cache_enabled,
                     std::uint32_t max_long_anchors, ContextMachineCostModel cost_model,
@@ -574,6 +574,7 @@ public:
         if (exact_shared != nullptr) {
             reclaim_private_owners_for_capture(program, private_baseline, reassess_private);
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                note_skipped_private_capture(private_baseline);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
             }
@@ -828,6 +829,7 @@ public:
         if (!selected) {
             reclaim_private_owners_for_capture(program, private_baseline, reassess_private);
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                note_skipped_private_capture(private_baseline);
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
             }
@@ -1990,6 +1992,24 @@ private:
         return tokens;
     }
 
+    [[nodiscard]] static std::uint64_t saturating_add_u64(std::uint64_t a,
+                                                          std::uint64_t b) noexcept {
+        return a > std::numeric_limits<std::uint64_t>::max() - b
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : a + b;
+    }
+
+    // A private capture the reclaim could not make room for adds the work it would have protected
+    // to the debt (only where the capture reclaim is enabled).
+    void note_skipped_private_capture(const CaptureAssessment& baseline) noexcept {
+        if (!reclaim_private_for_capture_ || !baseline.publishes_private ||
+            baseline.physically_feasible) {
+            return;
+        }
+        capture_skip_debt_ =
+            saturating_add_u64(capture_skip_debt_, baseline.protected_rebuild_work.tokens);
+    }
+
     [[nodiscard]] static std::uint64_t reclaim_priority(const CatalogEntry& entry) noexcept {
         const std::uint64_t cost = continuation_rebuild_tokens(entry.summary);
         return entry.reclaim_floor > std::numeric_limits<std::uint64_t>::max() - cost
@@ -2036,7 +2056,15 @@ private:
                                             Reassess&& reassess) {
         if (!reclaim_private_for_capture_) { return; }
         while (baseline.publishes_private && !baseline.physically_feasible) {
-            const std::uint64_t protected_tokens = baseline.protected_rebuild_work.tokens;
+            // A continuation (or anchor) is worth its GreedyDual priority, the inflation when it
+            // was last used plus its rebuild tokens; the capture may take it when that is no more
+            // than the capture's own priority now (inflation plus the work it protects) plus the
+            // work already lost to skipped captures. A one-off side capture never pays for a long
+            // session; a session nobody returns to ages out as releases raise the inflation, or as
+            // an active conversation keeps losing its turn checkpoints to it.
+            const std::uint64_t allowance = saturating_add_u64(
+                saturating_add_u64(reclaim_inflation_, baseline.protected_rebuild_work.tokens),
+                capture_skip_debt_);
             std::optional<std::uint32_t> victim;
             std::optional<std::uint32_t> anchored;
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -2046,12 +2074,14 @@ private:
                     private_has_active_edge(slot)) {
                     continue;
                 }
-                if (continuation_rebuild_tokens(entry.summary) <= protected_tokens &&
+                if (reclaim_priority(entry) <= allowance &&
                     (!victim || reclaim_key(entry) < reclaim_key(catalog_[*victim]))) {
                     victim = slot;
                 }
                 if (!entry.summary.long_anchors.empty() &&
-                    lowest_long_anchor(entry.summary)->rebuild_work.tokens <= protected_tokens &&
+                    saturating_add_u64(entry.reclaim_floor,
+                                       lowest_long_anchor(entry.summary)->rebuild_work.tokens) <=
+                        allowance &&
                     (!anchored || reclaim_key(entry) < reclaim_key(catalog_[*anchored]))) {
                     anchored = slot;
                 }
@@ -2065,6 +2095,7 @@ private:
             reclaim_inflation_  = std::max(reclaim_inflation_, reclaim_priority(entry));
             const auto released = program.release_continuation(std::move(*entry.handle));
             if (released.status != ConsumeStatus::Consumed) { return; }
+            capture_skip_debt_          = 0;
             const std::uint32_t dropped = continuation_checkpoint_count(entry.summary);
             erase_session_if_owner(entry.id);
             clear_catalog_entry(entry);
@@ -3883,6 +3914,10 @@ private:
     RuntimeStats context_stats_;
     std::uint64_t next_continuation_id_ = 1;
     std::uint64_t reclaim_inflation_    = 0;
+    // Rebuild tokens of the private captures skipped for lack of StateImages since the capture
+    // reclaim last released a continuation (reclaim_private_owners_for_capture): once the work a
+    // conversation keeps losing exceeds what an idle continuation is worth, that one goes.
+    std::uint64_t capture_skip_debt_ = 0;
     std::vector<bool> lease_demote_tried_; // reclaim_device_kv_for_lease: one demotion per owner
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;

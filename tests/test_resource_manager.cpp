@@ -3306,6 +3306,44 @@ void test_hostless_private_capture_reclaim_never_pays_more_than_it_protects() {
     (void)finish_active(manager, program, active, 12);
 }
 
+// An idle session that costs more to rebuild than one capture protects stays (above), but not
+// forever: the work lost by the captures it keeps out accumulates, and once it covers the session's
+// priority the session is released and the debt starts again (three agent sessions in a row on two
+// GPUs otherwise lost every turn closure after the first session).
+void test_hostless_private_capture_debt_releases_abandoned_session() {
+    FakeManager manager(1, 3, 0, true, 2, test_cost_model(), true);
+    FakeProgram program;
+    const ActiveRequest session = start_active(manager, program, 95, make_base(95), 1);
+    (void)finish_active(manager, program, session, 300);
+    const ActiveRequest active = start_active(manager, program, 96, make_base(96), 2);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 96, .frontier = 12},
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_private      = true,
+        .physically_feasible    = false,
+    };
+    program.capture_summary.endpoint        = endpoint(96, 12);
+    program.capture_feasible_after_releases = 1;
+    for (std::uint32_t offer = 0; offer < 4; ++offer) {
+        const auto reserved = manager.reserve_active_capture(
+            program, active.lane, FakeCaptureOffer{.id = 40 + offer}, 0, {});
+        require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped &&
+                    program.released_continuations.empty() && program.skipped_captures == offer + 1,
+                "a capture released the session before the skipped work covered it");
+    }
+    // Debt 4 x 64 = 256: 64 + 256 >= 300.
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 44}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved &&
+                program.released_continuations == std::vector<std::uint32_t>{session.sequence.id},
+            "the skipped captures' debt did not release the abandoned session");
+    auto progress      = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published,
+            "the capture did not publish after the debt released the session");
+    (void)finish_active(manager, program, active, 12);
+}
+
 void test_projected_nested_shared_candidates_use_marginal_value() {
     FakeManager manager = make_manager(1, 2, 2);
     FakeProgram program;
@@ -4057,6 +4095,8 @@ int main() {
              test_hostless_private_capture_reclaim_drops_anchors_first);
     run_test("Host-less private capture reclaim never pays more than it protects",
              test_hostless_private_capture_reclaim_never_pays_more_than_it_protects);
+    run_test("private capture debt releases an abandoned session",
+             test_hostless_private_capture_debt_releases_abandoned_session);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",

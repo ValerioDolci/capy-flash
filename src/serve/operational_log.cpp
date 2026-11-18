@@ -219,8 +219,7 @@ void log_tensor_parallel(spdlog::logger& logger, const GenerationService& servic
         } else if (!load.tp_mailbox_fallback.empty()) {
             logger.warn("tensor parallel | pinned-host mailbox kept for the target forward "
                         "only: {}; the MTP draft phase uses the cross-device copies. This "
-                        "is expected under WSL2; NINFER_TP_MAILBOX_DRAFT=copies starts "
-                        "this way directly",
+                        "is expected under WSL2",
                         load.tp_mailbox_fallback);
         }
         if (!load.tp_proposal_head.empty()) {

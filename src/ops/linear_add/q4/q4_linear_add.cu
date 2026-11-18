@@ -48,8 +48,12 @@ void launch_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stre
 }
 } // namespace
 
+bool q4_linear_add_admits(std::int32_t rows, std::int32_t k) noexcept {
+    return rows == 5120 && k == 6144;
+}
+
 Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
-    if (rows != 5120 || k != 6144 || tokens <= 0) {
+    if (!q4_linear_add_admits(rows, k) || tokens <= 0) {
         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
     }
     if (tokens == 1) return launch_gemv<GemvR1W8>;

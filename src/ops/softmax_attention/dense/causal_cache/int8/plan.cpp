@@ -95,8 +95,8 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
 }
 
 namespace {
-// int8_kv_pv_half_acc_for_test; -1 = default.
-int test_pv_half_acc = -1;
+// int8_kv_pv_half_acc_force; -1 = default.
+int forced_pv_half_acc = -1;
 } // namespace
 
 bool int8_kv_pv_half_acc_enabled() {
@@ -104,9 +104,9 @@ bool int8_kv_pv_half_acc_enabled() {
         const char* e = std::getenv("NINFER_ATTN_PV_F16ACC");
         return e != nullptr && e[0] == '1';
     }();
-    return test_pv_half_acc >= 0 ? test_pv_half_acc != 0 : env;
+    return forced_pv_half_acc >= 0 ? forced_pv_half_acc != 0 : env;
 }
 
-void int8_kv_pv_half_acc_for_test(int pv_half_acc) noexcept { test_pv_half_acc = pv_half_acc; }
+void int8_kv_pv_half_acc_force(int pv_half_acc) noexcept { forced_pv_half_acc = pv_half_acc; }
 
 } // namespace ninfer::ops::detail

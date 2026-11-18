@@ -69,6 +69,15 @@ gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_
                                         std::int32_t input_rows, LinearPolicy policy,
                                         std::int32_t min_tokens, std::int32_t max_tokens);
 
+/**
+ * Whether the single-parent gdn_input_proj() and its conv snapshot/record forms register the
+ * format and the Q|K|V|Z parent `[parent_rows,input_rows]` (the Q3_G128_FP16, NVFP4 and FP8 forms
+ * of `[16384,5120]`). A caller that holds only the weight format and shape chooses with it between
+ * these Ops and a Linear + row split. It reports no workspace and launches nothing.
+ */
+[[nodiscard]] bool gdn_input_proj_registered(QType parent_qtype, std::int32_t parent_rows,
+                                             std::int32_t input_rows);
+
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

@@ -3,6 +3,7 @@
 // Two-device (tp 2) forms of gdn_gating_proj.
 
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/linear.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,16 @@ namespace ninfer::ops {
 // weights and vectors, `ws[r]`, `g[r]` and `beta[r]` must be resident on `ec.dev[r]`, and rank r's
 // work is enqueued on `ec.dev[r]->stream`. Inputs staged on a device's legacy default stream must
 // be retired before the call; the call does not synchronize and preserves the current device.
+//
+// `policy` is the compute policy of the layer's GDN input projection; the BF16 gating takes no
+// quantized route under any policy, but under AllowA4Decode (the columns after the prefill) T=1
+// runs the kernel of T=2..32, so g and beta get the same bits at every decoding and verification
+// width.
+
+/// Whether gdn_gating_proj_column_parallel() registers the weight format and one rank's
+/// `[heads,input_rows]` A and B shards (BF16 `[24,5120]`). It launches nothing.
+[[nodiscard]] bool gdn_gating_proj_column_parallel_registered(QType qtype, std::int32_t heads,
+                                                              std::int32_t input_rows);
 
 /// Per-rank transient capacity at the shard profile (`heads` 24, `input_rows` 5120).
 [[nodiscard]] std::size_t gdn_gating_proj_column_parallel_workspace_capacity_bytes(
@@ -31,16 +42,15 @@ void gdn_gating_proj_column_parallel(
     const std::array<Tensor, 2>& x, const std::array<Weight, 2>& a_weight,
     const std::array<Weight, 2>& b_weight, const std::array<Tensor, 2>& A_log,
     const std::array<Tensor, 2>& dt_bias, const std::array<WorkspaceArena*, 2>& ws,
-    const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta, const ExecutionContext& ec);
+    const std::array<Tensor, 2>& g, const std::array<Tensor, 2>& beta, LinearPolicy policy,
+    const ExecutionContext& ec);
 
 /// Contiguous-parent form: per-rank BF16 `ab_weight` [48,5120] holding the rank's A rows in
 /// [0,24) and its B rows in [24,48).
-void gdn_gating_proj_column_parallel(const std::array<Tensor, 2>& x,
-                                     const std::array<Weight, 2>& ab_weight,
-                                     const std::array<Tensor, 2>& A_log,
-                                     const std::array<Tensor, 2>& dt_bias,
-                                     const std::array<WorkspaceArena*, 2>& ws,
-                                     const std::array<Tensor, 2>& g,
-                                     const std::array<Tensor, 2>& beta, const ExecutionContext& ec);
+void gdn_gating_proj_column_parallel(
+    const std::array<Tensor, 2>& x, const std::array<Weight, 2>& ab_weight,
+    const std::array<Tensor, 2>& A_log, const std::array<Tensor, 2>& dt_bias,
+    const std::array<WorkspaceArena*, 2>& ws, const std::array<Tensor, 2>& g,
+    const std::array<Tensor, 2>& beta, LinearPolicy policy, const ExecutionContext& ec);
 
 } // namespace ninfer::ops

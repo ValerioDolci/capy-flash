@@ -6,7 +6,6 @@
 #include "models/qwen3_5/measurement.h"
 #include "models/qwen3_5/program/program.h"
 #include "ninfer/ops/rope.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -310,44 +309,9 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         throw std::logic_error("loaded Model device count does not match the Engine tp");
     }
     frontend.complete();
-    const bool gguf_banks = models::qwen3_5::gguf_routed_experts(instance->parameters);
-    if (instance->parameters.qwen4 &&
-        instance->parameters.model.config().text.qwen4_routed_experts()) {
-        // CPU threads of the missing experts: an explicit value (--expert-cpu-threads) wins, 0 is
-        // resolved from this machine.
-        auto& e                = options.routed_experts;
-        std::uint32_t& threads = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
-        std::string reason     = "set by the caller (--expert-cpu-threads)";
-        if (threads == 0) {
-            threads = static_cast<std::uint32_t>(ops::host::auto_expert_cpu_threads(
-                ops::host::host_cpu_topology(), gguf_banks, &reason));
-            reason  = "auto: " + reason;
-        }
-        std::fprintf(stderr, "routed experts: %u CPU threads for the missing experts (%s)\n",
-                     threads, reason.c_str());
-    }
-    if (gguf_banks) {
-        // ggml block expert banks run without prefill expert streaming and the
-        // miss split (not implemented for them): plan and run so.
-        auto& e = options.routed_experts;
-        // Without --stream-min-tokens the threshold follows the device count: at tp 2 the CPU
-        // path costs ~0.45 s + ~1 ms per token of TTFT and the ring a flat ~0.85-0.95 s up to
-        // ~600 tokens; at one GPU the ring leaves part of each layer to the CPU
-        // (Qwen4OffloadOptions::gguf_cpu_hybrid).
-        const std::uint32_t gguf_min = e.stream_min_tokens_set ? e.stream_min_tokens
-                                       : execution != nullptr  ? 600U
-                                                               : 256U;
-        if (e.stream_min_tokens > 0 || e.miss_split.mode != MissSplitMode::Off) {
-            std::fprintf(stderr,
-                         "routed experts: ggml block banks; prefill experts on the GPU from "
-                         "%u tokens%s, miss split off\n",
-                         gguf_min,
-                         e.stream_min_tokens_set ? "" : " (default for this device count)");
-        }
-        e.gguf_stream_min_tokens = e.stream_min_tokens > 0 ? gguf_min : 0; // the GGUF prefill ring
-        e.cpu_threads            = e.gguf_cpu_threads;
-        e.stream_min_tokens      = 0;
-        e.miss_split.mode        = MissSplitMode::Off;
+    for (const auto& line : models::qwen3_5::resolve_routed_expert_options(
+             instance->parameters, execution != nullptr, options.routed_experts)) {
+        std::fputs(line.c_str(), stderr);
     }
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
@@ -518,8 +482,10 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         free_runtime_bytes(device, execution);
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
-    summary.architecture = models::architecture_name(instance->model->config().text.architecture);
-    summary.model_name   = instance->model->info().name;
+    const auto& registered    = *instance->model->config().text.registered;
+    summary.architecture      = std::string(registered.text);
+    summary.turn_anchors      = registered.turn_anchors;
+    summary.model_name        = instance->model->info().name;
     summary.prefill_signature = signature;
     // Every rank's resident formats: at tp 2 the Vision tower may sit on rank 1 alone and the
     // drafter and proposal head on rank 0 alone, so neither rank's views list them all.
@@ -565,6 +531,7 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     summary.tp_drafter            = instance->program->tp_transport().drafter;
     summary.tp_eager_transport    = instance->program->tp_transport().eager_transport;
     summary.tp_prefill_overlap    = instance->program->tp_transport().prefill_overlap;
+    summary.projection_routes = models::qwen3_5::execution::projection_routes(instance->parameters);
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

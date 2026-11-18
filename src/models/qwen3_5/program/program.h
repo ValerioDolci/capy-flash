@@ -896,20 +896,19 @@ struct TpTransportStatus {
     // The mailbox's slot, the widest captured all-reduce it carries (hidden x (K+1) x C BF16); 0
     // when the captured all-reduces run on the copies.
     std::size_t slot_bytes = 0;
-    // Under MTP or DFlash2 with the optimized proposal head: "split by vocabulary" or "rank 0"
-    // (NINFER_TP_DRAFT_HEAD=primary; for DFlash2 also NINFER_TP_DRAFTER=primary); empty otherwise.
+    // Under MTP or DFlash2 with the optimized proposal head: "split by vocabulary" or "rank 0" (a
+    // head that does not split); empty otherwise.
     std::string proposal_head;
     // Under DFlash2: "split (16/4 heads, MLP halves; selector on rank 1)" (on rank 0 with
-    // NINFER_TP_SELECTOR=primary, NINFER_TP_DRAFT_HEAD=primary or Vision on rank 1) or "rank 0"
-    // (NINFER_TP_DRAFTER=primary); empty otherwise.
+    // NINFER_TP_SELECTOR=primary or Vision on rank 1) or "rank 0" (a drafter that did not split);
+    // empty otherwise.
     std::string drafter;
-    // The eager (prefill) all-reduces' transport: "pinned host exchange", "direct peer copies"
-    // or "driver-staged copies"; empty at tp 1.
+    // The eager (prefill) all-reduces' transport: "pinned host exchange" or "direct peer copies";
+    // empty at tp 1.
     std::string eager_transport;
-    // The text prefill overlap's split-phase sums (dense models): "pinned host lanes", "direct
-    // peer lanes", "driver-staged peer lanes (test only)" (NINFER_TP_PEER_OVERLAP=force without
-    // P2P), "off (one call per chunk)" or "off (NINFER_TP_PREFILL_OVERLAP=0)"; empty at tp 1
-    // and for Qwen4Exp.
+    // The text prefill overlap's split-phase sums (dense models), each followed by " + slices":
+    // "pinned host lanes", "direct peer lanes" or "driver-staged peer lanes (test only)"
+    // (NINFER_TP_PEER_OVERLAP=force without P2P); empty at tp 1 and for Qwen4Exp.
     std::string prefill_overlap;
 };
 
@@ -1296,6 +1295,13 @@ struct RuntimeContractAccess {
 // model's routed experts are not offloaded (EngineOptions::routed_experts does not apply).
 // True when the Qwen4Exp routed experts are ggml block banks.
 [[nodiscard]] bool gguf_routed_experts(const execution::Parameters& parameters);
+// Resolves the routed-expert options of the loaded model once, before planning: the CPU threads
+// of the missing experts (0 = from this machine) and, for ggml block banks, the prefill streaming
+// threshold of the device count with the miss split off. Returns the startup log line of each
+// choice.
+[[nodiscard]] std::vector<std::string>
+resolve_routed_expert_options(const execution::Parameters& parameters, bool two_devices,
+                              RoutedExpertOptions& options);
 [[nodiscard]] std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                                        const EngineOptions& options);
 // Device bytes of the staged miss split's scratch slots, or 0 when not used.

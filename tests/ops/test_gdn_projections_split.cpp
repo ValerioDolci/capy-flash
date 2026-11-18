@@ -900,10 +900,11 @@ int run_gating_case(const ExecutionContext& ec, std::uint32_t seed, bool fused) 
 
         retire_staging(ec);
         if (fused) {
-            ops::gdn_gating_proj_column_parallel(x, ab_weight, log_a, bias, workspace, g, beta, ec);
+            ops::gdn_gating_proj_column_parallel(x, ab_weight, log_a, bias, workspace, g, beta,
+                                                 ops::LinearPolicy::AllowA4, ec);
         } else {
             ops::gdn_gating_proj_column_parallel(x, a_weight, b_weight, log_a, bias, workspace, g,
-                                                 beta, ec);
+                                                 beta, ops::LinearPolicy::AllowA4, ec);
         }
         synchronize_both(ec);
 

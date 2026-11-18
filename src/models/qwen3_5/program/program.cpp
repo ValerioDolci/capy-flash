@@ -3,9 +3,12 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/qwen4_layer_profile.h"
+#include "ops/host_moe/host_moe_executor.h"
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -20,7 +23,7 @@ SequencePlan& SequencePlan::operator=(SequencePlan&&) noexcept = default;
 SequencePlan::~SequencePlan() = default;
 
 std::uint32_t SequencePlan::capacity() const noexcept {
-    return impl_ != nullptr ? impl_->capacity : 0;
+    return impl_ != nullptr ? impl_->inputs.capacity : 0;
 }
 
 std::uint32_t SequencePlan::kv_capacity() const noexcept {
@@ -28,7 +31,7 @@ std::uint32_t SequencePlan::kv_capacity() const noexcept {
 }
 
 std::uint32_t SequencePlan::max_concurrency() const noexcept {
-    return impl_ != nullptr ? impl_->max_concurrency : 0;
+    return impl_ != nullptr ? impl_->inputs.max_concurrency : 0;
 }
 
 std::size_t SequencePlan::device_reservation_bytes() const noexcept {
@@ -634,6 +637,50 @@ bool gguf_routed_experts(const execution::Parameters& parameters) {
            !parameters.qwen4->layers.empty() && parameters.qwen4->layers.front().moe().experts.gguf;
 }
 
+std::vector<std::string> resolve_routed_expert_options(const execution::Parameters& parameters,
+                                                       bool two_devices,
+                                                       RoutedExpertOptions& options) {
+    std::vector<std::string> log;
+    const bool gguf_banks = gguf_routed_experts(parameters);
+    if (parameters.qwen4 && parameters.model.config().text.qwen4_routed_experts()) {
+        // CPU threads of the missing experts: an explicit value (--expert-cpu-threads) wins, 0 is
+        // resolved from this machine.
+        auto& e                = options;
+        std::uint32_t& threads = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
+        std::string reason     = "set by the caller (--expert-cpu-threads)";
+        if (threads == 0) {
+            threads = static_cast<std::uint32_t>(ops::host::auto_expert_cpu_threads(
+                ops::host::host_cpu_topology(), gguf_banks, &reason));
+            reason  = "auto: " + reason;
+        }
+        log.push_back("routed experts: " + std::to_string(threads) +
+                      " CPU threads for the missing experts (" + reason + ")\n");
+    }
+    if (gguf_banks) {
+        // ggml block expert banks run without prefill expert streaming and the
+        // miss split (not implemented for them): plan and run so.
+        auto& e = options;
+        // Without --stream-min-tokens the threshold follows the device count: at tp 2 the CPU
+        // path costs ~0.45 s + ~1 ms per token of TTFT and the ring a flat ~0.85-0.95 s up to
+        // ~600 tokens; at one GPU the ring leaves part of each layer to the CPU
+        // (Qwen4OffloadOptions::gguf_cpu_expert_us).
+        const std::uint32_t gguf_min = e.stream_min_tokens_set ? e.stream_min_tokens
+                                       : two_devices           ? 600U
+                                                               : 256U;
+        if (e.stream_min_tokens > 0 || e.miss_split.mode != MissSplitMode::Off) {
+            log.push_back("routed experts: ggml block banks; prefill experts on the GPU from " +
+                          std::to_string(gguf_min) + " tokens" +
+                          (e.stream_min_tokens_set ? "" : " (default for this device count)") +
+                          ", miss split off\n");
+        }
+        e.gguf_stream_min_tokens = e.stream_min_tokens > 0 ? gguf_min : 0; // the GGUF prefill ring
+        e.cpu_threads            = e.gguf_cpu_threads;
+        e.stream_min_tokens      = 0;
+        e.miss_split.mode        = MissSplitMode::Off;
+    }
+    return log;
+}
+
 std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                          const EngineOptions& options) {
     // A dense Qwen4Exp FFN has no routed experts, so no slot.
@@ -659,7 +706,8 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
         constexpr std::int32_t kProbe = 100;
         const auto base               = execution::Qwen4OffloadExperts::layer_slot_profile(
             layers, static_cast<std::int32_t>(parameters.qwen4->layers.size()), kProbe, 0,
-            static_cast<std::int32_t>(options.tp), qwen4_exclusive_layers());
+            static_cast<std::int32_t>(options.tp),
+            qwen4_exclusive_layers(options.routed_experts.exclusive_layers));
         std::int64_t uniform = 0, weighted = 0;
         for (std::size_t l = 0; l < bytes.size(); ++l) {
             uniform += bytes[l];
@@ -697,7 +745,7 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->parameters != &parameters) {
+    if (plan.impl_->inputs.parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
     auto impl =
@@ -711,10 +759,10 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, ExecutionContext& execution,
                                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->parameters != &parameters) {
+    if (plan.impl_->inputs.parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
-    if (execution.tp != 2 || plan.impl_->tp != 2 || !execution.dev[0] || !execution.dev[1]) {
+    if (execution.tp != 2 || plan.impl_->inputs.tp != 2 || !execution.dev[0] || !execution.dev[1]) {
         throw std::invalid_argument("tensor-parallel Program requires a two-device plan and "
                                     "ExecutionContext");
     }

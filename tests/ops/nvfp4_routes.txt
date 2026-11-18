@@ -1,0 +1,910 @@
+# NVFP4 route inventory, widths 1..65536 (tests/ops/test_decode_policy_routes.cpp).
+linear 14336x5120 A16Only 1..1 A16 a16#0
+linear 14336x5120 A16Only 2..2 A16 a16#1
+linear 14336x5120 A16Only 3..8 A16 a16#2
+linear 14336x5120 A16Only 9..16 A16 a16#3
+linear 14336x5120 A16Only 17..24 A16 a16#4
+linear 14336x5120 A16Only 25..32 A16 a16#5
+linear 14336x5120 A16Only 33..64 A16 a16#6
+linear 14336x5120 A16Only 65..128 A16 a16#7
+linear 14336x5120 A16Only 129..65536 A16 a16#8
+linear 14336x5120 AllowA8 1..1 A16 a16#0
+linear 14336x5120 AllowA8 2..2 A16 a16#1
+linear 14336x5120 AllowA8 3..8 A16 a16#2
+linear 14336x5120 AllowA8 9..16 A16 a16#3
+linear 14336x5120 AllowA8 17..24 A16 a16#4
+linear 14336x5120 AllowA8 25..32 A16 a16#5
+linear 14336x5120 AllowA8 33..64 A16 a16#6
+linear 14336x5120 AllowA8 65..128 A16 a16#7
+linear 14336x5120 AllowA8 129..65536 A16 a16#8
+linear 14336x5120 AllowA4 1..1 A16 a16#0
+linear 14336x5120 AllowA4 2..2 A16 a16#1
+linear 14336x5120 AllowA4 3..3 A16 a16#2
+linear 14336x5120 AllowA4 4..64 A4 a4#0 RowMajor
+linear 14336x5120 AllowA4 65..96 A4 a4#1 RowMajor
+linear 14336x5120 AllowA4 97..128 A4 a4#2 RowMajor
+linear 14336x5120 AllowA4 129..192 A4 a4#3 RowMajor
+linear 14336x5120 AllowA4 193..384 A4 a4#4 RowMajor
+linear 14336x5120 AllowA4 385..511 A4 a4#2 RowMajor
+linear 14336x5120 AllowA4 512..1023 A4 a4#5 Tiled128
+linear 14336x5120 AllowA4 1024..65536 A4 a4#6 Tiled256
+linear 14336x5120 AllowA4Decode 1..1 A16 a16#0
+linear 14336x5120 AllowA4Decode 2..2 A16 a16#1
+linear 14336x5120 AllowA4Decode 3..3 A16 a16#2
+linear 14336x5120 AllowA4Decode 4..64 A4 a4#0 RowMajor
+linear 14336x5120 AllowA4Decode 65..96 A4 a4#1 RowMajor
+linear 14336x5120 AllowA4Decode 97..128 A4 a4#2 RowMajor
+linear 14336x5120 AllowA4Decode 129..192 A4 a4#3 RowMajor
+linear 14336x5120 AllowA4Decode 193..384 A4 a4#4 RowMajor
+linear 14336x5120 AllowA4Decode 385..511 A4 a4#2 RowMajor
+linear 14336x5120 AllowA4Decode 512..1023 A4 a4#5 Tiled128
+linear 14336x5120 AllowA4Decode 1024..65536 A4 a4#6 Tiled256
+linear 16384x5120 A16Only 1..1 A16 a16#0
+linear 16384x5120 A16Only 2..2 A16 a16#1
+linear 16384x5120 A16Only 3..8 A16 a16#2
+linear 16384x5120 A16Only 9..16 A16 a16#3
+linear 16384x5120 A16Only 17..24 A16 a16#4
+linear 16384x5120 A16Only 25..32 A16 a16#5
+linear 16384x5120 A16Only 33..64 A16 a16#6
+linear 16384x5120 A16Only 65..96 A16 a16#7
+linear 16384x5120 A16Only 97..65536 A16 a16#8
+linear 16384x5120 AllowA8 1..1 A16 a16#0
+linear 16384x5120 AllowA8 2..2 A16 a16#1
+linear 16384x5120 AllowA8 3..8 A16 a16#2
+linear 16384x5120 AllowA8 9..16 A16 a16#3
+linear 16384x5120 AllowA8 17..24 A16 a16#4
+linear 16384x5120 AllowA8 25..32 A16 a16#5
+linear 16384x5120 AllowA8 33..64 A16 a16#6
+linear 16384x5120 AllowA8 65..96 A16 a16#7
+linear 16384x5120 AllowA8 97..65536 A16 a16#8
+linear 16384x5120 AllowA4 1..32 A4 a4#0 RowMajor
+linear 16384x5120 AllowA4 33..96 A4 a4#1 RowMajor
+linear 16384x5120 AllowA4 97..128 A4 a4#2 RowMajor
+linear 16384x5120 AllowA4 129..192 A4 a4#3 RowMajor
+linear 16384x5120 AllowA4 193..511 A4 a4#4 RowMajor
+linear 16384x5120 AllowA4 512..65536 A4 a4#5 Tiled256
+linear 16384x5120 AllowA4Decode 1..32 A4 a4#0 RowMajor
+linear 16384x5120 AllowA4Decode 33..96 A4 a4#1 RowMajor
+linear 16384x5120 AllowA4Decode 97..128 A4 a4#2 RowMajor
+linear 16384x5120 AllowA4Decode 129..192 A4 a4#3 RowMajor
+linear 16384x5120 AllowA4Decode 193..511 A4 a4#4 RowMajor
+linear 16384x5120 AllowA4Decode 512..65536 A4 a4#5 Tiled256
+linear 34816x5120 A16Only 1..1 A16 a16#0
+linear 34816x5120 A16Only 2..2 A16 a16#1
+linear 34816x5120 A16Only 3..8 A16 a16#2
+linear 34816x5120 A16Only 9..16 A16 a16#3
+linear 34816x5120 A16Only 17..24 A16 a16#4
+linear 34816x5120 A16Only 25..32 A16 a16#5
+linear 34816x5120 A16Only 33..64 A16 a16#6
+linear 34816x5120 A16Only 65..96 A16 a16#7
+linear 34816x5120 A16Only 97..65536 A16 a16#8
+linear 34816x5120 AllowA8 1..1 A16 a16#0
+linear 34816x5120 AllowA8 2..2 A16 a16#1
+linear 34816x5120 AllowA8 3..8 A16 a16#2
+linear 34816x5120 AllowA8 9..16 A16 a16#3
+linear 34816x5120 AllowA8 17..24 A16 a16#4
+linear 34816x5120 AllowA8 25..32 A16 a16#5
+linear 34816x5120 AllowA8 33..64 A16 a16#6
+linear 34816x5120 AllowA8 65..96 A16 a16#7
+linear 34816x5120 AllowA8 97..65536 A16 a16#8
+linear 34816x5120 AllowA4 1..32 A4 a4#0 RowMajor
+linear 34816x5120 AllowA4 33..64 A4 a4#1 RowMajor
+linear 34816x5120 AllowA4 65..128 A4 a4#2 RowMajor
+linear 34816x5120 AllowA4 129..255 A4 a4#3 RowMajor
+linear 34816x5120 AllowA4 256..65536 A4 a4#4 Tiled256
+linear 34816x5120 AllowA4Decode 1..32 A4 a4#0 RowMajor
+linear 34816x5120 AllowA4Decode 33..64 A4 a4#1 RowMajor
+linear 34816x5120 AllowA4Decode 65..128 A4 a4#2 RowMajor
+linear 34816x5120 AllowA4Decode 129..255 A4 a4#3 RowMajor
+linear 34816x5120 AllowA4Decode 256..65536 A4 a4#4 Tiled256
+linear 5120x6144 A16Only 1..1 A16 a16#0
+linear 5120x6144 A16Only 2..2 A16 a16#1
+linear 5120x6144 A16Only 3..8 A16 a16#2
+linear 5120x6144 A16Only 9..16 A16 a16#3
+linear 5120x6144 A16Only 17..24 A16 a16#4
+linear 5120x6144 A16Only 25..32 A16 a16#5
+linear 5120x6144 A16Only 33..48 A16 a16#6
+linear 5120x6144 A16Only 49..64 A16 a16#7
+linear 5120x6144 A16Only 65..128 A16 a16#8
+linear 5120x6144 A16Only 129..65536 A16 a16#9
+linear 5120x6144 AllowA8 1..1 A16 a16#0
+linear 5120x6144 AllowA8 2..2 A16 a16#1
+linear 5120x6144 AllowA8 3..8 A16 a16#2
+linear 5120x6144 AllowA8 9..16 A16 a16#3
+linear 5120x6144 AllowA8 17..24 A16 a16#4
+linear 5120x6144 AllowA8 25..32 A16 a16#5
+linear 5120x6144 AllowA8 33..48 A16 a16#6
+linear 5120x6144 AllowA8 49..64 A16 a16#7
+linear 5120x6144 AllowA8 65..128 A16 a16#8
+linear 5120x6144 AllowA8 129..65536 A16 a16#9
+linear 5120x6144 AllowA4 1..1 A16 a16#0
+linear 5120x6144 AllowA4 2..2 A16 a16#1
+linear 5120x6144 AllowA4 3..8 A16 a16#2
+linear 5120x6144 AllowA4 9..16 A16 a16#3
+linear 5120x6144 AllowA4 17..128 A4 a4#0 RowMajor
+linear 5120x6144 AllowA4 129..192 A4 a4#1 RowMajor
+linear 5120x6144 AllowA4 193..384 A4 a4#2 RowMajor
+linear 5120x6144 AllowA4 385..512 A4 a4#3 RowMajor
+linear 5120x6144 AllowA4 513..1023 A4 a4#2 RowMajor
+linear 5120x6144 AllowA4 1024..65536 A4 a4#4 Tiled256
+linear 5120x6144 AllowA4Decode 1..7 A16Decode a16#2
+linear 5120x6144 AllowA4Decode 8..8 A16 a16#2
+linear 5120x6144 AllowA4Decode 9..16 A16 a16#3
+linear 5120x6144 AllowA4Decode 17..128 A4 a4#0 RowMajor
+linear 5120x6144 AllowA4Decode 129..192 A4 a4#1 RowMajor
+linear 5120x6144 AllowA4Decode 193..384 A4 a4#2 RowMajor
+linear 5120x6144 AllowA4Decode 385..512 A4 a4#3 RowMajor
+linear 5120x6144 AllowA4Decode 513..1023 A4 a4#2 RowMajor
+linear 5120x6144 AllowA4Decode 1024..65536 A4 a4#4 Tiled256
+linear 5120x17408 A16Only 1..1 A16 a16#0
+linear 5120x17408 A16Only 2..2 A16 a16#1
+linear 5120x17408 A16Only 3..4 A16 a16#2
+linear 5120x17408 A16Only 5..5 A16 a16#3
+linear 5120x17408 A16Only 6..8 A16 a16#4
+linear 5120x17408 A16Only 9..16 A16 a16#5
+linear 5120x17408 A16Only 17..24 A16 a16#6
+linear 5120x17408 A16Only 25..48 A16 a16#7
+linear 5120x17408 A16Only 49..64 A16 a16#8
+linear 5120x17408 A16Only 65..128 A16 a16#9
+linear 5120x17408 A16Only 129..65536 A16 a16#10
+linear 5120x17408 AllowA8 1..1 A16 a16#0
+linear 5120x17408 AllowA8 2..2 A16 a16#1
+linear 5120x17408 AllowA8 3..4 A16 a16#2
+linear 5120x17408 AllowA8 5..5 A16 a16#3
+linear 5120x17408 AllowA8 6..8 A16 a16#4
+linear 5120x17408 AllowA8 9..16 A16 a16#5
+linear 5120x17408 AllowA8 17..24 A16 a16#6
+linear 5120x17408 AllowA8 25..48 A16 a16#7
+linear 5120x17408 AllowA8 49..64 A16 a16#8
+linear 5120x17408 AllowA8 65..128 A16 a16#9
+linear 5120x17408 AllowA8 129..65536 A16 a16#10
+linear 5120x17408 AllowA4 1..1 A16 a16#0
+linear 5120x17408 AllowA4 2..2 A16 a16#1
+linear 5120x17408 AllowA4 3..4 A16 a16#2
+linear 5120x17408 AllowA4 5..5 A16 a16#3
+linear 5120x17408 AllowA4 6..7 A16 a16#4
+linear 5120x17408 AllowA4 8..64 A4 a4#0 RowMajor
+linear 5120x17408 AllowA4 65..128 A4 a4#1 RowMajor
+linear 5120x17408 AllowA4 129..192 A4 a4#2 RowMajor
+linear 5120x17408 AllowA4 193..384 A4 a4#3 RowMajor
+linear 5120x17408 AllowA4 385..512 A4 a4#4 RowMajor
+linear 5120x17408 AllowA4 513..1023 A4 a4#3 RowMajor
+linear 5120x17408 AllowA4 1024..65536 A4 a4#5 Tiled256
+linear 5120x17408 AllowA4Decode 1..1 A16Decode a16#11
+linear 5120x17408 AllowA4Decode 2..2 A16Decode a16#1
+linear 5120x17408 AllowA4Decode 3..4 A16Decode a16#2
+linear 5120x17408 AllowA4Decode 5..5 A16Decode a16#3
+linear 5120x17408 AllowA4Decode 6..6 A16Decode a16#12
+linear 5120x17408 AllowA4Decode 7..7 A16Decode a16#13
+linear 5120x17408 AllowA4Decode 8..64 A4 a4#0 RowMajor
+linear 5120x17408 AllowA4Decode 65..128 A4 a4#1 RowMajor
+linear 5120x17408 AllowA4Decode 129..192 A4 a4#2 RowMajor
+linear 5120x17408 AllowA4Decode 193..384 A4 a4#3 RowMajor
+linear 5120x17408 AllowA4Decode 385..512 A4 a4#4 RowMajor
+linear 5120x17408 AllowA4Decode 513..1023 A4 a4#3 RowMajor
+linear 5120x17408 AllowA4Decode 1024..65536 A4 a4#5 Tiled256
+linear 17408x5120 A16Only 1..1 A16 a16#0
+linear 17408x5120 A16Only 2..2 A16 a16#1
+linear 17408x5120 A16Only 3..8 A16 a16#2
+linear 17408x5120 A16Only 9..16 A16 a16#3
+linear 17408x5120 A16Only 17..24 A16 a16#4
+linear 17408x5120 A16Only 25..32 A16 a16#5
+linear 17408x5120 A16Only 33..64 A16 a16#6
+linear 17408x5120 A16Only 65..96 A16 a16#7
+linear 17408x5120 A16Only 97..65536 A16 a16#8
+linear 17408x5120 AllowA8 1..1 A16 a16#0
+linear 17408x5120 AllowA8 2..2 A16 a16#1
+linear 17408x5120 AllowA8 3..8 A16 a16#2
+linear 17408x5120 AllowA8 9..16 A16 a16#3
+linear 17408x5120 AllowA8 17..24 A16 a16#4
+linear 17408x5120 AllowA8 25..32 A16 a16#5
+linear 17408x5120 AllowA8 33..64 A16 a16#6
+linear 17408x5120 AllowA8 65..96 A16 a16#7
+linear 17408x5120 AllowA8 97..65536 A16 a16#8
+linear 17408x5120 AllowA4 1..32 A4 a4#0 RowMajor
+linear 17408x5120 AllowA4 33..64 A4 a4#1 RowMajor
+linear 17408x5120 AllowA4 65..128 A4 a4#2 RowMajor
+linear 17408x5120 AllowA4 129..255 A4 a4#3 RowMajor
+linear 17408x5120 AllowA4 256..65536 A4 a4#4 Tiled256
+linear 17408x5120 AllowA4Decode 1..32 A4 a4#0 RowMajor
+linear 17408x5120 AllowA4Decode 33..64 A4 a4#1 RowMajor
+linear 17408x5120 AllowA4Decode 65..128 A4 a4#2 RowMajor
+linear 17408x5120 AllowA4Decode 129..255 A4 a4#3 RowMajor
+linear 17408x5120 AllowA4Decode 256..65536 A4 a4#4 Tiled256
+linear 5120x8704 A16Only 1..1 A16 a16#0
+linear 5120x8704 A16Only 2..2 A16 a16#1
+linear 5120x8704 A16Only 3..4 A16 a16#2
+linear 5120x8704 A16Only 5..5 A16 a16#3
+linear 5120x8704 A16Only 6..8 A16 a16#4
+linear 5120x8704 A16Only 9..16 A16 a16#5
+linear 5120x8704 A16Only 17..24 A16 a16#6
+linear 5120x8704 A16Only 25..48 A16 a16#7
+linear 5120x8704 A16Only 49..64 A16 a16#8
+linear 5120x8704 A16Only 65..128 A16 a16#9
+linear 5120x8704 A16Only 129..65536 A16 a16#10
+linear 5120x8704 AllowA8 1..1 A16 a16#0
+linear 5120x8704 AllowA8 2..2 A16 a16#1
+linear 5120x8704 AllowA8 3..4 A16 a16#2
+linear 5120x8704 AllowA8 5..5 A16 a16#3
+linear 5120x8704 AllowA8 6..8 A16 a16#4
+linear 5120x8704 AllowA8 9..16 A16 a16#5
+linear 5120x8704 AllowA8 17..24 A16 a16#6
+linear 5120x8704 AllowA8 25..48 A16 a16#7
+linear 5120x8704 AllowA8 49..64 A16 a16#8
+linear 5120x8704 AllowA8 65..128 A16 a16#9
+linear 5120x8704 AllowA8 129..65536 A16 a16#10
+linear 5120x8704 AllowA4 1..1 A16 a16#0
+linear 5120x8704 AllowA4 2..2 A16 a16#1
+linear 5120x8704 AllowA4 3..4 A16 a16#2
+linear 5120x8704 AllowA4 5..5 A16 a16#3
+linear 5120x8704 AllowA4 6..7 A16 a16#4
+linear 5120x8704 AllowA4 8..64 A4 a4#0 RowMajor
+linear 5120x8704 AllowA4 65..128 A4 a4#1 RowMajor
+linear 5120x8704 AllowA4 129..192 A4 a4#2 RowMajor
+linear 5120x8704 AllowA4 193..384 A4 a4#3 RowMajor
+linear 5120x8704 AllowA4 385..512 A4 a4#4 RowMajor
+linear 5120x8704 AllowA4 513..1023 A4 a4#3 RowMajor
+linear 5120x8704 AllowA4 1024..65536 A4 a4#5 Tiled256
+linear 5120x8704 AllowA4Decode 1..1 A16Decode a16#11
+linear 5120x8704 AllowA4Decode 2..2 A16Decode a16#1
+linear 5120x8704 AllowA4Decode 3..4 A16Decode a16#2
+linear 5120x8704 AllowA4Decode 5..5 A16Decode a16#3
+linear 5120x8704 AllowA4Decode 6..6 A16Decode a16#12
+linear 5120x8704 AllowA4Decode 7..7 A16Decode a16#13
+linear 5120x8704 AllowA4Decode 8..64 A4 a4#0 RowMajor
+linear 5120x8704 AllowA4Decode 65..128 A4 a4#1 RowMajor
+linear 5120x8704 AllowA4Decode 129..192 A4 a4#2 RowMajor
+linear 5120x8704 AllowA4Decode 193..384 A4 a4#3 RowMajor
+linear 5120x8704 AllowA4Decode 385..512 A4 a4#4 RowMajor
+linear 5120x8704 AllowA4Decode 513..1023 A4 a4#3 RowMajor
+linear 5120x8704 AllowA4Decode 1024..65536 A4 a4#5 Tiled256
+linear 5120x3072 A16Only 1..1 A16 a16#0
+linear 5120x3072 A16Only 2..2 A16 a16#1
+linear 5120x3072 A16Only 3..8 A16 a16#2
+linear 5120x3072 A16Only 9..16 A16 a16#3
+linear 5120x3072 A16Only 17..24 A16 a16#4
+linear 5120x3072 A16Only 25..32 A16 a16#5
+linear 5120x3072 A16Only 33..48 A16 a16#6
+linear 5120x3072 A16Only 49..64 A16 a16#7
+linear 5120x3072 A16Only 65..128 A16 a16#8
+linear 5120x3072 A16Only 129..65536 A16 a16#9
+linear 5120x3072 AllowA8 1..1 A16 a16#0
+linear 5120x3072 AllowA8 2..2 A16 a16#1
+linear 5120x3072 AllowA8 3..8 A16 a16#2
+linear 5120x3072 AllowA8 9..16 A16 a16#3
+linear 5120x3072 AllowA8 17..24 A16 a16#4
+linear 5120x3072 AllowA8 25..32 A16 a16#5
+linear 5120x3072 AllowA8 33..48 A16 a16#6
+linear 5120x3072 AllowA8 49..64 A16 a16#7
+linear 5120x3072 AllowA8 65..128 A16 a16#8
+linear 5120x3072 AllowA8 129..65536 A16 a16#9
+linear 5120x3072 AllowA4 1..1 A16 a16#0
+linear 5120x3072 AllowA4 2..2 A16 a16#1
+linear 5120x3072 AllowA4 3..8 A16 a16#2
+linear 5120x3072 AllowA4 9..16 A16 a16#3
+linear 5120x3072 AllowA4 17..128 A4 a4#0 RowMajor
+linear 5120x3072 AllowA4 129..192 A4 a4#1 RowMajor
+linear 5120x3072 AllowA4 193..384 A4 a4#2 RowMajor
+linear 5120x3072 AllowA4 385..512 A4 a4#3 RowMajor
+linear 5120x3072 AllowA4 513..1023 A4 a4#2 RowMajor
+linear 5120x3072 AllowA4 1024..65536 A4 a4#4 Tiled256
+linear 5120x3072 AllowA4Decode 1..7 A16Decode a16#2
+linear 5120x3072 AllowA4Decode 8..8 A16 a16#2
+linear 5120x3072 AllowA4Decode 9..16 A16 a16#3
+linear 5120x3072 AllowA4Decode 17..128 A4 a4#0 RowMajor
+linear 5120x3072 AllowA4Decode 129..192 A4 a4#1 RowMajor
+linear 5120x3072 AllowA4Decode 193..384 A4 a4#2 RowMajor
+linear 5120x3072 AllowA4Decode 385..512 A4 a4#3 RowMajor
+linear 5120x3072 AllowA4Decode 513..1023 A4 a4#2 RowMajor
+linear 5120x3072 AllowA4Decode 1024..65536 A4 a4#4 Tiled256
+linear 8192x2560 A16Only 1..1 A16 a16#0
+linear 8192x2560 A16Only 2..2 A16 a16#1
+linear 8192x2560 A16Only 3..8 A16 a16#2
+linear 8192x2560 A16Only 9..16 A16 a16#3
+linear 8192x2560 A16Only 17..64 A16 a16#4
+linear 8192x2560 A16Only 65..65536 A16 a16#5
+linear 8192x2560 AllowA8 1..1 A16 a16#0
+linear 8192x2560 AllowA8 2..2 A16 a16#1
+linear 8192x2560 AllowA8 3..8 A16 a16#2
+linear 8192x2560 AllowA8 9..16 A16 a16#3
+linear 8192x2560 AllowA8 17..64 A16 a16#4
+linear 8192x2560 AllowA8 65..65536 A16 a16#5
+linear 8192x2560 AllowA4 1..1 A16 a16#0
+linear 8192x2560 AllowA4 2..2 A16 a16#1
+linear 8192x2560 AllowA4 3..8 A16 a16#2
+linear 8192x2560 AllowA4 9..16 A16 a16#3
+linear 8192x2560 AllowA4 17..64 A16 a16#4
+linear 8192x2560 AllowA4 65..65536 A16 a16#5
+linear 8192x2560 AllowA4Decode 1..1 A16 a16#0
+linear 8192x2560 AllowA4Decode 2..2 A16 a16#1
+linear 8192x2560 AllowA4Decode 3..8 A16 a16#2
+linear 8192x2560 AllowA4Decode 9..16 A16 a16#3
+linear 8192x2560 AllowA4Decode 17..64 A16 a16#4
+linear 8192x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 6656x2560 A16Only 1..1 A16 a16#0
+linear 6656x2560 A16Only 2..2 A16 a16#1
+linear 6656x2560 A16Only 3..8 A16 a16#2
+linear 6656x2560 A16Only 9..16 A16 a16#3
+linear 6656x2560 A16Only 17..64 A16 a16#4
+linear 6656x2560 A16Only 65..65536 A16 a16#5
+linear 6656x2560 AllowA8 1..1 A16 a16#0
+linear 6656x2560 AllowA8 2..2 A16 a16#1
+linear 6656x2560 AllowA8 3..8 A16 a16#2
+linear 6656x2560 AllowA8 9..16 A16 a16#3
+linear 6656x2560 AllowA8 17..64 A16 a16#4
+linear 6656x2560 AllowA8 65..65536 A16 a16#5
+linear 6656x2560 AllowA4 1..1 A16 a16#0
+linear 6656x2560 AllowA4 2..2 A16 a16#1
+linear 6656x2560 AllowA4 3..8 A16 a16#2
+linear 6656x2560 AllowA4 9..16 A16 a16#3
+linear 6656x2560 AllowA4 17..64 A16 a16#4
+linear 6656x2560 AllowA4 65..65536 A16 a16#5
+linear 6656x2560 AllowA4Decode 1..1 A16 a16#0
+linear 6656x2560 AllowA4Decode 2..2 A16 a16#1
+linear 6656x2560 AllowA4Decode 3..8 A16 a16#2
+linear 6656x2560 AllowA4Decode 9..16 A16 a16#3
+linear 6656x2560 AllowA4Decode 17..64 A16 a16#4
+linear 6656x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 124160x2560 A16Only 1..1 A16 a16#0
+linear 124160x2560 A16Only 2..2 A16 a16#1
+linear 124160x2560 A16Only 3..8 A16 a16#2
+linear 124160x2560 A16Only 9..16 A16 a16#3
+linear 124160x2560 A16Only 17..64 A16 a16#4
+linear 124160x2560 A16Only 65..65536 A16 a16#5
+linear 124160x2560 AllowA8 1..1 A16 a16#0
+linear 124160x2560 AllowA8 2..2 A16 a16#1
+linear 124160x2560 AllowA8 3..8 A16 a16#2
+linear 124160x2560 AllowA8 9..16 A16 a16#3
+linear 124160x2560 AllowA8 17..64 A16 a16#4
+linear 124160x2560 AllowA8 65..65536 A16 a16#5
+linear 124160x2560 AllowA4 1..1 A16 a16#0
+linear 124160x2560 AllowA4 2..2 A16 a16#1
+linear 124160x2560 AllowA4 3..8 A16 a16#2
+linear 124160x2560 AllowA4 9..16 A16 a16#3
+linear 124160x2560 AllowA4 17..64 A16 a16#4
+linear 124160x2560 AllowA4 65..65536 A16 a16#5
+linear 124160x2560 AllowA4Decode 1..1 A16 a16#0
+linear 124160x2560 AllowA4Decode 2..2 A16 a16#1
+linear 124160x2560 AllowA4Decode 3..8 A16 a16#2
+linear 124160x2560 AllowA4Decode 9..16 A16 a16#3
+linear 124160x2560 AllowA4Decode 17..64 A16 a16#4
+linear 124160x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 512x2560 A16Only 1..1 A16 a16#0
+linear 512x2560 A16Only 2..2 A16 a16#1
+linear 512x2560 A16Only 3..8 A16 a16#2
+linear 512x2560 A16Only 9..16 A16 a16#3
+linear 512x2560 A16Only 17..64 A16 a16#4
+linear 512x2560 A16Only 65..65536 A16 a16#5
+linear 512x2560 AllowA8 1..1 A16 a16#0
+linear 512x2560 AllowA8 2..2 A16 a16#1
+linear 512x2560 AllowA8 3..8 A16 a16#2
+linear 512x2560 AllowA8 9..16 A16 a16#3
+linear 512x2560 AllowA8 17..64 A16 a16#4
+linear 512x2560 AllowA8 65..65536 A16 a16#5
+linear 512x2560 AllowA4 1..1 A16 a16#0
+linear 512x2560 AllowA4 2..2 A16 a16#1
+linear 512x2560 AllowA4 3..8 A16 a16#2
+linear 512x2560 AllowA4 9..16 A16 a16#3
+linear 512x2560 AllowA4 17..64 A16 a16#4
+linear 512x2560 AllowA4 65..65536 A16 a16#5
+linear 512x2560 AllowA4Decode 1..1 A16 a16#0
+linear 512x2560 AllowA4Decode 2..2 A16 a16#1
+linear 512x2560 AllowA4Decode 3..8 A16 a16#2
+linear 512x2560 AllowA4Decode 9..16 A16 a16#3
+linear 512x2560 AllowA4Decode 17..64 A16 a16#4
+linear 512x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 640x2560 A16Only 1..1 A16 a16#0
+linear 640x2560 A16Only 2..2 A16 a16#1
+linear 640x2560 A16Only 3..8 A16 a16#2
+linear 640x2560 A16Only 9..16 A16 a16#3
+linear 640x2560 A16Only 17..64 A16 a16#4
+linear 640x2560 A16Only 65..65536 A16 a16#5
+linear 640x2560 AllowA8 1..1 A16 a16#0
+linear 640x2560 AllowA8 2..2 A16 a16#1
+linear 640x2560 AllowA8 3..8 A16 a16#2
+linear 640x2560 AllowA8 9..16 A16 a16#3
+linear 640x2560 AllowA8 17..64 A16 a16#4
+linear 640x2560 AllowA8 65..65536 A16 a16#5
+linear 640x2560 AllowA4 1..1 A16 a16#0
+linear 640x2560 AllowA4 2..2 A16 a16#1
+linear 640x2560 AllowA4 3..8 A16 a16#2
+linear 640x2560 AllowA4 9..16 A16 a16#3
+linear 640x2560 AllowA4 17..64 A16 a16#4
+linear 640x2560 AllowA4 65..65536 A16 a16#5
+linear 640x2560 AllowA4Decode 1..1 A16 a16#0
+linear 640x2560 AllowA4Decode 2..2 A16 a16#1
+linear 640x2560 AllowA4Decode 3..8 A16 a16#2
+linear 640x2560 AllowA4Decode 9..16 A16 a16#3
+linear 640x2560 AllowA4Decode 17..64 A16 a16#4
+linear 640x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 2560x3072 A16Only 1..1 A16 a16#0
+linear 2560x3072 A16Only 2..2 A16 a16#1
+linear 2560x3072 A16Only 3..8 A16 a16#2
+linear 2560x3072 A16Only 9..16 A16 a16#3
+linear 2560x3072 A16Only 17..64 A16 a16#4
+linear 2560x3072 A16Only 65..65536 A16 a16#5
+linear 2560x3072 AllowA8 1..1 A16 a16#0
+linear 2560x3072 AllowA8 2..2 A16 a16#1
+linear 2560x3072 AllowA8 3..8 A16 a16#2
+linear 2560x3072 AllowA8 9..16 A16 a16#3
+linear 2560x3072 AllowA8 17..64 A16 a16#4
+linear 2560x3072 AllowA8 65..65536 A16 a16#5
+linear 2560x3072 AllowA4 1..1 A16 a16#0
+linear 2560x3072 AllowA4 2..2 A16 a16#1
+linear 2560x3072 AllowA4 3..8 A16 a16#2
+linear 2560x3072 AllowA4 9..16 A16 a16#3
+linear 2560x3072 AllowA4 17..64 A16 a16#4
+linear 2560x3072 AllowA4 65..65536 A16 a16#5
+linear 2560x3072 AllowA4Decode 1..1 A16 a16#0
+linear 2560x3072 AllowA4Decode 2..2 A16 a16#1
+linear 2560x3072 AllowA4Decode 3..8 A16 a16#2
+linear 2560x3072 AllowA4Decode 9..16 A16 a16#3
+linear 2560x3072 AllowA4Decode 17..64 A16 a16#4
+linear 2560x3072 AllowA4Decode 65..65536 A16 a16#5
+linear 13312x2560 A16Only 1..1 A16 a16#0
+linear 13312x2560 A16Only 2..2 A16 a16#1
+linear 13312x2560 A16Only 3..8 A16 a16#2
+linear 13312x2560 A16Only 9..16 A16 a16#3
+linear 13312x2560 A16Only 17..64 A16 a16#4
+linear 13312x2560 A16Only 65..65536 A16 a16#5
+linear 13312x2560 AllowA8 1..1 A16 a16#0
+linear 13312x2560 AllowA8 2..2 A16 a16#1
+linear 13312x2560 AllowA8 3..8 A16 a16#2
+linear 13312x2560 AllowA8 9..16 A16 a16#3
+linear 13312x2560 AllowA8 17..64 A16 a16#4
+linear 13312x2560 AllowA8 65..65536 A16 a16#5
+linear 13312x2560 AllowA4 1..1 A16 a16#0
+linear 13312x2560 AllowA4 2..2 A16 a16#1
+linear 13312x2560 AllowA4 3..8 A16 a16#2
+linear 13312x2560 AllowA4 9..16 A16 a16#3
+linear 13312x2560 AllowA4 17..64 A16 a16#4
+linear 13312x2560 AllowA4 65..65536 A16 a16#5
+linear 13312x2560 AllowA4Decode 1..1 A16 a16#0
+linear 13312x2560 AllowA4Decode 2..2 A16 a16#1
+linear 13312x2560 AllowA4Decode 3..8 A16 a16#2
+linear 13312x2560 AllowA4Decode 9..16 A16 a16#3
+linear 13312x2560 AllowA4Decode 17..64 A16 a16#4
+linear 13312x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 16384x2560 A16Only 1..1 A16 a16#0
+linear 16384x2560 A16Only 2..2 A16 a16#1
+linear 16384x2560 A16Only 3..8 A16 a16#2
+linear 16384x2560 A16Only 9..16 A16 a16#3
+linear 16384x2560 A16Only 17..64 A16 a16#4
+linear 16384x2560 A16Only 65..65536 A16 a16#5
+linear 16384x2560 AllowA8 1..1 A16 a16#0
+linear 16384x2560 AllowA8 2..2 A16 a16#1
+linear 16384x2560 AllowA8 3..8 A16 a16#2
+linear 16384x2560 AllowA8 9..16 A16 a16#3
+linear 16384x2560 AllowA8 17..64 A16 a16#4
+linear 16384x2560 AllowA8 65..65536 A16 a16#5
+linear 16384x2560 AllowA4 1..1 A16 a16#0
+linear 16384x2560 AllowA4 2..2 A16 a16#1
+linear 16384x2560 AllowA4 3..8 A16 a16#2
+linear 16384x2560 AllowA4 9..16 A16 a16#3
+linear 16384x2560 AllowA4 17..64 A16 a16#4
+linear 16384x2560 AllowA4 65..65536 A16 a16#5
+linear 16384x2560 AllowA4Decode 1..1 A16 a16#0
+linear 16384x2560 AllowA4Decode 2..2 A16 a16#1
+linear 16384x2560 AllowA4Decode 3..8 A16 a16#2
+linear 16384x2560 AllowA4Decode 9..16 A16 a16#3
+linear 16384x2560 AllowA4Decode 17..64 A16 a16#4
+linear 16384x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 1280x2560 A16Only 1..1 A16 a16#0
+linear 1280x2560 A16Only 2..2 A16 a16#1
+linear 1280x2560 A16Only 3..8 A16 a16#2
+linear 1280x2560 A16Only 9..16 A16 a16#3
+linear 1280x2560 A16Only 17..64 A16 a16#4
+linear 1280x2560 A16Only 65..65536 A16 a16#5
+linear 1280x2560 AllowA8 1..1 A16 a16#0
+linear 1280x2560 AllowA8 2..2 A16 a16#1
+linear 1280x2560 AllowA8 3..8 A16 a16#2
+linear 1280x2560 AllowA8 9..16 A16 a16#3
+linear 1280x2560 AllowA8 17..64 A16 a16#4
+linear 1280x2560 AllowA8 65..65536 A16 a16#5
+linear 1280x2560 AllowA4 1..1 A16 a16#0
+linear 1280x2560 AllowA4 2..2 A16 a16#1
+linear 1280x2560 AllowA4 3..8 A16 a16#2
+linear 1280x2560 AllowA4 9..16 A16 a16#3
+linear 1280x2560 AllowA4 17..64 A16 a16#4
+linear 1280x2560 AllowA4 65..65536 A16 a16#5
+linear 1280x2560 AllowA4Decode 1..1 A16 a16#0
+linear 1280x2560 AllowA4Decode 2..2 A16 a16#1
+linear 1280x2560 AllowA4Decode 3..8 A16 a16#2
+linear 1280x2560 AllowA4Decode 9..16 A16 a16#3
+linear 1280x2560 AllowA4Decode 17..64 A16 a16#4
+linear 1280x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 248320x2560 A16Only 1..1 A16 a16#0
+linear 248320x2560 A16Only 2..2 A16 a16#1
+linear 248320x2560 A16Only 3..8 A16 a16#2
+linear 248320x2560 A16Only 9..16 A16 a16#3
+linear 248320x2560 A16Only 17..64 A16 a16#4
+linear 248320x2560 A16Only 65..65536 A16 a16#5
+linear 248320x2560 AllowA8 1..1 A16 a16#0
+linear 248320x2560 AllowA8 2..2 A16 a16#1
+linear 248320x2560 AllowA8 3..8 A16 a16#2
+linear 248320x2560 AllowA8 9..16 A16 a16#3
+linear 248320x2560 AllowA8 17..64 A16 a16#4
+linear 248320x2560 AllowA8 65..65536 A16 a16#5
+linear 248320x2560 AllowA4 1..1 A16 a16#0
+linear 248320x2560 AllowA4 2..2 A16 a16#1
+linear 248320x2560 AllowA4 3..8 A16 a16#2
+linear 248320x2560 AllowA4 9..16 A16 a16#3
+linear 248320x2560 AllowA4 17..64 A16 a16#4
+linear 248320x2560 AllowA4 65..65536 A16 a16#5
+linear 248320x2560 AllowA4Decode 1..1 A16 a16#0
+linear 248320x2560 AllowA4Decode 2..2 A16 a16#1
+linear 248320x2560 AllowA4Decode 3..8 A16 a16#2
+linear 248320x2560 AllowA4Decode 9..16 A16 a16#3
+linear 248320x2560 AllowA4Decode 17..64 A16 a16#4
+linear 248320x2560 AllowA4Decode 65..65536 A16 a16#5
+linear 2560x6144 A16Only 1..1 A16 a16#0
+linear 2560x6144 A16Only 2..2 A16 a16#1
+linear 2560x6144 A16Only 3..8 A16 a16#2
+linear 2560x6144 A16Only 9..16 A16 a16#3
+linear 2560x6144 A16Only 17..64 A16 a16#4
+linear 2560x6144 A16Only 65..65536 A16 a16#5
+linear 2560x6144 AllowA8 1..1 A16 a16#0
+linear 2560x6144 AllowA8 2..2 A16 a16#1
+linear 2560x6144 AllowA8 3..8 A16 a16#2
+linear 2560x6144 AllowA8 9..16 A16 a16#3
+linear 2560x6144 AllowA8 17..64 A16 a16#4
+linear 2560x6144 AllowA8 65..65536 A16 a16#5
+linear 2560x6144 AllowA4 1..1 A16 a16#0
+linear 2560x6144 AllowA4 2..2 A16 a16#1
+linear 2560x6144 AllowA4 3..8 A16 a16#2
+linear 2560x6144 AllowA4 9..16 A16 a16#3
+linear 2560x6144 AllowA4 17..64 A16 a16#4
+linear 2560x6144 AllowA4 65..65536 A16 a16#5
+linear 2560x6144 AllowA4Decode 1..1 A16 a16#0
+linear 2560x6144 AllowA4Decode 2..2 A16 a16#1
+linear 2560x6144 AllowA4Decode 3..8 A16 a16#2
+linear 2560x6144 AllowA4Decode 9..16 A16 a16#3
+linear 2560x6144 AllowA4Decode 17..64 A16 a16#4
+linear 2560x6144 AllowA4Decode 65..65536 A16 a16#5
+linear 2560x640 A16Only 1..8 A16 a16#0
+linear 2560x640 A16Only 9..16 A16 a16#1
+linear 2560x640 A16Only 17..64 A16 a16#2
+linear 2560x640 A16Only 65..65536 A16 a16#3
+linear 2560x640 AllowA8 1..8 A16 a16#0
+linear 2560x640 AllowA8 9..16 A16 a16#1
+linear 2560x640 AllowA8 17..64 A16 a16#2
+linear 2560x640 AllowA8 65..65536 A16 a16#3
+linear 2560x640 AllowA4 1..8 A16 a16#0
+linear 2560x640 AllowA4 9..16 A16 a16#1
+linear 2560x640 AllowA4 17..64 A16 a16#2
+linear 2560x640 AllowA4 65..65536 A16 a16#3
+linear 2560x640 AllowA4Decode 1..8 A16 a16#0
+linear 2560x640 AllowA4Decode 9..16 A16 a16#1
+linear 2560x640 AllowA4Decode 17..64 A16 a16#2
+linear 2560x640 AllowA4Decode 65..65536 A16 a16#3
+linear 28672x5120 A16Only 1..1 A16 a16#0
+linear 28672x5120 A16Only 2..2 A16 a16#1
+linear 28672x5120 A16Only 3..8 A16 a16#2
+linear 28672x5120 A16Only 9..16 A16 a16#3
+linear 28672x5120 A16Only 17..24 A16 a16#4
+linear 28672x5120 A16Only 25..32 A16 a16#5
+linear 28672x5120 A16Only 33..64 A16 a16#6
+linear 28672x5120 A16Only 65..96 A16 a16#7
+linear 28672x5120 A16Only 97..65536 A16 a16#8
+linear 28672x5120 AllowA8 1..1 A16 a16#0
+linear 28672x5120 AllowA8 2..2 A16 a16#1
+linear 28672x5120 AllowA8 3..8 A16 a16#2
+linear 28672x5120 AllowA8 9..16 A16 a16#3
+linear 28672x5120 AllowA8 17..24 A16 a16#4
+linear 28672x5120 AllowA8 25..32 A16 a16#5
+linear 28672x5120 AllowA8 33..64 A16 a16#6
+linear 28672x5120 AllowA8 65..96 A16 a16#7
+linear 28672x5120 AllowA8 97..65536 A16 a16#8
+linear 28672x5120 AllowA4 1..32 A4 a4#0 RowMajor
+linear 28672x5120 AllowA4 33..64 A4 a4#1 RowMajor
+linear 28672x5120 AllowA4 65..128 A4 a4#2 RowMajor
+linear 28672x5120 AllowA4 129..65536 A4 a4#3 RowMajor
+linear 28672x5120 AllowA4Decode 1..32 A4 a4#0 RowMajor
+linear 28672x5120 AllowA4Decode 33..64 A4 a4#1 RowMajor
+linear 28672x5120 AllowA4Decode 65..128 A4 a4#2 RowMajor
+linear 28672x5120 AllowA4Decode 129..65536 A4 a4#3 RowMajor
+linear 5120x14336 A16Only 1..1 A16 a16#0
+linear 5120x14336 A16Only 2..2 A16 a16#1
+linear 5120x14336 A16Only 3..4 A16 a16#2
+linear 5120x14336 A16Only 5..5 A16 a16#3
+linear 5120x14336 A16Only 6..8 A16 a16#4
+linear 5120x14336 A16Only 9..16 A16 a16#5
+linear 5120x14336 A16Only 17..24 A16 a16#6
+linear 5120x14336 A16Only 25..48 A16 a16#7
+linear 5120x14336 A16Only 49..64 A16 a16#8
+linear 5120x14336 A16Only 65..128 A16 a16#9
+linear 5120x14336 A16Only 129..65536 A16 a16#10
+linear 5120x14336 AllowA8 1..1 A16 a16#0
+linear 5120x14336 AllowA8 2..2 A16 a16#1
+linear 5120x14336 AllowA8 3..4 A16 a16#2
+linear 5120x14336 AllowA8 5..5 A16 a16#3
+linear 5120x14336 AllowA8 6..8 A16 a16#4
+linear 5120x14336 AllowA8 9..16 A16 a16#5
+linear 5120x14336 AllowA8 17..24 A16 a16#6
+linear 5120x14336 AllowA8 25..48 A16 a16#7
+linear 5120x14336 AllowA8 49..64 A16 a16#8
+linear 5120x14336 AllowA8 65..128 A16 a16#9
+linear 5120x14336 AllowA8 129..65536 A16 a16#10
+linear 5120x14336 AllowA4 1..1 A16 a16#0
+linear 5120x14336 AllowA4 2..2 A16 a16#1
+linear 5120x14336 AllowA4 3..4 A16 a16#2
+linear 5120x14336 AllowA4 5..5 A16 a16#3
+linear 5120x14336 AllowA4 6..7 A16 a16#4
+linear 5120x14336 AllowA4 8..64 A4 a4#0 RowMajor
+linear 5120x14336 AllowA4 65..128 A4 a4#1 RowMajor
+linear 5120x14336 AllowA4 129..192 A4 a4#2 RowMajor
+linear 5120x14336 AllowA4 193..384 A4 a4#3 RowMajor
+linear 5120x14336 AllowA4 385..512 A4 a4#4 RowMajor
+linear 5120x14336 AllowA4 513..65536 A4 a4#3 RowMajor
+linear 5120x14336 AllowA4Decode 1..1 A16 a16#0
+linear 5120x14336 AllowA4Decode 2..2 A16 a16#1
+linear 5120x14336 AllowA4Decode 3..4 A16 a16#2
+linear 5120x14336 AllowA4Decode 5..5 A16 a16#3
+linear 5120x14336 AllowA4Decode 6..7 A16 a16#4
+linear 5120x14336 AllowA4Decode 8..64 A4 a4#0 RowMajor
+linear 5120x14336 AllowA4Decode 65..128 A4 a4#1 RowMajor
+linear 5120x14336 AllowA4Decode 129..192 A4 a4#2 RowMajor
+linear 5120x14336 AllowA4Decode 193..384 A4 a4#3 RowMajor
+linear 5120x14336 AllowA4Decode 385..512 A4 a4#4 RowMajor
+linear 5120x14336 AllowA4Decode 513..65536 A4 a4#3 RowMajor
+linear 5120x7168 A16Only 1..1 A16 a16#0
+linear 5120x7168 A16Only 2..2 A16 a16#1
+linear 5120x7168 A16Only 3..4 A16 a16#2
+linear 5120x7168 A16Only 5..5 A16 a16#3
+linear 5120x7168 A16Only 6..8 A16 a16#4
+linear 5120x7168 A16Only 9..16 A16 a16#5
+linear 5120x7168 A16Only 17..24 A16 a16#6
+linear 5120x7168 A16Only 25..48 A16 a16#7
+linear 5120x7168 A16Only 49..64 A16 a16#8
+linear 5120x7168 A16Only 65..128 A16 a16#9
+linear 5120x7168 A16Only 129..65536 A16 a16#10
+linear 5120x7168 AllowA8 1..1 A16 a16#0
+linear 5120x7168 AllowA8 2..2 A16 a16#1
+linear 5120x7168 AllowA8 3..4 A16 a16#2
+linear 5120x7168 AllowA8 5..5 A16 a16#3
+linear 5120x7168 AllowA8 6..8 A16 a16#4
+linear 5120x7168 AllowA8 9..16 A16 a16#5
+linear 5120x7168 AllowA8 17..24 A16 a16#6
+linear 5120x7168 AllowA8 25..48 A16 a16#7
+linear 5120x7168 AllowA8 49..64 A16 a16#8
+linear 5120x7168 AllowA8 65..128 A16 a16#9
+linear 5120x7168 AllowA8 129..65536 A16 a16#10
+linear 5120x7168 AllowA4 1..1 A16 a16#0
+linear 5120x7168 AllowA4 2..2 A16 a16#1
+linear 5120x7168 AllowA4 3..4 A16 a16#2
+linear 5120x7168 AllowA4 5..5 A16 a16#3
+linear 5120x7168 AllowA4 6..7 A16 a16#4
+linear 5120x7168 AllowA4 8..64 A4 a4#0 RowMajor
+linear 5120x7168 AllowA4 65..128 A4 a4#1 RowMajor
+linear 5120x7168 AllowA4 129..192 A4 a4#2 RowMajor
+linear 5120x7168 AllowA4 193..384 A4 a4#3 RowMajor
+linear 5120x7168 AllowA4 385..512 A4 a4#4 RowMajor
+linear 5120x7168 AllowA4 513..65536 A4 a4#3 RowMajor
+linear 5120x7168 AllowA4Decode 1..1 A16 a16#0
+linear 5120x7168 AllowA4Decode 2..2 A16 a16#1
+linear 5120x7168 AllowA4Decode 3..4 A16 a16#2
+linear 5120x7168 AllowA4Decode 5..5 A16 a16#3
+linear 5120x7168 AllowA4Decode 6..7 A16 a16#4
+linear 5120x7168 AllowA4Decode 8..64 A4 a4#0 RowMajor
+linear 5120x7168 AllowA4Decode 65..128 A4 a4#1 RowMajor
+linear 5120x7168 AllowA4Decode 129..192 A4 a4#2 RowMajor
+linear 5120x7168 AllowA4Decode 193..384 A4 a4#3 RowMajor
+linear 5120x7168 AllowA4Decode 385..512 A4 a4#4 RowMajor
+linear 5120x7168 AllowA4Decode 513..65536 A4 a4#3 RowMajor
+linear 8192x5120 A16Only 1..1 A16 a16#0
+linear 8192x5120 A16Only 2..2 A16 a16#1
+linear 8192x5120 A16Only 3..8 A16 a16#2
+linear 8192x5120 A16Only 9..16 A16 a16#3
+linear 8192x5120 A16Only 17..24 A16 a16#4
+linear 8192x5120 A16Only 25..32 A16 a16#5
+linear 8192x5120 A16Only 33..64 A16 a16#6
+linear 8192x5120 A16Only 65..96 A16 a16#7
+linear 8192x5120 A16Only 97..65536 A16 a16#8
+linear 8192x5120 AllowA8 1..1 A16 a16#0
+linear 8192x5120 AllowA8 2..2 A16 a16#1
+linear 8192x5120 AllowA8 3..8 A16 a16#2
+linear 8192x5120 AllowA8 9..16 A16 a16#3
+linear 8192x5120 AllowA8 17..24 A16 a16#4
+linear 8192x5120 AllowA8 25..32 A16 a16#5
+linear 8192x5120 AllowA8 33..64 A16 a16#6
+linear 8192x5120 AllowA8 65..96 A16 a16#7
+linear 8192x5120 AllowA8 97..65536 A16 a16#8
+linear 8192x5120 AllowA4 1..32 A4 a4#0 RowMajor
+linear 8192x5120 AllowA4 33..96 A4 a4#1 RowMajor
+linear 8192x5120 AllowA4 97..128 A4 a4#2 RowMajor
+linear 8192x5120 AllowA4 129..192 A4 a4#3 RowMajor
+linear 8192x5120 AllowA4 193..65536 A4 a4#4 RowMajor
+linear 8192x5120 AllowA4Decode 1..32 A4 a4#0 RowMajor
+linear 8192x5120 AllowA4Decode 33..96 A4 a4#1 RowMajor
+linear 8192x5120 AllowA4Decode 97..128 A4 a4#2 RowMajor
+linear 8192x5120 AllowA4Decode 129..192 A4 a4#3 RowMajor
+linear 8192x5120 AllowA4Decode 193..65536 A4 a4#4 RowMajor
+linear 7168x5120 A16Only 1..1 A16 a16#0
+linear 7168x5120 A16Only 2..2 A16 a16#1
+linear 7168x5120 A16Only 3..8 A16 a16#2
+linear 7168x5120 A16Only 9..16 A16 a16#3
+linear 7168x5120 A16Only 17..24 A16 a16#4
+linear 7168x5120 A16Only 25..32 A16 a16#5
+linear 7168x5120 A16Only 33..64 A16 a16#6
+linear 7168x5120 A16Only 65..128 A16 a16#7
+linear 7168x5120 A16Only 129..65536 A16 a16#8
+linear 7168x5120 AllowA8 1..1 A16 a16#0
+linear 7168x5120 AllowA8 2..2 A16 a16#1
+linear 7168x5120 AllowA8 3..8 A16 a16#2
+linear 7168x5120 AllowA8 9..16 A16 a16#3
+linear 7168x5120 AllowA8 17..24 A16 a16#4
+linear 7168x5120 AllowA8 25..32 A16 a16#5
+linear 7168x5120 AllowA8 33..64 A16 a16#6
+linear 7168x5120 AllowA8 65..128 A16 a16#7
+linear 7168x5120 AllowA8 129..65536 A16 a16#8
+linear 7168x5120 AllowA4 1..1 A16 a16#0
+linear 7168x5120 AllowA4 2..2 A16 a16#1
+linear 7168x5120 AllowA4 3..3 A16 a16#2
+linear 7168x5120 AllowA4 4..64 A4 a4#0 RowMajor
+linear 7168x5120 AllowA4 65..96 A4 a4#1 RowMajor
+linear 7168x5120 AllowA4 97..128 A4 a4#2 RowMajor
+linear 7168x5120 AllowA4 129..192 A4 a4#3 RowMajor
+linear 7168x5120 AllowA4 193..384 A4 a4#4 RowMajor
+linear 7168x5120 AllowA4 385..512 A4 a4#2 RowMajor
+linear 7168x5120 AllowA4 513..65536 A4 a4#4 RowMajor
+linear 7168x5120 AllowA4Decode 1..1 A16 a16#0
+linear 7168x5120 AllowA4Decode 2..2 A16 a16#1
+linear 7168x5120 AllowA4Decode 3..3 A16 a16#2
+linear 7168x5120 AllowA4Decode 4..64 A4 a4#0 RowMajor
+linear 7168x5120 AllowA4Decode 65..96 A4 a4#1 RowMajor
+linear 7168x5120 AllowA4Decode 97..128 A4 a4#2 RowMajor
+linear 7168x5120 AllowA4Decode 129..192 A4 a4#3 RowMajor
+linear 7168x5120 AllowA4Decode 193..384 A4 a4#4 RowMajor
+linear 7168x5120 AllowA4Decode 385..512 A4 a4#2 RowMajor
+linear 7168x5120 AllowA4Decode 513..65536 A4 a4#4 RowMajor
+linear_add 5120x6144 A16Only 1..65536 A16
+linear_add 5120x6144 AllowA8 1..65536 A16
+linear_add 5120x6144 AllowA4 1..16 A16
+linear_add 5120x6144 AllowA4 17..65536 A4
+linear_add 5120x6144 AllowA4Decode 1..7 A16Decode
+linear_add 5120x6144 AllowA4Decode 8..16 A16
+linear_add 5120x6144 AllowA4Decode 17..65536 A4
+linear_add 5120x3072 A16Only 1..65536 A16
+linear_add 5120x3072 AllowA8 1..65536 A16
+linear_add 5120x3072 AllowA4 1..16 A16
+linear_add 5120x3072 AllowA4 17..65536 A4
+linear_add 5120x3072 AllowA4Decode 1..7 A16Decode
+linear_add 5120x3072 AllowA4Decode 8..16 A16
+linear_add 5120x3072 AllowA4Decode 17..65536 A4
+linear_add 5120x17408 A16Only 1..65536 A16
+linear_add 5120x17408 AllowA8 1..65536 A16
+linear_add 5120x17408 AllowA4 1..7 A16
+linear_add 5120x17408 AllowA4 8..65536 A4
+linear_add 5120x17408 AllowA4Decode 1..7 A16Decode
+linear_add 5120x17408 AllowA4Decode 8..65536 A4
+linear_add 5120x8704 A16Only 1..65536 A16
+linear_add 5120x8704 AllowA8 1..65536 A16
+linear_add 5120x8704 AllowA4 1..7 A16
+linear_add 5120x8704 AllowA4 8..65536 A4
+linear_add 5120x8704 AllowA4Decode 1..7 A16Decode
+linear_add 5120x8704 AllowA4Decode 8..65536 A4
+linear_swiglu A16Only 1..1 DecodeFusedA16
+linear_swiglu A16Only 2..65536 SmallTFusedA16
+linear_swiglu AllowA8 1..1 DecodeFusedA16
+linear_swiglu AllowA8 2..65536 SmallTFusedA16
+linear_swiglu AllowA4 1..1 DecodeFusedA16
+linear_swiglu AllowA4 2..4 SmallTFusedA16
+linear_swiglu AllowA4 5..255 FusedA4
+linear_swiglu AllowA4 256..65536 TmaFusedA4
+linear_swiglu AllowA4Decode 1..7 SlicedKFusedA16
+linear_swiglu AllowA4Decode 8..255 FusedA4
+linear_swiglu AllowA4Decode 256..65536 TmaFusedA4
+attn_input A16Only 1..65536 A16
+attn_input AllowA8 1..65536 A16
+attn_input AllowA4 1..3 A16
+attn_input AllowA4 4..65536 A4
+attn_input AllowA4Decode 1..65536 A4
+gdn_conv B=1 A16Only 1..1 DecodeFusedA16
+gdn_conv B=1 A16Only 2..16 SmallTFusedA16
+gdn_conv B=1 A16Only 17..65536 rejected
+gdn_conv B=1 AllowA8 1..1 DecodeFusedA16
+gdn_conv B=1 AllowA8 2..16 SmallTFusedA16
+gdn_conv B=1 AllowA8 17..65536 rejected
+gdn_conv B=1 AllowA4 1..1 DecodeFusedA16
+gdn_conv B=1 AllowA4 2..3 SmallTFusedA16
+gdn_conv B=1 AllowA4 4..65536 Materialized
+gdn_conv B=1 AllowA4Decode 1..65536 Materialized
+gdn_conv B=2 A16Only 1..65536 Materialized
+gdn_conv B=2 AllowA8 1..65536 Materialized
+gdn_conv B=2 AllowA4 1..65536 Materialized
+gdn_conv B=2 AllowA4Decode 1..65536 Materialized
+gdn_conv B=3 A16Only 1..65536 Materialized
+gdn_conv B=3 AllowA8 1..65536 Materialized
+gdn_conv B=3 AllowA4 1..65536 Materialized
+gdn_conv B=3 AllowA4Decode 1..65536 Materialized
+gdn_conv B=4 A16Only 1..65536 Materialized
+gdn_conv B=4 AllowA8 1..65536 Materialized
+gdn_conv B=4 AllowA4 1..65536 Materialized
+gdn_conv B=4 AllowA4Decode 1..65536 Materialized
+gdn_conv B=5 A16Only 1..65536 Materialized
+gdn_conv B=5 AllowA8 1..65536 Materialized
+gdn_conv B=5 AllowA4 1..65536 Materialized
+gdn_conv B=5 AllowA4Decode 1..65536 Materialized
+gdn_conv B=6 A16Only 1..65536 Materialized
+gdn_conv B=6 AllowA8 1..65536 Materialized
+gdn_conv B=6 AllowA4 1..65536 Materialized
+gdn_conv B=6 AllowA4Decode 1..65536 Materialized
+gdn_conv B=7 A16Only 1..65536 Materialized
+gdn_conv B=7 AllowA8 1..65536 Materialized
+gdn_conv B=7 AllowA4 1..65536 Materialized
+gdn_conv B=7 AllowA4Decode 1..65536 Materialized
+gdn_conv B=8 A16Only 1..65536 Materialized
+gdn_conv B=8 AllowA8 1..65536 Materialized
+gdn_conv B=8 AllowA4 1..65536 Materialized
+gdn_conv B=8 AllowA4Decode 1..65536 Materialized
+gdn_gating_shard A16Only 1..1 Gemv
+gdn_gating_shard A16Only 2..32 FusedSplit10
+gdn_gating_shard A16Only 33..65536 Split10
+gdn_gating_shard AllowA8 1..1 Gemv
+gdn_gating_shard AllowA8 2..32 FusedSplit10
+gdn_gating_shard AllowA8 33..65536 Split10
+gdn_gating_shard AllowA4 1..1 Gemv
+gdn_gating_shard AllowA4 2..32 FusedSplit10
+gdn_gating_shard AllowA4 33..65536 Split10
+gdn_gating_shard AllowA4Decode 1..32 FusedSplit10
+gdn_gating_shard AllowA4Decode 33..65536 Split10
+attn_input a4 1..64 a4#0 RowMajor
+attn_input a4 65..96 a4#1 RowMajor
+attn_input a4 97..128 a4#2 RowMajor
+attn_input a4 129..192 a4#3 RowMajor
+attn_input a4 193..384 a4#4 RowMajor
+attn_input a4 385..511 a4#2 RowMajor
+attn_input a4 512..1023 a4#5 Tiled128
+attn_input a4 1024..65536 a4#6 Tiled256
+attn_input_shard a4 1..64 a4#0 RowMajor
+attn_input_shard a4 65..96 a4#1 RowMajor
+attn_input_shard a4 97..128 a4#2 RowMajor
+attn_input_shard a4 129..192 a4#3 RowMajor
+attn_input_shard a4 193..384 a4#4 RowMajor
+attn_input_shard a4 385..511 a4#2 RowMajor
+attn_input_shard a4 512..1023 a4#5 Tiled128
+attn_input_shard a4 1024..65536 a4#6 Tiled256
+gdn_input a4 1..64 a4#0 RowMajor
+gdn_input a4 65..96 a4#1 RowMajor
+gdn_input a4 97..128 a4#2 RowMajor
+gdn_input a4 129..192 a4#3 RowMajor
+gdn_input a4 193..511 a4#4 RowMajor
+gdn_input a4 512..65536 a4#5 Tiled256
+gdn_input_shard a4 1..64 a4#0 RowMajor
+gdn_input_shard a4 65..96 a4#1 RowMajor
+gdn_input_shard a4 97..128 a4#2 RowMajor
+gdn_input_shard a4 129..192 a4#3 RowMajor
+gdn_input_shard a4 193..511 a4#4 RowMajor
+gdn_input_shard a4 512..65536 a4#5 Tiled256
+linear_add 5120x6144 a4 1..64 a4#0 RowMajor
+linear_add 5120x6144 a4 65..128 a4#1 RowMajor
+linear_add 5120x6144 a4 129..192 a4#2 RowMajor
+linear_add 5120x6144 a4 193..384 a4#3 RowMajor
+linear_add 5120x6144 a4 385..512 a4#4 RowMajor
+linear_add 5120x6144 a4 513..1023 a4#3 RowMajor
+linear_add 5120x6144 a4 1024..65536 a4#5 Tiled256
+linear_add 5120x3072 a4 1..64 a4#0 RowMajor
+linear_add 5120x3072 a4 65..128 a4#1 RowMajor
+linear_add 5120x3072 a4 129..192 a4#2 RowMajor
+linear_add 5120x3072 a4 193..384 a4#3 RowMajor
+linear_add 5120x3072 a4 385..512 a4#4 RowMajor
+linear_add 5120x3072 a4 513..1023 a4#3 RowMajor
+linear_add 5120x3072 a4 1024..65536 a4#5 Tiled256
+linear_add 5120x17408 a4 1..64 a4#0 RowMajor
+linear_add 5120x17408 a4 65..128 a4#1 RowMajor
+linear_add 5120x17408 a4 129..192 a4#2 RowMajor
+linear_add 5120x17408 a4 193..384 a4#3 RowMajor
+linear_add 5120x17408 a4 385..512 a4#4 RowMajor
+linear_add 5120x17408 a4 513..1023 a4#3 RowMajor
+linear_add 5120x17408 a4 1024..65536 a4#5 Tiled256
+linear_add 5120x8704 a4 1..64 a4#0 RowMajor
+linear_add 5120x8704 a4 65..128 a4#1 RowMajor
+linear_add 5120x8704 a4 129..192 a4#2 RowMajor
+linear_add 5120x8704 a4 193..384 a4#3 RowMajor
+linear_add 5120x8704 a4 385..512 a4#4 RowMajor
+linear_add 5120x8704 a4 513..1023 a4#3 RowMajor
+linear_add 5120x8704 a4 1024..65536 a4#5 Tiled256
+linear_swiglu a4 1..32 a4#0 RowMajor
+linear_swiglu a4 33..64 a4#1 RowMajor
+linear_swiglu a4 65..96 a4#2 RowMajor
+linear_swiglu a4 97..65536 a4#3 RowMajor

@@ -132,8 +132,7 @@ void ProgramImpl::bind_prefill_grammar_mask(SequenceState& sequence, RequestCont
 }
 
 bool ProgramImpl::sampling_bypass_hooks() const noexcept {
-    return !qwen4_forced_tokens.empty() || !qwen4_mtp_oracle.empty() || qwen4_replay != nullptr ||
-           qwen4_tfdump != nullptr;
+    return validation && validation->bypasses_sampling();
 }
 
 } // namespace ninfer::models::qwen3_5::detail

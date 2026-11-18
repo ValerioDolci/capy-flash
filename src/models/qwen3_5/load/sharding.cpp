@@ -196,20 +196,6 @@ void merge_axis(ParentState& state, const LogicalShard& shard, const std::string
     }
 }
 
-// NINFER_TP_DRAFT_HEAD=primary keeps the optimized proposal head whole on rank 0, its placement
-// before the vocabulary split, for A/B runs on one binary.
-bool proposal_head_primary_requested() {
-    const char* value = std::getenv("NINFER_TP_DRAFT_HEAD");
-    return value != nullptr && std::string_view(value) == "primary";
-}
-
-// NINFER_TP_DRAFTER=primary keeps every DFlash2 drafter weight and its proposal head whole on rank
-// 0, the placement before the drafter split, for A/B runs on one binary.
-bool drafter_primary_requested() {
-    const char* value = std::getenv("NINFER_TP_DRAFTER");
-    return value != nullptr && std::string_view(value) == "primary";
-}
-
 // The optimized head splits by vocabulary rows when it is indexed (fewer rows than the vocabulary,
 // every row a candidate) and each rank's block has a registered split route. MTP proposes on both
 // ranks through the split argmax (at most ops::kArgmaxSplitMaxRowsPerRank rows per rank); its
@@ -217,30 +203,30 @@ bool drafter_primary_requested() {
 // vocabulary-split top sixteen (ops::linear_topk_split, [65536,5120] blocks), whose keys carry
 // global token IDs: its token IDs split with the head's rows.
 bool split_proposal_rows(std::uint64_t rows, const Config& config, const LoadOptions& options) {
-    if (proposal_head_primary_requested() || rows == config.text.vocab_size) { return false; }
+    if (rows == config.text.vocab_size) { return false; }
     const auto tp = static_cast<std::uint64_t>(options.tp);
     if (rows % tp != 0) { return false; }
     if (options.mtp()) {
         return rows / tp <= static_cast<std::uint64_t>(ops::kArgmaxSplitMaxRowsPerRank);
     }
     if (options.dflash2()) {
-        return !drafter_primary_requested() &&
-               rows / tp == static_cast<std::uint64_t>(ops::kLinearTopKSplitRows);
+        return rows / tp == static_cast<std::uint64_t>(ops::kLinearTopKSplitRows);
     }
     return false;
 }
 
-// The DFlash2 drafter at tp 2 (NINFER_TP_DRAFTER=primary keeps it PrimaryOnly): a draft block's
+// The DFlash2 drafter at tp 2: a draft block's
 // attention heads and MLP rows split like a Text block's, with the query, key and value heads of
 // each rank in contiguous blocks; the convolution kernels, the norms and the feature projection are
 // replicated (every rank computes the same context and conv coefficients from its own copy of the
 // replicated residual); the candidate selector sits on one rank (selector_rank()).
 bool split_dflash2_drafter(const Config& config, const LoadOptions& options) {
-    return options.dflash2() && options.tp > 1 && !drafter_primary_requested() && config.draft;
+    return options.dflash2() && options.tp > 1 && config.draft;
 }
 
-// NINFER_TP_SELECTOR=primary keeps the split drafter's candidate selector on rank 0, the placement
-// before it moved to rank 1, for A/B runs on one binary.
+// NINFER_TP_SELECTOR=primary keeps the split drafter's candidate selector on rank 0: slightly
+// faster rounds, paid with the selector's memory on the rank that bounds the KV capacity
+// (docs/capy-flash/diagnostics.md).
 bool selector_primary_requested() {
     const char* value = std::getenv("NINFER_TP_SELECTOR");
     return value != nullptr && std::string_view(value) == "primary";
@@ -251,13 +237,11 @@ bool selector_primary_requested() {
 // weights, leaving rank 0 (the one that bounds the KV capacity) that much more context. Both ranks
 // rank the candidates of their proposal head blocks, and the selecting rank sends the drafts and
 // their distributions to the other (execution/tp2/draft_tp2.inc). Rank 0 with the Vision tower on
-// rank 1, with the proposal head whole on rank 0 (NINFER_TP_DRAFT_HEAD=primary: only rank 0 holds
-// the candidates), or with NINFER_TP_SELECTOR=primary. The Program rejects a selector on rank 1
-// over a proposal head that did not split (startup_tp2.inc).
+// rank 1, or with NINFER_TP_SELECTOR=primary. The Program rejects a selector on rank 1 over a
+// proposal head that did not split (startup_tp2.inc).
 int selector_rank(const LoadOptions& options) {
     const bool vision_on_rank1 = options.vision && options.vision_rank == 1;
-    return vision_on_rank1 || proposal_head_primary_requested() || selector_primary_requested() ? 0
-                                                                                                : 1;
+    return vision_on_rank1 || selector_primary_requested() ? 0 : 1;
 }
 
 LogicalShard draft_block_shard(std::string_view name, std::string_view leaf,

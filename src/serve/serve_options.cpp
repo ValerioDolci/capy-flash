@@ -4,10 +4,13 @@
 #include "product/speculative_options.h"
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -67,16 +70,20 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 } // namespace
 
 std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
-                                   std::string_view architecture) {
+                                   std::uint32_t model_default, std::uint32_t tp) {
     if (configured) { return *configured; }
-    return architecture == "Qwen4ExpForCausalLM" ? 0U : 1U;
+    // At tp 2 an anchor is one more StateImage per turn in the checkpoint pools the turn closures
+    // need: with it, a 27B agent replay of three sessions lost every turn closure after the first
+    // session (prefix reuse 53-58 % instead of 89 %).
+    if (tp > 1) { return 0U; }
+    return model_default;
 }
 
 namespace {
 
 // Serving profiles: the configurations the release launchers start (two 16 GB boards; 27b-16gb:
 // one). They are inserted before the command line's own flags, so an explicit flag overrides its
-// profile value; the KV capacity is left to follow --max-context.
+// profile value; the KV capacity follows --max-context unless the profile sets it.
 struct ServeProfile {
     std::string_view name;
     std::vector<std::string_view> flags;
@@ -102,6 +109,33 @@ const std::vector<ServeProfile>& serve_profiles() {
           "mtp",
           "--draft-tokens",
           "3",
+          "--host-kv-mib",
+          "4096",
+          "--host-state-slots",
+          "8",
+          "--embedding-host"}},
+        // flash-next for several clients at once (agents): three lanes, the generating KV in RAM so
+        // the expert slots keep the VRAM, room for three full contexts, one MTP draft token (the
+        // wider verify rows cost more than they save with more than one lane).
+        {"flash-next-multi",
+         {"--tp",
+          "2",
+          "--devices",
+          "0,1",
+          "--kv-dtype",
+          "int8",
+          "--elastic",
+          "--max-context",
+          "262144",
+          "--kv-capacity",
+          "786432",
+          "--max-concurrency",
+          "3",
+          "--kv-ram-active",
+          "--spec",
+          "mtp",
+          "--draft-tokens",
+          "1",
           "--host-kv-mib",
           "4096",
           "--host-state-slots",
@@ -160,7 +194,7 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--host-state-slots",
           "8"}},
         // Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
-        // (docs/serving.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9
+        // (docs/serving/capy-flash.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9
         // GiB).
         {"27b-16gb",
          {"--device",
@@ -204,8 +238,9 @@ const ServeProfile& find_profile(std::string_view name) {
     for (const ServeProfile& profile : serve_profiles()) {
         if (profile.name == name) { return profile; }
     }
-    throw std::invalid_argument("unknown --profile " + std::string(name) +
-                                " (known: flash-next, flash-next-1gpu, 27b, 27b-16gb)");
+    throw std::invalid_argument(
+        "unknown --profile " + std::string(name) +
+        " (known: flash-next, flash-next-multi, flash-next-1gpu, 27b, 27b-16gb)");
 }
 
 std::string profile_text(std::string_view name) {
@@ -242,7 +277,8 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] "
+           " <model.ninfer> [--profile flash-next|flash-next-multi|flash-next-1gpu|27b|27b-16gb] "
+           "[--host H] "
            "[--port N] [--api-key KEY|--api-key-file FILE] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] [--decode-share F] "
@@ -263,10 +299,12 @@ std::string serve_usage_text(const char* argv0) {
            "[--disk-cache-idle-ms N] "
            "[--disk-cache-flush-seconds N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
-           "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
+           "[--max-long-anchors-per-continuation N] [--turn-anchors N] [--no-endpoint-reuse] "
            "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--kv-ram-active] "
+           "[--kv-ram-region-tokens N] [--kv-ram-cache-blocks N] "
            "[--miss-split auto|calibrate|off] "
-           "[--stream-min-tokens N] [--expert-cpu-threads N] "
+           "[--stream-min-tokens N] [--expert-cpu-threads N] [--expert-cpus LIST] "
+           "[--expert-exclusive-layers N] [--gguf-hybrid-cost A,B,C] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
@@ -276,6 +314,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--host-pinned-max-gib G] [--no-prefix-reuse] "
+           "[--q8-a8 32|128] [--attn-pv-f16acc] [--tp-ar-payload fp16|int8] "
            "[--reasoning-close-retry|--no-reasoning-close-retry] "
            "[--reasoning-eos-guard|--no-reasoning-eos-guard] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -287,11 +326,14 @@ std::string serve_usage_text(const char* argv0) {
            "Serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints.\n"
            "\n"
            "General:\n"
-           "  --profile <flash-next|flash-next-1gpu|27b|27b-16gb>\n"
+           "  --profile <flash-next|flash-next-multi|flash-next-1gpu|27b|27b-16gb>\n"
            "    Apply the tested configuration of a model before the other flags, which override "
            "it (27b-16gb: one 16 GB GPU, 3-bit GSQ 27B artifact).\n"
            "    flash-next: " +
            profile_text("flash-next") +
+           "\n"
+           "    flash-next-multi: " +
+           profile_text("flash-next-multi") +
            "\n"
            "    27b: " +
            profile_text("27b") +
@@ -435,6 +477,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --turn-anchors <N>\n"
            "    Anchors per turn.\n"
            "    default: 2\n"
+           "  --no-endpoint-reuse\n"
+           "    Never resume from the end of the previous reply (a decode state): resume from the "
+           "last prefill checkpoint and prefill the reply again, so a follow-up turn gives the "
+           "same tokens whether or not the reply was still cached. Costs time to first token.\n"
            "  --kv-lease-window <N>\n"
            "    A request reserves its prompt plus N output tokens of Device KV and grows as its "
            "answer grows; 0 reserves the whole max_tokens at admission.\n"
@@ -461,6 +507,17 @@ std::string serve_usage_text(const char* argv0) {
            "    Use pinned host RAM for the text attention KV, taken 8192 tokens at a time as "
            "conversations grow (at most --kv-capacity tokens), and copies only the indexer's "
            "selected blocks to the GPU (results unchanged).\n"
+           "  --kv-ram-region-tokens <N>\n"
+           "    With --kv-ram-active: tokens per layer of the VRAM staging region of a prefill; "
+           "longer contexts stage the union of each chunk's selections (results unchanged; "
+           "NINFER_KVRAM_REGION_TOKENS also sets it).\n"
+           "    default: 262144\n"
+           "  --kv-ram-cache-blocks <N>\n"
+           "    With --kv-ram-active: 4-token blocks of the VRAM block cache per text attention "
+           "layer, raised to hold one layer of --max-context; more keeps more of the indexer's "
+           "past selections on the GPU for more VRAM (results unchanged; "
+           "NINFER_KVRAM_CACHE_BLOCKS also sets it).\n"
+           "    default: 4096\n"
            "  --miss-split <auto|calibrate|off>\n"
            "    Auto lets the GPU read part of each window's missing experts (best at one GPU); "
            "calibrate does the same with costs measured on this machine (GPU copy rate at startup, "
@@ -477,6 +534,21 @@ std::string serve_usage_text(const char* argv0) {
            "    CPU threads of the missing experts; default auto from the machine, logged at "
            "startup: max(6, cores/2, 2 per L3 domain), one per physical core with ggml block "
            "expert banks.\n"
+           "  --expert-cpus <LIST>\n"
+           "    CPUs of the missing experts as taskset writes them (0-7,16): one thread per listed "
+           "CPU, pinned in that order, SMT siblings allowed; replaces the automatic list and "
+           "--expert-cpu-threads (same results; NINFER_HOST_MOE_CPUS also sets it).\n"
+           "  --expert-exclusive-layers <N>\n"
+           "    ggml block expert banks (64 GB edition): the first N layers keep the experts the "
+           "GPUs hold at startup in VRAM only, without a page-locked RAM copy (less RAM; "
+           "NINFER_QWEN4_EXCLUSIVE_LAYERS also sets it).\n"
+           "    default: 0 (off)\n"
+           "  --gguf-hybrid-cost <A,B,C>\n"
+           "    ggml block expert banks on one GPU: cost model in microseconds of the prompt "
+           "chunks' CPU share (A per expert, B per routed token of an expert on the CPU, C per "
+           "expert copied over PCIe); slower RAM or a faster link want a smaller CPU share "
+           "(NINFER_GGUF_HYBRID_COST also sets it).\n"
+           "    default: 35,3.6,100\n"
            "  --host-pinned-max-gib <N>\n"
            "    Keep at most N GiB of the host-mapped weights (Flash-Next expert banks) "
            "page-locked; the banks of the least used layers beyond it stay in pageable memory "
@@ -521,6 +593,21 @@ std::string serve_usage_text(const char* argv0) {
            "    While a prompt runs, the requests already decoding get F times the time of each "
            "prompt unit (at least one decode round per unit); 1 gives both equal time.\n"
            "    default: 0, max: 16\n"
+           "  --q8-a8 <32|128>\n"
+           "    Changes the numbers (opt-in): Flash-Next's dense Q8 projections of a prompt chunk "
+           "run on int8 tensor cores, activations in groups of 32 or 128 values (prefill +7-8 %; "
+           "NINFER_Q8_A8 also sets it).\n"
+           "    default: off\n"
+           "  --attn-pv-f16acc\n"
+           "    Changes the numbers (opt-in): the INT8-KV prefill attention sums P x V of each "
+           "64-key tile in FP16 (the 27B on long prompts: prefill +6 % at 16k, +25 % at 128k; "
+           "NINFER_ATTN_PV_F16ACC=1 also sets it).\n"
+           "    default: off\n"
+           "  --tp-ar-payload <fp16|int8>\n"
+           "    int8 changes the numbers (opt-in): at tp 2 Flash-Next's prefill exchange between "
+           "the GPUs carries int8 codes with an FP16 scale per 32 rows (prefill +7-8 %; "
+           "NINFER_TP_AR_PAYLOAD=int8 also sets it).\n"
+           "    default: fp16\n"
            "  --prefill-miss-dump <DIR>\n"
            "    Diagnose prefix-reuse misses: when a request recomputes at least "
            "--prefill-miss-min-tokens prompt tokens, shares at least --prefill-miss-min-match of "
@@ -895,6 +982,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.elastic_kv.enabled = true;
         } else if (arg == "--kv-ram-active") {
             options.kv_ram_active = true;
+        } else if (arg == "--kv-ram-region-tokens") {
+            const int tokens = parse_nonnegative_int(require_value("--kv-ram-region-tokens"),
+                                                     "kv-ram-region-tokens");
+            if (tokens < 1 || tokens > (1 << 30)) {
+                throw std::invalid_argument("--kv-ram-region-tokens must be 1..1073741824");
+            }
+            options.kv_ram_region_tokens = static_cast<std::uint32_t>(tokens);
+        } else if (arg == "--kv-ram-cache-blocks") {
+            const int blocks = parse_nonnegative_int(require_value("--kv-ram-cache-blocks"),
+                                                     "kv-ram-cache-blocks");
+            if (blocks < 1 || blocks > (1 << 24)) {
+                throw std::invalid_argument("--kv-ram-cache-blocks must be 1..16777216");
+            }
+            options.kv_ram_cache_blocks = static_cast<std::uint32_t>(blocks);
         } else if (arg == "--kv-grow") {
             options.elastic_kv.grow_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kv-grow"), "kv-grow"));
@@ -931,6 +1032,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--expert-cpu-threads must be 1..64");
             }
             options.expert_cpu_threads = static_cast<std::uint32_t>(n);
+        } else if (arg == "--expert-cpus") {
+            try {
+                options.expert_cpus = ops::host::parse_cpu_list(require_value("--expert-cpus"));
+            } catch (const std::invalid_argument& error) {
+                throw std::invalid_argument(std::string("--expert-cpus: ") + error.what());
+            }
+        } else if (arg == "--expert-exclusive-layers") {
+            options.expert_exclusive_layers = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--expert-exclusive-layers"), "expert-exclusive-layers"));
+        } else if (arg == "--gguf-hybrid-cost") {
+            const std::string value = require_value("--gguf-hybrid-cost");
+            std::array<double, 3> cost{};
+            char tail = 0;
+            if (std::sscanf(value.c_str(), "%lf,%lf,%lf%c", &cost[0], &cost[1], &cost[2], &tail) !=
+                    3 ||
+                !(cost[0] >= 0.0) || !(cost[1] >= 0.0) || !(cost[2] > 0.0) ||
+                !std::isfinite(cost[0]) || !std::isfinite(cost[1]) || !std::isfinite(cost[2])) {
+                throw std::invalid_argument("--gguf-hybrid-cost must be A,B,C microseconds "
+                                            "(A, B >= 0, C > 0)");
+            }
+            options.gguf_hybrid_cost = cost;
         } else if (arg == "--stream-min-tokens") {
             options.stream_min_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--stream-min-tokens"), "stream-min-tokens"));
@@ -1051,8 +1173,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                             "representing at least 1 byte and less than 16 EiB");
             }
             options.host_pinned_max_bytes = *bytes;
+        } else if (arg == "--q8-a8") {
+            const std::string_view value = require_value("--q8-a8");
+            if (value != "32" && value != "128") {
+                throw std::invalid_argument("--q8-a8 must be 32 or 128");
+            }
+            options.lossy_prefill.q8_a8 = value == "32" ? 32 : 128;
+        } else if (arg == "--attn-pv-f16acc") {
+            options.lossy_prefill.attn_pv_f16acc = true;
+        } else if (arg == "--tp-ar-payload") {
+            const std::string_view value = require_value("--tp-ar-payload");
+            if (value != "fp16" && value != "int8") {
+                throw std::invalid_argument("--tp-ar-payload must be fp16 or int8");
+            }
+            options.lossy_prefill.tp_ar_payload_int8 = value == "int8";
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--no-endpoint-reuse") {
+            options.context_cache.resume_session_endpoints = false;
         } else if (arg == "--reasoning-close-retry") {
             options.reasoning_close_retry = true;
         } else if (arg == "--no-reasoning-close-retry") {

@@ -195,7 +195,7 @@ and commit semantics, including their numerical boundary.
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
 the configured blocks in chunks. It preserves state and positions across chunks. The blocks run in
 the Text forward's plain residual ([Qwen4Exp reference, the Text forward's
-options](qwen4-exp-model.md#the-text-forwards-options); `execution/qwen4_forward.h`), with the
+options](qwen4-exp-model.md#the-text-forwards-options); `execution/text_forward.h`), with the
 27B's fused Ops in every block. Final offset
 RMSNorm and the full output head produce the target distribution. Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
@@ -241,7 +241,7 @@ width and vocabulary ([`sharding.h`](../../src/models/qwen3_5/load/sharding.h));
 both ranks when it is given a `TpExecution` ([`tp.h`](../../src/models/qwen3_5/execution/tp.h))
 naming rank 1's parameters, arena, GDN state pool, KV caches, prefill KV rows, ordinary decode
 control, Text forward runtime, the ReplaySSM records of a speculative backend and, under MTP, its
-prefill frames; the Text layers run in the Qwen4 forward on both ranks.
+prefill frames; the Text layers run in the Text forward on both ranks.
 
 Each block issues one rank's work on that device's stream:
 
@@ -345,7 +345,7 @@ tap reads rank 0's residual as for text.
 At tp 2 DFlash2 splits the drafter and the candidate ranking of the optimized proposal head as
 well as the target; placement, round and state are in [DFlash2](dflash.md#tensor-parallel-execution).
 
-The Program plans one per-rank layout (`SequencePlanImpl::tp`): KV heads and GDN state halved,
+The Program plans one per-rank layout (`SequencePlanningInputs::tp`): KV heads and GDN state halved,
 and a workspace sized from the tp 2 workspace plan's allocation order with the rank's
 `shard_text_config` extents, the all-reduce staging and the vocabulary-split logits; the ReplaySSM
 records hold one rank's heads. Rank 1 allocates the same layout without the drafter's state

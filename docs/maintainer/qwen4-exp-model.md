@@ -313,13 +313,44 @@ Dense checkpoints convert with the Qwen3.5 dense MLP naming, MTP layer included.
 are for correctness work on new geometries; `tools/capy_flash/gen_synthetic.py --ffn dense` writes
 such checkpoints.
 
+### Quantizing from BF16
+
+A new dense 27B ships as BF16/FP8; third-party quantizations come days later. The recipes
+`qwen3_8_27b_bf16_nvfp4_rtn(_all)` (Qwen3.5 dense mathematics) and `qwen4_nvfp4_rtn_all`
+(Qwen4Exp dense) quantize the BF16 checkpoint alone by round-to-nearest, with no calibration:
+NVFP4 runs A16Only, FP8 rows AllowA8.
+
+| recipe | layout | measured on Qwen3.8-27B, two GPUs |
+|---|---|---|
+| `…_rtn` | MLP NVFP4 in the first 7/8 of the layers; the other projections, head and embedding FP8 rows (the `qwen3_8_27b_nvfp4` layout) | GSM8K (330) 0.973, MMLU-Pro (252) 0.806, against the QUASAR artifact's 0.961 and 0.782 (paired b/c 2/6, p 0.29; 6/12, p 0.24). 21.3 GB against 17.2 GB: it starts at `--kv-capacity 262144`, not the profile's 327680; decode 13 % slower, prefill 2x slower (A16 NVFP4, FP8 attention and GDN) |
+| `…_rtn_all` | every attention, GDN and MLP projection NVFP4, FP8 head and embedding (the QUASAR artifact's layout) | converted (17.25 GB), not evaluated |
+
+Same check, one GPU: a 3-bit grouped RTN body in the GSQ artifact's layout lost 8 points of GSM8K
+and 23 of MMLU-Pro against GSQ (p < 1e-4), so a one-GPU 27B needs a calibrated or post-trained
+3-bit quantization, not RTN. Conversion runs on the CPU with less than 1 GiB of RAM: 14-20 minutes
+for the NVFP4 layouts of a 27B (about 32 s per 10⁹ NVFP4 weights, 57 s per 10⁹ FP8 weights).
+
+```bash
+OMP_NUM_THREADS=8 python -m tools.convert --model /path/to/qwen3.8-27b-bf16 --recipe qwen3_8_27b_bf16_nvfp4_rtn \
+  --components text,vision,mtp --proposal --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --device cpu --out /path/to/model.ninfer
+```
+
+For a dense Qwen4 checkpoint the recipe is `qwen4_nvfp4_rtn_all`; the proposal head and the
+chat template follow what the release's serving needs.
+
+The light quality check that compares an artifact with a reference artifact: GSM8K `--limit 330`
+and MMLU-Pro `--limit 18` (252), think on, greedy, 8192 output tokens, one request at a time, paired
+per question (exact McNemar), plus `ninfer-perplexity --quick`. About one hour of both GPUs per
+artifact.
+
 ## Execution
 
-`execution/qwen4_forward.h` (one template for execution and startup workspace sizing, at one
+`execution/text_forward.h` (one template for execution and startup workspace sizing, at one
 device or over the two ranks of `--tp 2`; its members by responsibility in
-`execution/qwen4_forward/`, instantiated for both uses in `execution/qwen4_forward.cpp`; the
-Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
-`execution/qwen4_text.cpp` (one function per call over the ranks), Program state in `program/` and
+`execution/text_forward/`, instantiated for both uses in `execution/text_forward.cpp`; the
+Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
+`execution/text_forward_context.cpp` (one function per call over the ranks), Program state in `program/` and
 `state/`:
 
 - **Residual**: `hyper_connection_expand` of the embedding; every mixer is
@@ -351,7 +382,7 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
   (one BF16 rounding). Backends (`execution/qwen4_experts.h`, `EngineOptions::routed_experts`):
   - **Offload** (default): a device slot cache per layer (`ExpertCache`, slot table read by
     `moe_slots_nvfp4`, W4A4) for the hot experts, and the CPU for the routed experts the table does
-    not hold (`ops/sparse_moe/host`: `HostMoeMailbox` + `HostMoeExecutor`, NVFP4 W4A8 in AVX-512
+    not hold (`ops/host_moe`: `HostMoeMailbox` + `HostMoeExecutor`, NVFP4 W4A8 in AVX-512
     VNNI or AVX2 by `host_isa()`, same bits, 6 pinned threads). Per layer, inside the round's CUDA Graph: right after the router a publish
     kernel and two stream memory writes hand x, the routing and the host-side ids to the CPU; the GPU
     runs the shared expert and the resident experts; a stream memory wait (no SM held) and an
@@ -435,14 +466,14 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
   proposal steps the same way, each rank from its own retained copy of the target hidden: rank 1
   keeps its prompt chunk's wide residual in its own `prefill_hidden` and writes its capture
   checkpoints.
-- **MTP** (`Qwen4Forward::run_mtp`, round schedule `program/speculative/mtp.cpp`): the stem over
+- **MTP** (`TextForward::run_mtp`, round schedule `program/speculative/mtp.cpp`): the stem over
   the target's wide residual and the shifted token, one QSA block over the MTP KV cache (layer 0,
   its own index planes) with the MTP experts, the MTP output mixer and the Text output head. Prompt
   chunks append every column's K/V and index records (stem + attention mixer + `qsa_append` only);
   the last prompt column runs the layer and drafts K tokens autoregressively. A round verifies the
   window `[anchor, d1..dK]` (K+1 columns per lane) through the Text forward in record mode: GDN
   writes ReplaySSM records (`gdn_projected_conv_record`, `gated_delta_net_replay_record`), PLE
-  copies its convolution inputs to `Qwen4Runtime::ple_record`, QSA appends K/V and index records in
+  copies its convolution inputs to `ForwardRuntime::ple_record`, QSA appends K/V and index records in
   place. Acceptance is tp2's (`speculative_accept_greedy_drafts`: greedy prefix match, or rejection
   sampling against the one-hot draft at temperature > 0). The commit folds the accepted prefix:
   `gdn_replay_fold` over the 36 GDN layers and `ple_conv_advance` of the recorded PLE inputs
@@ -487,7 +518,7 @@ Program-owned inputs and taps in `execution/qwen4_runtime.h`), entry points in
 
 ## The Text forward's options
 
-`Qwen4Forward` is the one Text forward of every model: Qwen4Exp (Qwen3.8-Flash-Next, dense Qwen4)
+`TextForward` is the one Text forward of every model: Qwen4Exp (Qwen3.8-Flash-Next, dense Qwen4)
 and the dense Qwen3.5 architecture (Qwen3.8-27B). Its options are selected by the configuration and
 the bound Parameters, never by name:
 
@@ -510,14 +541,16 @@ consumes (`close()` routes the closing projection to `y` instead of the residual
 
 **Dense gated attention** (`dense_attention`): q|k|gate|v projection, q/k RMSNorm, RoPE (tp 2: the
 fused norm+RoPE Op), causal attention over the paged KV with the call's envelope
-(`Qwen4Columns::envelope`), sigmoid output gate, closing projection. Without QSA the KV cache has no
+(`ForwardColumns::envelope`), sigmoid output gate, closing projection. Without QSA the KV cache has no
 index planes.
 
 **Fused routes** (`Qwen4FusedRoutes`, `Prepare::qwen4_routes`): resolved once when the Parameters
-are prepared, by asking each fused Op's capacity query for the rank's actual parent shape, format
-and policy (one device: the plain Op; tp 2: its column-parallel form). An unregistered profile
-throws in the query and keeps the generic chain; `NINFER_QWEN4_FUSED=0` forces the generic chain
-in every Qwen4Exp block (A/B). The blocks of a dense Qwen3.5 model always take the fused routes.
+are prepared, by asking each fused Op's `*_registered` query for the rank's actual parent format
+and shape (one device: the plain Op; tp 2: its column-parallel form; `attn_input` by its query and
+key/value rows). Each query reads the predicate its Op's capacity query rejects with, so a
+registered profile is one the capacity query accepts for every policy and T. An unregistered
+profile keeps the generic chain; `NINFER_QWEN4_FUSED=0` forces the generic chain in every Qwen4Exp
+block (A/B). The blocks of a dense Qwen3.5 model always take the fused routes.
 
 | route | fused Ops (one device / tp 2) | registered for |
 |---|---|---|
@@ -527,6 +560,11 @@ in every Qwen4Exp block (A/B). The blocks of a dense Qwen3.5 model always take t
 | `swiglu` | `linear_swiglu` / `linear_swiglu_column_parallel` | [34816,5120] (FFN 17408) NVFP4, FP8, Q4, Q8, Q3; [28672,5120] (FFN 14336) NVFP4; their tp 2 halves |
 
 Qwen3.8-Flash-Next (hidden 2560) has no registered profile and keeps the generic chain.
+
+The startup log counts the Text layers' routes in one `info` line after `engine ready`, e.g.
+`projection routes | 64 text layers | gdn_input fused 48 | gdn_gating fused 48 | attn_input fused
+16 | swiglu fused 64` (`projection_routes()`, `LoadSummary::projection_routes`), so a shape that
+falls back to the generic chain is visible.
 
 **A dense Qwen3.5 model.** The artifact, names, binding, tp 2 sharding and stored formats are the
 Qwen3.5 ones. `Parameters` builds `qwen4` blocks as views of the Qwen3.5 blocks (no

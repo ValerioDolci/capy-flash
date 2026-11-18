@@ -4,11 +4,12 @@
 // [14336,5120] parent (12 of 24 query/gate heads, 2 of 4 key/value heads), rows
 // query|key|gate|value = 3072|512|3072|512.
 //
-// The shard runs the parent's own FP8 attn_input_proj sources, compiled a second time by the
-// fp8_attn_input_shard_*.cu/.cpp translation units of this directory with the section output
-// and the entry points renamed (fp8_attn_input_shard_names.h). Both share K, so every route,
-// schedule and token cutoff is the parent's by construction; only the split-K partial reservation
-// is the shard's own (fewer row tiles split earlier).
+// Both share K, so every route, schedule and token cutoff is the parent's by construction; only the
+// split-K partial reservation is the shard's own (fewer row tiles split earlier). The parent's
+// plan (fp8/fp8_attn_input_plan.cpp) runs both problems, and its launcher sources
+// (fp8/fp8_attn_input_{decode,a16_small_t,a16_gemm,a8}.cu) serve the shard too, with the shard's
+// section output as a template argument (Fp8AttnInputShardOutput, fp8/fp8_attn_input_output.cuh):
+// the shard's entry points below and its partial reservation are defined next to the parent's.
 
 #include "core/weight.h"
 #include "core/arena.h"

@@ -5,7 +5,7 @@
 // checkpoint is (per-16 E4M3 scale = amax / 6 * S, E2M1 round-to-nearest-even, one FP32 divisor
 // per matrix), so codes, scales and divisors have realistic distributions.
 
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include <array>
 #include <cmath>

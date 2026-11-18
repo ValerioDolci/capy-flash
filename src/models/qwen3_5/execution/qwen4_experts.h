@@ -2,7 +2,7 @@
 
 // Routed-expert backends of the Qwen4Exp (Qwen3.8-Flash-Next) MoE block.
 //
-// The block computes router, shared expert and output combine itself (qwen4_forward/moe.h); a
+// The block computes router, shared expert and output combine itself (text_forward/moe.h); a
 // backend only produces the FP32 partial sum of the routed experts,
 //
 //   partial[:,t] = sum_k weights[k,t] * expert_{ids[k,t]}(x[:,t])     (every k, every t)
@@ -44,7 +44,7 @@
 #include "ninfer/ops/moe_slots.h"
 #include "ninfer/ops/moe_slots_gguf.h"
 #include "ninfer/types.h"
-#include "ops/sparse_moe/host/host_moe_mailbox.h"
+#include "ops/host_moe/host_moe_mailbox.h"
 
 #include <cuda_runtime.h>
 
@@ -90,7 +90,7 @@ enum class Qwen4Window : std::uint8_t {
 // rank's partition of the experts (ID parity); routed()/run() are called on the rank's
 // stream with the rank's device current and write that partition's FP32 partial alone. The
 // forward adds the gated shared expert on the block's owner rank and then sums the two partials
-// with one FP32 all-reduce (qwen4_forward/moe.h). The offload backend at tp 2 is one
+// with one FP32 all-reduce (text_forward/moe.h). The offload backend at tp 2 is one
 // Qwen4OffloadExperts on rank 0 owning the cache of both GPUs (partition by ID parity), the
 // mailbox and the CPU executor, and a Qwen4OffloadPeerExperts on rank 1: each rank runs the
 // experts resident in its own slots; the CPU computes every routed expert resident on neither GPU
@@ -202,8 +202,16 @@ struct Qwen4OffloadOptions {
     // (ExpertCachePolicy::set_active_columns). 0 = none.
     std::int32_t elastic_columns = 0;
     std::int32_t cpu_threads; // host expert threads, spread over the CCDs
-    std::int32_t insert_cap;  // insertions per layer per decode window (0 = no cap)
-    double admit_threshold;   // > 0: decayed-frequency admission into a full layer
+    // RoutedExpertOptions::cpus: the executor's CPUs in place of cpu_threads spread over the
+    // CCDs; empty = NINFER_HOST_MOE_CPUS or the spread (ops::host::HostMoeMailboxConfig).
+    std::vector<int> cpus;
+    // RoutedExpertOptions::exclusive_layers (qwen4_exclusive_layers()).
+    std::optional<std::uint32_t> exclusive_layers;
+    // RoutedExpertOptions::gguf_hybrid_cost: {gguf_cpu_expert_us, gguf_cpu_route_us,
+    // gguf_link_us} in place of NINFER_GGUF_HYBRID_COST and the defaults below.
+    std::optional<std::array<double, 3>> gguf_hybrid_cost;
+    std::int32_t insert_cap; // insertions per layer per decode window (0 = no cap)
+    double admit_threshold;  // > 0: decayed-frequency admission into a full layer
     double half_life_tokens;
     double evict_tau_windows;       // > 0: frequency x recency victim, 0 = LRU
     std::int32_t prompt_tokens = 8; // largest prefill chunk (routing log length)
@@ -247,8 +255,7 @@ struct Qwen4OffloadOptions {
     // whole. The default costs are those that gave the shortest time to first token at every
     // prompt length on the reference machine (Ryzen 9 9900X, 12 threads, DDR5; RTX 5070 Ti, PCIe
     // 5.0 x8), where the CPU and the copies share the RAM bandwidth.
-    // NINFER_GGUF_HYBRID=0: off; NINFER_GGUF_HYBRID_COST=a,b,link: other costs.
-    bool gguf_cpu_hybrid      = true;
+    // gguf_hybrid_cost, else NINFER_GGUF_HYBRID_COST=a,b,link: other costs.
     double gguf_cpu_expert_us = 35.0;
     double gguf_cpu_route_us  = 3.6;
     double gguf_link_us       = 100.0;
@@ -294,10 +301,6 @@ struct Qwen4OffloadOptions {
     // in its layer's prompt targets), so the experts the decode needs most land first. Off: the
     // prompt window is observed once the chunk completed, its fills queue layer by layer.
     bool warm_start;
-    // Reclaim the lent layers before a prompt chunk that needs nothing lent (the short tail
-    // after a prompt's wide chunks): 1 = the refill overlaps the chunk, 2 = the chunk waits for
-    // the refill (and finds the layers filled), 0 = off (NINFER_QWEN4_EARLY_RECLAIM).
-    std::int32_t early_reclaim = 1;
     // keep_decode_residency: prompt windows change neither the residency nor the frequencies
     // (ExpertCachePolicy::count_prompt; their routing still feeds the streaming CPU tail and the
     // counters), and the layers a prompt lends refill afterwards with the experts they held when
@@ -498,8 +501,8 @@ private:
     std::int64_t snapshot_saved_    = 0;
     bool snapshot_any_window_       = false;
     Qwen4Window snapshot_last_kind_ = Qwen4Window::Decode;
-    // Early reclaim: whether the refill lands before the chunk runs (mode 2, and with
-    // deterministic publication).
+    // Early reclaim: whether the refill lands before the chunk runs (with deterministic
+    // publication).
     [[nodiscard]] bool early_reclaim_waits() const noexcept;
     void snapshot_save_block();
 public:

@@ -18,8 +18,8 @@
 //  5. prefill: decode_rows_bf16 the same BF16 values; gemm_bf16 the same outputs (reported);
 //  6. HostMoeExecutor (Options::isa = Avx2 vs Avx512Vnni) on GGUF layers: the same outputs for
 //     calls of T = 1..8 tokens (synthetic layers and, with NINFER_GGUF_BANKS, the real ones).
-#include "ops/sparse_moe/host/host_gguf.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_gguf.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include "nlohmann/json.hpp"
 

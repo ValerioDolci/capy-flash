@@ -3,8 +3,8 @@
 //
 // One Text call over the rank-0 operands, and with a non-null `tp` over both ranks of a
 // two-device Model (tp.h). With `tp`, the text and multimodal prefill chunk (with its MTP prompt
-// alignment or DFlash feature capture) and ordinary decode run the Qwen4 forward on both ranks
-// (qwen4_text.cpp), and speculative target verification (with or without DFlash feature capture),
+// alignment or DFlash feature capture) and ordinary decode run the Text forward on both ranks
+// (text_forward_context.cpp), and speculative target verification (with or without DFlash feature capture),
 // the MTP decode-round forwards and proposals, the MTP bridge and their logits run split through
 // the rank-array overloads below; the single-rank MTP and verification entries are rejected with
 // std::invalid_argument. The constructor rejects incomplete Text forward and MTP bindings.

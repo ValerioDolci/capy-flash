@@ -49,6 +49,22 @@ using Nvfp4N28672K5120 = Nvfp4Geometry<28672, 5120>;
 // same route.
 inline constexpr std::int32_t kNvfp4OutputFamilyFirstA4Tokens = 17;
 inline constexpr std::int32_t kNvfp4DownFamilyFirstA4Tokens   = 8;
+// First token count at which the same row-parallel pairs take the A4 TMA route: linear_add over
+// every problem above (nvfp4_linear_add_a4.cu) and linear() over [5120,6144], [5120,17408] and
+// their halves, so both ranks of a pair also run the same schedule past the A4 crossover.
+inline constexpr std::int32_t kNvfp4OutputDownFamilyFirstTmaTokens = 1024;
+// First token count at which nvfp4 attn_input_proj over [14336,5120] and its two-device shard
+// [7168,5120] takes the A4 route (nvfp4_attn_input_plan.cpp); linear() over the same two problems
+// uses the same crossover. [14336,5120] is also the two-device half of the dense FFN-14336 gate|up:
+// linear() there (the unfused chain) keeps this crossover, while the fused linear_swiglu over that
+// half has its own (nvfp4_linear_swiglu_plan.cpp).
+inline constexpr std::int32_t kNvfp4AttnInputFamilyFirstA4Tokens = 4;
+// First token count at which the fused A4 launchers switch to their TMA GEMM:
+// attn_input_proj over [14336,5120] and its shard (Tiled128 scales, Tiled256 from 1024),
+// gdn_input_proj over [16384,5120] and its shard, and linear_swiglu over its gate|up problems.
+inline constexpr std::int32_t kNvfp4AttnInputFamilyFirstTmaTokens = 512;
+inline constexpr std::int32_t kNvfp4GdnInputFamilyFirstTmaTokens  = 512;
+inline constexpr std::int32_t kNvfp4SwiGluFamilyFirstTmaTokens    = 256;
 
 using Nvfp4Activation3072Geometry  = Nvfp4ActivationGeometry<3072>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;

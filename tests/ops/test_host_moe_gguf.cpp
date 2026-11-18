@@ -14,7 +14,7 @@
 //    equals the same token's output in a call of its own (T independence); identical bits with
 //    Options::gguf_only;
 //  - tokens without a host expert (all ids < 0) get 0.
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include "nlohmann/json.hpp"
 

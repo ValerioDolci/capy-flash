@@ -68,38 +68,44 @@ can be anywhere in their section.
 
 A shard (`attn_input_proj` [7168,5120], `gdn_input_proj` [8192,5120]) or half (`linear_swiglu`
 [17408,5120]) is the parent's problem with fewer output rows and the same K, so it must take the
-parent's routes, schedules and token cutoffs. Instead of editing the parent's launchers to accept
-a second output type, each shard translation unit includes the parent's launcher source after a
-names header that renames the output type (or geometry) and the entry points:
+parent's routes, schedules and token cutoffs. The parent's own sources serve it:
 
-```cpp
-#include "ops/attn_input_proj/tp2/fp8_attn_input_shard_prelude.h"   // family headers, real names
-#include "ops/attn_input_proj/tp2/fp8_attn_input_shard_names.h"     // #define Fp8AttentionInputOutput ...
-#include "ops/attn_input_proj/fp8/fp8_attn_input_a8.cu"             // the parent's source
-```
+- Where every launcher of the parent already reads its output rows from the weight and its
+  template arguments depend only on K, the half needs nothing of its own: the parent's one plan
+  serves it, and the wrapper registers the half's rows next to the parent's. NVFP4
+  `linear_swiglu` works this way for [17408,5120] and for the dense FFN-14336 gate|up
+  [28672,5120] and its half [14336,5120]; so do the FP8 `linear_swiglu` plan, matrix and A8
+  launchers.
+- Where a kernel takes the rows at compile time, the parent's launcher source is a template on
+  the output (the section output type of `gdn_input_proj` and `attn_input_proj`, the geometry of
+  the FP8 `linear_swiglu` decode and small-T kernels) and defines the shard's entry points next to
+  the parent's. The shard's output types are declared next to the parent's
+  (`*_output.cuh`), so the kernels keep their names. The parent's plan runs both problems with each
+  one's launchers (a table per problem, e.g. `fp8_attn_input_shard_dispatch` in
+  `fp8/fp8_attn_input_plan.cpp`; for FP8 `linear_swiglu` the wrapper passes the half's A16
+  launchers, `tp2/linear_swiglu_half.h`). The Q8 DFlash2 drafter's [3072,5120] shard works the
+  same way (`q8/q8_dflash2_attn_input.cu`).
+- One exception to "next to the parent's": the NVFP4 a16 launchers of `gdn_input_proj` and
+  `attn_input_proj` are header templates (`nvfp4_{gdn,attn}_input_a16.cuh`) and the shard's
+  instance is compiled in its own unit (`tp2/nvfp4_*_shard_a16.cu`). With both instances in one
+  unit the compiler generates the second one's A16 MMA kernels differently (same names and
+  template arguments, other machine code); one instance per unit keeps the code of each.
 
-The prelude includes the family's headers first, under their real names, so that only the
-parent source's own code is renamed. The plan/dispatch source is compiled the same way, so the
-shard's dispatcher is the parent's route logic calling the shard's launchers; the two-device wrapper
-calls it (`fp8_attn_input_shard_dispatch`). What is genuinely the shard's own stays explicit in
-these files: the FP8 split-K partial reservations (`*_shard_partial_capacity_bytes`) and the
-NVFP4 attention shard's TMA scale tile at T=1024 (`nvfp4_attn_input_shard_a4.cu`, via
-`tp2::DeviceTuning`).
+What is genuinely the shard's own stays explicit: the FP8 split-K partial reservations
+(`*_shard_partial_capacity_bytes`, next to the parent's in the A8 launcher sources) and the NVFP4
+attention shard's TMA scale tile at T=1024 (`nvfp4_attn_input_shard_a4.cu`, via
+`tp2::DeviceTuning`). A change to a parent launcher reaches the shard by construction; a change
+that must not (a row count, not K) shows in the split tests (`*_split_test`).
 
-If a parent launcher changes, the shard follows automatically. Two changes would make it wrong
-silently, and `tools/tp2/check_shard_sources.py` (the gate's `shards` stage) fails on both:
-a template, inline or kernel definition outside an anonymous namespace in a re-included source (the
-parent's and the shard's bodies would share one name and the linker would keep one), and a renamed
-identifier appearing in a header the prelude does not include first. The rest breaks at compile or
-link time:
-
-- the parent renames or removes the output type, a launcher, or a source file → update the names
-  header or the include in `tp2/`;
-- the parent adds a non-static function to one of these sources → duplicate symbol at link time;
-  add a rename for it in the names header (see how `fp8_attn_input_partial_capacity_bytes` is
-  renamed to an unused name in `fp8_attn_input_shard_a8.cu`);
-- the parent starts using one of its constants for something the shard must change (a row count,
-  not K) → the split tests (`*_split_test`) fail; add a rename or an explicit shard override.
+One shard is still the parent's source compiled a second time:
+`context_kv_materialize/tp2/materialize_shard_h4.cu` includes `materialize.cu` after
+`materialize_h4_names.h`, which sets the source's overridable KV-head count to 4 and renames the
+entry point. There the head count is a namespace-scope constant read by the kernels, not a template
+argument; making it one would rename the kernels. `tools/tp2/check_shard_sources.py` (the gate's
+`shards` stage) guards this form: it fails on a template, inline or kernel definition outside an
+anonymous namespace in the re-included source (the parent's and the shard's bodies would share one
+name and the linker would keep one) and on a renamed identifier appearing in a header the shard
+unit does not include first.
 
 `linear_add` does not use this pattern: its half problems differ from their parents in K, and
 the parent selects the schedule family by comparing K with 6144/17408, so the halves need the
@@ -176,7 +182,7 @@ what a new model family implements:
 |---|---|
 | `ExecutionContext`, peer access, `--tp/--devices` options, symmetric KV capacity (`runtime/engine`) | placement rules per logical parameter: `shard_rule` in [`load/sharding.cpp`](../../src/models/qwen3_5/load/sharding.cpp) (Rows/Columns/Replicated/PrimaryOnly/SingleDevice) |
 | sharded materialization (`artifact::Binder` shard resolver, `tensor_slice`, `materialize` on an `ExecutionContext`) | the config split: `shard_text_config` in [`execution/tp.cpp`](../../src/models/qwen3_5/execution/tp.cpp) (which heads, channels and widths halve) |
-| transport: `allreduce_sum`, `PeerEvents`, `PeerMailbox`, `concat_rows`, split argmax | the split schedule: `execution/tp2/` (the `*_split` forms the Qwen4 forward and the MTP head use: which projection is column- or row-parallel, where the two all-reduces of a layer sit) |
+| transport: `allreduce_sum`, `PeerEvents`, `PeerMailbox`, `concat_rows`, split argmax | the split schedule: `execution/tp2/` (the `*_split` forms the Text forward and the MTP head use: which projection is column- or row-parallel, where the two all-reduces of a layer sit) |
 | split Op forms (`include/ninfer/ops/tp2/`): column/row-parallel `linear`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `gdn_gating_proj` | the shard shapes of the new model's dimensions: registered in each Op like any problem (`linear` shapes files; the `tp2/*_shard_*` sets of the fused Ops, one more set per new shard shape) |
 | dual-device CUDA Graph capture (`core/tp2`), KV and StateImage mirrors | the Program integration: rank 1's runtime and mirrors (`program/tp2/program_impl_tp2.inc`), the rounds' peer ingress, `TpExecution` |
 | `tp2::DeviceTuning`, `tools/tp2/gate.sh` | per-rank persistent layouts and the tp2 workspace plan (`program/tp2/startup_tp2.inc`), the tp2 checks of the planner and the Engine |

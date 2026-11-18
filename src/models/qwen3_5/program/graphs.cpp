@@ -328,8 +328,8 @@ void ProgramImpl::prepare_graphs() {
             }
         }
         // The one execution that follows (eager warm-up or graph launch) does not stage n-gram
-        // rows: release its PLE layer at once (Qwen4Runtime::decode_ple_staged).
-        raise_qwen4_ple_staged();
+        // rows: release its PLE layer at once (ForwardRuntime::decode_ple_staged).
+        qwen4_ple.raise_staged();
     };
     const auto execution_core = [&] {
         return execution::ExecutionCore{device,
@@ -343,7 +343,7 @@ void ProgramImpl::prepare_graphs() {
                                         proposal_head,
                                         tp_binding(),
                                         graph_peer_bridge(),
-                                        qwen4_runtime()};
+                                        forward_runtime()};
     };
 
     // Under WSL2 a captured exchange can hang in a graph's first launch although the startup
@@ -420,7 +420,7 @@ void ProgramImpl::prepare_graphs() {
                 state_images->continuation_hidden_store(),
                 peer ? &*peer->io.mtp_decode : nullptr,
                 peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-                qwen4_mtp_calib != nullptr};
+                validation && validation->mtp_calib()};
             const GraphExecutionProfile code_warm = planned_profiles.front();
             // As for ordinary rounds: every batch size is warmed eagerly on both devices at tp 2
             // before any capture, since batch shape selects kernels.

@@ -1,0 +1,36 @@
+# stderr: messages go through the logger with a level.
+# <count> <path>; counts may only go down (tools/check_ratchets.py).
+11 apps/cli/main.cpp
+2 apps/perplexity/main.cpp
+3 apps/serve/main.cpp
+4 src/artifact/materializer.cpp
+1 src/core/arena.cu
+2 src/core/decode_graph.cpp
+2 src/core/device.cu
+1 src/core/device_scope.h
+1 src/core/disk_kv_cache.cpp
+2 src/core/expert_cache.cu
+1 src/core/paged_kv_cache.cpp
+1 src/core/tp2/decode_graph_tp2.inc
+19 src/models/qwen3_5/execution/qwen4_experts.cpp
+2 src/models/qwen3_5/execution/text_forward_context.cpp
+1 src/models/qwen3_5/execution/qwen4_tfdump.cpp
+3 src/models/qwen3_5/execution/reasoning_eos_guard.cpp
+1 src/models/qwen3_5/program/grammar_masks.cpp
+1 src/models/qwen3_5/program/planning/startup.cpp
+2 src/models/qwen3_5/program/storage/context.cpp
+11 src/models/qwen3_5/program/storage/disk_kv.cpp
+1 src/models/qwen3_5/program/storage/qwen4_elastic.cpp
+1 src/models/qwen3_5/program/transactions/capture.cpp
+3 src/ops/common/allreduce.cu
+1 src/ops/common/peer_mailbox.cu
+1 src/ops/linear/q3/q3_linear.cu
+2 src/ops/linear/q8/q8_a8.cu
+1 src/ops/linear_attention/gated_delta_net/common.cuh
+1 src/ops/host_moe/host_moe_executor.cpp
+1 src/ops/host_moe/host_moe_mailbox.cu
+1 src/product/logging/logging.cpp
+1 src/runtime/engine/constraint_masks.h
+9 src/runtime/engine/engine_core.h
+1 src/runtime/engine/model_instance.cpp
+1 src/serve/generation_service.cpp

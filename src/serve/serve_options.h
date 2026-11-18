@@ -4,6 +4,7 @@
 #include "product/logging/logging.h"
 #include "serve/request.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -72,7 +73,10 @@ struct ServeOptions {
     bool embedding_host = false; // token embedding table in mapped pinned host memory
     // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
     std::uint64_t host_pinned_max_bytes = 0;
-    bool allow_prefix_reuse             = true;
+    // --q8-a8, --attn-pv-f16acc, --tp-ar-payload int8: prefill speed for a small change in the
+    // numbers, all off (README «Optional speed switches»).
+    LossyPrefillOptions lossy_prefill;
+    bool allow_prefix_reuse = true;
     // --reasoning-close-retry (on by default, every model; --no-reasoning-close-retry):
     // a reply that ends with the model's terminal token inside its thinking (or right after
     // "</think>" with blank content and no tool call) is closed with "\n</think>\n\n" and continued
@@ -86,7 +90,8 @@ struct ServeOptions {
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
     // turn branches from the conversation; see to_prompt_input.
-    // Unset = the model's default (resolve_turn_anchors): 0 on Qwen4Exp, 1 elsewhere.
+    // Unset = the default (resolve_turn_anchors): 0 at tp 2, otherwise the model's registered
+    // default (0 on Qwen4Exp, 1 elsewhere).
     // On Qwen3.8-Flash-Next every prefill pass reads the non-resident experts from host RAM
     // (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67 s instead of
     // 1.82 s); a cancelled or edited turn then re-prefills the conversation. On models whose
@@ -107,6 +112,15 @@ struct ServeOptions {
     // threads of the missing experts, pinned one per allowed physical core, spread over the L3
     // domains). Unset = resolved at load from the machine (ops::host::auto_expert_cpu_threads).
     std::optional<std::uint32_t> expert_cpu_threads;
+    // --expert-cpus (RoutedExpertOptions::cpus; empty = NINFER_HOST_MOE_CPUS or automatic),
+    // --expert-exclusive-layers (RoutedExpertOptions::exclusive_layers) and --gguf-hybrid-cost
+    // (RoutedExpertOptions::gguf_hybrid_cost); unset leaves the engine's environment and defaults.
+    std::vector<int> expert_cpus;
+    std::optional<std::uint32_t> expert_exclusive_layers;
+    std::optional<std::array<double, 3>> gguf_hybrid_cost;
+    // --kv-ram-region-tokens / --kv-ram-cache-blocks (EngineOptions; 0 = environment or default).
+    std::uint32_t kv_ram_region_tokens = 0;
+    std::uint32_t kv_ram_cache_blocks  = 0;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
@@ -141,10 +155,12 @@ std::string resolve_public_model_id(const ServeOptions& options,
 // Engine's max_context, which the Engine lowers to the context left after the prompt.
 [[nodiscard]] int resolve_default_max_tokens(const ServeOptions& options,
                                              std::uint32_t max_context);
-// --turn-anchors when given, otherwise the model's default: 0 for Qwen4ExpForCausalLM (each prefill
-// pass reads the non-resident experts from host RAM), 1 for every other architecture.
+// --turn-anchors when given, otherwise the default: 0 at tp 2 (each anchor holds a StateImage per
+// turn in the pools the turn closures need), at tp 1 the model's default
+// (LoadSummary::turn_anchors: 0 for Qwen4ExpForCausalLM, whose prefill passes read the
+// non-resident experts from host RAM).
 [[nodiscard]] std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
-                                                 std::string_view architecture);
+                                                 std::uint32_t model_default, std::uint32_t tp);
 
 std::string serve_usage_text(const char* argv0);
 

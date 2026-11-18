@@ -105,7 +105,3 @@ target_link_options(ninfer_serve_tp_transport_recovery_real_test PRIVATE
   "LINKER:--wrap=_ZN6ninfer6models7qwen3_57Program22recover_peer_transportB5cxx11Ev")
 set_tests_properties(ninfer_serve_tp_transport_recovery_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
-# Documentation guard: every serve flag, NINFER_* variable and conversion recipe of the sources
-# appears in the user docs (tools/check_docs.py).
-add_test(NAME ninfer_docs_guard_test
-  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/check_docs.py ${PROJECT_SOURCE_DIR})

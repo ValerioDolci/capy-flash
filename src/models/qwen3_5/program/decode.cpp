@@ -3,7 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
-#include "models/qwen3_5/execution/qwen4_runtime.h"
+#include "models/qwen3_5/execution/forward_runtime.h"
 #include "models/qwen3_5/execution/qwen4_tfdump.h"
 #include "core/nvtx.h"
 #include "core/device.h"
@@ -54,8 +54,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, nullptr, state.execution.tp);
-        card.set_qwen4_runtime(state.execution.qwen4);
-        if (const Qwen4Runtime* qwen4 = state.execution.qwen4;
+        card.set_forward_runtime(state.execution.qwen4);
+        if (const ForwardRuntime* qwen4 = state.execution.qwen4;
             qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr &&
             qwen4->decode_ple_staged == nullptr) {
             // The round's n-gram rows, gathered on the host before the launch (one upload node).
@@ -65,7 +65,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                        cudaMemcpyHostToDevice, state.execution.device.stream));
             if (state.execution.tp != nullptr) {
                 // tp 2: rank 1 uploads the same host rows into its own copy (replicated PLE).
-                const Qwen4Runtime* peer = state.execution.tp->qwen4;
+                const ForwardRuntime* peer = state.execution.tp->qwen4;
                 if (peer == nullptr || peer->decode_ple_rows.data == nullptr) {
                     throw std::logic_error("Qwen4Exp tp 2 decode has no rank 1 PLE rows");
                 }
@@ -168,10 +168,87 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
     return topology.executable;
 }
 
+struct RoundGraph {
+    DecodeGraphProfile& profile;
+    DecodeGraphExecutable* executable;
+};
+
+// The CUDA Graph profile that covers a round of `batch_size` rows up to `frontier`, installed in
+// its topology's executable.
+RoundGraph select_round_graph(DecodeGraphFamily& family, std::size_t batch_size,
+                              std::uint32_t frontier, const char* label) {
+    DecodeGraphProfile& profile =
+        select_graph_profile(family, static_cast<std::uint32_t>(batch_size), frontier, label);
+    return {profile, &install_graph_profile(family, profile, label)};
+}
+
+// Membership common to every decode round: at least one row, no more rows than lanes, one budget
+// per row.
+void require_round_membership(std::span<const std::uint32_t> lanes,
+                              std::span<const runtime::RoundBudget> budgets,
+                              std::uint32_t max_concurrency, const char* label) {
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+        throw std::invalid_argument(std::string(label) + " membership is invalid");
+    }
+}
+
+// The lane of `row` exists and does not repeat an earlier row's lane.
+void require_round_lane(std::span<const std::uint32_t> lanes, std::size_t row,
+                        std::uint32_t max_concurrency, const char* label) {
+    const std::uint32_t lane = lanes[row];
+    if (lane >= max_concurrency ||
+        std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+            lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+        throw std::invalid_argument(std::string(label) + " contains an invalid or duplicate lane");
+    }
+}
+
+// Between rounds the ledger holds the executed tokens plus the one the next round executes, and
+// the prefix identity and digests cover the whole ledger.
+bool ledger_at_decode_frontier(const SequenceState& sequence) {
+    return sequence.ledger_frontier == sequence.execution_frontier + 1 &&
+           sequence.ledger.size() == sequence.ledger_frontier &&
+           sequence.prefix_identity.size() == sequence.ledger_frontier &&
+           sequence.prefix_digests.size() == sequence.ledger_frontier;
+}
+
+// Drafts the row's budget leaves room for: every verified row also commits its bonus token.
+std::uint32_t drafts_within_budget(const runtime::RoundBudget& budget) noexcept {
+    return budget.generated_tokens_remaining > 1 ? budget.generated_tokens_remaining - 1U : 0U;
+}
+
 // Observation only: the entry is appended within the capacity reserved by install_sampling.
 void record_accepted_length(RequestControl& request, std::uint8_t length) noexcept {
     std::vector<std::uint8_t>& lengths = request.speculative_stats.accepted_lengths;
     if (lengths.size() < request.accepted_length_steps) { lengths.push_back(length); }
+}
+
+// Speculative statistics of one verified row: `extent` drafts verified, `accepted` of them taken.
+// A row verified without drafts is a fallback step.
+void record_speculative_row(RequestControl& request, std::uint32_t extent, std::int32_t accepted) {
+    if (extent == 0) {
+        request.speculative_stats.fallback_steps += 1;
+    } else {
+        request.speculative_stats.rounds += 1;
+        request.speculative_stats.drafted_tokens += extent;
+        request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted);
+        for (std::int32_t i = 0; i < accepted; ++i) {
+            request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
+        }
+    }
+    if (request.accepted_length_steps != 0) {
+        record_accepted_length(request, extent == 0 ? kSpeculativeFallbackStep
+                                                    : static_cast<std::uint8_t>(accepted));
+    }
+}
+
+// The row's round is executed and awaits resolution: `produced` tokens past `base_S`.
+void set_round_pending(RequestControl& request, PendingKind kind, std::uint32_t base_E,
+                       std::uint32_t base_S, std::uint32_t produced, double seconds) {
+    request.pending = PendingCandidate{
+        .kind = kind, .base_E = base_E, .base_S = base_S, .prompt_tokens = 0, .produced = produced};
+    request.lifecycle = Lifecycle::Pending;
+    request.timings.decode_seconds += seconds;
 }
 
 } // namespace
@@ -210,7 +287,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
 
 void ProgramImpl::copy_tail(SequenceState& sequence, std::int32_t column) {
     // A Qwen4Exp chunk wider than prefill_hidden ran on lent workspace and left its last
-    // column in prefill_hidden's last column (qwen4_text.cpp keep_last_column).
+    // column in prefill_hidden's last column (text_forward_context.cpp keep_last_column).
     if (qwen4_prompt_base_chunk > 0 && column >= prefill_hidden.ne[1] &&
         column < static_cast<std::int32_t>(prefill_chunk)) {
         column = prefill_hidden.ne[1] - 1;
@@ -334,28 +411,18 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
-        throw std::invalid_argument("ordinary batch membership is invalid");
-    }
+    require_round_membership(lanes, budgets, max_concurrency, "ordinary batch");
 
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
-        const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency ||
-            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
-                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::invalid_argument("ordinary batch contains an invalid or duplicate lane");
-        }
+        require_round_lane(lanes, row, max_concurrency, "ordinary batch");
+        const std::uint32_t lane      = lanes[row];
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
             text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
-            sequence.execution_frontier >= capacity ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.execution_frontier >= capacity || !ledger_at_decode_frontier(sequence)) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -369,13 +436,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "ordinary batch");
-            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
-            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            const RoundGraph graph = select_round_graph(ordinary_graphs, lanes.size(),
+                                                        maximum_frontier, "ordinary batch");
+            executable             = graph.executable;
+            envelope               = {graph.profile.min_execution_frontier + 1,
+                                      graph.profile.max_execution_frontier + 1};
         }
-        if (qwen4_ple_gather) { begin_qwen4_ple_round(); }
+        if (qwen4_ple.gather) { qwen4_ple.begin_round(); }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = active_sequence(lanes[row]);
@@ -395,10 +462,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             // Structured output: the row's mask, uploaded before the launch (D2).
             ordinary_host_ingress->sampling[row].mask = fill_grammar_mask(row, lanes[row], {});
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
-            if (qwen4_ple_gather) {
+            if (qwen4_ple.gather) {
                 // Qwen4Exp n-gram embedding of the row's token at `frontier` (its context is the
                 // ledger before it).
-                queue_qwen4_ple_rows(lanes[row], frontier,
+                qwen4_ple.queue_rows(lanes[row], frontier,
                                      std::span<const TokenId>(&sequence.ledger[frontier], 1), row);
             }
         }
@@ -406,7 +473,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge(), qwen4_runtime()},
+             proposal_head, tp_binding(), graph_peer_bridge(), forward_runtime()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -416,11 +483,11 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
         // An eager round gathers its n-gram rows before the body; a graph round after the launch
         // (on the stager thread).
-        if (qwen4_ple_gather && (executable == nullptr || !qwen4_ple_stager)) {
-            stage_qwen4_ple_round();
+        if (qwen4_ple.gather && (executable == nullptr || !qwen4_ple.stager)) {
+            qwen4_ple.stage_round(*this);
         }
         mark_workspace_usage(workspace_plan.ordinary_round);
-        qwen4_begin_window(execution::Qwen4Window::Decode);
+        qwen4_routed.begin_window(*this, execution::Qwen4Window::Decode);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         submit_range.reset();
@@ -430,60 +497,21 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             // The n-gram rows are gathered on the stager thread while the device runs the layers
             // before the PLE layer.
-            const bool ple_staging = qwen4_ple_gather && executable != nullptr && qwen4_ple_stager;
-            if (ple_staging) { qwen4_ple_stager->start(); }
+            const bool ple_staging = qwen4_ple.gather && executable != nullptr && qwen4_ple.stager;
+            if (ple_staging) { qwen4_ple.stager->start(); }
             // The expert cache policy reads the round's routing while the device runs it.
-            qwen4_observe_window();
+            qwen4_routed.observe_window(*this);
             synchronize_devices();
-            if (ple_staging) { qwen4_ple_stager->finish(); }
+            if (ple_staging) { qwen4_ple.stager->finish(); }
         }
         timing.end_wait();
         // Eager rounds: the next round's n-gram rows (the sampled token's) start their page
         // reads now; a graph round gathers them after its launch instead.
-        if (executable == nullptr) { prefetch_qwen4_ple_next_round(lanes, false); }
-        qwen4_end_window();
-        if (!qwen4_forced_tokens.empty()) {
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                force_qwen4_tokens(active_sequence(lanes[row]),
-                                   &ordinary_host_egress->sampled_tokens[row], 1);
-            }
-        }
-        if (qwen4_replay) {
-            // Replay: the reference token (teacher forcing through the ordinary route).
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                const SequenceState& sequence = active_sequence(lanes[row]);
-                if (const execution::Qwen4ReplaySequence* ref =
-                        qwen4_replay->match(sequence.ledger)) {
-                    if (ordinary_host_egress->sampled_tokens[row] !=
-                        ref->ids[sequence.ledger.size()]) {
-                        ++qwen4_replay->argmax_disagreements;
-                    }
-                    ordinary_host_egress->sampled_tokens[row] = ref->ids[sequence.ledger.size()];
-                    ++qwen4_replay->forced_tokens;
-                } else {
-                    ++qwen4_replay->rounds_unmatched;
-                }
-            }
-        }
-        if (qwen4_top2_file) {
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                write_qwen4_top2(io.ordinary->logits.slice(1, static_cast<std::int32_t>(row), 1),
-                                 lanes[row], active_sequence(lanes[row]).execution_frontier, 0);
-            }
-        }
-        if (qwen4_tfdump && qwen4_tfdump->logits_enabled()) {
-            // Validation dump of the round's logits (position = the consumed token's position).
-            const Tensor logits =
-                io.ordinary->logits.slice(1, 0, static_cast<std::int32_t>(lanes.size()));
-            std::vector<std::uint16_t> host(static_cast<std::size_t>(logits.numel()));
-            CUDA_CHECK(
-                cudaMemcpy(host.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost));
-            std::vector<std::int32_t> positions;
-            for (const std::uint32_t lane : lanes) {
-                positions.push_back(
-                    static_cast<std::int32_t>(active_sequence(lane).execution_frontier));
-            }
-            qwen4_tfdump->write_logits(host, logits.ne[0], positions);
+        if (executable == nullptr) { qwen4_ple.prefetch_next_round(*this, lanes, false); }
+        qwen4_routed.end_window(*this);
+        if (validation) {
+            validation->after_ordinary_round(
+                *this, lanes, ordinary_host_egress->sampled_tokens.data(), io.ordinary->logits);
         }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -492,15 +520,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            log_qwen4_round('o', base_E, 0, 0, seconds);
-            TokenId token = ordinary_host_egress->sampled_tokens[row];
-            if (qwen4_tfdump) {
-                // Validation: teacher-forced decode (NINFER_QWEN4_TFDUMP_FORCE).
-                if (const std::int32_t forced = qwen4_tfdump->forced_token(sequence.ledger.size());
-                    forced >= 0) {
-                    token                                     = forced;
-                    ordinary_host_egress->sampled_tokens[row] = token;
-                }
+            TokenId token              = ordinary_host_egress->sampled_tokens[row];
+            if (validation) {
+                validation->on_ordinary_commit(*this, base_E, seconds, sequence.ledger.size(),
+                                               token, ordinary_host_egress->sampled_tokens[row]);
             }
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
             sequence.text_kv_valid = base_E + 1;
@@ -510,13 +533,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
             sequence.prefix_digests.append_generated(std::span<const TokenId>(&token, 1),
                                                      sequence.rope_delta);
-            request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
-                                                 .base_E        = base_E,
-                                                 .base_S        = base_S,
-                                                 .prompt_tokens = 0,
-                                                 .produced      = 1};
-            request.lifecycle = Lifecycle::Pending;
-            request.timings.decode_seconds += seconds;
+            set_round_pending(request, PendingKind::Ordinary, base_E, base_S, 1, seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens =
@@ -528,12 +545,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            raise_qwen4_ple_staged(); // a launched round may wait for its n-gram rows
+            qwen4_ple.raise_staged(); // a launched round may wait for its n-gram rows
             synchronize_devices();
-            if (qwen4_ple_stager) { qwen4_ple_stager->finish(); }
+            if (qwen4_ple.stager) { qwen4_ple.stager->finish(); }
         } catch (...) {}
         timing.end_wait();
-        qwen4_abandon_window();
+        qwen4_routed.abandon_window(*this);
         clear_execution_failure_lanes(lanes);
         throw;
     }
@@ -550,19 +567,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
-        throw std::invalid_argument("MTP batch membership is invalid");
-    }
+    require_round_membership(lanes, budgets, max_concurrency, "MTP batch");
 
     const std::uint32_t width      = draft_window + 1;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
-        const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency ||
-            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
-                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::invalid_argument("MTP batch contains an invalid or duplicate lane");
-        }
+        require_round_lane(lanes, row, max_concurrency, "MTP batch");
+        const std::uint32_t lane      = lanes[row];
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
@@ -571,11 +582,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
             sequence.execution_frontier >= capacity ||
             sequence.mtp_kv_valid != sequence.execution_frontier ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier ||
-            sequence.mtp_draft_count > draft_window) {
+            !ledger_at_decode_frontier(sequence) || sequence.mtp_draft_count > draft_window) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -593,49 +600,30 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
         if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes = mtp_causal_attention_envelopes(profile.max_execution_frontier, draft_window,
-                                                       capacity);
+            const RoundGraph graph =
+                select_round_graph(mtp_graphs, lanes.size(), maximum_frontier, "MTP batch");
+            executable = graph.executable;
+            envelopes  = mtp_causal_attention_envelopes(graph.profile.max_execution_frontier,
+                                                        draft_window, capacity);
         }
-        if (qwen4_ple_gather) { begin_qwen4_ple_round(); }
+        if (qwen4_ple.gather) { qwen4_ple.begin_round(); }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1
-                                                    : 0;
-            // Replay: the recorded window of this frontier (extent, drafts) and the reference.
-            const execution::Qwen4ReplaySequence* replay_ref =
-                qwen4_replay ? qwen4_replay->match(sequence.ledger) : nullptr;
-            const execution::Qwen4ReplayWindow* replay_window = nullptr;
-            if (replay_ref != nullptr) {
-                const auto it = replay_ref->windows.find(frontier);
-                if (it != replay_ref->windows.end()) { replay_window = &it->second; }
-                ++(replay_window != nullptr ? qwen4_replay->windows_replayed
-                                            : qwen4_replay->windows_unlisted);
-            } else if (qwen4_replay) {
-                ++qwen4_replay->rounds_unmatched;
-            }
-            // NINFER_QWEN4_REPLAY_MODEL_DRAFTS=1 keeps the model's own drafts (and extent)
-            // where the replay has no recorded window: forced targets with realistic rejections.
-            static const bool replay_model_drafts = [] {
-                const char* v = std::getenv("NINFER_QWEN4_REPLAY_MODEL_DRAFTS");
-                return v != nullptr && std::string_view(v) == "1";
-            }();
-            const std::uint32_t proposed_extent = replay_window != nullptr ? replay_window->extent
-                                                  : replay_ref != nullptr && !replay_model_drafts
-                                                      ? draft_window
-                                                      : sequence.mtp_draft_count;
+            const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
+            ValidationHooks::MtpRowReplay replay;
+            const std::uint32_t proposed_extent =
+                validation ? validation->plan_mtp_row(sequence.ledger, frontier, draft_window,
+                                                      sequence.mtp_draft_count, replay)
+                           : sequence.mtp_draft_count;
+            const std::uint32_t extent_limit =
+                std::min({draft_window, max_by_budget, qwen3_5::kMtpDecodeMaximumDrafts,
+                          capacity - sequence.execution_frontier - 1});
             const std::uint32_t extent =
-                qwen4_mtp_no_drafts
-                    ? 0U
-                    : std::min({proposed_extent, draft_window, max_by_budget, qwen4_mtp_extent_cap,
-                                capacity - sequence.execution_frontier - 1});
+                validation ? validation->cap_mtp_extent(proposed_extent, extent_limit)
+                           : std::min(proposed_extent, extent_limit);
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -662,38 +650,11 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
-            if (!qwen4_mtp_oracle.empty()) {
-                // Validation oracle drafts: the reference continuation of the matching sequence.
-                for (const std::vector<TokenId>& line : qwen4_mtp_oracle) {
-                    if (line.size() <= sequence.ledger.size() ||
-                        !std::equal(sequence.ledger.begin(), sequence.ledger.end(), line.begin())) {
-                        continue;
-                    }
-                    for (std::uint32_t j = 0; j < extent && frontier + 1U + j < line.size(); ++j) {
-                        mtp_host_ingress->current_drafts[row * draft_window + j] =
-                            line[frontier + 1U + j];
-                    }
-                    break;
-                }
-            }
-            if (replay_ref != nullptr) {
-                // Replay: recorded drafts (or the reference itself where no window was
-                // recorded), and the reference continuation as every column's target, so the
-                // device accepts the recorded count and commits the reference tokens.
-                const auto& ids = replay_ref->ids;
-                for (std::uint32_t j = 0; j < extent; ++j) {
-                    const std::size_t at = frontier + 1U + j;
-                    if (replay_window == nullptr && replay_model_drafts) { continue; }
-                    mtp_host_ingress->current_drafts[row * draft_window + j] =
-                        replay_window != nullptr && j < replay_window->drafts.size()
-                            ? replay_window->drafts[j]
-                            : ids[std::min(at, ids.size() - 1)];
-                }
-                for (std::uint32_t j = 0; j < width; ++j) {
-                    const std::size_t at = frontier + 1U + j;
-                    mtp_host_ingress->forced_targets[row * width + j] =
-                        ids[std::min(at, ids.size() - 1)];
-                }
+            if (validation) {
+                validation->override_mtp_drafts(
+                    sequence.ledger, frontier, extent, width, replay,
+                    &mtp_host_ingress->current_drafts[row * draft_window],
+                    &mtp_host_ingress->forced_targets[row * width]);
             }
             // Structured output: masks of the K+1 verified columns from the host drafts of this
             // round (lookahead, matcher unchanged); columns past an illegal draft carry a safe
@@ -702,7 +663,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 row, lanes[row],
                 std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * draft_window],
                                          extent));
-            if (qwen4_ple_gather) {
+            if (qwen4_ple.gather) {
                 // Qwen4Exp n-gram rows of the verified window: the anchor, then the drafts (the
                 // padding columns past the extent repeat the anchor and are never committed).
                 std::array<TokenId, kMtpDecodeMaximumWidth> window{};
@@ -710,7 +671,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 for (std::uint32_t j = 0; j < draft_window; ++j) {
                     window[j + 1] = mtp_host_ingress->current_drafts[row * draft_window + j];
                 }
-                queue_qwen4_ple_rows(lanes[row], frontier,
+                qwen4_ple.queue_rows(lanes[row], frontier,
                                      std::span<const TokenId>(window.data(), width), row * width);
             }
         }
@@ -718,7 +679,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge(), qwen4_runtime()},
+             proposal_head, tp_binding(), graph_peer_bridge(), forward_runtime()},
             decoder->text_kv,
             *decoder->mtp_cache(),
             *io.mtp_decode,
@@ -727,18 +688,18 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             state_images->continuation_hidden_store(),
             peer ? &*peer->io.mtp_decode : nullptr,
             peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-            qwen4_mtp_calib != nullptr};
+            validation && validation->mtp_calib()};
 
         // An eager round gathers its n-gram rows before the body; a graph round after the launch
         // (on the stager thread).
-        if (qwen4_ple_gather && (executable == nullptr || !qwen4_ple_stager)) {
-            stage_qwen4_ple_round();
+        if (qwen4_ple.gather && (executable == nullptr || !qwen4_ple.stager)) {
+            qwen4_ple.stage_round(*this);
         }
         prepare_range.reset();
         mark_workspace_usage(workspace_plan.mtp_round);
         // One expert window per MTP round: the verification over the Text layers, then the MTP
         // layer's alignment and draft calls (the offload backend's layer num_hidden_layers).
-        qwen4_begin_window(execution::Qwen4Window::Decode);
+        qwen4_routed.begin_window(*this, execution::Qwen4Window::Decode);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     draft_window, envelopes, executable);
         submit_range.reset();
@@ -747,67 +708,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
             // The n-gram rows are gathered on the stager thread while the device runs the layers
-            // before the PLE layer, which waits for them (Qwen4Runtime::decode_ple_staged).
-            const bool ple_staging = qwen4_ple_gather && executable != nullptr && qwen4_ple_stager;
-            if (ple_staging) { qwen4_ple_stager->start(); }
+            // before the PLE layer, which waits for them (ForwardRuntime::decode_ple_staged).
+            const bool ple_staging = qwen4_ple.gather && executable != nullptr && qwen4_ple.stager;
+            if (ple_staging) { qwen4_ple.stager->start(); }
             // The expert cache policy reads the round's routing while the device runs it.
-            qwen4_observe_window();
+            qwen4_routed.observe_window(*this);
             synchronize_devices();
-            if (ple_staging) { qwen4_ple_stager->finish(); }
+            if (ple_staging) { qwen4_ple.stager->finish(); }
         }
         timing.end_wait();
         // Eager rounds: the next round's n-gram rows are known now; their page reads
         // overlap the window end, the commit and the next round's preparation. A graph round
         // gathers them after its launch, off the host's critical path, so it skips this.
-        if (executable == nullptr) { prefetch_qwen4_ple_next_round(lanes, true); }
-        qwen4_end_window();
-        if (!qwen4_forced_tokens.empty()) {
-            // Only the round's last committed token is not consumed by the round itself, so only
-            // single-token commits (NINFER_QWEN4_MTP_NO_DRAFTS) can be forced.
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                if (mtp_host_egress->licensed_counts[row] != 1) {
-                    throw std::logic_error(
-                        "NINFER_QWEN4_FORCE_TOKENS requires one token per round");
-                }
-                force_qwen4_tokens(active_sequence(lanes[row]),
-                                   mtp_host_egress->licensed_tokens.data() + row * width, 1);
-            }
-        }
-        if (qwen4_tfdump && qwen4_tfdump->logits_enabled()) {
-            // Validation dump of the target logits of every committed verification column
-            // (position = the consumed token's position, as for ordinary rounds).
-            const Tensor logits = io.mtp_decode->target_logits;
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                const std::int32_t count = mtp_host_egress->licensed_counts[row];
-                const Tensor columns =
-                    logits.slice(2, static_cast<std::int32_t>(row), 1).slice(1, 0, count);
-                std::vector<std::uint16_t> host(static_cast<std::size_t>(columns.numel()));
-                CUDA_CHECK(
-                    cudaMemcpy(host.data(), columns.data, columns.bytes(), cudaMemcpyDeviceToHost));
-                std::vector<std::int32_t> positions;
-                for (std::int32_t j = 0; j < count; ++j) {
-                    positions.push_back(
-                        static_cast<std::int32_t>(active_sequence(lanes[row]).execution_frontier +
-                                                  static_cast<std::uint32_t>(j)));
-                }
-                qwen4_tfdump->write_logits(host, logits.ne[0], positions);
-            }
-        }
-        if (qwen4_top2_file) {
-            // Validation: the target's top-2 of every committed verification column.
-            const Tensor logits = io.mtp_decode->target_logits;
-            for (std::size_t row = 0; row < lanes.size(); ++row) {
-                const std::int32_t count = mtp_host_egress->licensed_counts[row];
-                for (std::int32_t j = 0; j < count; ++j) {
-                    write_qwen4_top2(logits.slice(2, static_cast<std::int32_t>(row), 1)
-                                         .slice(1, j, 1)
-                                         .view({logits.ne[0], 1}),
-                                     lanes[row],
-                                     active_sequence(lanes[row]).execution_frontier +
-                                         static_cast<std::uint32_t>(j),
-                                     1);
-                }
-            }
+        if (executable == nullptr) { qwen4_ple.prefetch_next_round(*this, lanes, true); }
+        qwen4_routed.end_window(*this);
+        if (validation) {
+            validation->after_mtp_round(
+                *this, lanes, width, mtp_host_egress->licensed_counts.data(),
+                mtp_host_egress->licensed_tokens.data(), io.mtp_decode->target_logits);
         }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -837,52 +755,16 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
-            log_qwen4_round('m', base_E, pcur, accepted_i, seconds);
-            if (qwen4_replay_record != nullptr) {
-                std::fprintf(qwen4_replay_record, "win %u %u %d", base_E, pcur, accepted_i);
-                for (std::uint32_t j = 0; j < draft_window; ++j) {
-                    std::fprintf(qwen4_replay_record, " %d",
-                                 mtp_host_ingress->current_drafts[row * draft_window + j]);
-                }
-                std::fputc('\n', qwen4_replay_record);
+            if (validation) {
+                validation->on_mtp_commit(
+                    *this, base_E, pcur, accepted_i, seconds,
+                    std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * draft_window],
+                                             draft_window),
+                    sequence.ledger, row_tokens);
             }
-            if (qwen4_replay) {
-                if (const execution::Qwen4ReplaySequence* ref =
-                        qwen4_replay->match(sequence.ledger)) {
-                    for (std::int32_t j = 0; j < count_i; ++j) {
-                        const std::size_t at = sequence.ledger.size() + static_cast<std::size_t>(j);
-                        if (at >= ref->ids.size() ||
-                            ref->ids[at] != row_tokens[static_cast<std::size_t>(j)]) {
-                            ++qwen4_replay->commit_mismatches;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (pcur == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += pcur;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
-                }
-            }
-            if (request.accepted_length_steps != 0) {
-                record_accepted_length(request, pcur == 0 ? kSpeculativeFallbackStep
-                                                          : static_cast<std::uint8_t>(accepted_i));
-            }
-            request.pending = PendingCandidate{
-                .kind          = PendingKind::Speculative,
-                .base_E        = base_E,
-                .base_S        = base_S,
-                .prompt_tokens = 0,
-                .produced      = static_cast<std::uint32_t>(count_i),
-            };
-            request.lifecycle = Lifecycle::Pending;
-            request.timings.decode_seconds += seconds;
+            record_speculative_row(request, pcur, accepted_i);
+            set_round_pending(request, PendingKind::Speculative, base_E, base_S,
+                              static_cast<std::uint32_t>(count_i), seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
@@ -897,12 +779,12 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            raise_qwen4_ple_staged(); // a launched round may wait for its n-gram rows
+            qwen4_ple.raise_staged(); // a launched round may wait for its n-gram rows
             synchronize_devices();
-            if (qwen4_ple_stager) { qwen4_ple_stager->finish(); }
+            if (qwen4_ple.stager) { qwen4_ple.stager->finish(); }
         } catch (...) {}
         timing.end_wait();
-        qwen4_abandon_window();
+        qwen4_routed.abandon_window(*this);
         clear_execution_failure_lanes(lanes);
         throw;
     }
@@ -918,20 +800,14 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     if (speculative_backend != SpeculativeBackend::DFlash2 || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
-        throw std::invalid_argument("DFlash batch membership is invalid");
-    }
+    require_round_membership(lanes, budgets, max_concurrency, "DFlash batch");
 
     const std::uint32_t width           = draft_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
-        const std::uint32_t lane = lanes[row];
-        if (lane >= max_concurrency ||
-            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
-                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
-            throw std::invalid_argument("DFlash batch contains an invalid or duplicate lane");
-        }
+        require_round_lane(lanes, row, max_concurrency, "DFlash batch");
+        const std::uint32_t lane      = lanes[row];
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
@@ -941,15 +817,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
             sequence.execution_frontier - sequence.dflash_context_frontier > width ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-            sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            !ledger_at_decode_frontier(sequence)) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
-        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                ? budgets[row].generated_tokens_remaining - 1U
-                                                : 0U;
+        const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
         // D3: a constrained row drafts nothing (its drafts are born on the device, after the
         // host masks): an ordinary round for that row, counted as a fallback step.
         const std::uint32_t extent = row_constrained(row)
@@ -970,13 +841,13 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
-            envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
-            target_envelope = {
+            const RoundGraph graph =
+                select_round_graph(dflash_graphs, lanes.size(), maximum_frontier, "DFlash batch");
+            const DecodeGraphProfile& profile = graph.profile;
+            executable                        = graph.executable;
+            envelopes                         = dflash_envelopes(profile.min_execution_frontier,
+                                                                 profile.max_execution_frontier, draft_window);
+            target_envelope                   = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
                                      draft_window + 1ULL))};
@@ -986,9 +857,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1U
-                                                    : 0U;
+            const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
             const std::uint32_t extent =
                 row_constrained(row)
                     ? 0U
@@ -1063,32 +932,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
-            if (extent == 0) {
-                request.speculative_stats.fallback_steps += 1;
-            } else {
-                request.speculative_stats.rounds += 1;
-                request.speculative_stats.drafted_tokens += extent;
-                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
-                for (std::int32_t i = 0; i < accepted_i; ++i) {
-                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
-                        1;
-                }
-            }
-            if (request.accepted_length_steps != 0) {
-                record_accepted_length(request, extent == 0
-                                                    ? kSpeculativeFallbackStep
-                                                    : static_cast<std::uint8_t>(accepted_i));
-            }
+            record_speculative_row(request, extent, accepted_i);
             sequence.dflash_context_frontier = base_E;
-            request.pending                  = PendingCandidate{
-                                 .kind          = PendingKind::Speculative,
-                                 .base_E        = base_E,
-                                 .base_S        = base_S,
-                                 .prompt_tokens = 0,
-                                 .produced      = static_cast<std::uint32_t>(count_i),
-            };
-            request.lifecycle = Lifecycle::Pending;
-            request.timings.decode_seconds += seconds;
+            set_round_pending(request, PendingKind::Speculative, base_E, base_S,
+                              static_cast<std::uint32_t>(count_i), seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),
@@ -1161,10 +1008,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     case PendingKind::None:
         throw std::logic_error("non-speculative pending round has an invalid kind");
     }
-    if (sequence.ledger_frontier != sequence.execution_frontier + 1 ||
-        sequence.ledger.size() != sequence.ledger_frontier ||
-        sequence.prefix_identity.size() != sequence.ledger_frontier ||
-        sequence.prefix_digests.size() != sequence.ledger_frontier) {
+    if (!ledger_at_decode_frontier(sequence)) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
     // Begin publishes a sampled token but does not execute it through the target. An exact-hit

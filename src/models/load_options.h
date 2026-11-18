@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace ninfer::models {
@@ -23,6 +24,8 @@ struct LoadOptions {
     bool embedding_host = false;
     // Most bytes of the host-mapped parents to keep page-locked (EngineOptions); 0 = no limit.
     std::uint64_t host_pinned_max_bytes = 0;
+    // RoutedExpertOptions::exclusive_layers (models/qwen3_5/qwen4_layer_profile.h).
+    std::optional<std::uint32_t> exclusive_layers;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -71,7 +74,8 @@ struct LoadOptions {
             .tp                    = options.tp,
             .vision_rank           = vision_rank(options),
             .embedding_host        = options.embedding_host,
-            .host_pinned_max_bytes = options.host_pinned_max_bytes};
+            .host_pinned_max_bytes = options.host_pinned_max_bytes,
+            .exclusive_layers      = options.routed_experts.exclusive_layers};
 }
 
 } // namespace ninfer::models

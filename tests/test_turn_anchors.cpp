@@ -1,7 +1,7 @@
 // add_turn_anchor_markers (--turn-anchors): how many engine anchors survive alongside protocol
 // markers. The protocol markers own the explicit-marker budget (kMaximumExplicitPromptCacheMarkers,
 // the Anthropic block-level breakpoint allowance); engine anchors yield to them so a client that
-// fills the allowance is not rejected for the serving layer's own marker (docs/serving.md).
+// fills the allowance is not rejected for the serving layer's own marker (docs/serving/options.md).
 #include "serve/turn_anchors.h"
 
 #include <iostream>

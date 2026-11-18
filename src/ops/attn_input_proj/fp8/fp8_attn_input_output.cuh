@@ -21,5 +21,8 @@ static_assert((kFp8AttnInputKeyRows % 8) == 0);
 static_assert((kFp8AttnInputGateRows % 8) == 0);
 
 using Fp8AttentionInputOutput = LinearBf16SegmentedOutput<6144, 1024, 6144, 1024>;
+// The [7168,5120] two-device shard's query|key|gate|value section output, in the parent's section
+// order (tp2/fp8_attn_input_shard.h).
+using Fp8AttnInputShardOutput = LinearBf16SegmentedOutput<3072, 512, 3072, 512>;
 
 } // namespace ninfer::ops::detail

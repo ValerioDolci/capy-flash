@@ -452,8 +452,9 @@ void print_run(const char* label, const char* leg, const ninfer::GenerationResul
 }
 
 int exercise_prefix_reuse(ninfer::Engine& engine, const char* label) {
-    const std::string document = long_document();
-    const auto first_turn      = [&] {
+    std::uint64_t endpoint_selections = 0;
+    const std::string document        = long_document();
+    const auto first_turn             = [&] {
         ninfer::PromptInput input =
             user_prompt(document + "\nQuestion: what is 17*23? Answer with the number only.");
         mark_like_chat_completions(input);
@@ -486,6 +487,8 @@ int exercise_prefix_reuse(ninfer::Engine& engine, const char* label) {
         ninfer::GenerationResult result =
             engine.generate(engine.prepare(second_turn()), greedy(32, allow_prefix_reuse));
         const ninfer::RuntimeStats after = engine.runtime_stats();
+        endpoint_selections +=
+            after.private_endpoint_selections - before.private_endpoint_selections;
         print_run(label, leg, result,
                   after.computed_prefill_tokens - before.computed_prefill_tokens);
         std::cout << "  selections endpoint "
@@ -546,6 +549,13 @@ int exercise_prefix_reuse(ninfer::Engine& engine, const char* label) {
         std::cerr << label << ": the cold second turn resumed a retained prefix\n";
         ++failures;
     }
+    // --no-endpoint-reuse: the second turns resume from a prefill checkpoint, never from the end
+    // of the first reply, and still give the cold prefill's tokens (checked above).
+    if (!engine.options().context_cache.resume_session_endpoints && endpoint_selections != 0) {
+        std::cerr << label << ": resumed a session endpoint " << endpoint_selections
+                  << " time(s) with endpoint reuse off\n";
+        ++failures;
+    }
     if (repeat.reused_prompt_tokens == repeat.prompt.prompt_tokens) {
         std::cout << label << ": the repeated second turn resumed its whole prompt\n";
     }
@@ -589,6 +599,13 @@ int main(int argc, char** argv) {
         {
             ninfer::Engine engine(long_engine_options(artifact, optimized, 1));
             failures += exercise_prefix_reuse(engine, "MTP prefix reuse, 1 lane");
+        }
+        {
+            ninfer::EngineOptions options = long_engine_options(artifact, optimized, 1);
+            options.context_cache.resume_session_endpoints = false;
+            ninfer::Engine engine(std::move(options));
+            failures +=
+                exercise_prefix_reuse(engine, "MTP prefix reuse, 1 lane, no endpoint reuse");
         }
         if (failures != 0) { return 1; }
     } catch (const std::exception& error) {

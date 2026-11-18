@@ -32,7 +32,7 @@
 #include "models/qwen3_5/execution/qwen4_experts.h"
 #include "models/qwen3_5/qwen4_layer_profile.h"
 #include "ninfer/ops/moe_slots.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include <cuda_runtime.h>
 
@@ -294,7 +294,7 @@ struct Fixture {
         return std::make_unique<Qwen4OffloadExperts>(views, o, memory.view, 0, stream);
     }
 
-    // One forward call of a layer (routed() then run(), as Qwen4Forward::moe); returns the FP32
+    // One forward call of a layer (routed() then run(), as TextForward::moe); returns the FP32
     // partial on the host.
     std::vector<float> call(Qwen4RoutedExperts& backend, const Call& c, std::uint64_t seed) {
         auto scope       = work.scope();

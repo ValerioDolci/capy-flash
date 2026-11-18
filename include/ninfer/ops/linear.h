@@ -22,19 +22,34 @@ enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
     AllowA8, ///< Admit either A16 or A8 compute profiles.
     AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    /// AllowA4 for the columns a model computes after the prefill (decoding and speculative
+    /// verification). At widths 1..kAllowA4DecodeMaxWidth a resolver may run the route of width 4,
+    /// the MTP K=3 verification width, so that a token column gets the same bits at every
+    /// decoding and verification width; elsewhere it resolves as AllowA4.
+    AllowA4Decode,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4;
-}
-
-[[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4;
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA4Decode;
 }
 
 [[nodiscard]] constexpr bool allows_a4(LinearPolicy policy) noexcept {
-    return policy == LinearPolicy::AllowA4;
+    return policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA4Decode;
+}
+
+[[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8 || allows_a4(policy);
+}
+
+// The widest call whose route AllowA4Decode may change: from 8 columns on (DFlash2 verification,
+// batched lanes) it resolves as AllowA4 everywhere.
+inline constexpr std::int32_t kAllowA4DecodeMaxWidth = 7;
+
+// The policy a model passes for a projection's columns after the prefill: AllowA4Decode for an
+// AllowA4 projection, the projection's own policy otherwise.
+[[nodiscard]] constexpr LinearPolicy decode_policy(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA4 ? LinearPolicy::AllowA4Decode : policy;
 }
 
 // Transient bytes a linear may use when the workspace has room for them (an optional faster route:

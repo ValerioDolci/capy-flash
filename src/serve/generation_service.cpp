@@ -384,6 +384,12 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         engine_options.routed_experts.stream_min_tokens     = *options_.stream_min_tokens;
         engine_options.routed_experts.stream_min_tokens_set = true;
     }
+    engine_options.routed_experts.cpus             = options_.expert_cpus;
+    engine_options.routed_experts.exclusive_layers = options_.expert_exclusive_layers;
+    engine_options.routed_experts.gguf_hybrid_cost = options_.gguf_hybrid_cost;
+    engine_options.kv_ram_region_tokens            = options_.kv_ram_region_tokens;
+    engine_options.kv_ram_cache_blocks             = options_.kv_ram_cache_blocks;
+
     engine_options.rope_yarn_factor           = options_.rope_yarn_factor;
     engine_options.rope_original_max_position = options_.rope_original_max_position;
     engine_options.enable_vision              = options_.enable_vision;
@@ -393,6 +399,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.tp_mailbox                 = options_.tp_mailbox;
     engine_options.embedding_host             = options_.embedding_host;
     engine_options.host_pinned_max_bytes      = options_.host_pinned_max_bytes;
+    engine_options.lossy_prefill              = options_.lossy_prefill;
     engine_options.speculative                = options_.speculative;
     engine_options.context_cache              = options_.context_cache;
     engine_options.context_cost.preset_path   = options_.context_cost_presets;
@@ -403,7 +410,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.startup_observer           = std::move(startup_observer);
     engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
     turn_anchors_ =
-        resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
+        resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().turn_anchors,
+                             static_cast<std::uint32_t>(options_.tp));
     if (options_.reasoning_close_retry) {
         reasoning_guard_tokens_ = engine_->reasoning_guard_tokens();
     }

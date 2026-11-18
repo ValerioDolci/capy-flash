@@ -36,6 +36,7 @@ set(ninfer_op_tests
   gdn_headsplit
   linear_swiglu_split
   linear_add_split
+  verify_width_columns
   hyper_connection
   ple
   moe_slots
@@ -46,6 +47,12 @@ foreach(op IN LISTS ninfer_op_tests)
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
     LIBRARIES ninfer_ops)
 endforeach()
+
+# Host only; compares the NVFP4 route inventory with tests/ops/nvfp4_routes.txt.
+ninfer_add_op_test(ninfer_decode_policy_routes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decode_policy_routes.cpp"
+  LIBRARIES ninfer_ops
+  NEEDS_SOURCE_DIR)
 
 # The prefill exchange receives by kernel on a pair without peer access by default; the same test with
 # NINFER_TP_XIN_KERNEL=0 keeps the copy-engine path covered. Skips with fewer than two GPUs like the test.

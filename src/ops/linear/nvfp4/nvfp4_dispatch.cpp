@@ -1,5 +1,4 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
-#include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include <array>
 #include <stdexcept>
@@ -24,6 +23,16 @@ const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPoli
 }
 } // namespace
 
+Nvfp4LinearRoute nvfp4_linear_route(std::int32_t n, std::int32_t k, LinearPolicy policy,
+                                    std::int32_t tokens) {
+    const auto& shape = resolve_shape(n, k, policy);
+    if (allows_a4(policy) && shape.uses_a4(tokens, tokens)) return Nvfp4LinearRoute::A4;
+    if (policy == LinearPolicy::AllowA4Decode && tokens <= kAllowA4DecodeMaxWidth &&
+        shape.a16_decode != nullptr)
+        return Nvfp4LinearRoute::A16Decode;
+    return Nvfp4LinearRoute::A16;
+}
+
 std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k,
                                                   LinearPolicy policy, std::int32_t min_tokens,
                                                   std::int32_t max_tokens) {
@@ -35,17 +44,34 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
                : 0;
 }
 
+Nvfp4LinearSelection nvfp4_linear_selection(std::int32_t n, std::int32_t k, LinearPolicy policy,
+                                            std::int32_t tokens) {
+    const auto& shape = resolve_shape(n, k, policy);
+    const auto route  = nvfp4_linear_route(n, k, policy, tokens);
+    switch (route) {
+    case Nvfp4LinearRoute::A16:
+        return {route, shape.a16(tokens)};
+    case Nvfp4LinearRoute::A16Decode:
+        return {route, shape.a16_decode(tokens)};
+    case Nvfp4LinearRoute::A4:
+        break;
+    }
+    return {route, nullptr, shape.a4(tokens)};
+}
+
+std::span<const Nvfp4LinearShape* const> nvfp4_linear_shapes() { return kShapes; }
+
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
     validate_nvfp4_weight(weight, "nvfp4 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("nvfp4 linear: T must be positive");
-    const auto& shape = resolve_shape(weight.n, weight.k, policy);
-    if (!allows_a4(policy) || !shape.uses_a4(x.ne[1], x.ne[1]))
-        return shape.a16(x, weight, out, stream);
+    const auto selection = nvfp4_linear_selection(weight.n, weight.k, policy, x.ne[1]);
+    if (selection.route != Nvfp4LinearRoute::A4) return selection.a16(x, weight, out, stream);
     if (workspace == nullptr)
         throw std::invalid_argument("nvfp4 A4 linear requires caller workspace");
     auto scope         = workspace->scope();
     const auto scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
-    shape.a4(x, weight, out, scratch, stream);
+    launch_nvfp4_a4_quantize(x, weight, scratch, selection.a4.scales, stream);
+    selection.a4.launch(weight, out, scratch, x.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

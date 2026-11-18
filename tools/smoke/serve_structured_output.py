@@ -637,7 +637,7 @@ def check_robustness(args: argparse.Namespace) -> list[Result]:
     return results
 
 
-# --- hostile inputs (structured output limits, docs/serving.md) ----------------------------------
+# --- hostile inputs (structured output limits, docs/serving/structured-output.md) ----------------------------------
 
 
 def nested_items_schema(levels: int) -> str:

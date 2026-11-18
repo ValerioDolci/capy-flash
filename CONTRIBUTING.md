@@ -102,8 +102,9 @@ semantic contracts. In particular:
   numerical criterion;
 - verify the complete affected transition for stateful behavior;
 - exercise relevant supported shapes and execution routes for CUDA changes;
-- measure performance at the level being claimed; and
-- keep externally observable implementation, schema tests, and documentation consistent.
+- measure performance at the level being claimed;
+- keep externally observable implementation, schema tests, and documentation consistent; and
+- add a new test that needs no GPU to the `cpu` label list (`tests/cmake/TestLabels.cmake`).
 
 Use the existing project workflows:
 
@@ -113,10 +114,30 @@ Use the existing project workflows:
   development and qualification.
 
 Run `pre-commit install` once: every commit then formats the files it changes (clang-format for
-C/C++/CUDA, ruff for Python) and checks Python errors and spelling (ruff, typos), the same hooks CI
-runs on a pull request. A change that can alter generated
+C/C++/CUDA, ruff for Python), checks Python errors and spelling (ruff, typos), the documentation
+(`tools/check_docs.py`) and the ratchets (`tools/check_ratchets.py`), the same hooks CI runs on a
+pull request. A change that can alter generated
 tokens also needs the model-level quality check described in [`AGENTS.md`](AGENTS.md)
 (GSM8K and MMLU-Pro, paired per question), unless its output is proven bit-identical.
+
+### Rules that keep the code small
+
+- **One fast path.** A new variant of a kernel, an execution route or an option enters only with a
+  measured gain at the level it claims, and it replaces what it beats in the same change; a variant
+  that does not win is not merged. A route chosen by the number of rows (tokens) states whether it
+  gives the same per-token bits as the route it shares the work with.
+- **Defaults change after a measurement**: alternating arms (ABBA), the GPU power profile stated, the
+  numbers in the pull request.
+- **Kernels** come with a parity check against a reference, a microbenchmark, an end-to-end run, and
+  the greedy gate (`tools/tp2/gate.sh`) or the quality check above.
+- **No new environment variables** to select behaviour: a documented flag, or nothing. Validation
+  hooks (oracles, forced tokens, dumps) are the exception and are listed in
+  [`docs/capy-flash/diagnostics.md`](docs/capy-flash/diagnostics.md).
+- **Comments describe the code as it is**: no dates, versions, measurement IDs or history; those
+  belong in commit messages. Dead code goes away in its own commit.
+- **Ratchets.** `tools/check_ratchets.py` keeps per-file counts of what is being phased out (`getenv`,
+  a source file including another one, history in comments, direct `stderr` writes) in
+  `tools/ratchets/*.allow`. A count can only go down; the change that lowers it updates the list.
 
 Run the focused checks needed to establish the changed behavior and its material claims. Record the
 exact commands and summarize the results. If a relevant check could not be run, state that

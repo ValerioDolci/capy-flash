@@ -31,7 +31,7 @@ namespace ninfer::models::qwen3_5::execution {
 inline constexpr int kTensorParallelWidth = 2;
 
 struct DFlashPeerDrafter; // execution/tp2/draft_split.h
-struct Qwen4Runtime;      // execution/qwen4_runtime.h
+struct ForwardRuntime;    // execution/forward_runtime.h
 
 // The logical Text config narrowed to one rank's share: attention query/KV heads, GDN key/value
 // heads, the Dense intermediate width and the vocabulary are divided by `width`; the hidden size,
@@ -126,7 +126,7 @@ struct TpExecution {
     const GdnReplayRecords* replay_records = nullptr;
     // Rank 1's runtime inputs of the Text forward (with routed experts its backend over the odd
     // expert IDs, its PLE convolution states and decode PLE rows).
-    const Qwen4Runtime* qwen4 = nullptr;
+    const ForwardRuntime* qwen4 = nullptr;
     // Side streams of the tp 2 GDN gating overlap (tp2/gdn_gating_overlap.h), Program-owned.
     GdnGatingOverlap* gdn_gating = nullptr;
 
@@ -153,7 +153,7 @@ struct TpExecution {
     // The captured MTP or masked-draft (DFlash2) draft phase keeps its all-reduces on the staged
     // copies even when the pinned-host mailbox carries the target forward's
     // (ops::PeerEvents::StagedScope). Set by the Program when the mailbox hung in a full
-    // speculative round (WSL2) or by NINFER_TP_MAILBOX_DRAFT=copies.
+    // speculative round (WSL2).
     bool staged_draft_collectives = false;
 
     [[nodiscard]] bool complete() const noexcept {

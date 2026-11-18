@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -28,10 +29,17 @@ inline constexpr std::array<std::int16_t, 49> kQwen4LayerSlotWeights = {
 // layers, Qwen4OffloadExperts::ring_layers / layers_below), kept page-locked first.
 inline constexpr std::int32_t kQwen4PinnedTopLayers = 12;
 
-// Exclusive tier (GGUF banks): the first NINFER_QWEN4_EXCLUSIVE_LAYERS expert layers keep the
-// experts the GPUs hold at start-up in VRAM only, without a page-locked host copy. 0 = off. Read
-// once per process; any text but a non-negative integer is refused.
-[[nodiscard]] inline std::int32_t qwen4_exclusive_layers() {
+// Exclusive tier (GGUF banks): the first N expert layers keep the experts the GPUs hold at
+// start-up in VRAM only, without a page-locked host copy. 0 = off. N is `option`
+// (RoutedExpertOptions::exclusive_layers) when set, else NINFER_QWEN4_EXCLUSIVE_LAYERS, read once
+// per process (any text but a non-negative integer is refused), else 0.
+[[nodiscard]] inline std::int32_t qwen4_exclusive_layers(std::optional<std::uint32_t> option) {
+    if (option) {
+        if (*option > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("exclusive expert layers: too many layers");
+        }
+        return static_cast<std::int32_t>(*option);
+    }
     static const std::int32_t layers = [] {
         const char* v = std::getenv("NINFER_QWEN4_EXCLUSIVE_LAYERS");
         if (v == nullptr || *v == 0) { return 0; }

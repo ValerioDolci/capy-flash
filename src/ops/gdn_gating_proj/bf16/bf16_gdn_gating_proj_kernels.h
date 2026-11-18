@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -60,18 +61,29 @@ void bf16_gdn_gating_proj_small_t_split10_shard_launch(const Tensor& x, const We
                                                        const Tensor& dt_bias, void* workspace,
                                                        std::size_t workspace_bytes, Tensor& g,
                                                        Tensor& beta, cudaStream_t stream);
-// T=2..32 in one launch: the split-10 partial sums of every slice reduced in split order inside
+// T=1..32 in one launch: the split-10 partial sums of every slice reduced in split order inside
 // the CTA, bit-identical to bf16_gdn_gating_proj_small_t_split10_shard_launch at the same T.
 void bf16_gdn_gating_proj_small_t_fused_shard_launch(const Tensor& x, const Weight& a_weight,
                                                      const Weight& b_weight, const Tensor& A_log,
                                                      const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                                      cudaStream_t stream);
-// GEMV at T=1 and the fused split-10 kernel through T=32 (workspace unused), the two-kernel
-// split-10 form above that.
+enum class Bf16GdnGatingShardRoute : std::uint8_t {
+    Gemv,
+    FusedSplit10,
+    Split10,
+};
+
+// GEMV at T=1 and the fused split-10 kernel through T=32, the two-kernel split-10 form above that.
+// `policy` is the GDN input projection's: under AllowA4Decode T=1 runs the fused split-10 kernel
+// too, whose per-column reduction does not depend on T, so g and beta get the same bits at every
+// decoding and verification width.
+[[nodiscard]] Bf16GdnGatingShardRoute bf16_gdn_gating_shard_route(LinearPolicy policy,
+                                                                  std::int32_t tokens);
+// Runs bf16_gdn_gating_shard_route() (workspace unused through T=32).
 void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                                     const Tensor& A_log, const Tensor& dt_bias, void* workspace,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
-                                    cudaStream_t stream);
+                                    LinearPolicy policy, cudaStream_t stream);
 [[nodiscard]] std::size_t bf16_gdn_gating_shard_workspace_bytes(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

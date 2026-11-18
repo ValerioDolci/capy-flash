@@ -34,6 +34,16 @@ namespace ninfer::ops {
     QType shard_qtype, LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
+ * Whether attn_input_proj_column_parallel() registers the shard format and one rank's q|k|gate|v
+ * shard of `query_rows` query/gate and `key_rows` key/value rows over `input_rows` (the FP8 and
+ * NVFP4 `[7168,5120]` shards above). It reports no workspace and launches nothing.
+ */
+[[nodiscard]] bool attn_input_proj_column_parallel_registered(QType shard_qtype,
+                                                              std::int32_t query_rows,
+                                                              std::int32_t key_rows,
+                                                              std::int32_t input_rows);
+
+/**
  * @brief Column-parallel (head-split) single-parent projection across two devices.
  *
  * @details Rank r computes `q[r]`, `gate[r]`, `k[r]` and `v[r]` from `x[r]` and its shard

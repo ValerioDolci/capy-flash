@@ -6,7 +6,7 @@
 #   NINFER_MODEL_ID (qwen3.8-27b: the `model` name requests must use)
 #   NINFER_VISION=0 turns Vision off (--no-vision; artifacts without a vision component).
 # Extra flags are appended and win over the profile. Run it under a supervisor that restarts on a
-# non-zero exit: ninfer-serve exits with status 2 once the Engine fails (docs/serving.md).
+# non-zero exit: ninfer-serve exits with status 2 once the Engine fails (docs/serving/endpoints.md).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 1 ] || { echo "usage: $0 <artifact.ninfer> [ninfer-serve flags...]" >&2; exit 2; }

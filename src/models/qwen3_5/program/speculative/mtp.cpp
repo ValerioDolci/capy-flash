@@ -230,7 +230,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    stream));
-        if (const Qwen4Runtime* qwen4 = state.execution.qwen4;
+        if (const ForwardRuntime* qwen4 = state.execution.qwen4;
             qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr &&
             qwen4->decode_ple_staged == nullptr) {
             // Qwen4Exp: the n-gram rows of the verified window, gathered on the host before the
@@ -277,7 +277,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache, tp);
-        card.set_qwen4_runtime(state.execution.qwen4);
+        card.set_forward_runtime(state.execution.qwen4);
         const MtpRoundView round = slice_mtp_frame(frame, batch_size);
         {
             Tensor verify_ids       = round.verify_ids;

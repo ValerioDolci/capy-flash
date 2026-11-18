@@ -164,6 +164,11 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // False: a request never resumes from a SessionEndpoint (the state the decode left after a
+    // reply), in VRAM, RAM or on disk; it resumes from the last prefill checkpoint before it and
+    // prefills the reply again, so its tokens do not depend on whether that endpoint was still
+    // cached (eviction, restart). Costs the reply's prefill on every follow-up turn.
+    bool resume_session_endpoints = true;
     // Disk tier (opt-in): retained conversations are written to files in
     // `disk_directory` (at most `disk_capacity_bytes`, least recently used out) after
     // `disk_idle_ms` of Engine inactivity (0: never) and at a clean shutdown
@@ -247,6 +252,14 @@ struct RoutedExpertOptions {
     // machine at load (process affinity, physical cores, L3 domains: max(6, cores/2, 2 per L3
     // domain), capped by the cores; 6 on the 9900X).
     std::uint32_t cpu_threads = 0;
+    // The executor's CPUs, one thread per entry, pinned in this order (SMT siblings may be
+    // listed); replaces the automatic list and cpu_threads. Empty: NINFER_HOST_MOE_CPUS if set,
+    // else automatic. ninfer-serve --expert-cpus.
+    std::vector<int> cpus;
+    // ggml block banks: the first N expert layers keep the experts the GPUs hold at start-up in
+    // VRAM only, without a page-locked host copy; 0 = off. Unset: NINFER_QWEN4_EXCLUSIVE_LAYERS
+    // if set, else 0. ninfer-serve --expert-exclusive-layers.
+    std::optional<std::uint32_t> exclusive_layers;
     // Cache insertions per layer per decode window; 0 = unlimited.
     std::uint32_t insert_cap = 2;
     // > 0: a missing expert enters a full layer only with a decayed routing frequency of at least
@@ -285,6 +298,11 @@ struct RoutedExpertOptions {
     // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the
     // 9900X).
     std::uint32_t gguf_cpu_threads = 0;
+    // ggml block banks on one GPU, hybrid prefill: the cost model of the CPU share in
+    // microseconds {CPU per expert, CPU per routed token of an expert, PCIe copy per expert}.
+    // Unset: NINFER_GGUF_HYBRID_COST if set, else {35, 3.6, 100} (Qwen4OffloadOptions).
+    // ninfer-serve --gguf-hybrid-cost.
+    std::optional<std::array<double, 3>> gguf_hybrid_cost;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
     // While streaming, leave the experts the previous prompt chunk routed least to the CPU (in
@@ -330,6 +348,21 @@ struct ElasticKvOptions {
     // base slots are sized for it instead of the whole pool's KV, and a request needing more KV
     // fails.
     std::size_t kv_budget_bytes = 0;
+};
+
+// Prefill switches that trade a small change in the numbers for speed (README «Optional speed
+// switches»); all off by default. Each is also set by its environment variable (the field, when
+// set, wins). Process-wide: the engine applies them when it plans, before its first launch.
+struct LossyPrefillOptions {
+    // Q8 dense projections of a prompt chunk on int8 tensor cores, activations in groups of 32 or
+    // 128 values; 0 = NINFER_Q8_A8 if set, else off. ninfer-serve --q8-a8.
+    std::uint32_t q8_a8 = 0;
+    // INT8-KV prefill attention accumulates P x V of each 64-key tile in FP16;
+    // false = NINFER_ATTN_PV_F16ACC. ninfer-serve --attn-pv-f16acc.
+    bool attn_pv_f16acc = false;
+    // tp 2 prefill MoE exchange (and mixer output) with an int8 payload instead of FP16;
+    // false = NINFER_TP_AR_PAYLOAD. ninfer-serve --tp-ar-payload int8.
+    bool tp_ar_payload_int8 = false;
 };
 
 struct EngineOptions {
@@ -404,6 +437,7 @@ struct EngineOptions {
     // results; slower where they are used. With kv_ram_active the Host KV planes count in the
     // limit: the weights keep the limit minus them page-locked.
     std::uint64_t host_pinned_max_bytes = 0;
+    LossyPrefillOptions lossy_prefill;
     RoutedExpertOptions routed_experts;
     ElasticKvOptions elastic_kv;
     // Active KV in RAM (Qwen4Exp, docs/maintainer/active-kv-in-ram.md): the text KV pool's K/V and
@@ -412,6 +446,12 @@ struct EngineOptions {
     // indexer's selected blocks of every decoding request into a VRAM cache, prefill stages the
     // visible pages of each layer. Frees the KV's VRAM for expert slots or for more requests.
     bool kv_ram_active = false;
+    // With kv_ram_active: tokens per layer of the VRAM staging region of a prefill, and 4-token
+    // blocks per text attention layer of the VRAM block cache. 0: NINFER_KVRAM_REGION_TOKENS /
+    // NINFER_KVRAM_CACHE_BLOCKS if set, else the defaults (262,144 tokens, 4,096 blocks).
+    // ninfer-serve --kv-ram-region-tokens / --kv-ram-cache-blocks.
+    std::uint32_t kv_ram_region_tokens = 0;
+    std::uint32_t kv_ram_cache_blocks  = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -1360,6 +1400,9 @@ struct LoadDeviceSummary {
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // The model's default private long-anchor count at tp 1 (serving's --turn-anchors); every
+    // model serves 0 at tp 2.
+    std::uint32_t turn_anchors = 1;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
@@ -1386,7 +1429,7 @@ struct LoadSummary {
     bool peer_access = false;
     // tp 2 with CUDA Graphs: the transport of the captured all-reduces once startup is done.
     // "mailbox" (the pinned-host mailbox passed its startup probe), "mailbox, MTP draft on copies"
-    // (NINFER_TP_MAILBOX_DRAFT=copies, or a full MTP round hung in its first launch), "copies"
+    // (a full MTP round hung in its first launch), "copies"
     // (cross-device copies: --no-tp-mailbox, direct peer access, no CUDA Graphs, the probe
     // failed, or a round hung with the draft phase on copies too), empty at tp 1.
     std::string tp_transport;
@@ -1396,20 +1439,22 @@ struct LoadSummary {
     // timed out in a graph's first launch; steps joined by "; then "); empty otherwise.
     std::string tp_mailbox_fallback;
     // The mailbox's slot bytes while tp_transport names the mailbox: the widest captured all-reduce
-    // it carries (hidden x (K+1) x max_concurrency BF16; one request's width with
-    // NINFER_TP_MAILBOX_SLOT=request); 0 otherwise.
+    // it carries (hidden x (K+1) x max_concurrency BF16); 0 otherwise.
     std::size_t tp_mailbox_slot_bytes = 0;
     // tp 2 MTP or DFlash2 with the optimized proposal head: where it proposes, "split by
-    // vocabulary" (both ranks, the default) or "rank 0" (NINFER_TP_DRAFT_HEAD=primary, and for
-    // DFlash2 NINFER_TP_DRAFTER=primary); empty otherwise.
+    // vocabulary" (both ranks) or "rank 0" (a head that does not split); empty otherwise.
     std::string tp_proposal_head;
-    // tp 2 DFlash2: where the drafter runs, "split (...)" (both ranks, the default) or "rank 0"
-    // (NINFER_TP_DRAFTER=primary); empty otherwise.
+    // tp 2 DFlash2: where the drafter runs, "split (...)" (both ranks) or "rank 0" (a drafter that
+    // did not split); empty otherwise.
     std::string tp_drafter;
     // tp 2: the eager (prefill) all-reduces' transport and the text prefill overlap's split-phase
     // sums (TpTransportStatus::eager_transport / prefill_overlap); empty at tp 1.
     std::string tp_eager_transport;
     std::string tp_prefill_overlap;
+    // The Text layers' projections on their fused Op or on the generic chain (Linear and the
+    // elementwise Ops), counted per fused Op, e.g. "64 text layers | gdn_input fused 48 | ...";
+    // a shape no fused Op registers shows up as generic. Rank 0's blocks (tp 2 ranks agree).
+    std::string projection_routes;
     ContextCostSummary context_cost;
 };
 

@@ -43,39 +43,59 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream);
 }
 
-template <class Geometry, std::size_t... Offsets>
+template <class Geometry, int First, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<Launch, sizeof...(Offsets)>{
-        &launch_exact<Geometry, 2 + static_cast<int>(Offsets)>...};
+        &launch_exact<Geometry, First + static_cast<int>(Offsets)>...};
 }
 
-template <class Geometry>
+// Widths 2..5 for the output family. The MLP down family runs this kernel at T=2..5 under every
+// policy and at T=1..7 under AllowA4Decode (nvfp4_linear_add_a16_decode_launch), whose per-row K
+// loop gives a column the same bits at every width.
+constexpr int kOutputFirst = 2;
+constexpr int kOutputLast  = 5;
+constexpr int kDownFirst   = 1;
+constexpr int kDownLast    = kAllowA4DecodeMaxWidth;
+static_assert(kDownLast < kNvfp4DownFamilyFirstA4Tokens);
+
+template <class Geometry, int First, int Last>
 constexpr auto make_launchers() {
-    return make_launchers<Geometry>(std::make_index_sequence<5 - 2 + 1>{});
+    return make_launchers<Geometry, First>(std::make_index_sequence<Last - First + 1>{});
 }
 
-constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4N5120K6144>();
-constexpr auto kResidual17408Launchers = make_launchers<Nvfp4N5120K17408>();
-constexpr auto kResidual8704Launchers  = make_launchers<Nvfp4N5120K8704>();
-constexpr auto kResidual3072Launchers  = make_launchers<Nvfp4N5120K3072>();
+constexpr auto kResidual6144Launchers =
+    make_launchers<Nvfp4N5120K6144, kOutputFirst, kOutputLast>();
+constexpr auto kResidual17408Launchers = make_launchers<Nvfp4N5120K17408, kDownFirst, kDownLast>();
+constexpr auto kResidual8704Launchers  = make_launchers<Nvfp4N5120K8704, kDownFirst, kDownLast>();
+constexpr auto kResidual3072Launchers =
+    make_launchers<Nvfp4N5120K3072, kOutputFirst, kOutputLast>();
+
+template <class Launchers>
+void launch_width(const Launchers& launchers, int first, const Tensor& x, const Weight& weight,
+                  Tensor& residual, cudaStream_t stream) {
+    const int index = x.ne[1] - first;
+    if (index < 0 || index >= static_cast<int>(launchers.size())) {
+        throw std::invalid_argument("nvfp4 linear_add small-T: unsupported T");
+    }
+    launchers[static_cast<std::size_t>(index)](x, weight, residual, stream);
+}
 
 } // namespace
 
 void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                      cudaStream_t stream) {
-    const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
     case Nvfp4GeometryId::N5120K6144:
-        kResidual6144Launchers[index](x, weight, residual, stream);
+        launch_width(kResidual6144Launchers, kOutputFirst, x, weight, residual, stream);
         return;
     case Nvfp4GeometryId::N5120K17408:
-        kResidual17408Launchers[index](x, weight, residual, stream);
+        launch_width(kResidual17408Launchers, kDownFirst, x, weight, residual, stream);
         return;
     case Nvfp4GeometryId::N5120K8704:
-        kResidual8704Launchers[index](x, weight, residual, stream);
+        launch_width(kResidual8704Launchers, kDownFirst, x, weight, residual, stream);
         return;
     case Nvfp4GeometryId::N5120K3072:
-        kResidual3072Launchers[index](x, weight, residual, stream);
+        launch_width(kResidual3072Launchers, kOutputFirst, x, weight, residual, stream);
         return;
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:

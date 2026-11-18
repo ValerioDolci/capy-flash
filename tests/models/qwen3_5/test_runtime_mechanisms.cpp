@@ -8,6 +8,15 @@
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context_work.h"
 
+#include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/tp2/attn_input_proj.h"
+#include "ninfer/ops/tp2/gdn_gating_proj.h"
+#include "ninfer/ops/tp2/gdn_input_proj.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -467,6 +476,120 @@ void test_resource_difference_names_the_failing_ledger() {
            "covered resource difference is exact");
 }
 
+template <class Query>
+bool accepted(Query&& query) {
+    try {
+        (void)query();
+        return true;
+    } catch (const std::exception&) { return false; }
+}
+
+// Each fused Op's *_registered query, which the Qwen4Exp parameters read to choose between the
+// fused route and the generic chain, agrees with what its capacity queries accept for every
+// format, policy and a grid of shapes around the registered ones (the parameters asked the
+// capacity queries before the registered queries existed; the decision must not move).
+void test_fused_route_queries_match_capacity() {
+    using ninfer::QType;
+    using ninfer::ops::LinearPolicy;
+    constexpr std::int32_t kLast = 65536;
+    std::vector<QType> formats;
+    for (int q = 0; q <= static_cast<int>(QType::Q3_G128_FP16); ++q) {
+        formats.push_back(static_cast<QType>(q));
+    }
+    const std::array policies{LinearPolicy::A16Only, LinearPolicy::AllowA8, LinearPolicy::AllowA4};
+    const std::array hidden{5120, 2560, 4096};
+    namespace ops = ninfer::ops;
+    for (const QType f : formats) {
+        const auto label = [&](std::string_view op, std::int32_t n, std::int32_t k) {
+            return std::string(op) + " qtype " + std::to_string(static_cast<int>(f)) + " [" +
+                   std::to_string(n) + "," + std::to_string(k) + "]";
+        };
+        for (const LinearPolicy p : policies) {
+            for (const std::int32_t k : hidden) {
+                for (const std::int32_t n : {16384, 8192, 16385, 12288}) {
+                    const bool single = accepted([&] {
+                        (void)ops::gdn_input_proj_workspace_capacity_bytes(f, n, k, p, 1, kLast);
+                        for (const std::int32_t batch : {1, 8}) {
+                            (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                f, n, k, p, batch, 1, 16);
+                            (void)ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                                f, n, k, p, batch, 2, 16);
+                        }
+                    });
+                    expect(single == ops::gdn_input_proj_registered(f, n, k),
+                           label("gdn_input_proj", n, k));
+                    const bool shard = accepted([&] {
+                        (void)ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
+                            f, n, k, p, 1, kLast);
+                        for (const std::int32_t batch : {1, 8}) {
+                            (void)ops::
+                                gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+                                    f, n, k, p, batch, 1, 16);
+                            (void)ops::
+                                gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+                                    f, n, k, p, batch, 2, 16);
+                        }
+                    });
+                    expect(shard == ops::gdn_input_proj_column_parallel_registered(f, n, k),
+                           label("gdn_input_proj column-parallel", n, k));
+                }
+                for (const std::int32_t heads : {48, 24, 32}) {
+                    const bool single =
+                        f == QType::BF16 && accepted([&] {
+                            (void)ops::gdn_gating_proj_workspace_capacity_bytes(heads, k, 1, kLast);
+                        });
+                    expect(single == ops::gdn_gating_proj_registered(f, heads, k),
+                           label("gdn_gating_proj", heads, k));
+                    const bool shard =
+                        f == QType::BF16 && accepted([&] {
+                            (void)ops::gdn_gating_proj_column_parallel_workspace_capacity_bytes(
+                                heads, k, 1, kLast);
+                        });
+                    expect(shard == ops::gdn_gating_proj_column_parallel_registered(f, heads, k),
+                           label("gdn_gating_proj column-parallel", heads, k));
+                }
+                // q|k|gate|v geometries: the registered 24/4 heads of 256 and their halves, and
+                // neighbours with the same or another parent row count.
+                for (const auto [query, key] : std::array<std::array<std::int32_t, 2>, 5>{
+                         {{6144, 1024}, {3072, 512}, {6656, 512}, {4096, 1024}, {3328, 256}}}) {
+                    const std::int32_t n = 2 * (query + key);
+                    // The fixed 24/4 heads of 256 that the parameters required next to the
+                    // capacity query (tp 1 parent [14336,5120], tp 2 shard [7168,5120]).
+                    const bool single = query == 6144 && key == 1024 && accepted([&] {
+                                            (void)ops::attn_input_proj_workspace_capacity_bytes(
+                                                f, n, k, p, 1, kLast);
+                                        });
+                    expect(single == ops::attn_input_proj_registered(f, query, key, k),
+                           label("attn_input_proj", n, k));
+                    const bool shard =
+                        query == 3072 && key == 512 && n == 7168 && k == 5120 &&
+                        (f == QType::NVFP4 || f == QType::FP8_E4M3FN_ROW_BF16) && accepted([&] {
+                            (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
+                                f, p, 1, kLast);
+                        });
+                    expect(shard ==
+                               ops::attn_input_proj_column_parallel_registered(f, query, key, k),
+                           label("attn_input_proj column-parallel", n, k));
+                }
+                for (const std::int32_t n : {34816, 17408, 28672, 14336, 13824}) {
+                    const bool fused = ops::linear_swiglu_registered(f, n, k);
+                    expect(!fused || accepted([&] {
+                        (void)ops::linear_swiglu_workspace_capacity_bytes(f, n, k, p, 1, kLast);
+                    }),
+                           label("linear_swiglu", n, k));
+                }
+                for (const std::int32_t inputs : {6144, 17408, 3072, 8704, 14336, 7168, 12288}) {
+                    const bool add = accepted([&] {
+                        (void)ops::linear_add_workspace_capacity_bytes(f, k, inputs, p, 1, kLast);
+                    });
+                    expect(add == ops::linear_add_registered(f, k, inputs),
+                           label("linear_add", k, inputs));
+                }
+            }
+        }
+    }
+}
+
 int main() {
     test_decoder_layout();
     test_round_layout();
@@ -475,6 +598,7 @@ int main() {
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
     test_resource_difference_names_the_failing_ledger();
+    test_fused_route_queries_match_capacity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

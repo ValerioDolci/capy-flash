@@ -442,7 +442,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, nullptr, tp);
         // The Program's Text-forward runtime.
-        card.set_qwen4_runtime(state.execution.qwen4);
+        card.set_forward_runtime(state.execution.qwen4);
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
         // The split drafter captures rank 1's own features from its copy of the residual.

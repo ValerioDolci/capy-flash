@@ -19,7 +19,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -46,16 +48,6 @@ bool contiguous(std::span<const ops::WeightInput> inputs) {
     return parent != nullptr;
 }
 
-// Whether a capacity query of a fused Op accepts the profile (registered routes answer, the
-// others throw). Startup only: the answer is kept in Qwen4FusedRoutes.
-template <class Query>
-bool registered(Query&& query) {
-    try {
-        (void)query();
-        return true;
-    } catch (const std::exception&) { return false; }
-}
-
 // NINFER_QWEN4_FUSED=0 keeps every Qwen4Exp block on the generic chain (A/B and bisection).
 bool qwen4_fused_enabled() {
     static const bool on = [] {
@@ -64,9 +56,6 @@ bool qwen4_fused_enabled() {
     }();
     return on;
 }
-
-// The largest prompt chunk a capacity query covers (the routes are T-independent past it).
-constexpr std::int32_t kRouteQueryColumns = 65536;
 
 class Prepare {
 public:
@@ -643,87 +632,46 @@ public:
         return out;
     }
 
-    // Shape-keyed fused routes of a Qwen4Exp block on this rank (Qwen4FusedRoutes): the 27B's
-    // fused Ops answer for their registered geometries and formats (e.g. hidden 5120, 24 Q / 4 KV
-    // heads of 256, GDN 16 K / 48 V heads of 128, NVFP4/FP8 parents); every other geometry,
-    // Qwen3.8-Flash-Next's hidden 2560 included, keeps the generic chain. At tp 2 the routes are
-    // the two-device split forms at this rank's shard shapes.
+    // Shape-keyed fused routes of a Qwen4Exp block on this rank (Qwen4FusedRoutes): each fused
+    // Op's *_registered query answers for the weight's format and shape (e.g. the 27B's hidden
+    // 5120, 24 Q / 4 KV heads of 256, GDN 16 K / 48 V heads of 128, NVFP4/FP8 parents); every
+    // other geometry, Qwen3.8-Flash-Next's hidden 2560 included, keeps the generic chain. At tp 2
+    // the routes are the two-device split forms at this rank's shard shapes.
     Qwen4FusedRoutes qwen4_routes(const Qwen4BlockParameters& b) const {
         Qwen4FusedRoutes out;
         if (!qwen4_fused_enabled()) { return out; }
-        const int last = kRouteQueryColumns;
         if (const auto* g = std::get_if<GdnParameters>(&b.mixer)) {
             if (const auto* p = std::get_if<LinearParameters>(&g->projection)) {
                 const Weight& w = p->weight;
-                out.gdn_input   = registered([&] {
-                    if (sharded_) {
-                        (void)ops::gdn_input_proj_column_parallel_workspace_capacity_bytes(
-                            w.qtype, w.n, w.k, p->policy, 1, last);
-                    } else {
-                        (void)ops::gdn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k,
-                                                                             p->policy, 1, last);
-                    }
-                    for (const std::int32_t batch : {1, 8}) {
-                        if (sharded_) {
-                            (void)ops::
-                                gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
-                                    w.qtype, w.n, w.k, p->policy, batch, 1, 16);
-                            (void)ops::
-                                gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
-                                    w.qtype, w.n, w.k, p->policy, batch, 2, 16);
-                        } else {
-                            (void)ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                                w.qtype, w.n, w.k, p->policy, batch, 1, 16);
-                            (void)ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                                w.qtype, w.n, w.k, p->policy, batch, 2, 16);
-                        }
-                    }
-                });
+                out.gdn_input =
+                    sharded_ ? ops::gdn_input_proj_column_parallel_registered(w.qtype, w.n, w.k)
+                             : ops::gdn_input_proj_registered(w.qtype, w.n, w.k);
             }
             if (const auto* c = std::get_if<LinearParameters>(&g->control);
-                c != nullptr && c->weight.qtype == QType::BF16 && c->weight.n % 2 == 0) {
+                c != nullptr && c->weight.n % 2 == 0) {
                 const Weight& w = c->weight;
-                out.gdn_gating  = registered([&] {
-                    if (sharded_) {
-                        (void)ops::gdn_gating_proj_column_parallel_workspace_capacity_bytes(
-                            w.n / 2, w.k, 1, last);
-                    } else {
-                        (void)ops::gdn_gating_proj_workspace_capacity_bytes(w.n / 2, w.k, 1, last);
-                    }
-                });
+                out.gdn_gating =
+                    sharded_
+                        ? ops::gdn_gating_proj_column_parallel_registered(w.qtype, w.n / 2, w.k)
+                        : ops::gdn_gating_proj_registered(w.qtype, w.n / 2, w.k);
             }
         }
         if (const auto* q = std::get_if<QsaParameters>(&b.mixer)) {
-            const Weight& w     = q->projection.weight;
-            const auto& a       = *model_.config().text.attention;
-            const auto width    = model_.device_count() > 1 ? 2U : 1U;
-            const auto expected = 2 * (a.query_width() + a.key_width()) / width;
-            // The registered parents hold q|k|gate|v rows of 24 query / 4 KV heads of 256 (one
-            // rank's half at tp 2) over hidden 5120.
-            const bool shape = static_cast<std::uint64_t>(w.n) == expected &&
-                               w.n == (sharded_ ? 7168 : 14336) && w.k == 5120 &&
-                               a.head_dim == 256 && a.num_attention_heads == 24 &&
-                               a.num_key_value_heads == 4;
+            const Weight& w   = q->projection.weight;
+            const auto& a     = *model_.config().text.attention;
+            const auto width  = model_.device_count() > 1 ? 2U : 1U;
+            const auto query  = static_cast<std::int32_t>(a.query_width() / width);
+            const auto key    = static_cast<std::int32_t>(a.key_width() / width);
+            const bool parent = w.n == 2 * (query + key);
             out.attn_input =
-                shape && registered([&] {
-                    if (sharded_) {
-                        if (w.qtype != QType::NVFP4 && w.qtype != QType::FP8_E4M3FN_ROW_BF16) {
-                            throw std::invalid_argument("no split route");
-                        }
-                        (void)ops::attn_input_proj_column_parallel_workspace_capacity_bytes(
-                            w.qtype, q->projection.policy, 1, last);
-                    } else {
-                        (void)ops::attn_input_proj_workspace_capacity_bytes(
-                            w.qtype, w.n, w.k, q->projection.policy, 1, last);
-                    }
-                });
+                parent &&
+                (sharded_
+                     ? ops::attn_input_proj_column_parallel_registered(w.qtype, query, key, w.k)
+                     : ops::attn_input_proj_registered(w.qtype, query, key, w.k));
         }
         if (const auto* d = std::get_if<DenseParameters>(&b.ffn)) {
             const Weight& w = d->gate_up.weight;
-            out.swiglu      = ops::linear_swiglu_registered(w.qtype, w.n, w.k) && registered([&] {
-                             (void)ops::linear_swiglu_workspace_capacity_bytes(
-                                 w.qtype, w.n, w.k, d->gate_up.policy, 1, last);
-                         });
+            out.swiglu      = ops::linear_swiglu_registered(w.qtype, w.n, w.k);
         }
         return out;
     }
@@ -751,6 +699,45 @@ private:
     bool sharded_ = false;
 };
 
+void use_decode_policy(LinearParameters& p) { p.policy = ops::decode_policy(p.policy); }
+
+void use_decode_policy(ops::ProjectionWeights& p) {
+    if (auto* single = std::get_if<LinearParameters>(&p)) { use_decode_policy(*single); }
+}
+
+// The Text blocks with every projection under its decode policy (Parameters::qwen4_decode).
+Qwen4Parameters decode_parameters(const Qwen4Parameters& prefill) {
+    Qwen4Parameters out = prefill;
+    for (Qwen4BlockParameters& block : out.layers) {
+        std::visit(
+            [](auto& mixer) {
+                using Mixer = std::decay_t<decltype(mixer)>;
+                if constexpr (std::is_same_v<Mixer, QsaParameters>) {
+                    use_decode_policy(mixer.projection);
+                    use_decode_policy(mixer.output);
+                    use_decode_policy(mixer.indexer);
+                } else if constexpr (std::is_same_v<Mixer, GdnParameters>) {
+                    use_decode_policy(mixer.projection);
+                    use_decode_policy(mixer.control);
+                    use_decode_policy(mixer.output);
+                } else {
+                    use_decode_policy(mixer.projection);
+                    use_decode_policy(mixer.output);
+                }
+            },
+            block.mixer);
+        if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+            use_decode_policy(dense->gate_up);
+            use_decode_policy(dense->down);
+        } else if (auto& shared = std::get<Qwen4MoeParameters>(block.ffn).shared) {
+            use_decode_policy(shared->gate_up);
+            use_decode_policy(shared->down);
+        }
+        if (block.ple) { use_decode_policy(block.ple->key_value); }
+    }
+    return out;
+}
+
 } // namespace
 
 Parameters::Parameters(const Model& source, int rank) : model(source), device(rank) {
@@ -776,7 +763,8 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
                 return prepare.qwen4_block(w.qwen4->layers[i]);
             }));
         }
-        qwen4 = std::move(q);
+        qwen4        = std::move(q);
+        qwen4_decode = decode_parameters(*qwen4);
         if (w.qwen4_mtp) {
             qwen4_mtp = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
         }
@@ -807,7 +795,7 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
     }
-    // A dense Qwen3.5 model runs its Text layers through the Qwen4 forward with the plain
+    // A dense Qwen3.5 model runs its Text layers through the Text forward with the plain
     // residual. The MTP head stays the Qwen3.5 one (`mtp`).
     Qwen4Parameters q;
     q.final_norm = prepare.tensor(w.text.final_norm);
@@ -816,7 +804,8 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
         q.layers.push_back(with_context("text/layers/" + std::to_string(i),
                                         [&] { return prepare.qwen35_block(w.text.layers[i]); }));
     }
-    qwen4 = std::move(q);
+    qwen4        = std::move(q);
+    qwen4_decode = decode_parameters(*qwen4);
     if (w.vision && prepare.resident(w.vision->patch_embedding)) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }
@@ -840,10 +829,41 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
                 throw std::invalid_argument(
                     "proposal/head: the tensor-parallel half [" + std::to_string(head.weight.n) +
                     "," + std::to_string(head.weight.k) + "] has no registered linear route (" +
-                    error.what() + "); NINFER_TP_DRAFT_HEAD=primary keeps it whole on rank 0");
+                    error.what() + ")");
             }
         }
     }
+}
+
+std::string projection_routes(const Parameters& parameters) {
+    if (!parameters.qwen4) { return {}; }
+
+    struct Count {
+        const char* op;
+        std::size_t fused = 0, generic = 0;
+
+        void add(bool route) { ++(route ? fused : generic); }
+    };
+
+    std::array<Count, 4> counts{{{"gdn_input"}, {"gdn_gating"}, {"attn_input"}, {"swiglu"}}};
+    for (const Qwen4BlockParameters& b : parameters.qwen4->layers) {
+        if (std::holds_alternative<GdnParameters>(b.mixer)) {
+            counts[0].add(b.fused.gdn_input);
+            counts[1].add(b.fused.gdn_gating);
+        } else {
+            counts[2].add(b.fused.attn_input);
+        }
+        if (std::holds_alternative<DenseParameters>(b.ffn)) { counts[3].add(b.fused.swiglu); }
+    }
+    std::string out = std::to_string(parameters.qwen4->layers.size()) + " text layers";
+    for (const Count& c : counts) {
+        if (c.fused + c.generic == 0) { continue; }
+        out += std::string(" | ") + c.op;
+        if (c.fused != 0) { out += " fused " + std::to_string(c.fused); }
+        if (c.fused != 0 && c.generic != 0) { out += ","; }
+        if (c.generic != 0) { out += " generic " + std::to_string(c.generic); }
+    }
+    return out;
 }
 
 } // namespace ninfer::models::qwen3_5::execution

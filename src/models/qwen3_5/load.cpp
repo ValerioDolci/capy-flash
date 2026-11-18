@@ -89,7 +89,8 @@ std::int32_t qwen4_expert_layer(std::string_view name, std::uint32_t text_layers
 // materializer may move the least important layers' banks to pageable memory when the page-locked
 // allocation cannot hold them all; every other HostMapped parent (--embedding-host) keeps rank 0.
 void rank_host_mapped(artifact::MaterializationPlan& plan,
-                      std::span<const loading::PendingWeight> weights, const TextConfig& text) {
+                      std::span<const loading::PendingWeight> weights, const TextConfig& text,
+                      std::optional<std::uint32_t> exclusive_layers) {
     std::unordered_map<std::size_t, std::int32_t> layer_of;
     std::int32_t layers = static_cast<std::int32_t>(text.num_hidden_layers);
     for (const auto& weight : weights) {
@@ -107,7 +108,7 @@ void rank_host_mapped(artifact::MaterializationPlan& plan,
         rank[static_cast<std::size_t>(order[i])] = static_cast<std::uint32_t>(i + 1);
     }
     const std::uint64_t experts  = std::get<MoeConfig>(text.ffn).num_experts;
-    const std::int32_t exclusive = qwen4_exclusive_layers();
+    const std::int32_t exclusive = qwen4_exclusive_layers(exclusive_layers);
     for (auto& placement : plan.host_mapped_objects) {
         const auto found = layer_of.find(placement.object.index);
         if (found != layer_of.end()) {
@@ -186,7 +187,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->pending                                 = std::move(bindings.weights);
     out->materialization                         = std::move(binder).finish();
     out->materialization.host_pinned_limit_bytes = options.host_pinned_max_bytes;
-    if (text.qwen4_routed_experts()) { rank_host_mapped(out->materialization, out->pending, text); }
+    if (text.qwen4_routed_experts()) {
+        rank_host_mapped(out->materialization, out->pending, text, options.exclusive_layers);
+    }
     out->info.name = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();

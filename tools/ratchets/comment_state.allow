@@ -1,0 +1,10 @@
+# comment_state: comments describe the code as it is: no measurement IDs, dates, versions or history.
+# <count> <path>; counts may only go down (tools/check_ratchets.py).
+1 include/ninfer/ops/sparse_attention.h
+1 src/models/qwen3_5/execution/qwen4_experts.cpp
+1 src/models/qwen3_5/frontend/frontend.h
+1 src/models/qwen3_5/frontend/output_constraint.cpp
+1 src/models/qwen3_5/program/transactions/commit.cpp
+1 src/ops/rmsnorm_rope/tp2/rmsnorm_rope_text_shard.cu
+1 src/runtime/engine/engine_core.h
+1 src/serve/request_validation.cpp

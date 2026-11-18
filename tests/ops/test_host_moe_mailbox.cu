@@ -20,7 +20,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/moe_slots.h"
-#include "ops/sparse_moe/host/host_moe_mailbox.h"
+#include "ops/host_moe/host_moe_mailbox.h"
 
 #include <cuda_runtime.h>
 

@@ -1,6 +1,6 @@
 // Translation-unit fragment of src/models/qwen3_5/execution/text.cpp, included once at its end
 // (after its closing namespace): TextContext at tensor-parallel width 2 apart from the Text layers,
-// which the Qwen4 forward runs on both ranks (execution/qwen4_text.cpp, qwen4_forward.h): the
+// which the Text forward runs on both ranks (execution/text_forward_context.cpp, text_forward.h): the
 // binding checks, the rank accessors, the rank-pair entry points that hand over to it, the
 // vocabulary-split logits and the Qwen3.5 MTP head over both ranks. It shares text.cpp's private
 // helpers (require_tensor_shape, ScopedValue, ...) without copying them. Not a header.
@@ -303,7 +303,7 @@ void TextContext::mtp_prompt_chunk_tp2(std::span<const int> alignment_ids, std::
 // Tensor-parallel (tp == 2) speculative verification and MTP
 // =================================================================================================
 //
-// Verification runs the Text forward (qwen4_text.cpp) on both ranks over K+1 columns per row, with
+// Verification runs the Text forward (text_forward_context.cpp) on both ranks over K+1 columns per row, with
 // masked columns and ReplaySSM records on each rank. The Qwen3.5 MTP head is one decoder layer, so
 // its split form is a text layer's with the MTP's operands:
 //
@@ -325,7 +325,7 @@ void TextContext::target_verify_batch(
     const RankTensors& valid_columns, const RankTensors& kv_table_rows,
     const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
     const RankTensors& hidden, Tensor& logits, Tensor& target_tokens, DFlashFeatureSink* sink) {
-    qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+    forward_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                         linear_state_source_slots, envelope, hidden, logits, target_tokens, sink);
 }
 

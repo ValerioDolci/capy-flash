@@ -395,6 +395,62 @@ def qwen4_nvfp4(model, recipe, sources):
             recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
 
 
+# Dense 27B-class checkpoints quantized from BF16 alone by round-to-nearest, in the two measured
+# layouts (docs/maintainer/qwen4-exp-model.md#quantizing-from-bf16). No calibration: every NVFP4
+# projection takes 16-bit activations (A16Only), the FP8 rows dynamic A8 (AllowA8).
+
+
+def _bf16_rtn_nvfp4(model, recipe, sources, *, qwen4: bool, nvfp4_attention: bool):
+    """MLP NVFP4 (nvfp4_mse) in the first 7/8 of the Text layers; with ``nvfp4_attention`` also the
+    remaining MLPs and the attention and GDN projections, else those FP8 rows (fp8_row_maxabs). The
+    output head and the embedding are FP8 rows.
+
+    Qwen3.5 dense mathematics: every other Text projection as the attention ones, GDN a/b as
+    stored, the MTP layer as the production MTP3 artifacts (_mtp_nvfp4_layer), Vision as the official
+    optional formats. Qwen4Exp dense mathematics: the Text projections outside qwen4_nvfp4's set
+    (hyper-connection mixers, QSA indexer, PLE, GDN a|b) and the MTP layer as qwen4_nvfp4."""
+    if qwen4:
+        qwen4_nvfp4(model, recipe, sources)
+    else:
+        if "num_experts" in model.config or model.config.get("model_type") == "qwen4_exp_text":
+            raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+        _optional(model, recipe)
+        _mtp_nvfp4_layer(model, recipe)
+    recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
+    recipe.assign("text/output_head", format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+    nvfp4_layers = model.config["num_hidden_layers"] * 7 // 8
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if qwen4 and not name.endswith(_QWEN4_NVFP4_DENSE):
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            continue
+        layer = int(name.split("/")[2])
+        if nvfp4_attention or ("/mlp/" in name and layer < nvfp4_layers):
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+        else:
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, activation_policy="AllowA8")
+
+
+def qwen3_8_27b_bf16_nvfp4_rtn(model, recipe, sources):
+    """The qwen3_8_27b_nvfp4 layout from a dense Qwen3.5 BF16 checkpoint: MLP NVFP4 (A16) in the
+    first 7/8 of the layers, every other projection, the head and the embedding FP8 rows."""
+    _bf16_rtn_nvfp4(model, recipe, sources, qwen4=False, nvfp4_attention=False)
+
+
+def qwen3_8_27b_bf16_nvfp4_rtn_all(model, recipe, sources):
+    """The production QUASAR artifact's layout from a dense Qwen3.5 BF16 checkpoint: every Text
+    projection NVFP4 (A16; GDN a/b as stored), FP8 row head and embedding."""
+    _bf16_rtn_nvfp4(model, recipe, sources, qwen4=False, nvfp4_attention=True)
+
+
+def qwen4_nvfp4_rtn_all(model, recipe, sources):
+    """qwen4_nvfp4 with FP8 row head and embedding: qwen3_8_27b_bf16_nvfp4_rtn_all's layout for a
+    dense Qwen4 BF16 checkpoint."""
+    _bf16_rtn_nvfp4(model, recipe, sources, qwen4=True, nvfp4_attention=True)
+
+
 MXFP8 = "mxfp8_e4m3fn_g32_ue8m0"
 NVFP4_ROW = "nvfp4_row_e4m3_g16"
 _VERBATIM_LAYOUTS = {MXFP8: "block_scale_k32_v1", NVFP4_ROW: "row_interleaved_v1"}
@@ -598,6 +654,8 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
+    "qwen3_8_27b_bf16_nvfp4_rtn": qwen3_8_27b_bf16_nvfp4_rtn,
+    "qwen3_8_27b_bf16_nvfp4_rtn_all": qwen3_8_27b_bf16_nvfp4_rtn_all,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense": qwen3_8_flash_next_nvfp4_dense,
     "qwen3_8_flash_next_nvfp4_mix": qwen3_8_flash_next_nvfp4_mix,
@@ -607,4 +665,5 @@ RECIPES = {
     "qwen4_bf16": qwen4_bf16,
     "qwen4_bf16_hcq8": qwen4_bf16_hcq8,
     "qwen4_nvfp4": qwen4_nvfp4,
+    "qwen4_nvfp4_rtn_all": qwen4_nvfp4_rtn_all,
 }

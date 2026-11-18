@@ -41,6 +41,12 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
     }
+    // AllowA4Decode materializes the A4 projection at every width, as the MTP K=3 verification
+    // width 4 does, so a token column has the same bits at every width; the two-device shard
+    // follows through nvfp4_gdn_conv_uses_a4().
+    if (policy == LinearPolicy::AllowA4Decode && tokens <= kAllowA4DecodeMaxWidth) {
+        return {Nvfp4GdnConvScheduleId::Materialized};
+    }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
     return {Nvfp4GdnConvScheduleId::Materialized};

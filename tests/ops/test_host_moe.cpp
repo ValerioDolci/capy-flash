@@ -23,7 +23,7 @@
 //    quantized) and vs an emulation of the GPU qf_moe W4A4 recipe (FP4 activations with E4M3
 //    block scales and a global scale, bf16 roundings of gemm1 and SwiGLU).
 #include "host_moe_fixture.h"
-#include "ops/sparse_moe/host/host_moe_executor.h"
+#include "ops/host_moe/host_moe_executor.h"
 
 #include <algorithm>
 #include <cmath>

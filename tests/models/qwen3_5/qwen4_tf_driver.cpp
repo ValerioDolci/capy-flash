@@ -32,7 +32,8 @@
 //   [--miss-split auto|off] [--split-min N] [--split-max N]
 //   [--split-costs
 //   cpu_fixed,cpu_expert,cpu_column,cpu_read_slowdown,gpu_fixed,gpu_expert,gpu_column]. The
-//   resolved slot count and the device memory budget are printed to stderr (memory: ...).
+//   resolved slot count and the device memory budget are printed to stderr (memory: ...), with the
+//   Text layers' projection routes (projection routes: ..., as in the startup log).
 // IDS is a text file of whitespace-separated token ids.
 #include "ninfer/engine.h"
 
@@ -295,6 +296,7 @@ int main(int argc, char** argv) {
                       << m.available_after_startup_bytes << " B, kv " << m.kv_capacity
                       << " tokens, prefill chunk " << m.prefill_chunk << " (lent workspace "
                       << m.routed_expert_prompt_workspace_bytes << " B)\n";
+            std::cerr << "projection routes: " << engine.load_summary().projection_routes << '\n';
         };
         std::ofstream file;
         std::ostream* out = &std::cout;

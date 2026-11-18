@@ -73,12 +73,12 @@ std::optional<CudaCompletionEvent> peer_context_completion_;
 // graph families, whose kernels address its slab: both are destroyed first.
 std::optional<ops::PeerMailbox> peer_mailbox;
 // The eager all-reduces' pinned-host transport (prefill chunks), attached to peer_events
-// without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=0 / =1 force it off / on). Declared
-// before peer_events, which points to it.
+// without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=1 forces it on). Declared before
+// peer_events, which points to it.
 std::optional<ops::HostExchange> host_exchange;
 // The split-phase sums' direct-copy lanes, attached to peer_events with peer
-// access and no HostExchange (NINFER_TP_PEER_OVERLAP=0 / =force: off / also without P2P).
-// Declared before peer_events, which points to it.
+// access and no HostExchange (NINFER_TP_PEER_OVERLAP=force: also without P2P). Declared
+// before peer_events, which points to it.
 std::optional<ops::PeerLanes> peer_lanes;
 std::optional<ops::PeerEvents> peer_events;
 // The side streams of the tp 2 GDN gating overlap. Declared before the graph families,

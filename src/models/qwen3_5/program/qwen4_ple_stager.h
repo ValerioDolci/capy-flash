@@ -3,7 +3,7 @@
 // Qwen4Exp deferred decode rows: a persistent helper thread that runs one job per round (the
 // round's n-gram gather into the pinned staging, then the raise of the PLE layers' words) after
 // the launch, so the execution thread observes the round's routing for the expert cache policy
-// on time meanwhile (Qwen4Runtime::decode_ple_staged, ProgramImpl::stage_qwen4_ple_round).
+// on time meanwhile (ForwardRuntime::decode_ple_staged, Qwen4PleRuntime::stage_round).
 
 #include <atomic>
 #include <cstdint>

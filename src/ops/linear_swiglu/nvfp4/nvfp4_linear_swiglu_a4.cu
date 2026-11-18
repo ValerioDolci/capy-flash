@@ -10,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_a4_tiles.h"
 
 #include <cuda_bf16.h>
 
@@ -18,21 +19,18 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Every registered gate|up problem shares K (nvfp4_linear_swiglu_plan.h); the output rows come
+// from the weight, so these instances serve all of them.
 using Geometry = Nvfp4N34816K5120;
 // Column tiles amortize gate/up decode over the complete speculative block.
-using M32N128  = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N128  = Nvfp4A4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
-using M128N128 = Nvfp4A4MmaSchedule<128, 128, 256, 4, 4, 2, 1>;
-using M96N128  = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1>;
-
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
+using M96N128 = Nvfp4A4MmaSchedule<96, 128, 256, 3, 4, 2, 1>;
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4A4Workspace workspace, int tokens,
                  cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
     launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
-                           LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+                           LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2},
                            SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
 }
 
@@ -48,17 +46,16 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 
 } // namespace
 
+Nvfp4LinearSwiGluA4Launch nvfp4_linear_swiglu_select_a4(std::int32_t tokens) {
+    if (tokens <= 32) return launch<Nvfp4A4T32R128>;
+    if (tokens <= Nvfp4A4T64R128W16::kBlockTokens) return launch<Nvfp4A4T64R128W16>;
+    if (tokens <= M96N128::kBlockTokens) return launch<M96N128>;
+    return launch<Nvfp4A4T128R128PipelinedW16>;
+}
+
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
-    if (x.ne[1] <= 32) {
-        launch<M32N128>(x, weight, out, workspace, stream);
-    } else if (x.ne[1] <= M64N128::kBlockTokens) {
-        launch<M64N128>(x, weight, out, workspace, stream);
-    } else if (x.ne[1] <= M96N128::kBlockTokens) {
-        launch<M96N128>(x, weight, out, workspace, stream);
-    } else {
-        launch<M128N128>(x, weight, out, workspace, stream);
-    }
+    nvfp4_linear_swiglu_select_a4(x.ne[1])(x, weight, out, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

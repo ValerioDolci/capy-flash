@@ -85,6 +85,7 @@ runtime weight repacking, or placeholders for hypothetical targets without a pro
 Project-owned APIs, CLIs, Python tools, fixtures, reports, formats, and documentation do not preserve
 backward compatibility. When replacing behavior, remove superseded aliases, fallbacks, transition
 branches, and their tests within the affected contract. Leave unrelated paths alone.
+The rules in [`CONTRIBUTING.md`](CONTRIBUTING.md) (one fast path, ratchets) apply to agents too.
 
 Advertised OpenAI and Anthropic protocol behavior is an external contract. Changes update the
 affected schema tests and serving documentation together.

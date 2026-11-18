@@ -2,6 +2,11 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/attn_input_proj/tp2/fp8_attn_input_shard.h"
+
+// One A8 launcher source for the [14336,5120] parent and its [7168,5120] two-device shard: they
+// share K, so the schedules and token cutoffs are the same; the section output and the split-K
+// partial reservation are each problem's own.
 
 namespace ninfer::ops::detail {
 namespace {
@@ -10,19 +15,13 @@ using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
 
-} // namespace
-
-std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
-    return max_tokens > 384 ? Bulk::kPartialBytes : 0;
-}
-
-void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                              Tensor& key, Tensor& value, Fp8A8Workspace workspace,
-                              cudaStream_t stream) {
+template <class Output>
+void launch_a8(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& key,
+               Tensor& value, Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    const Fp8AttentionInputOutput output{
-        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
-        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
+    const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),
+                        static_cast<__nv_bfloat16*>(gate.data),
+                        static_cast<__nv_bfloat16*>(value.data)};
     const auto operands = fp8_a8_operands(weight, workspace, x.ne[1]);
     const auto launch   = [&]<class Schedule>() {
         using S = Fp8ScheduleInstance<Schedule, 5120>;
@@ -39,5 +38,29 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
     if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
     launch.template operator()<Bulk>();
+}
+
+} // namespace
+
+std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
+    return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+}
+
+// The shard's own split-K reservation: 28 row tiles, so Bulk (the parent's schedule above) splits
+// its last wave from T=289 (84 tiles) on, where the parent's 56 tiles split from T=385.
+std::size_t fp8_attn_input_shard_partial_capacity_bytes(std::int32_t max_tokens) {
+    return max_tokens > 288 ? Bulk::kPartialBytes : 0;
+}
+
+void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                              Tensor& key, Tensor& value, Fp8A8Workspace workspace,
+                              cudaStream_t stream) {
+    launch_a8<Fp8AttentionInputOutput>(x, weight, q, gate, key, value, workspace, stream);
+}
+
+void fp8_attn_input_shard_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                    Tensor& key, Tensor& value, Fp8A8Workspace workspace,
+                                    cudaStream_t stream) {
+    launch_a8<Fp8AttnInputShardOutput>(x, weight, q, gate, key, value, workspace, stream);
 }
 } // namespace ninfer::ops::detail

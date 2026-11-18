@@ -1,0 +1,15 @@
+# source_include: a translation unit does not include another one; shared code goes in headers.
+# <count> <path>; counts may only go down (tools/check_ratchets.py).
+1 src/core/decode_graph.cpp
+1 src/core/paged_kv_cache.cpp
+1 src/models/qwen3_5/execution/draft.cpp
+1 src/models/qwen3_5/execution/text.cpp
+2 src/models/qwen3_5/execution/text.h
+1 src/models/qwen3_5/program/planning/startup.cpp
+1 src/models/qwen3_5/program/prefill.cpp
+1 src/models/qwen3_5/program/program_impl.cpp
+2 src/models/qwen3_5/program/program_impl.h
+1 src/models/qwen3_5/program/speculative/mtp.cpp
+1 src/models/qwen3_5/program/speculative/target_verification.cpp
+1 src/ops/context_kv_materialize/tp2/materialize_shard_h4.cu
+1 src/runtime/engine/model_instance.cpp

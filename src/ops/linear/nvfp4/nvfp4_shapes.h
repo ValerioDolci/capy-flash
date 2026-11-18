@@ -1,13 +1,18 @@
 #pragma once
 #include "ops/linear/nvfp4/nvfp4_launch.h"
-#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 namespace ninfer::ops::detail {
+// A registered [n,k] problem: its selections by token count. nvfp4_dispatch() asks them at every
+// call, and the route inventory asks them for every width.
 struct Nvfp4LinearShape {
     std::int32_t n, k;
-    Nvfp4Launch a16;
-    void (*a4)(const Tensor&, const Weight&, Tensor&, Nvfp4A4Workspace, cudaStream_t);
+    Nvfp4Launch (*a16)(std::int32_t tokens);
+    // Null when the shape has no A4 route (uses_a4 is then always false).
+    Nvfp4A4Route (*a4)(std::int32_t tokens);
     bool (*uses_a4)(std::int32_t min_tokens, std::int32_t max_tokens);
+    // The A16 selection of AllowA4Decode below the A4 crossover, where it differs from `a16`:
+    // every width there gives a column the bits of width 4. Null: AllowA4Decode runs `a16` there.
+    Nvfp4Launch (*a16_decode)(std::int32_t tokens) = nullptr;
 };
 
 extern const Nvfp4LinearShape kNvfp4N14336K5120;

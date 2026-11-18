@@ -78,6 +78,7 @@ void validate_policy(LinearPolicy policy) {
     case LinearPolicy::A16Only:
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA4:
+    case LinearPolicy::AllowA4Decode:
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
@@ -115,6 +116,27 @@ bool fp8_residual_problem(std::int32_t output_rows, std::int32_t input_rows) {
 }
 
 } // namespace
+
+bool linear_add_registered(QType qtype, std::int32_t output_rows, std::int32_t input_rows) {
+    switch (qtype) {
+    case QType::BF16:
+        return detail::bf16_linear_add_admits(output_rows, input_rows, 1);
+    case QType::Q3_G128_FP16:
+        return output_rows > 0 && input_rows > 0 && input_rows % 128 == 0;
+    case QType::Q4_G64_FP16:
+        return detail::q4_linear_add_admits(output_rows, input_rows);
+    case QType::Q5_G64_FP16:
+        return detail::q5_linear_add_admits({output_rows, input_rows, input_rows, 1});
+    case QType::Q8_G32_FP16:
+        return detail::q8_linear_add_admits({output_rows, input_rows, input_rows, 1});
+    case QType::NVFP4:
+        return nvfp4_residual_problem(output_rows, input_rows);
+    case QType::FP8_E4M3FN_ROW_BF16:
+        return fp8_residual_problem(output_rows, input_rows);
+    default:
+        return false;
+    }
+}
 
 std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                                 std::int32_t input_rows, std::int32_t min_tokens,

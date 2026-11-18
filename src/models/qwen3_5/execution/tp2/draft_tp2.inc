@@ -302,9 +302,8 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     // this device stalls behind that spin, so the target's inbound copies must be
     // complete before either rank enters the mailbox phase: the rendezvous the MTP path gets from
     // its draft phase's staged collectives.
-    // Only once the draft phase runs on the staged copies (the WSL2 step-down, or
-    // NINFER_TP_MAILBOX_DRAFT=copies): where the mailbox holds, the extra cross-stream wait is
-    // not needed and the decode round stays as it was.
+    // Only once the draft phase runs on the staged copies (the WSL2 step-down): where the mailbox
+    // holds, the extra cross-stream wait is not needed and the decode round stays as it was.
     if (tp->staged_draft_collectives) {
         CUDA_CHECK(cudaEventRecord(events.pull_done(static_cast<int>(target)), stream));
         ScopedCurrentDevice::select(ec.dev[source]->device);

@@ -363,7 +363,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head, tp ? &*tp : nullptr, graph_peer_bridge(), qwen4_runtime()},
+                     proposal_head, tp ? &*tp : nullptr, graph_peer_bridge(), forward_runtime()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,

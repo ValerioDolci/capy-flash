@@ -192,6 +192,8 @@ const char* policy_name(ops::LinearPolicy policy) {
         return "a8";
     case ops::LinearPolicy::AllowA4:
         return "a4";
+    case ops::LinearPolicy::AllowA4Decode:
+        return "a4-decode";
     }
     throw std::invalid_argument("unknown linear policy");
 }

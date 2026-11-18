@@ -302,11 +302,8 @@ rows), the matching input columns of `attention/output`, half of the `mlp/{gate,
 matching `mlp/down` columns. The norms, both dynamic convolutions' `base_kernel` and
 `kernel_projection`, `feature_projection`, `context_norm` and `final_norm` are replicated, and
 `candidate_selector/*` is rank 0's. The optimized head `proposal/head` Q4 `[131072,5120]` and its
-`proposal/token_ids` split by rows into `[65536,5120]` / `[65536]` blocks.
-`NINFER_TP_DRAFTER=primary` keeps the whole drafter, its state and the head on rank 0 (the rank-0
-drafter of the first two-device port, with only the head split: rank 1 then receives the final
-hidden through one `allreduce_sum` against zeros); `NINFER_TP_DRAFT_HEAD=primary` keeps the head on
-rank 0. The startup log names both placements (`DFlash2 proposal head`, `DFlash2 drafter`).
+`proposal/token_ids` split by rows into `[65536,5120]` / `[65536]` blocks. The startup log names
+both placements (`DFlash2 proposal head`, `DFlash2 drafter`).
 
 **Round** (`execution::dflash2_draft_round_tp2`, `execution/tp2/draft_tp2.inc`, one call from
 `dflash_decode_batch_body`). The residual is replicated and bit-identical on both ranks:

@@ -85,7 +85,7 @@ struct MoeGgufLayer {
  *   block); integer sub-block dot products of the stored codes (dp4a) with the IQ2_S/IQ3_XXS
  *   half-scale terms exact; FP32 accumulation; h = silu(g) * u in FP32; the partial is the FP32
  *   sum over k in top-k order (deterministic, independent of which slot holds an expert).
- *   The host path (ops/sparse_moe/host/host_gguf.h, quantize_pack_*_q8f32) quantizes x and h with
+ *   The host path (ops/host_moe/host_gguf.h, quantize_pack_*_q8f32) quantizes x and h with
  *   the same rule, so CPU and GPU see the same integer codes; their FP32 sums differ in order.
  *   Oracle: FP64 over ggml-dequantized weights and the op's own quantized activations.
  * Effects: writes `out` only; must not overlap any input or the workspace.

@@ -6,16 +6,21 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
+#include "ops/gdn_input_proj/tp2/nvfp4_gdn_input_shard.h"
+
 #include <array>
 #include <cstddef>
 #include <utility>
+
+// One small-T launcher source for the [16384,5120] parent and its [8192,5120] two-device shard (one
+// instance per qkv|z section output).
 
 namespace ninfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
 
-template <int ActiveTokens>
+template <class Output, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                   cudaStream_t stream) {
     using Geometry = Nvfp4N16384K5120;
@@ -29,23 +34,29 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     launch_nvfp4_a16_simt<
         Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         nvfp4_a16_operands(x, weight),
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)},
+        Output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)},
         LinearIdentityEpilogue{}, stream);
 }
 
-template <std::size_t... Offsets>
+template <class Output, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
-    return std::array<Launch, sizeof...(Offsets)>{&launch_exact<2 + static_cast<int>(Offsets)>...};
+    return std::array<Launch, sizeof...(Offsets)>{
+        &launch_exact<Output, 2 + static_cast<int>(Offsets)>...};
 }
 
-constexpr auto kLaunchers = make_launchers(std::make_index_sequence<2 - 2 + 1>{});
+template <class Output>
+constexpr auto kLaunchers = make_launchers<Output>(std::make_index_sequence<2 - 2 + 1>{});
 
 } // namespace
 
 void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) {
-    kLaunchers[x.ne[1] - 2](x, weight, qkv, z, stream);
+    kLaunchers<Nvfp4GdnInputOutput>[x.ne[1] - 2](x, weight, qkv, z, stream);
+}
+
+void nvfp4_gdn_input_shard_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                          Tensor& z, cudaStream_t stream) {
+    kLaunchers<Nvfp4GdnInputShardOutput>[x.ne[1] - 2](x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

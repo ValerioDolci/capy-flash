@@ -46,7 +46,7 @@ void append_prefetch_paired_prefix(const Weight& w, std::size_t bytes, ExchangeP
 // The weight of a projection with a single parent; null for a paired one.
 [[nodiscard]] const Weight* single_projection(const ops::ProjectionWeights& projection) noexcept;
 
-// The hints of the dense block schedule (the plain residual, qwen4_forward/plain.h). A mixer's
+// The hints of the dense block schedule (the plain residual, text_forward/plain.h). A mixer's
 // all-reduce is followed by the post-attention norm and the paired gate|up GEMM of the same layer;
 // an FFN's by the next layer's input norm and input projection: Q|K|G|V for attention, for GDN the
 // small BF16 A|B gating projection (whole, when it fits half the budget) and then Q|K|V|Z.

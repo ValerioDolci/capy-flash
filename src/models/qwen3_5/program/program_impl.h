@@ -20,13 +20,15 @@
 #include "models/qwen3_5/program/storage/qwen4_elastic.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
-#include "models/qwen3_5/program/qwen4_ple_stager.h"
+#include "models/qwen3_5/program/qwen4_ple_runtime.h"
+#include "models/qwen3_5/program/qwen4_routed_expert_runtime.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
 #include "models/qwen3_5/execution/qwen4_experts.h"
-#include "models/qwen3_5/execution/qwen4_runtime.h"
+#include "models/qwen3_5/execution/forward_runtime.h"
 #include "models/qwen3_5/execution/qwen4_tfdump.h"
+#include "models/qwen3_5/program/validation_hooks.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 
@@ -648,6 +650,8 @@ public:
     void reset_memory_peaks() noexcept;
 
     friend struct qwen3_5::detail::PressurePlanningSessionImpl;
+    friend class ValidationHooks;
+    friend class Qwen4PleRuntime;
 
     const execution::Parameters& parameters;
     DeviceContext& device;
@@ -676,8 +680,8 @@ public:
     const WorkspacePlan workspace_plan;
 #include "models/qwen3_5/program/tp2/program_impl_public.inc"
 
-    // Elastic KV (plan.elastic_kv): the KV page planes and the expert slot pools, in their own
-    // VMM arena (PersistentLayout::elastic_bytes) whose KV pages and elastic expert columns are
+    // Elastic KV (plan.inputs.elastic_kv): the KV page planes and the expert slot pools, in their
+    // own VMM arena (PersistentLayout::elastic_bytes) whose KV pages and elastic expert columns are
     // backed on demand (Qwen4ElasticVram); everything else stays in `persistent`.
     std::unique_ptr<ElasticArena> elastic_arena;
     DeviceArena persistent;
@@ -784,154 +788,50 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
 
-    // Qwen4Exp (one device or tp 2): routed-expert backend, n-gram gather and its pinned staging,
+    // Qwen4Exp (one device or tp 2): routed experts, PLE (n-gram gather and its pinned staging),
     // the validation dump, and the runtime record every Qwen4Exp TextContext reads.
-    std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_experts;
-    std::uint32_t qwen4_expert_slots      = 0;
-    std::size_t qwen4_expert_pool_bytes   = 0;
-    std::int32_t qwen4_expert_publish_lag = 0;
-    // The elastic KV <-> expert slot manager (null unless plan.elastic_kv.enabled).
-    std::unique_ptr<Qwen4ElasticVram> qwen4_elastic;
-    std::optional<execution::Qwen4ExpertBank> qwen4_mtp_bank;
-    // Host copy of the MTP bank's expanded weight divisors (gate|up [2E] then down [E]) for the
-    // offload backend (CPU path, device divisor table); empty for per-expert banks.
-    std::vector<float> qwen4_mtp_host_divisors;
-    std::optional<execution::Qwen4ExpertBank> qwen4_peer_mtp_bank; // tp 2: rank 1's MTP bank
-    std::unique_ptr<execution::Qwen4MoeProbe> qwen4_mtp_probe;
-    // NINFER_QWEN4_TOP2=<file> (validation): one line per decoded position, the target's two
-    // largest logits: lane position source(0 ordinary, 1 verify) id1 logit1 id2 logit2.
-    std::FILE* qwen4_top2_file = nullptr;
-    // NINFER_QWEN4_MTP_CALIB=<file> (measurement): one line per verified MTP round, "extent
-    // accepted logp_1 .. logp_K" (the proposals' own softmax log-probabilities).
-    std::FILE* qwen4_mtp_calib = nullptr;
-    // NINFER_QWEN4_MTP_ORACLE=<file> (validation): one whole token sequence per line (prompt +
-    // a reference continuation). A round whose committed ledger is a prefix of a line drafts that
-    // line's next tokens instead of the MTP proposals, so verification and the commit of long
-    // accepted prefixes are exercised whatever the draft head's quality.
-    std::vector<std::vector<TokenId>> qwen4_mtp_oracle;
-    // NINFER_QWEN4_FORCE_TOKENS=<file> (validation, same format): a round of a matching sequence
-    // commits the file's tokens instead of its own choices (teacher forcing through the decode or
-    // the verification route; with NINFER_QWEN4_MTP_NO_DRAFTS one token per round). The logits and
-    // the state the round computed are untouched: they depend only on the consumed tokens.
-    std::vector<std::vector<TokenId>> qwen4_forced_tokens;
-    void force_qwen4_tokens(const SequenceState& sequence, TokenId* tokens,
-                            std::int32_t count) const;
-    // NINFER_QWEN4_MTP_NO_DRAFTS=1 (validation): every round verifies its anchor alone (extent 0,
-    // the fallback step), i.e. greedy decode through the verification route.
-    bool qwen4_mtp_no_drafts = false;
-    // NINFER_QWEN4_MTP_EXTENT_CAP=<k> (validation/measurement): verify at most k proposals per
-    // round in the K-wide window (the cost of a column at fixed drafting work).
-    std::uint32_t qwen4_mtp_extent_cap = qwen3_5::kMtpDecodeMaximumDrafts;
-    void write_qwen4_top2(const Tensor& logits_column, std::uint32_t lane, std::uint32_t position,
-                          int source);
-    std::unique_ptr<execution::PleGather> qwen4_ple_gather;
-    std::optional<PinnedHostBuffer> qwen4_ple_host;
-    std::optional<PinnedHostBuffer> qwen4_decode_ple_buffer;
+    Qwen4RoutedExpertRuntime qwen4_routed;
+    // PLE: n-gram gather, staging, deferred decode rows (empty without PLE).
+    Qwen4PleRuntime qwen4_ple;
     // Rank 1's commit work (fold) joined into rank 0's stream when the commit does not wait.
     std::optional<CudaCompletionEvent> qwen4_peer_commit_event;
-    std::uint16_t* qwen4_decode_ple_host = nullptr;
-    // Deferred decode rows (Qwen4Runtime::decode_ple_staged): the mapped words of rank 0 and rank
-    // 1, and the round's queued gathers (prepared before the launch, run after it).
-    std::optional<PinnedHostBuffer> qwen4_ple_staged_words;
-    std::array<std::uint32_t*, 2> qwen4_ple_staged{};
-
-    struct Qwen4PleStage {
-        std::uint32_t lane       = 0;
-        std::uint32_t frontier   = 0;
-        std::uint32_t count      = 0;
-        std::size_t first_column = 0;
-        std::array<TokenId, qwen3_5::kMtpDecodeMaximumWidth> tokens{};
-    };
-
-    std::vector<Qwen4PleStage> qwen4_ple_queue;
-    // Runs stage_qwen4_ple_round() of a graph round after its launch (created with the words).
-    std::unique_ptr<Qwen4PleStager> qwen4_ple_stager;
-    std::unique_ptr<execution::Qwen4TfDump> qwen4_tfdump;
-    // Teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY, see
-    // qwen4_tfdump.h) and its recorder (NINFER_QWEN4_REPLAY_RECORD=<file>: "req <prompt tokens>"
-    // at every first token, "win <frontier> <extent> <accepted> <drafts...>" per MTP round).
-    std::unique_ptr<execution::Qwen4Replay> qwen4_replay;
-    std::FILE* qwen4_replay_record = nullptr;
-    // Round log (NINFER_QWEN4_ROUND_LOG=<file>, measurement): one line per decode round,
-    // "<o|m> <frontier> <extent> <accepted> <round us> <host gap us> <missing> <cpu experts>
-    // <gpu-share experts> <expert window wall us> <fill wait us> <elastic expert columns>" (gap =
-    // previous round's end -> this round's start, -1 for a request's first round; columns -1
-    // without elastic KV).
-    std::FILE* qwen4_round_log = nullptr;
-    std::chrono::steady_clock::time_point qwen4_round_end{};
-    bool qwen4_round_follows = false;
-    void log_qwen4_round(char kind, std::uint32_t frontier, std::uint32_t extent,
-                         std::int32_t accepted, double round_seconds);
-    std::optional<execution::Qwen4Runtime> qwen4_runtime_record;
-    // The draft shortlist proposal head (Qwen4Runtime::draft_head of rank 0), when planned.
+    // Validation and diagnostic hooks of the rounds (null when none is set).
+    std::unique_ptr<ValidationHooks> validation;
+    std::optional<execution::ForwardRuntime> forward_runtime_record;
+    // The draft shortlist proposal head (ForwardRuntime::draft_head of rank 0), when planned.
     std::optional<execution::Qwen4DraftHead> qwen4_draft_head;
-    // tp 2: rank 1's expert backend (the odd expert IDs) and runtime record (TpExecution::qwen4).
-    std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_peer_experts;
-    std::optional<execution::Qwen4Runtime> qwen4_peer_runtime_record;
+    // tp 2: rank 1's runtime record (TpExecution::qwen4).
+    std::optional<execution::ForwardRuntime> qwen4_peer_runtime_record;
 
-    [[nodiscard]] const execution::Qwen4Runtime* qwen4_runtime() const noexcept {
-        return qwen4_runtime_record ? &*qwen4_runtime_record : nullptr;
+    [[nodiscard]] const execution::ForwardRuntime* forward_runtime() const noexcept {
+        return forward_runtime_record ? &*forward_runtime_record : nullptr;
     }
 
     void construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backing);
-    void construct_qwen4_experts(const SequencePlanImpl& plan, DeviceSpan backing,
-                                 execution::Qwen4Runtime& runtime,
-                                 execution::Qwen4Runtime& peer_runtime);
-    // Expert window of one execution on every rank's backend (qwen4_experts.h window protocol):
-    // begin before anything of it is enqueued, observe once it is enqueued, end after the
-    // devices completed it (abandon on failure). No-ops without Qwen4Exp experts.
-    void qwen4_begin_window(execution::Qwen4Window kind);
-    void qwen4_observe_window();
-    void qwen4_end_window();
-    void qwen4_abandon_window() noexcept;
 
     // Runs `body` (an execution outside the decode rounds and prefill chunks, e.g. the MTP
     // prefix-reuse bridge) as one prompt window when Qwen4Exp experts are bound: begin, body,
     // observe, device synchronization, end. Without them `body` runs as is.
     template <class Body>
     void in_qwen4_window(Body&& body) {
-        if (!qwen4_experts) {
+        if (!qwen4_routed.experts) {
             body();
             return;
         }
-        qwen4_begin_window(execution::Qwen4Window::Prompt);
+        qwen4_routed.begin_window(*this, execution::Qwen4Window::Prompt);
         try {
             body();
-            qwen4_observe_window();
+            qwen4_routed.observe_window(*this);
             synchronize_devices();
-            qwen4_end_window();
+            qwen4_routed.end_window(*this);
         } catch (...) {
             try {
                 synchronize_devices();
             } catch (...) {}
-            qwen4_abandon_window();
+            qwen4_routed.abandon_window(*this);
             throw;
         }
     }
-
-    // Qwen4Exp PLE n-gram rows of a decode window into the pinned round buffer: columns
-    // [first_column, first_column + tokens.size()) are the tokens `tokens` at positions
-    // frontier.., with `ledger` (the committed tokens before `frontier`) as their history.
-    // Page prefetch of the next round's n-gram rows (an MTP round's anchor and drafts, or
-    // an ordinary round's sampled token, are in the egress once this round has synchronized), so
-    // the storage reads overlap the commit and the next round's host preparation.
-    void prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> lanes, bool mtp);
-    void stage_qwen4_ple_rows(std::span<const TokenId> ledger, std::uint32_t frontier,
-                              std::span<const TokenId> tokens, std::size_t first_column);
-    // Deferred decode rows. A round: begin_qwen4_ple_round() (no stream waiting: lowers the
-    // words), queue_qwen4_ple_rows() per row while preparing, the launch, then
-    // stage_qwen4_ple_round() gathers the queued rows into the pinned staging and raises the
-    // words (also on failure). raise_qwen4_ple_staged() alone releases an execution whose rows
-    // do not matter (warm-up, graph preparation) or that failed after its launch.
-    void begin_qwen4_ple_round();
-    void queue_qwen4_ple_rows(std::uint32_t lane, std::uint32_t frontier,
-                              std::span<const TokenId> tokens, std::size_t first_column);
-    void stage_qwen4_ple_round();
-    void raise_qwen4_ple_staged() noexcept;
-    // Qwen4Exp speculative commit: advances each row's PLE convolution history by its committed
-    // prefix of the verified window (the PLE half of the ReplaySSM fold).
-    void fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow> rows);
-    void fold_qwen4_ple_rank(std::span<const ops::GdnReplayFoldRow> rows, int rank);
 
 private:
     void advance_resource_revision() noexcept {

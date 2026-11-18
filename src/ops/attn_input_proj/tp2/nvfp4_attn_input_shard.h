@@ -4,12 +4,14 @@
 // [14336,5120] parent (12 of 24 query/gate heads, 2 of 4 key/value heads), rows
 // query|key|gate|value = 3072|512|3072|512.
 //
-// The shard runs the parent's own NVFP4 attn_input_proj sources, compiled a second time by the
-// nvfp4_attn_input_shard_*.cu/.cpp translation units of this directory with the section output
-// and the entry points renamed (nvfp4_attn_input_shard_names.h). Both share K, so every route,
-// schedule, token cutoff and the workspace capacity are the parent's by construction. One measured
-// exception: at T=1024 the shard's A4 TMA
-// route keeps the 128-token scale tiles (nvfp4_attn_input_shard_a4.cu).
+// Both share K, so every route, schedule, token cutoff and the workspace capacity are the parent's
+// by construction. One measured exception: at T=1024 the shard's A4 TMA route keeps the 128-token
+// scale tiles (nvfp4_attn_input_shard_a4.cu). The parent's plan (nvfp4/nvfp4_attn_input_plan.cpp)
+// and its launcher sources (decode, small-T, A4, TMA) serve the shard too, with the shard's section
+// output as a template argument (Nvfp4AttnInputShardOutput, nvfp4/nvfp4_attn_input_output.cuh);
+// the shard's entry points below are defined next to the parent's, except the A16 one, which
+// instantiates the parent's template (nvfp4/nvfp4_attn_input_a16.cuh) in its own unit
+// (nvfp4_attn_input_shard_a16.cu).
 
 #include "core/weight.h"
 #include "core/arena.h"
@@ -39,16 +41,17 @@ void nvfp4_attn_input_shard_small_t_launch(const Tensor& x, const Weight& weight
 void nvfp4_attn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                       Tensor& gate, Tensor& k, Tensor& v,
                                       Nvfp4A4Workspace workspace, cudaStream_t stream);
-// The parent's A4 launcher at the shard shape, which nvfp4_attn_input_shard_a4_launch() wraps.
+// The parent's A4 launcher at the shard's section output (nvfp4/nvfp4_attn_input_a4.cu), which
+// nvfp4_attn_input_shard_a4_launch() wraps.
 void nvfp4_attn_input_shard_a4_launch_upstream(const Tensor& x, const Weight& weight, Tensor& q,
                                                Tensor& gate, Tensor& k, Tensor& v,
                                                Nvfp4A4Workspace workspace, cudaStream_t stream);
-// In the non-RDC archive, like the parent's launch_nvfp4_a4_tma_attention().
+// In the non-RDC archive, next to the parent's launch_nvfp4_a4_tma_attention().
 void launch_nvfp4_a4_tma_attention_shard(const Nvfp4A4Operands& p, __nv_bfloat16* query,
                                          __nv_bfloat16* gate, __nv_bfloat16* key,
                                          __nv_bfloat16* value, cudaStream_t stream);
 
-// nvfp4_attn_input_dispatch() at the shard shape.
+// nvfp4_attn_input_dispatch() at the shard shape, with the shard's launchers.
 void nvfp4_attn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, LinearPolicy policy,
                                      WorkspaceArena* workspace, cudaStream_t stream);

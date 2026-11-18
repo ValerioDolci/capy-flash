@@ -32,6 +32,8 @@ inline const char* policy_name(ops::LinearPolicy policy) {
         return "AllowA8";
     case ops::LinearPolicy::AllowA4:
         return "AllowA4";
+    case ops::LinearPolicy::AllowA4Decode:
+        return "AllowA4Decode";
     }
     return "?";
 }
