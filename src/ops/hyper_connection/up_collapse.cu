@@ -1,5 +1,9 @@
 // Implements: ops/hyper_connection/launch.h (hc_up_collapse_*)
 //
+// The general route's Q8 projections at T > 128: FP16 operands with FP16 accumulation per 64-wide
+// K tile (q8_a16_mma F16), the Up projection fused with the collapse and Down and the unfused Up
+// on the same schedule (hc_projection_launch), so the fused and unfused routes give the same bits.
+//
 // The general route's Up projection fused with the collapse. Unfused, the Up Linear
 // writes m = up . low as BF16 [S*H, T] and hyper_connection_collapse reads it back with the
 // normalized residual: at prefill widths about 1 GB of traffic per mixer and chunk. Here the Up
@@ -139,7 +143,18 @@ void hc_up_collapse_launch(const Tensor& lowrank, const Weight& up, const Tensor
     launch_q8_a16_mma<UpSchedule, HcStreamRows>(
         q8_linear_operands(lowrank, up), LinearBf16Output{out, hidden},
         HcCollapseEpilogue{static_cast<const __nv_bfloat16*>(normalized.data), out, hidden}, stream,
-        HcStreamRows{hidden});
+        HcStreamRows{hidden}, true);
+}
+
+bool hc_projection_supported(const Weight& w, std::int32_t tokens) {
+    return w.qtype == QType::Q8_G32_FP16 && tokens > 128;
+}
+
+void hc_projection_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_q8_a16_mma<UpSchedule>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream, Q8MmaIdentityRows<UpSchedule>{}, true);
 }
 
 } // namespace ninfer::ops::detail

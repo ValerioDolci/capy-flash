@@ -203,7 +203,11 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
     Tensor up                 = workspace.alloc(DType::BF16, {geometry.wide, tokens});
     detail::grouped_offset_rmsnorm_launch(residual, weights.norm, kHcStreams, eps, normalized,
                                           stream);
-    linear(normalized, weights.down, projection, stream);
+    if (detail::hc_projection_supported(weights.down, tokens)) {
+        detail::hc_projection_launch(normalized, weights.down, projection, stream);
+    } else {
+        linear(normalized, weights.down, projection, stream);
+    }
     detail::hyper_connection_gates_launch(projection, kHcStreams, lowrank, inject, stream);
     // The fused epilogue reads `normalized` and writes `mixed` 16 bytes at a time; a misaligned
     // operand keeps the unfused route, whose collapse falls back to its scalar kernel.
@@ -212,7 +216,11 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
         detail::hc_up_collapse_launch(lowrank, weights.up, normalized, mixed, stream);
         return;
     }
-    linear(lowrank, weights.up, up, stream);
+    if (detail::hc_projection_supported(weights.up, tokens)) {
+        detail::hc_projection_launch(lowrank, weights.up, up, stream);
+    } else {
+        linear(lowrank, weights.up, up, stream);
+    }
     detail::hyper_connection_collapse_launch(up, normalized, kHcStreams, mixed, stream);
 }
 

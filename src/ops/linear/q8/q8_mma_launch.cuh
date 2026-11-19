@@ -7,7 +7,7 @@ namespace ninfer::ops::detail {
 template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class Output,
           class Epilogue>
 void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
-                       cudaStream_t stream, RowPolicy row_policy = {}) {
+                       cudaStream_t stream, RowPolicy row_policy = {}, bool f16 = false) {
     validate_q8_operands(operands);
     if (operands.k % 8 != 0 || operands.padded_k % Schedule::kBlockK != 0)
         throw std::invalid_argument("Q8 MMA requires K aligned to 8 and complete padded K tiles");
@@ -18,13 +18,23 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
     for_each_token_slice(operands.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(div_up(operands.rows / row_ratio, RowPolicy::kOutputRowsPerCta),
                         div_up(count, Schedule::kBlockTokens));
-        const auto launch = [&]<bool Full, bool FullK>() {
+        const auto launch_k = [&]<bool Full, bool FullK, bool F16>() {
             constexpr auto kernel =
-                q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy>;
+                q8_a16_mma_kernel<Schedule, Full, FullK, Output, Epilogue, RowPolicy, F16>;
             const int shared = q8_prepare_shared<q8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
             kernel<<<grid, Schedule::kThreads, shared, stream>>>(operands, output, epilogue,
                                                                  row_policy, offset, count);
             CUDA_CHECK(cudaGetLastError());
+        };
+        const auto launch = [&]<bool Full, bool FullK>() {
+            if constexpr (Schedule::kActivationStages == Schedule::kStages) {
+                if (f16) {
+                    launch_k.template operator()<Full, FullK, true>();
+                    return;
+                }
+            }
+            if (f16) { throw std::invalid_argument("Q8 MMA F16 needs two activation stages"); }
+            launch_k.template operator()<Full, FullK, false>();
         };
         if (!Schedule::kPredicated && operands.rows % Schedule::kBlockRows == 0 &&
             count % Schedule::kBlockTokens == 0 && operands.k == operands.padded_k &&

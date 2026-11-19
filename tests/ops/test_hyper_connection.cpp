@@ -958,6 +958,13 @@ int main(int argc, char** argv) {
                 failures += fused_collapse_parity_case(head, tokens, combine, 0xC100U + tokens);
             }
         }
+        // The general route at prefill widths: Down and Up on FP16 operands with FP16 accumulation
+        // per K tile (q8_a16_mma F16), against the oracle with the criteria of the narrower widths.
+        for (const std::int32_t tokens : {129, 300}) {
+            failures += mix_case(with_inject, tokens, false, Execution::Eager, 0xD000U + tokens);
+            failures += mix_case(with_inject, tokens, true, Execution::Eager, 0xD100U + tokens);
+            failures += mix_case(head, tokens, false, Execution::Eager, 0xD200U + tokens);
+        }
         const MixFixture second(true, 0x9100U);
         for (const std::int32_t tokens : {1, 4, 8}) {
             failures += chain_case(with_inject, second, tokens, Execution::Eager, 0xD000U + tokens);

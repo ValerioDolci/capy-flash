@@ -7,6 +7,11 @@
 // staged with cp.async before dequantization into a swizzled BF16
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
+//
+// F16 = true (two-stage activations only): the weights dequantize to FP16, each thread converts the
+// activation chunks it staged to FP16 after its own cp.async wait, and each BK tile's MMAs
+// accumulate in FP16 before the tile is added into the FP32 accumulators. On GeForce Blackwell
+// FP32 accumulation runs at half the rate of FP16 accumulation.
 
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
@@ -29,6 +34,11 @@ union alignas(16) Q8Bf16x8Bits {
 };
 
 static_assert(sizeof(Q8Bf16x8Bits) == 16);
+
+__device__ __forceinline__ unsigned q8_bf16x2_to_f16x2(unsigned v) {
+    const __half2 h = __floats2half2_rn(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+    return *reinterpret_cast<const unsigned*>(&h);
+}
 
 __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -53,7 +63,8 @@ inline constexpr int q8_mma_shared_bytes = [] {
     return Schedule::kSharedBytes > extra ? Schedule::kSharedBytes : extra;
 }();
 
-template <class Cfg, bool Full, bool FullK, class Output, class Epilogue, class RowPolicy>
+template <class Cfg, bool Full, bool FullK, class Output, class Epilogue, class RowPolicy,
+          bool F16 = false>
 __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mma_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_begin, int token_count) {
@@ -218,8 +229,14 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 const unsigned word = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
                 const int q0        = static_cast<int>(static_cast<std::int8_t>(word & 0xffu));
                 const int q1 = static_cast<int>(static_cast<std::int8_t>((word >> 8) & 0xffu));
-                decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                if constexpr (F16) {
+                    const __half2 hv   = __floats2half2_rn(static_cast<float>(q0) * scale,
                                                            static_cast<float>(q1) * scale);
+                    decoded.pair[pair] = *reinterpret_cast<const __nv_bfloat162*>(&hv);
+                } else {
+                    decoded.pair[pair] = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
+                                                               static_cast<float>(q1) * scale);
+                }
             }
             store_vec(&As[row * BK + q8_g32_swz64(row, col)], decoded.raw);
         }
@@ -234,6 +251,22 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::kStages;
         ninfer::ops::cp_wait<0>();
+        if constexpr (F16) {
+            static_assert(Cfg::kActivationStages == Cfg::kStages);
+            // The chunks this thread staged (stage_x's mapping), after its own wait.
+            for (int item = tid; item < BN * (BK / 8); item += Cfg::kThreads) {
+                const int nl = item / (BK / 8);
+                const int k8 = item - nl * (BK / 8);
+                auto* chunk =
+                    reinterpret_cast<uint4*>(&Bs[stage][nl * BK + q8_g32_swz64(nl, k8 * 8)]);
+                uint4 v = *chunk;
+                v.x     = q8_bf16x2_to_f16x2(v.x);
+                v.y     = q8_bf16x2_to_f16x2(v.y);
+                v.z     = q8_bf16x2_to_f16x2(v.z);
+                v.w     = q8_bf16x2_to_f16x2(v.w);
+                *chunk  = v;
+            }
+        }
         __syncthreads();
 
         dequant_w(kt);
@@ -268,6 +301,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             }
         };
 
+        [[maybe_unused]] unsigned tile_acc[MT][NT][2] = {}; // F16: this BK tile's sums
         if constexpr (Cfg::kFragmentPipeline == Q8MmaFragmentPipeline::PingPong)
             load_fragments(0, 0);
 #pragma unroll
@@ -283,11 +317,33 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                             af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                             bf[slot][ni][0], bf[slot][ni][1]);
+                    if constexpr (F16) {
+                        mma_f16_hacc(tile_acc[mi][ni][0], tile_acc[mi][ni][1], af[slot][mi][0],
+                                     af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                                     bf[slot][ni][0], bf[slot][ni][1]);
+                    } else {
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                                 bf[slot][ni][0], bf[slot][ni][1]);
+                    }
                 }
             }
+        }
+
+        if constexpr (F16) {
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const float2 lo =
+                        __half22float2(*reinterpret_cast<const __half2*>(&tile_acc[mi][ni][0]));
+                    const float2 hi =
+                        __half22float2(*reinterpret_cast<const __half2*>(&tile_acc[mi][ni][1]));
+                    acc[mi][ni][0] += lo.x;
+                    acc[mi][ni][1] += lo.y;
+                    acc[mi][ni][2] += hi.x;
+                    acc[mi][ni][3] += hi.y;
+                }
         }
 
         if constexpr (Cfg::kActivationStages == 1) {

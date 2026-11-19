@@ -34,6 +34,10 @@ void hyper_connection_gates_launch(const Tensor& projection, std::int32_t stream
 // 1 whenever supported.
 [[nodiscard]] bool hc_up_collapse_supported(const Weight& up, std::int32_t hidden,
                                             std::int32_t tokens);
+// The general route's Down and unfused Up at T > 128 (Q8): q8_a16_mma F16 on the fused Up's
+// schedule.
+[[nodiscard]] bool hc_projection_supported(const Weight& w, std::int32_t tokens);
+void hc_projection_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void hc_up_collapse_launch(const Tensor& lowrank, const Weight& up, const Tensor& normalized,
                            Tensor& mixed, cudaStream_t stream);
 void hc_up_collapse_force_for_test(int mode);
