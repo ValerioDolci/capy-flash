@@ -1134,6 +1134,12 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     CUDA_CHECK(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&join_, cudaEventDisableTiming));
+    if (peer != nullptr) { // tp 2: the hyper-connection block's wait prefetch (set_wait_prefetch)
+        const ScopedCurrentDevice scope(device); // rank 0's, as the compute stream it forks from
+        CUDA_CHECK(cudaStreamCreateWithFlags(&prefetch_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_join_, cudaEventDisableTiming));
+    }
     if (!options_.routing_path.empty()) {
         routing_ = std::fopen(options_.routing_path.c_str(), "wb");
         if (routing_ == nullptr) {
@@ -1389,10 +1395,12 @@ Qwen4OffloadExperts::~Qwen4OffloadExperts() {
     stream_.reset();
     mailbox_.reset();
     if (side_ != nullptr) { (void)cudaStreamSynchronize(side_); }
-    for (cudaEvent_t e : {enqueued_, fork_, join_}) {
+    if (prefetch_stream_ != nullptr) { (void)cudaStreamSynchronize(prefetch_stream_); }
+    for (cudaEvent_t e : {enqueued_, fork_, join_, prefetch_fork_, prefetch_join_}) {
         if (e != nullptr) { (void)cudaEventDestroy(e); }
     }
     if (side_ != nullptr) { (void)cudaStreamDestroy(side_); }
+    if (prefetch_stream_ != nullptr) { (void)cudaStreamDestroy(prefetch_stream_); }
 }
 
 Tensor Qwen4OffloadExperts::layer_table(std::int32_t layer) const {
@@ -1471,6 +1479,8 @@ void Qwen4OffloadExperts::routed(std::int32_t layer, const Qwen4ExpertBank& bank
     }
 }
 
+static unsigned long long qwen4_capture_id(cudaStream_t stream);
+
 void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
                               const Tensor& ids, const Tensor& weights, Tensor& partial,
                               WorkspaceArena& work, cudaStream_t stream) {
@@ -1479,6 +1489,14 @@ void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, c
         throw std::invalid_argument("Qwen4Exp offload experts: layer out of range");
     }
     const std::int32_t T = x.ne[1];
+
+    // set_wait_prefetch() covers this call alone, whichever path it takes.
+    struct ClearOnExit {
+        std::vector<ops::PeerL2Range>& v;
+
+        ~ClearOnExit() { v.clear(); }
+    } clear_wait_prefetch{wait_prefetch_};
+
     if (gguf_) {
         run_gguf(layer, bank, x, ids, weights, partial, work, stream);
         return;
@@ -1722,6 +1740,14 @@ void Qwen4OffloadExperts::run_gguf(std::int32_t layer, const Qwen4ExpertBank& ba
         published_layer_ = -1;
         gguf_partial(x, ids, weights, view, partial, work, stream);
         mailbox_->stamp(stream, layer, ops::host::kStampDevice);
+        if (!wait_prefetch_.empty() && prefetch_stream_ != nullptr) {
+            CUDA_CHECK(cudaEventRecord(prefetch_fork_, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream_, prefetch_fork_, 0));
+            ops::l2_prefetch(wait_prefetch_, prefetch_stream_);
+            CUDA_CHECK(cudaEventRecord(prefetch_join_, prefetch_stream_));
+            prefetch_pending_ = true; // joined by exchanged(), after the MoE exchange
+            prefetch_capture_ = qwen4_capture_id(stream);
+        }
         mailbox_->accumulate(stream, layer, T, static_cast<float*>(partial.data), nullptr);
         return;
     }
@@ -1838,7 +1864,24 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     if (host_experts) { mailbox_->accumulate(stream, layer, T, static_cast<float*>(partial.data)); }
 }
 
+// The id of the capture `stream` takes part in, 0 when it is not capturing.
+static unsigned long long qwen4_capture_id(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    unsigned long long id          = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &id));
+    return status == cudaStreamCaptureStatusActive ? id : 0;
+}
+
 void Qwen4OffloadExperts::exchanged(std::int32_t layer, cudaStream_t stream) {
+    if (prefetch_pending_) {
+        // A fork of the same capture (or of the same eager round) is joined; one left by a
+        // capture that failed before reaching here is dropped: waiting for an event recorded in
+        // another capture would invalidate this one.
+        prefetch_pending_ = false;
+        if (qwen4_capture_id(stream) == prefetch_capture_) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, prefetch_join_, 0));
+        }
+    }
     if (streaming_ && layer < text_layers_) { stream_->exchanged(layer, stream); }
 }
 

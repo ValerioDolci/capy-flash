@@ -37,6 +37,7 @@
 // begin_window: the execution fails instead of returning logits without the CPU experts.
 
 #include "core/arena.h"
+#include "ninfer/ops/peer_mailbox.h"
 #include "core/expert_cache.h"
 #include "models/qwen3_5/execution/qwen4_expert_stream.h"
 #include "core/tensor.h"
@@ -124,6 +125,10 @@ public:
     virtual void run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
                      const Tensor& ids, const Tensor& weights, Tensor& partial,
                      WorkspaceArena& work, cudaStream_t stream) = 0;
+
+    // Decode at tp 2: L2 prefetch ranges the next run() issues once this rank's device experts are
+    // enqueued, while it waits for the host's experts. Timings only; the default ignores them.
+    virtual void set_wait_prefetch(std::span<const ops::PeerL2Range> ranges) { (void)ranges; }
 
     // True when routed()/run() only enqueue device work (no host synchronization), so a decode
     // round that calls them can be captured in a CUDA Graph.
@@ -444,6 +449,11 @@ public:
     void prepare_prompt(std::int32_t columns, std::int64_t begin,
                         std::int64_t prompt_tokens) override;
     void exchanged(std::int32_t layer, cudaStream_t stream) override;
+
+    void set_wait_prefetch(std::span<const ops::PeerL2Range> ranges) override {
+        wait_prefetch_.assign(ranges.begin(), ranges.end());
+    }
+
     // Rank 1's exchanged() (Qwen4OffloadPeerExperts): rank 1's streamer.
     void exchanged_peer(std::int32_t layer, cudaStream_t stream);
     [[nodiscard]] std::int32_t prompt_arena_columns() const noexcept override;
@@ -751,6 +761,15 @@ private:
     cudaStream_t side_            = nullptr; // device reads of host experts
     cudaEvent_t fork_             = nullptr;
     cudaEvent_t join_             = nullptr;
+    // set_wait_prefetch(): consumed by the next run(), issued on prefetch_stream_ (on the compute
+    // stream its kernel would outlast a short host wait) and joined back into the
+    // compute stream by exchanged(), after the MoE exchange.
+    std::vector<ops::PeerL2Range> wait_prefetch_;
+    cudaStream_t prefetch_stream_        = nullptr;
+    cudaEvent_t prefetch_fork_           = nullptr;
+    cudaEvent_t prefetch_join_           = nullptr;
+    bool prefetch_pending_               = false;
+    unsigned long long prefetch_capture_ = 0; // capture id of the pending fork (0: not capturing)
     Tensor side_partial_; // routed() -> run(): FP32 [2560,T] of the device reads
 
     // Prefill streaming (null when off): the ring is the slots of the cache layers

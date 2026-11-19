@@ -186,7 +186,7 @@ inline constexpr int kPeerPipelinedThreads = 64;
 // kPeerPrefetchChunk per thread and pass) and exit. They touch no exchange state: no epoch, flag,
 // payload or partial, so the protocol, its lockstep and its arithmetic are unchanged and the
 // prefetch cannot change a result bit -- only which weight lines the next GEMM finds in L2.
-inline constexpr int kPeerPrefetchRanges          = 4;
+inline constexpr int kPeerPrefetchRanges          = 8;
 inline constexpr std::uint32_t kPeerPrefetchChunk = 4096u;
 inline constexpr int kPeerPrefetchMaxBlocks       = 32;
 

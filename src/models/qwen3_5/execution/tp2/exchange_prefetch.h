@@ -27,17 +27,23 @@ namespace ninfer::models::qwen3_5::execution {
 // One rank's hint: at most PeerMailbox::kL2PrefetchRanges ranges.
 using ExchangePrefetch = std::vector<ops::PeerL2Range>;
 
+// The weight formats a hint covers: the dense block's, or, for the Qwen4Exp hyper-connection
+// block (text_forward/residual.h), those and the Q8 row-split weights of its mixers and inputs.
+enum class PrefetchFormats { Dense, HyperConnection };
+
 // Bytes of `w` one row occupies (codes plus scales) in the formats a hint covers; 0 otherwise.
-[[nodiscard]] std::size_t prefetch_row_bytes(const Weight& w) noexcept;
+[[nodiscard]] std::size_t
+prefetch_row_bytes(const Weight& w, PrefetchFormats formats = PrefetchFormats::Dense) noexcept;
 
 // Appends the ranges holding rows [row, row + rows) of `w` (clipped to its rows): codes, then
 // scales (NVFP4: whole 128-row scale tiles). Appends nothing for a format without a row geometry
 // here or for an empty row interval.
 void append_prefetch_rows(const Weight& w, std::int64_t row, std::int64_t rows,
-                          ExchangePrefetch& out);
+                          ExchangePrefetch& out, PrefetchFormats formats = PrefetchFormats::Dense);
 
 // The leading rows of `w` that fit `bytes`, as ranges.
-void append_prefetch_prefix(const Weight& w, std::size_t bytes, ExchangePrefetch& out);
+void append_prefetch_prefix(const Weight& w, std::size_t bytes, ExchangePrefetch& out,
+                            PrefetchFormats formats = PrefetchFormats::Dense);
 
 // A paired gate|up parent (gate rows [0, n/2), up rows [n/2, n)): the leading rows of both halves,
 // `bytes` in all, as a paired GEMM's first CTAs read them.
@@ -54,8 +60,8 @@ void append_ffn_input_prefetch(const DenseParameters& ffn, std::size_t bytes,
                                ExchangePrefetch& out);
 void append_mixer_input_prefetch(const AttentionParameters& attention, std::size_t bytes,
                                  ExchangePrefetch& out);
-void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes,
-                                 ExchangePrefetch& out);
+void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes, ExchangePrefetch& out,
+                                 PrefetchFormats formats = PrefetchFormats::Dense);
 
 // The prefetch budget of the mailbox a captured exchange of `exchange_bytes` would take, 0 when
 // there is none (eager, staged, prefetch off).

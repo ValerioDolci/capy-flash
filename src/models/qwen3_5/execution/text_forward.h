@@ -444,6 +444,19 @@ private:
     [[nodiscard]] std::array<ExchangePrefetch, 2> next_input_hint(std::size_t layer,
                                                                   std::size_t bytes) const;
 
+    // The hyper-connection block's decode L2 prefetch (graph decode at tp 2; residual.h):
+    // the mixer exchange prefetches the layer's router (and shared gate|up on its owner rank), the
+    // MoE exchange the next layer's HC mixer and mixer input, and rank 0, while it waits for the
+    // host's experts, the same for itself.
+    [[nodiscard]] std::size_t hc_exchange_bytes() const;
+    [[nodiscard]] std::size_t hc_exchange_prefetch() const;
+    void hc_stage_prefetch(const std::array<ExchangePrefetch, 2>& hint);
+    [[nodiscard]] std::array<ExchangePrefetch, 2> hc_ffn_hint(std::size_t layer,
+                                                              std::size_t bytes) const;
+    [[nodiscard]] std::array<ExchangePrefetch, 2> hc_next_hint(std::size_t layer) const;
+    void append_hc_next(int r, std::size_t layer, std::size_t bytes, ExchangePrefetch& out) const;
+    void stage_wait_prefetch(std::size_t layer);
+
     // The width of the first half of a tp 2 prompt chunk under the half-chunk overlap, or 0:
     // prefill_overlap_split's widths, the split exchange available, a one-axis RoPE chunk (a
     // multimodal chunk's three-axis positions are not column-sliceable) and a feature tap, if any,
