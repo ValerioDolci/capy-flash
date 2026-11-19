@@ -366,7 +366,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-ram-region-tokens N] [--kv-ram-cache-blocks N] "
            "[--miss-split auto|calibrate|off] "
            "[--stream-min-tokens N] [--expert-cpu-threads N] [--expert-cpus LIST] "
-           "[--expert-exclusive-layers N] [--gguf-hybrid-cost A,B,C] "
+           "[--expert-exclusive-layers N] [--gguf-hybrid-cost A,B,C] [--expert-half-life N] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
@@ -615,6 +615,13 @@ std::string serve_usage_text(const char* argv0) {
            "expert copied over PCIe); slower RAM or a faster link want a smaller CPU share "
            "(NINFER_GGUF_HYBRID_COST also sets it).\n"
            "    default: 35,3.6,100\n"
+           "  --expert-half-life <N>\n"
+           "    Expert cache: half-life in routed tokens of the routing frequency that admits and "
+           "evicts experts; shorter follows a change of topic sooner. Changes which experts the "
+           "GPUs hold, so the tokens.\n"
+           "    default: " +
+           std::to_string(static_cast<int>(RoutedExpertOptions{}.half_life_tokens)) +
+           "\n"
            "  --host-pinned-max-gib <N>\n"
            "    Keep at most N GiB of the host-mapped weights (Flash-Next expert banks) "
            "page-locked; the banks of the least used layers beyond it stay in pageable memory "
@@ -1155,6 +1162,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                             "(A, B >= 0, C > 0)");
             }
             options.gguf_hybrid_cost = cost;
+        } else if (arg == "--expert-half-life") {
+            const std::string value = require_value("--expert-half-life");
+            double tokens           = 0.0;
+            try {
+                tokens = std::stod(value);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("--expert-half-life must be a number");
+            }
+            if (!(tokens > 0.0) || !std::isfinite(tokens)) {
+                throw std::invalid_argument("--expert-half-life must be a number of tokens > 0");
+            }
+            options.expert_half_life = static_cast<float>(tokens);
         } else if (arg == "--stream-min-tokens") {
             options.stream_min_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--stream-min-tokens"), "stream-min-tokens"));

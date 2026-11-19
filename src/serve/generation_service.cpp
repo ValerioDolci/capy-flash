@@ -421,6 +421,9 @@ ninfer::EngineOptions to_engine_options(const ServeOptions& options) {
     out.routed_experts.cpus             = options.expert_cpus;
     out.routed_experts.exclusive_layers = options.expert_exclusive_layers;
     out.routed_experts.gguf_hybrid_cost = options.gguf_hybrid_cost;
+    if (options.expert_half_life) {
+        out.routed_experts.half_life_tokens = *options.expert_half_life;
+    }
     out.kv_ram_region_tokens            = options.kv_ram_region_tokens;
     out.kv_ram_cache_blocks             = options.kv_ram_cache_blocks;
 
