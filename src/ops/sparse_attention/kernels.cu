@@ -626,13 +626,25 @@ __device__ __forceinline__ void radix_pass(SelectShared& sh, const std::uint32_t
             count(staged[staged_index(b)], true);
         }
     } else {
-        // Unstaged rows (long contexts) are read from L2 four scores per load.
-        for (std::int32_t b = 4 * tid; b < blocks; b += 4 * kSelectThreads) {
-            const float4 v = reinterpret_cast<const float4*>(row)[b / 4];
-            count(order_key(v.x), true);
-            count(order_key(v.y), b + 1 < blocks);
-            count(order_key(v.z), b + 2 < blocks);
-            count(order_key(v.w), b + 3 < blocks);
+        // Unstaged rows (long contexts) are read from L2 four scores per load, four loads in
+        // flight per thread before the first is counted.
+        constexpr int kLoads = 4;
+        for (std::int32_t b0 = 4 * tid; b0 < blocks; b0 += kLoads * 4 * kSelectThreads) {
+            float4 v[kLoads];
+#pragma unroll
+            for (int u = 0; u < kLoads; ++u) {
+                const std::int32_t b = b0 + u * 4 * kSelectThreads;
+                v[u]                 = b < blocks ? reinterpret_cast<const float4*>(row)[b / 4]
+                                                  : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            }
+#pragma unroll
+            for (int u = 0; u < kLoads; ++u) {
+                const std::int32_t b = b0 + u * 4 * kSelectThreads;
+                count(order_key(v[u].x), b < blocks);
+                count(order_key(v[u].y), b + 1 < blocks);
+                count(order_key(v[u].z), b + 2 < blocks);
+                count(order_key(v[u].w), b + 3 < blocks);
+            }
         }
     }
     __syncthreads();
@@ -715,12 +727,22 @@ __global__ void __launch_bounds__(kSelectThreads) qsa_topk_kernel(SelectArgs a, 
             for (std::int32_t b = begin; b < end; ++b) { visit(b, key_at(b)); }
             return;
         }
-        for (std::int32_t b = begin; b < end; b += 4) {
-            const float4 v = reinterpret_cast<const float4*>(row)[b / 4];
-            visit(b, order_key(v.x));
-            if (b + 1 < end) { visit(b + 1, order_key(v.y)); }
-            if (b + 2 < end) { visit(b + 2, order_key(v.z)); }
-            if (b + 3 < end) { visit(b + 3, order_key(v.w)); }
+        // Four loads in flight before the first is visited; visits stay in ascending order.
+        for (std::int32_t b0 = begin; b0 < end; b0 += 16) {
+            float4 v[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                v[u] = b0 + 4 * u < end ? reinterpret_cast<const float4*>(row)[(b0 + 4 * u) / 4]
+                                        : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const std::int32_t b = b0 + 4 * u;
+                if (b < end) { visit(b, order_key(v[u].x)); }
+                if (b + 1 < end) { visit(b + 1, order_key(v[u].y)); }
+                if (b + 2 < end) { visit(b + 2, order_key(v[u].z)); }
+                if (b + 3 < end) { visit(b + 3, order_key(v[u].w)); }
+            }
         }
     };
     int greater = 0, equal = 0;
