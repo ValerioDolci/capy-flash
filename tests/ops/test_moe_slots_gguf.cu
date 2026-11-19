@@ -15,12 +15,18 @@
 //   decode:  x coded with the Op's activation codec (per 32 values d = fl(amax / 127),
 //            q = roundf(v / d)); g, u in FP64; h = silu(g) * u; h coded with the same codec;
 //            out = sum_k alpha_k W_down . h_q.
-//   grouped: weights rounded to BF16 (RNE of the exact dequantization), BF16 x; g, u in FP64;
-//            h rounded to BF16; out = sum_k alpha_k W_down,bf16 . h_bf16.
+//   grouped: gate/up weights and x rounded to FP16, down weights to BF16 (RNE of the exact
+//            dequantization; the Op's tensor-core operands); g, u in FP64; h rounded to BF16;
+//            out = sum_k alpha_k W_down,bf16 . h_bf16.
 // An h code is "uncertain" when the Op's FP32 h can land on another code: the oracle carries an
 // FP32 error bound e_h for every h (e_g = eps * sum over 32-value sub-blocks |partial|, eps = 2e-6
-// for the dp4a GEMV, a rigorous bound for its 5 lane FMAs + 4 shuffle adds; 4e-6 for the BF16
-// tensor-core GEMM, ~20x its random-walk error over 160 MMAs; silu and the product add 4e-6 |h|),
+// for the dp4a GEMV, a rigorous bound for its 5 lane FMAs + 4 shuffle adds; for the grouped gate/up
+// GEMM, which accumulates each 64-wide K step's four MMAs in FP16 and adds the step into FP32,
+// e_g = 1.13e-3 * sqrt(sum of the squared FP16 accumulator values after each MMA): 4x the
+// random-walk error of a round-to-nearest FP16 accumulator (2^-11 / sqrt(3) of its value per
+// MMA). The FP32 GEMMs' 20x margin would make most BF16 h codes uncertain here (max A/rms ~1);
+// at 4x it is 0.28, still far below the error of a wrong layout. silu and the product add
+// 4e-6 |h|),
 // and every code reachable from [h - e_h, h + e_h] (and from the block scale range for q8) is
 // considered. Uncertain codes add their largest deviation times |W_down[r][i]| * |alpha| to the
 // allowance A[r] of output r. The count and max A/rms are printed.
@@ -28,8 +34,9 @@
 // Pre-registered criteria, per token t with resident experts and per output r:
 //   decode:  |out - ref| - A[r] <= 1e-3 * rms_t(ref)
 //   grouped: |out - ref| - A[r] <= 1e-3 * rms_t(ref)
-//     (BF16 bound: with the BF16 weight and h roundings reproduced by the oracle and the
-//     uncertain BF16 h codes in A, what remains is FP32 accumulation, ~1e-6 relative);
+//     (with the weight, x and h roundings reproduced by the oracle, the gate/up FP16
+//     accumulation in e_g and the uncertain BF16 h codes in A, what remains is the down GEMM's
+//     FP32 accumulation, ~1e-6 relative);
 //   tokens without a resident expert: exactly 0 (Store);
 //   exact (bitwise): repeated calls are identical; blob and planar placements give identical
 //   results; Accumulate = old + Store (FP32); BF16 Store = RNE(FP32 Store); a call with
@@ -88,7 +95,7 @@ constexpr int kGroupedT     = 300; // oracle columns of the grouped checks
 constexpr int kPieceT       = ops::detail::kGgufGroupedChunkColumns;
 constexpr int kWideT        = kPieceT + 52; // two grouped pieces
 constexpr double kDecodeTol = 1e-3, kGroupedTol = 1e-3;
-constexpr double kEpsDp4a = 2e-6, kEpsMma = 4e-6, kEpsSilu = 4e-6;
+constexpr double kEpsDp4a = 2e-6, kEpsMmaF16 = 1.13e-3, kEpsSilu = 4e-6;
 
 int failures = 0;
 
@@ -172,6 +179,8 @@ void dequant_row(Fmt f, const std::uint8_t* row, float* y, int k) {
 
 float bf16r(float v) { return bf16_to_f32(f32_to_bf16(v)); }
 
+float f16r(float v) { return __half2float(__float2half_rn(v)); }
+
 std::uint16_t fp16_bits(float f) {
     const __half_raw raw = __float2half_rn(f);
     return raw.x;
@@ -186,7 +195,7 @@ struct Bank {
     std::vector<int> ids;                        // [kNE] expert id of test expert j
     std::vector<int> j_of_id;                    // [E] test expert of an id, or -1
     std::vector<std::vector<std::uint8_t>> blob; // [kNE] 640 gate, 640 up, 2560 down rows
-    std::vector<std::vector<float>> wgu, wdn;    // dequantized (rounded to BF16 for grouped)
+    std::vector<std::vector<float>> wgu, wdn;    // dequantized (rounded as grouped uses them)
 };
 
 void init_geometry(Bank& b) {
@@ -340,9 +349,9 @@ void dequantize_bank(Bank& b) {
     });
 }
 
-void round_bank_bf16(Bank& b) {
+void round_bank_grouped(Bank& b) {
     parallel_for(kNE, [&](int j) {
-        for (float& v : b.wgu[static_cast<std::size_t>(j)]) v = bf16r(v);
+        for (float& v : b.wgu[static_cast<std::size_t>(j)]) v = f16r(v);
         for (float& v : b.wdn[static_cast<std::size_t>(j)]) v = bf16r(v);
     });
 }
@@ -479,11 +488,12 @@ Ref oracle_token(const Bank& b, const Routing& R, int t, bool grouped) {
     std::vector<double> xa(kH), g(kI), u(kI), eg(kI), eu(kI), h(kI), eh(kI), hq(kI), dev(kI);
     const std::uint16_t* xt = R.x.data() + std::size_t(t) * kH;
     if (grouped) {
-        for (int i = 0; i < kH; ++i) xa[static_cast<std::size_t>(i)] = bf16_to_f32(xt[i]);
+        for (int i = 0; i < kH; ++i) xa[static_cast<std::size_t>(i)] = f16r(bf16_to_f32(xt[i]));
     } else {
         codec_x(xt, xa.data());
     }
-    const double eps = grouped ? kEpsMma : kEpsDp4a;
+    const double eps   = grouped ? kEpsMmaF16 : kEpsDp4a;
+    const int part_len = grouped ? 16 : 32; // grouped: one MMA's K, four to an FP16 step
     for (int k = 0; k < kK; ++k) {
         const int id = R.ids[std::size_t(t) * kK + k];
         if (id < 0 || id >= b.table_size) continue;
@@ -493,14 +503,20 @@ Ref oracle_token(const Bank& b, const Routing& R, int t, bool grouped) {
         const float* W = b.wgu[static_cast<std::size_t>(j)].data();
         for (int r = 0; r < kGU; ++r) {
             const float* row = W + std::size_t(r) * kH;
-            double total = 0.0, magnitude = 0.0;
-            for (int s = 0; s < kH / 32; ++s) {
+            double total = 0.0, magnitude = 0.0, step = 0.0;
+            for (int s = 0; s < kH / part_len; ++s) {
                 double part = 0.0;
-                for (int i = 32 * s; i < 32 * s + 32; ++i)
+                for (int i = part_len * s; i < part_len * s + part_len; ++i)
                     part += static_cast<double>(row[i]) * xa[static_cast<std::size_t>(i)];
                 total += part;
-                magnitude += std::fabs(part);
+                if (grouped) {
+                    step = (s % 4 == 0 ? 0.0 : step) + part; // the FP16 accumulator after this MMA
+                    magnitude += step * step;
+                } else {
+                    magnitude += std::fabs(part);
+                }
             }
+            if (grouped) magnitude = std::sqrt(magnitude);
             if (r < kI) {
                 g[static_cast<std::size_t>(r)]  = total;
                 eg[static_cast<std::size_t>(r)] = eps * magnitude;
@@ -1097,7 +1113,7 @@ void run_bank(Bank& b, Gpu& g, std::mt19937_64& rng, bool bench) {
     auto blob       = make_blob(b, rng);
     auto planar     = make_planar(b, rng);
     decode_cases(b, R, g, *blob, *planar, rng);
-    round_bank_bf16(b);
+    round_bank_grouped(b);
     grouped_cases(b, R, g, *blob, *planar, rng);
     grouped_edge_counts(b, g, *blob, rng);
     b.wgu.clear();

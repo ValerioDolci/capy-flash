@@ -5,9 +5,14 @@
 // Implements: include/ninfer/ops/moe_slots_gguf.h (moe_grouped_gguf)
 //
 // Prefill grouped expert GEMMs over the native GGUF block formats: 64-token x 64-row tiles over
-// per-expert token lists. Weights are dequantized exactly (ggml reference arithmetic) into BF16
-// shared memory, activations are gathered with cp.async, mma.m16n8k16 BF16 with FP32
-// accumulation; h = silu(g) * u is rounded to BF16. Kept from fngine: both GEMM kernels (tile
+// per-expert token lists. Weights are dequantized exactly (ggml reference arithmetic) and rounded
+// into shared memory, activations are gathered with cp.async; h = silu(g) * u is rounded to BF16.
+//   * gate/up: FP16 weights and activations (BF16 x converts to FP16 exactly within its normal
+//     range), mma.m16n8k16 with FP16 accumulation over each 64-wide K step, added into FP32. On
+//     GeForce Blackwell FP32 accumulation runs at half the FP16-accumulation rate, and gate/up
+//     was bound by it;
+//   * down: BF16 weights and h, FP32 accumulation (its K is 640 and the kernel is latency-bound:
+//     FP16 accumulation measured no faster). Kept from fngine: both GEMM kernels (tile
 // shape, raw-weight staging, pinned dequantization ahead of the MMAs, swizzled shared tiles) and
 // the count / scan / scatter shape of its prefill routing.
 // Changes in this tree:
@@ -32,6 +37,7 @@
 #include "ops/launcher/kernel_attr_once.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -60,6 +66,34 @@ __device__ __forceinline__ int swz(int row, int chunk) {
     return row * kBK + ((chunk ^ (row & 7)) << 3);
 }
 
+__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const std::uint32_t*>(&h);
+}
+
+__device__ __forceinline__ unsigned bf16x2_to_f16x2(unsigned v) {
+    return pack_f16x2(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+}
+
+__device__ __forceinline__ int4 pack_f16x8(const float v[8]) {
+    int4 r;
+    r.x = int(pack_f16x2(v[0], v[1]));
+    r.y = int(pack_f16x2(v[2], v[3]));
+    r.z = int(pack_f16x2(v[4], v[5]));
+    r.w = int(pack_f16x2(v[6], v[7]));
+    return r;
+}
+
+// Adds an FP16 m16n8 accumulator pair (rows g and g + 8) into the FP32 fragment.
+__device__ __forceinline__ void add_f16_acc(float (&acc)[4], unsigned lo, unsigned hi) {
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&lo));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hi));
+    acc[0] += a.x;
+    acc[1] += a.y;
+    acc[2] += b.x;
+    acc[3] += b.y;
+}
+
 __device__ __forceinline__ int4 pack_bf16x8(const float v[8]) {
     int4 r;
     r.x = int(pack_bf16x2(v[0], v[1]));
@@ -69,18 +103,19 @@ __device__ __forceinline__ int4 pack_bf16x8(const float v[8]) {
     return r;
 }
 
-// Dequantize `Groups` consecutive 8-element groups of one staged weight row into BF16 registers.
+// Dequantize `Groups` consecutive 8-element groups of one staged weight row into BF16 (or FP16)
+// registers.
 // The values are materialized here (asm barrier), ahead of the volatile MMA sequence that follows
 // in the callers: letting the compiler interleave the dequant table lookups with the MMAs stalls
 // the tensor pipe (fngine measured ~3.5x slower gate/up GEMM).
-template <Format F, int Groups>
+template <Format F, int Groups, bool Fp16 = false>
 __device__ __forceinline__ void dequant_groups_pinned(const std::uint8_t* row, int g0,
                                                       int4 (&v)[Groups]) {
 #pragma unroll
     for (int i = 0; i < Groups; ++i) {
         float f[8];
         dequant8<F>(row, g0 + i, f);
-        v[i] = pack_bf16x8(f);
+        v[i] = Fp16 ? pack_f16x8(f) : pack_bf16x8(f);
         asm volatile("" : "+r"(v[i].x), "+r"(v[i].y), "+r"(v[i].z), "+r"(v[i].w));
     }
 }
@@ -123,6 +158,25 @@ __device__ __forceinline__ void load_a_tile(__nv_bfloat16* A, const __nv_bfloat1
         const int r = id / kChunksPerRow, c = id % kChunksPerRow;
         const __nv_bfloat16* src = rows[r] + k0 + c * 8;
         cp_async_zfill<16, Cache::cg>(A + swz(r, c), src, r < n ? 16 : 0);
+    }
+}
+
+// Converts to FP16, in place, the activation chunks this thread staged with load_a_tile (the same
+// thread -> chunk mapping), after this thread's own cp.async wait: no barrier precedes it. Done
+// once per tile instead of per A fragment, which every warp of a token half would repeat.
+template <int Rows = kTileM, int Threads = kThreads>
+__device__ __forceinline__ void convert_own_a_chunks(__nv_bfloat16* A) {
+#pragma unroll
+    for (int i = 0; i < (Rows * kChunksPerRow) / Threads; ++i) {
+        const int id = threadIdx.x + i * Threads;
+        const int r = id / kChunksPerRow, c = id % kChunksPerRow;
+        int4* chunk = reinterpret_cast<int4*>(A + swz(r, c));
+        int4 v      = *chunk;
+        v.x         = int(bf16x2_to_f16x2(unsigned(v.x)));
+        v.y         = int(bf16x2_to_f16x2(unsigned(v.y)));
+        v.z         = int(bf16x2_to_f16x2(unsigned(v.z)));
+        v.w         = int(bf16x2_to_f16x2(unsigned(v.w)));
+        *chunk      = v;
     }
 }
 
@@ -171,10 +225,11 @@ struct GateUpCfg {
 // ------------------------------------------------------------------------------- gate/up
 // CTA = (64-token tile of one expert, 64 intermediate rows): gate and up rows are computed
 // together so the epilogue can form h. Per 64-wide K step ks: A(ks+1) (token rows) is gathered
-// with cp.async; W(ks+1) is dequantized from the staged raw weight bytes into registers while the
-// MMAs of step ks run and stored to the single BF16 W buffer after a barrier; the raw bytes of the
-// next 256 elements are staged into the single raw buffer right after the last dequant of the
-// current segment.
+// with cp.async and converted to FP16 by the threads that staged it; W(ks+1) is dequantized from
+// the staged raw weight bytes into FP16 registers while the MMAs of step ks run and stored to the
+// single W buffer after a barrier; the raw bytes of the next 256 elements are staged into the
+// single raw buffer right after the last dequant of the current segment. Each step's MMAs
+// accumulate in FP16 (one m16n8 pair per accumulator), added into FP32 after the step.
 template <Format F>
 __global__ void __launch_bounds__(kThreads, 2)
     grouped_gate_up_kernel(const int4* tiles, const std::int32_t* tile_count,
@@ -215,13 +270,14 @@ __global__ void __launch_bounds__(kThreads, 2)
         const int seg = k / C::kStepsPerSeg;
         const std::uint8_t* src =
             Raw + wrow * C::kRawStride + raw_misalign4(my_row, std::int64_t(seg) * C::kSegBytes);
-        dequant_groups_pinned<F, 4>(src, (k % C::kStepsPerSeg) * kChunksPerRow + wgrp, v);
+        dequant_groups_pinned<F, 4, true>(src, (k % C::kStepsPerSeg) * kChunksPerRow + wgrp, v);
     };
 
     stage_raw4<2 * kTileN, C::kRawStride>(Raw, s_wrow, 0, limit);
     load_a_tile(As, s_rows, 0, n);
     cp_commit();
     cp_wait<0>();
+    convert_own_a_chunks(As);
     __syncthreads();
     {
         int4 v[4];
@@ -257,7 +313,8 @@ __global__ void __launch_bounds__(kThreads, 2)
         if (ks + 1 < kSteps) dequant_regs(ks + 1, wnext);
 
         if (active) {
-            const __nv_bfloat16* A = As + (ks & 1) * C::kAElems;
+            const __nv_bfloat16* A = As + (ks & 1) * C::kAElems; // FP16 bits
+            unsigned step[2][4][2] = {};                         // this step's FP16 accumulators
 #pragma unroll
             for (int kk = 0; kk < kBK / 16; ++kk) {
                 unsigned a[2][4], bg[2][2], bu[2][2];
@@ -269,18 +326,23 @@ __global__ void __launch_bounds__(kThreads, 2)
                     if (wm * 32 + mt * 16 >= n) continue; // padding rows only, never stored
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
-                        mma_bf16(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3],
-                                 a[mt][0], a[mt][1], a[mt][2], a[mt][3], bg[nt][0], bg[nt][1]);
-                        mma_bf16(acc[mt][2 + nt][0], acc[mt][2 + nt][1], acc[mt][2 + nt][2],
-                                 acc[mt][2 + nt][3], a[mt][0], a[mt][1], a[mt][2], a[mt][3],
-                                 bu[nt][0], bu[nt][1]);
+                        mma_f16_hacc(step[mt][nt][0], step[mt][nt][1], a[mt][0], a[mt][1], a[mt][2],
+                                     a[mt][3], bg[nt][0], bg[nt][1]);
+                        mma_f16_hacc(step[mt][2 + nt][0], step[mt][2 + nt][1], a[mt][0], a[mt][1],
+                                     a[mt][2], a[mt][3], bu[nt][0], bu[nt][1]);
                     }
                 }
             }
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) add_f16_acc(acc[mt][j], step[mt][j][0], step[mt][j][1]);
         }
         if (ks + 1 < kSteps) {
             __syncthreads(); // every warp is done reading W(ks) (and the raw segment, if finished)
             store_groups<4>(Ws, wrow, wgrp, wnext);
+            cp_wait<0>(); // only A(ks+1) is in flight here
+            convert_own_a_chunks(As + ((ks + 1) & 1) * C::kAElems);
             const int k1 = ks + 1;
             if (k1 % C::kStepsPerSeg == C::kStepsPerSeg - 1 && k1 + 1 < kSteps) {
                 // W(k1) was the last dequant of its segment: stage the next one (waited at the
