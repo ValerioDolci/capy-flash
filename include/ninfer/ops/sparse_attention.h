@@ -35,6 +35,13 @@ inline constexpr std::int32_t kQsaIndexKeyDim = 128;
 inline constexpr std::int32_t kQsaIndexRecordWords = 136;
 /** Pooled block-key plane: each of a block's `ratio`=4 token slots holds 32 of its 128 words. */
 inline constexpr std::int32_t kQsaBlockKeyWords = 32;
+/**
+ * Decode and verify top-k of qsa_select: a call whose envelope holds at most this many visible keys
+ * (rows of at most kQsaSplitTopkMinKeys / 4 blocks, the one-CTA kernel's staging) runs only the
+ * one-CTA kernel; a longer envelope also launches the split top-k for its longer rows, which
+ * changes the call's graph topology. The causal decode graph tiers end one tier here.
+ */
+inline constexpr std::uint32_t kQsaSplitTopkMinKeys = 81920;
 
 struct QsaGeometry {
     std::int32_t query_heads = 0;

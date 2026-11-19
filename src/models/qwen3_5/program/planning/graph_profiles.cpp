@@ -1,13 +1,19 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+
+#include "ninfer/ops/sparse_attention.h"
+
 #include <algorithm>
 #include <array>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
-// Resource tiers bound inactive attention work. They are not kernel/topology boundaries.
-constexpr std::array<std::uint32_t, 7> kCausalVisibleTiers{128,  512,   2048, 4096,
-                                                           8192, 16384, 32768};
+// Resource tiers bound inactive attention work. They are not kernel/topology boundaries but for
+// the last one: on Qwen4Exp the tiers past kQsaSplitTopkMinKeys also launch the QSA split top-k,
+// so a round crossing it re-instantiates that graph executable once, and no shorter frontier
+// launches the split.
+constexpr std::array<std::uint32_t, 8> kCausalVisibleTiers{
+    128, 512, 2048, 4096, 8192, 16384, 32768, ops::kQsaSplitTopkMinKeys};
 
 std::vector<GraphExecutionProfile>
 graph_profiles_through(std::uint32_t max_frontier,
@@ -36,7 +42,8 @@ std::vector<GraphExecutionProfile> causal_resource_profiles(std::uint32_t capaci
 } // namespace
 
 std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
-    // E+1 is the one-token visible window; all tiers share one topology per exact B.
+    // E+1 is the one-token visible window; the tiers share one topology per exact B (but for the
+    // QSA split top-k boundary above).
     return causal_resource_profiles(capacity, 1);
 }
 

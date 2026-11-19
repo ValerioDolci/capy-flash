@@ -391,7 +391,12 @@ is the `concat_rows` kernel: a 2D memcpy node, whose column count and buffers di
 profiles of one class, would fail the update with `ParametersChanged` only when a swap crossed such
 profiles, hence late and intermittently. Graph updates are never retried: a rejected update throws
 at both widths, and `update()` keeps a diagnostic that names the update result and the rejected
-node.
+node. One tier boundary changes the topology: on Qwen4Exp the decode tiers past
+`kQsaSplitTopkMinKeys` (81,920 visible keys, the longest row the one-CTA QSA top-k stages; the
+causal tiers end one tier there) also launch the split top-k (`ops/sparse_attention/kernels.cu`),
+and each column picks the split or the one-CTA kernel by its own length. A swap across that
+boundary re-instantiates the executable once (the update is rejected and `decode_graph.cpp` rebuilds it) instead of keeping a second
+topology class, whose graph allowance would take an expert slot per layer on one GPU.
 
 **Graph allowance.** At tp 1 the planner budgets graph classes from fixed constants. At tp 2 it
 uses the measured per-GPU values of [`core/tp2/device_tuning.h`](../../src/core/tp2/device_tuning.h):

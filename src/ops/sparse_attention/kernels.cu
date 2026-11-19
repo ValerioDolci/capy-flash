@@ -9,6 +9,7 @@
 #include "ops/sparse_attention/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 #include "ops/launcher/kernel_attr_once.h"
 #include "ops/launcher/rope.h"
 #include "ops/common/memory.cuh"
@@ -20,6 +21,7 @@
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 
+#include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -29,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -416,7 +419,8 @@ struct SelectArgs {
     std::int32_t tile_begin; // first global tile of this pass
     std::int32_t pass_tiles;
     std::int32_t max_blocks;
-    std::int32_t chunk_blocks; // blocks per score CTA
+    std::int32_t chunk_blocks;     // blocks per score CTA
+    std::int32_t split_min_blocks; // top-k: longer rows are the split's (0: no split this pass)
 };
 
 struct TileColumn {
@@ -674,6 +678,7 @@ __global__ void __launch_bounds__(kSelectThreads) qsa_topk_kernel(SelectArgs a, 
         if (tid == 0) { a.counts[col.column] = 0; }
         return;
     }
+    if (a.split_min_blocks > 0 && col.blocks > a.split_min_blocks) { return; } // the split's row
     const std::int32_t ratio  = g.ratio;
     const std::int32_t blocks = col.blocks;
     const std::int32_t keep   = min(g.block_topk, blocks);
@@ -749,6 +754,289 @@ __global__ void __launch_bounds__(kSelectThreads) qsa_topk_kernel(SelectArgs a, 
         selected[keep * ratio + t] = blocks * ratio + t;
     }
     if (tid == 0) { a.counts[col.column] = keep * ratio + tail; }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Split top-k: the same radix selection as qsa_topk_kernel, spread over
+// several CTAs per pass column for long rows. Three digit passes build each column's histogram
+// in global memory (integer atomics, so the counts are exact); the last CTA of a pass picks the
+// digit exactly as radix_pass does. A count kernel and an emit kernel then write the selection in
+// ascending block order with the first `ties` threshold keys, the global prefix sums taking the
+// place of the single CTA's block scans: the output is identical to qsa_topk_kernel's.
+
+constexpr int kSplitTopkThreads = 256;
+constexpr int kSplitTopkKeys    = 2048; // keys per CTA and pass (a target)
+constexpr int kMaxTopkSplits    = 64;
+// Rows of at most this many blocks fit the one-CTA kernel's staging and stay there. A pass runs
+// the split only when its envelope (the graph tier's) can hold longer rows; within it each column
+// goes to the split or to the one-CTA kernel by its own length. The graph tiers end one tier at
+// kQsaSplitTopkMinKeys, so only the tiers past it launch the split (graph_profiles.cpp).
+constexpr int kSplitTopkMinBlocks = static_cast<int>(kQsaSplitTopkMinKeys / 4); // 4-key blocks
+static_assert(kSplitTopkMinBlocks <= kStagedBlocks);
+// Passes of more than 64 slots (tile columns, padding included: prompt chunks) keep it too: their
+// thousands of columns fill the GPU with one CTA each.
+constexpr std::int32_t kSplitTopkMaxSlots = 64;
+
+struct TopkState {
+    std::uint32_t prefix;
+    std::int32_t remaining;
+    std::uint32_t counter;
+    std::uint32_t pad;
+};
+
+struct TopkSplitScratch {
+    int* hist;        // [slots][kRadixBins]
+    TopkState* state; // [slots]
+    int* counts;      // [slots][kMaxTopkSplits][2]: greater, equal
+};
+
+std::size_t topk_split_scratch_bytes(std::int32_t slots) {
+    return static_cast<std::size_t>(slots) *
+           (kRadixBins * sizeof(int) + sizeof(TopkState) + 2 * kMaxTopkSplits * sizeof(int));
+}
+
+TopkSplitScratch topk_split_scratch(void* base, std::int32_t slots) {
+    auto* p = static_cast<std::uint8_t*>(base);
+    TopkSplitScratch s{};
+    s.hist = reinterpret_cast<int*>(p);
+    p += static_cast<std::size_t>(slots) * kRadixBins * sizeof(int);
+    s.state = reinterpret_cast<TopkState*>(p);
+    p += static_cast<std::size_t>(slots) * sizeof(TopkState);
+    s.counts = reinterpret_cast<int*>(p);
+    return s;
+}
+
+// The pass column of this CTA, or a negative `blocks` when the column has no split work.
+struct SplitColumn {
+    TileColumn col;
+    std::int32_t slot;
+    bool split; // the column runs the radix selection
+    bool exists;
+};
+
+__device__ __forceinline__ SplitColumn split_column(const SelectArgs& a, const IndexGeometry& g) {
+    SplitColumn out{};
+    out.slot             = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t c = out.slot % kTileColumns;
+    const std::int32_t t = a.tile_begin + out.slot / kTileColumns;
+    out.exists           = c < a.tile_columns;
+    if (!out.exists) { return out; }
+    out.col    = tile_column(a, t, c, g.ratio);
+    out.exists = out.col.w < a.width;
+    out.split  = out.exists && out.col.live && out.col.blocks > kSplitTopkMinBlocks;
+    (void)g;
+    return out;
+}
+
+__device__ __forceinline__ void split_range(std::int32_t blocks, std::int32_t chunk,
+                                            std::int32_t& begin, std::int32_t& end) {
+    begin = min(blocks, static_cast<std::int32_t>(blockIdx.x) * chunk);
+    end   = min(blocks, begin + chunk);
+}
+
+template <int Pass>
+__global__ void __launch_bounds__(kSplitTopkThreads)
+    qsa_topk_split_hist_kernel(SelectArgs a, IndexGeometry g, TopkSplitScratch s,
+                               std::int32_t chunk) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    constexpr int kShift          = Pass == 0 ? 21 : Pass == 1 ? 10 : 0;
+    constexpr int kBits           = Pass == 2 ? 10 : 11;
+    constexpr std::uint32_t kMask = Pass == 0 ? 0u : Pass == 1 ? 0xFFE00000u : 0xFFFFFC00u;
+    const SplitColumn sc          = split_column(a, g);
+    if (!sc.split) { return; }
+    __shared__ int hist[kRadixBins];
+    __shared__ bool last;
+    const int tid           = static_cast<int>(threadIdx.x);
+    TopkState* st           = s.state + sc.slot;
+    int* ghist              = s.hist + static_cast<std::int64_t>(sc.slot) * kRadixBins;
+    const float* row        = a.scores + static_cast<std::int64_t>(sc.slot) * a.max_blocks;
+    const std::int32_t keep = min(g.block_topk, sc.col.blocks);
+    for (int i = tid; i < kRadixBins; i += kSplitTopkThreads) { hist[i] = 0; }
+    const std::uint32_t prefix =
+        Pass == 0 ? 0u : *reinterpret_cast<volatile std::uint32_t*>(&st->prefix);
+    __syncthreads();
+    std::int32_t begin = 0, end = 0;
+    split_range(sc.col.blocks, chunk, begin, end);
+    constexpr std::uint32_t kDigitMask = (1u << kBits) - 1u;
+    for (std::int32_t b = begin + tid; b < end; b += kSplitTopkThreads) {
+        const std::uint32_t key = order_key(row[b]);
+        if ((key & kMask) == prefix) {
+            atomicAdd(&hist[static_cast<int>((key >> kShift) & kDigitMask)], 1);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < (1 << kBits); i += kSplitTopkThreads) {
+        if (hist[i] != 0) { atomicAdd(&ghist[i], hist[i]); }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) { last = atomicAdd(&st->counter, 1u) == gridDim.x - 1; }
+    __syncthreads();
+    if (!last) { return; }
+    __threadfence();
+    // The last CTA: the digit whose keys from the top reach `need`, as radix_pass picks it.
+    for (int i = tid; i < kRadixBins; i += kSplitTopkThreads) {
+        hist[i] = i < (1 << kBits) ? *reinterpret_cast<volatile int*>(&ghist[i]) : 0;
+    }
+    __syncthreads();
+    const std::int32_t need = Pass == 0 ? keep : st->remaining;
+    constexpr int kPer      = kRadixBins / kSplitTopkThreads; // 8 bins per thread, descending
+    int local               = 0;
+    for (int k = 0; k < kPer; ++k) { local += hist[kRadixBins - 1 - (tid * kPer + k)]; }
+    using Scan = cub::BlockScan<int, kSplitTopkThreads>;
+    __shared__ typename Scan::TempStorage scan;
+    int before = 0;
+    Scan(scan).ExclusiveSum(local, before);
+    for (int k = 0; k < kPer; ++k) {
+        const int bin = kRadixBins - 1 - (tid * kPer + k);
+        const int cnt = hist[bin];
+        if (before < need && need <= before + cnt) {
+            st->prefix    = prefix | (static_cast<std::uint32_t>(bin) << kShift);
+            st->remaining = need - before;
+        }
+        before += cnt;
+    }
+    __syncthreads();
+    for (int i = tid; i < kRadixBins; i += kSplitTopkThreads) { ghist[i] = 0; }
+    if (tid == 0) { st->counter = 0; }
+}
+
+__global__ void __launch_bounds__(kSplitTopkThreads)
+    qsa_topk_split_count_kernel(SelectArgs a, IndexGeometry g, TopkSplitScratch s,
+                                std::int32_t chunk) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const SplitColumn sc = split_column(a, g);
+    if (!sc.split) { return; }
+    const int tid           = static_cast<int>(threadIdx.x);
+    const std::uint32_t thr = s.state[sc.slot].prefix;
+    const float* row        = a.scores + static_cast<std::int64_t>(sc.slot) * a.max_blocks;
+    std::int32_t begin = 0, end = 0;
+    split_range(sc.col.blocks, chunk, begin, end);
+    int greater = 0, equal = 0;
+    for (std::int32_t b = begin + tid; b < end; b += kSplitTopkThreads) {
+        const std::uint32_t key = order_key(row[b]);
+        greater += key > thr;
+        equal += key == thr;
+    }
+    using Reduce = cub::BlockReduce<int, kSplitTopkThreads>;
+    __shared__ typename Reduce::TempStorage red;
+    const int g_sum = Reduce(red).Sum(greater);
+    __syncthreads();
+    const int e_sum = Reduce(red).Sum(equal);
+    if (tid == 0) {
+        int* out =
+            s.counts + (static_cast<std::int64_t>(sc.slot) * kMaxTopkSplits + blockIdx.x) * 2;
+        out[0] = g_sum;
+        out[1] = e_sum;
+    }
+}
+
+__global__ void __launch_bounds__(kSplitTopkThreads)
+    qsa_topk_split_emit_kernel(SelectArgs a, IndexGeometry g, TopkSplitScratch s,
+                               std::int32_t chunk) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const SplitColumn sc = split_column(a, g);
+    if (!sc.split) { return; } // the one-CTA kernel writes the other columns
+    const int tid             = static_cast<int>(threadIdx.x);
+    const TileColumn& col     = sc.col;
+    std::int32_t* selected    = a.selected + static_cast<std::int64_t>(col.column) * a.max_selected;
+    const std::int32_t ratio  = g.ratio;
+    const std::int32_t blocks = col.blocks;
+    const std::int32_t keep   = min(g.block_topk, blocks);
+    const std::int32_t tail   = col.visible - blocks * ratio;
+    const std::uint32_t thr   = s.state[sc.slot].prefix;
+    const int ties            = s.state[sc.slot].remaining;
+    const float* row          = a.scores + static_cast<std::int64_t>(sc.slot) * a.max_blocks;
+    // This CTA's place among the splits before it (ascending block order).
+    __shared__ int cta_greater, cta_equal;
+    if (tid == 0) {
+        int gb = 0, eb = 0;
+        const int* c = s.counts + static_cast<std::int64_t>(sc.slot) * kMaxTopkSplits * 2;
+        for (unsigned k = 0; k < blockIdx.x; ++k) {
+            gb += c[2 * k];
+            eb += c[2 * k + 1];
+        }
+        cta_greater = gb;
+        cta_equal   = eb;
+    }
+    std::int32_t cbegin = 0, cend = 0;
+    split_range(blocks, chunk, cbegin, cend);
+    const std::int32_t len   = cend - cbegin;
+    const std::int32_t per   = (len + kSplitTopkThreads - 1) / kSplitTopkThreads;
+    const std::int32_t begin = min(cend, cbegin + tid * per);
+    const std::int32_t end   = min(cend, begin + per);
+    int greater = 0, equal = 0;
+    for (std::int32_t b = begin; b < end; ++b) {
+        const std::uint32_t key = order_key(row[b]);
+        greater += key > thr;
+        equal += key == thr;
+    }
+    using Scan = cub::BlockScan<int, kSplitTopkThreads>;
+    __shared__ typename Scan::TempStorage scan;
+    int greater_before = 0, equal_before = 0;
+    Scan(scan).ExclusiveSum(greater, greater_before);
+    __syncthreads();
+    Scan(scan).ExclusiveSum(equal, equal_before);
+    __syncthreads();
+    greater_before += cta_greater;
+    equal_before += cta_equal;
+    int taken_ties = max(0, min(equal, ties - equal_before));
+    int out        = greater_before + min(equal_before, ties);
+    for (std::int32_t b = begin; b < end; ++b) {
+        const std::uint32_t key = order_key(row[b]);
+        bool take               = key > thr;
+        if (!take && key == thr && taken_ties > 0) {
+            take = true;
+            --taken_ties;
+        }
+        if (take) {
+            for (int t = 0; t < ratio; ++t) { selected[out * ratio + t] = b * ratio + t; }
+            ++out;
+        }
+    }
+    if (blockIdx.x == 0) {
+        for (int t = tid; t < tail; t += kSplitTopkThreads) {
+            selected[keep * ratio + t] = blocks * ratio + t;
+        }
+        if (tid == 0) { a.counts[col.column] = keep * ratio + tail; }
+    }
+}
+
+__global__ void qsa_topk_split_zero_kernel(std::uint32_t* words, std::int32_t count) {
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    for (std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+         i < count; i += static_cast<std::int32_t>(gridDim.x * blockDim.x)) {
+        words[i] = 0;
+    }
+}
+
+void qsa_topk_split_launch(const SelectArgs& args, const IndexGeometry& g, std::int32_t pass,
+                           void* scratch, cudaStream_t stream) {
+    const std::int32_t slots = pass * kTileColumns;
+    std::int32_t splits      = std::min(
+        kMaxTopkSplits, std::max(1, (args.max_blocks + kSplitTopkKeys - 1) / kSplitTopkKeys));
+    std::int32_t chunk       = (args.max_blocks + splits - 1) / splits;
+    chunk                    = (chunk + 3) / 4 * 4;
+    splits                   = (args.max_blocks + chunk - 1) / chunk;
+    const TopkSplitScratch s = topk_split_scratch(scratch, slots);
+    const auto words         = static_cast<std::int32_t>(topk_split_scratch_bytes(slots) / 4);
+    CUDA_CHECK(pdl::launch_dependent({dim3(32), dim3(256), 0, stream}, qsa_topk_split_zero_kernel,
+                                     static_cast<std::uint32_t*>(scratch), words));
+    const dim3 grid(static_cast<unsigned>(splits), static_cast<unsigned>(slots));
+    const pdl::LaunchConfig cfg{grid, dim3(kSplitTopkThreads), 0, stream};
+    CUDA_CHECK(pdl::launch_dependent(cfg, qsa_topk_split_hist_kernel<0>, args, g, s, chunk));
+    CUDA_CHECK(pdl::launch_dependent(cfg, qsa_topk_split_hist_kernel<1>, args, g, s, chunk));
+    CUDA_CHECK(pdl::launch_dependent(cfg, qsa_topk_split_hist_kernel<2>, args, g, s, chunk));
+    CUDA_CHECK(pdl::launch_dependent(cfg, qsa_topk_split_count_kernel, args, g, s, chunk));
+    CUDA_CHECK(pdl::launch_dependent(cfg, qsa_topk_split_emit_kernel, args, g, s, chunk));
+}
+
+bool qsa_topk_split_pass(std::int32_t max_row_blocks, std::int32_t pass) {
+    return max_row_blocks > kSplitTopkMinBlocks && pass * kTileColumns <= kSplitTopkMaxSlots;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1434,6 +1722,32 @@ void qsa_append_launch(const Tensor& k, const Tensor& v, const Tensor& index_key
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The top-k of one pass. When the pass may split (qsa_topk_split_pass: a few columns, an envelope
+// past kSplitTopkMinBlocks), the split takes the rows longer than that and the one-CTA kernel the
+// others; otherwise the one-CTA kernel takes all. Decode and verify passes only: the thousands of
+// columns of a prompt chunk fill the GPU with one CTA each.
+static void topk_stage(SelectArgs args, const IndexGeometry& g, const QsaSelectPlan& plan,
+                       std::int32_t pass, float* scores, cudaStream_t stream) {
+    // Kernel attributes are per device: both tensor-parallel ranks launch this kernel.
+    static FuncAttrPerDevice topk_attribute;
+    topk_attribute.ensure(
+        qsa_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(sizeof(SelectShared) + (kStagedWords + 1) * sizeof(std::uint32_t)));
+    args.split_min_blocks = 0;
+    if (qsa_topk_split_pass(plan.max_row_blocks, pass)) {
+        float* split_scratch =
+            scores + static_cast<std::size_t>(plan.pass_tiles) * kTileColumns * plan.max_blocks;
+        qsa_topk_split_launch(args, g, pass, split_scratch, stream);
+        args.split_min_blocks = kSplitTopkMinBlocks;
+    }
+    const std::size_t staged = static_cast<std::size_t>(std::min(plan.max_blocks, kStagedBlocks));
+    const std::size_t shared =
+        sizeof(SelectShared) + (staged + staged / 32 + 1) * sizeof(std::uint32_t);
+    qsa_topk_kernel<<<static_cast<unsigned>(pass * kTileColumns), kSelectThreads, shared, stream>>>(
+        args, g);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 QsaSelectPlan qsa_select_plan(std::uint32_t max_visible_keys, std::int32_t ratio,
                               std::int32_t width, std::int32_t lanes) {
     QsaSelectPlan plan{};
@@ -1443,12 +1757,21 @@ QsaSelectPlan qsa_select_plan(std::uint32_t max_visible_keys, std::int32_t ratio
     // Score rows are a multiple of four floats so long rows are read as aligned float4.
     plan.max_blocks = static_cast<std::int32_t>(
         (max_visible_keys / static_cast<std::uint32_t>(ratio) + 4) / 4 * 4);
+    plan.max_row_blocks =
+        static_cast<std::int32_t>(max_visible_keys / static_cast<std::uint32_t>(ratio));
     return plan;
 }
 
 std::size_t qsa_select_scratch_bytes(const QsaSelectPlan& plan) {
+    // The split's scratch only for rows it takes; a pass of at most kSplitTopkMaxSlots slots
+    // (the last pass of a wide call may be one).
+    const std::size_t split =
+        plan.max_row_blocks > kSplitTopkMinBlocks
+            ? topk_split_scratch_bytes(std::min(plan.pass_tiles * kTileColumns, kSplitTopkMaxSlots))
+            : 0;
     return static_cast<std::size_t>(plan.pass_tiles) * kTileColumns * plan.max_blocks *
-           sizeof(float);
+               sizeof(float) +
+           split;
 }
 
 void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_positions,
@@ -1487,12 +1810,6 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
             full_tiles ? qsa_score_kernel<kScoreRegBlocksFull, true> : qsa_score_kernel<1, true>;
     }
 
-    // Kernel attributes are per device: both tensor-parallel ranks launch this kernel.
-    static FuncAttrPerDevice topk_attribute;
-    topk_attribute.ensure(
-        qsa_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(sizeof(SelectShared) + (kStagedWords + 1) * sizeof(std::uint32_t)));
-
     const std::int32_t tiles = plan.tiles_per_lane * args.lanes;
     for (std::int32_t begin = 0; begin < tiles; begin += plan.pass_tiles) {
         const std::int32_t pass = std::min(plan.pass_tiles, tiles - begin);
@@ -1510,13 +1827,7 @@ void qsa_select_launch(const Tensor& index_query, const Tensor& query_rope_posit
         const dim3 score_grid(static_cast<unsigned>(chunks), static_cast<unsigned>(pass));
         score<<<score_grid, score_threads(plan.tile_columns), score_shared, stream>>>(args, g);
         CUDA_CHECK(cudaGetLastError());
-        const std::size_t staged =
-            static_cast<std::size_t>(std::min(plan.max_blocks, kStagedBlocks));
-        const std::size_t shared =
-            sizeof(SelectShared) + (staged + staged / 32 + 1) * sizeof(std::uint32_t);
-        qsa_topk_kernel<<<static_cast<unsigned>(pass * kTileColumns), kSelectThreads, shared,
-                          stream>>>(args, g);
-        CUDA_CHECK(cudaGetLastError());
+        topk_stage(args, g, plan, pass, scores, stream);
     }
 }
 
@@ -1591,5 +1902,34 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
         CUDA_CHECK(cudaGetLastError());
     }
 }
+
+void qsa_topk_launch(const QsaSelectPlan& plan, std::int32_t ratio, std::int32_t budget,
+                     const std::int32_t* cache_positions, const std::int32_t* valid_columns,
+                     std::int32_t width, std::int32_t lanes, float* scratch, std::int32_t* selected,
+                     std::int32_t max_selected, std::int32_t* counts, cudaStream_t stream) {
+    SelectArgs args{};
+    args.cache          = cache_positions;
+    args.valid          = valid_columns;
+    args.scores         = scratch;
+    args.selected       = selected;
+    args.counts         = counts;
+    args.width          = width;
+    args.lanes          = lanes;
+    args.max_selected   = max_selected;
+    args.tile_columns   = plan.tile_columns;
+    args.tiles_per_lane = plan.tiles_per_lane;
+    args.max_blocks     = plan.max_blocks;
+    IndexGeometry g{};
+    g.ratio                  = ratio;
+    g.block_topk             = budget / ratio;
+    const std::int32_t tiles = plan.tiles_per_lane * lanes;
+    for (std::int32_t begin = 0; begin < tiles; begin += plan.pass_tiles) {
+        const std::int32_t pass = std::min(plan.pass_tiles, tiles - begin);
+        args.tile_begin         = begin;
+        args.pass_tiles         = pass;
+        topk_stage(args, g, plan, pass, scratch, stream);
+    }
+}
+
 
 } // namespace ninfer::ops::detail
