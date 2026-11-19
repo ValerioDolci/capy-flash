@@ -15,6 +15,7 @@
 // one of them is 0xFFFF.
 
 #include "core/expert_cache_policy.h"
+#include "ninfer/types.h"
 
 #include <algorithm>
 #include <chrono>
@@ -158,7 +159,9 @@ int main(int argc, char** argv) {
             c.half_life_tokens = std::stod(next());
         } else if (a == "--evict-tau") {
             c.evict_tau_windows = std::stod(next());
-            if (c.half_life_tokens <= 0.0) { c.half_life_tokens = 256.0; }
+            if (c.half_life_tokens <= 0.0) {
+                c.half_life_tokens = ninfer::RoutedExpertOptions{}.half_life_tokens;
+            }
         } else if (a == "--rule") {
             const std::string r = next();
             if (r == "engine") {

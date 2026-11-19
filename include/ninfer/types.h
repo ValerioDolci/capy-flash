@@ -264,9 +264,10 @@ struct RoutedExpertOptions {
     std::uint32_t insert_cap = 2;
     // > 0: a missing expert enters a full layer only with a decayed routing frequency of at least
     // this many routes (half-life `half_life_tokens`); 0 admits every insertion (LRU). The
-    // defaults (2 / 256) decode faster than LRU, with fewer misses per generated token.
+    // defaults (2 / 128) decode faster than LRU, with fewer misses per generated token; a shorter
+    // half-life follows a change of topic sooner.
     float admit_threshold  = 2.0F;
-    float half_life_tokens = 256.0F;
+    float half_life_tokens = 128.0F;
     // > 0: the victim of a cache insertion is the resident with the lowest decayed frequency x
     // 2^(-windows since its last use / evict_tau_windows) instead of the least recently used one
     // (frequency with half-life `half_life_tokens`); 0 = LRU. The default (4) decodes faster than

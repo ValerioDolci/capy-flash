@@ -118,6 +118,8 @@ struct ServeOptions {
     std::vector<int> expert_cpus;
     std::optional<std::uint32_t> expert_exclusive_layers;
     std::optional<std::array<double, 3>> gguf_hybrid_cost;
+    // --expert-half-life (RoutedExpertOptions::half_life_tokens); unset keeps the default.
+    std::optional<float> expert_half_life;
     // --kv-ram-region-tokens / --kv-ram-cache-blocks (EngineOptions; 0 = environment or default).
     std::uint32_t kv_ram_region_tokens = 0;
     std::uint32_t kv_ram_cache_blocks  = 0;
