@@ -582,6 +582,17 @@ void test_big_core_members() {
     expect(big_core_members(std::vector<int>{}, big).empty(), "big cores: no members");
 }
 
+// A pool on both kinds of core of a hybrid CPU (the chunk-sized gate/up items at tp 2).
+void test_hybrid_members() {
+    using ninfer::ops::host::hybrid_members;
+    const std::vector<int> big = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    expect(hybrid_members(std::vector<int>{0, 2, 16}, big), "hybrid: P- and E-core members");
+    expect(!hybrid_members(std::vector<int>{0, 2, 4}, big), "hybrid: P-core members only");
+    expect(!hybrid_members(std::vector<int>{16, 17}, big), "hybrid: E-core members only");
+    expect(!hybrid_members(std::vector<int>{0, 2}, std::vector<int>{}), "hybrid: not a hybrid CPU");
+    expect(!hybrid_members(std::vector<int>{}, big), "hybrid: no members");
+}
+
 } // namespace
 
 int main() {
@@ -595,6 +606,7 @@ int main() {
     test_auto_threads();
     test_cpu_list();
     test_big_core_members();
+    test_hybrid_members();
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape
     test_layer(rng, 5, 256, 128, false);  // small shape: one row tile, odd expert count

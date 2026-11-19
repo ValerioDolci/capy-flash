@@ -931,7 +931,14 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         options_.cpus.empty() ? ops::host::spread_cpus(options_.cpu_threads) : options_.cpus;
     config.cpus_explicit    = !options_.cpus.empty();
     config.route_log_tokens = log_tokens_;
-    config.gpu_stamps       = tracing;
+    // At tp 2 the cache holds twice the slots, so a decode call leaves the host few experts, often
+    // one or two. On a hybrid CPU a small core's slice item takes about three times a big core's,
+    // and the phase waits for the slowest: the chunk-sized gate/up items keep the big cores busy
+    // until it ends (HostMoeExecutor::Options::gguf_fine). With equal cores the slice items
+    // already spread evenly, and the finer items only add claims.
+    config.executor.gguf_fine =
+        partitions_ == 2 && ops::host::hybrid_members(config.cpus, ops::host::big_core_cpus());
+    config.gpu_stamps = tracing;
     // One record per publish: the Text layers once per window, every later (MTP) layer once per
     // call (a prompt chunk and its drafts, or an alignment and the AR drafts of a round).
     config.trace_capacity =

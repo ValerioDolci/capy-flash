@@ -388,7 +388,10 @@ Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
     runs the shared expert and the resident experts; a stream memory wait (no SM held) and an
     accumulate kernel add the CPU's FP32 partial; `moe_combine_shared` rounds once. A prefill chunk
     is one handshake per layer for all its columns (the CPU reads each missing expert once per
-    chunk, in dot groups of <= 8 tokens), the resident experts in calls of <= 8 columns. Optionally
+    chunk, in dot groups of <= 8 tokens), the resident experts in calls of <= 8 columns. At tp 2 on a
+    hybrid CPU (P- and E-cores, `/sys/devices/cpu_core/cpus`) the GGUF executor splits a decode call's
+    gate/up phase into items of one 8-row chunk of the gate or the up half of a slice, so a call of
+    one or two experts keeps every thread busy (same bits). Optionally
     (`--miss-split auto|calibrate`, decode calls) the GPU copies part of the missing experts from
     the host bank over PCIe into scratch slots on a second stream and computes them there while the
     CPU computes the rest.

@@ -248,6 +248,30 @@ void run_layer(const Layer& L, std::mt19937_64& rng, int Tmax) {
         check(out == outs[0], L.name + ": big-core decoder / E-core tail change the result");
     }
     {
+        // Chunk-sized gate/up items (calls of at most 8 tokens) on one executor across calls of
+        // 8, 1, 3 tokens, a wide call (slice items) and 8 again, with and without the big-core
+        // decoder and the small-core tail: the same bits as the slice items (a token's result
+        // does not depend on the call width, checked above).
+        for (const bool big : {false, true}) {
+            h::HostCpuPool pool(h::spread_cpus(big ? 12 : 3));
+            h::HostMoeExecutor::Options o{};
+            o.gguf_fine       = true;
+            o.gguf_big_gather = big;
+            o.gguf_ecore_tail = big ? 24 : 0;
+            h::HostMoeExecutor ex(pool, H, I, std::max(Tmax, 8), K, o);
+            for (const int Tc : {8, 1, 3, Tmax, 8}) {
+                const int Tf = std::min(Tc, Tmax);
+                std::vector<float> out(std::size_t(Tf) * H, 123.F);
+                ex.run(L.layer,
+                       h::HostMoeJob{Tf, K, x.data(), ids.data(), alpha.data(), out.data()});
+                check(std::memcmp(out.data(), outs[0].data(), sizeof(float) * out.size()) == 0,
+                      L.name + ": chunk-sized gate/up items change the result (T=" +
+                          std::to_string(Tf) + ")");
+            }
+            check(ex.gguf_fine_calls() > 0, L.name + ": the chunk-sized gate/up items never ran");
+        }
+    }
+    {
         // A GGUF-only executor (no NVFP4 activation buffers) computes the same bits.
         h::HostCpuPool pool(h::spread_cpus(3));
         h::HostMoeExecutor::Options options;

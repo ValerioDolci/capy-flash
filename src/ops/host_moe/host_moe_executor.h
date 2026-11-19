@@ -150,6 +150,8 @@ struct HostCpuTopology {
 // 1 for each of `cpus` (pool members in order) that is in `big`, else 0.
 [[nodiscard]] std::vector<std::uint8_t> big_core_members(std::span<const int> cpus,
                                                          std::span<const int> big);
+// Whether `cpus` (pool members) hold both big cores (in `big`) and small cores (not in it).
+[[nodiscard]] bool hybrid_members(std::span<const int> cpus, std::span<const int> big);
 
 // Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest allowed SMT
 // sibling of each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...
@@ -224,6 +226,14 @@ public:
         // the other members claim no gate/up or down item once fewer than N remain, so the end of a
         // phase runs on the big cores (an E-core item takes ~3x a P-core one). 0 = off.
         std::int32_t gguf_ecore_tail = 0;
+        // Calls of at most 8 tokens split the gate/up phase into items of one 8-row chunk of the
+        // gate or the up half of a 32-row slice (8 per slice) instead of one item per slice, so a
+        // call of one or two experts spreads over more members than it has slices; the slice's
+        // results are shared by the members and the member that completes its last chunk runs
+        // the SiLU-mul and the Q8_0 packing. The same decode, dots, layout and roundings: the
+        // same bits. gguf_ecore_tail applies to these items too. On at tp 2 on a hybrid CPU
+        // (Qwen4OffloadExperts).
+        bool gguf_fine = false;
     };
 
     // `max_tokens` >= 1 bounds the tokens of one call (any value; buffers scale with it).
@@ -235,6 +245,10 @@ public:
 
     // Intermediates of the last run() (qualification of the two phases separately).
     [[nodiscard]] std::int32_t intermediate_count() const noexcept;
+
+    // Calls that took Options::gguf_fine's chunk-sized gate/up items (tests).
+    [[nodiscard]] std::int64_t gguf_fine_calls() const noexcept { return gguf_fine_calls_; }
+
     [[nodiscard]] HostMoeIntermediate intermediate(std::int32_t i) const;
 
 private:
@@ -260,6 +274,13 @@ private:
     std::size_t gguf_x_bytes_ = 0, gguf_h_bytes_ = 0;
     std::vector<GgufMember> gguf_members_;
     alignas(64) std::atomic<std::int32_t> gguf_next_[3]{};
+    // Options::gguf_fine: per-slice gate/up results shared by the members, and per slice the chunks
+    // completed; this call takes the fine items (gguf_call).
+    bool gguf_fine_call_          = false;
+    std::int64_t gguf_fine_calls_ = 0;
+    std::vector<float> gguf_fine_gate_, gguf_fine_up_;
+    std::unique_ptr<std::atomic<std::int32_t>[]> gguf_fine_done_;
+    std::size_t gguf_fine_slices_ = 0;
     // Barrier 1 of a Static call, prefetching the member's down range meanwhile.
     void await_down(std::int32_t member);
     void phase_tokens(std::int32_t member);
