@@ -541,8 +541,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         for (const Qwen4ExpertBank& b : banks) { bytes.push_back(gguf_slot_bytes(b)); }
         gguf_pool_       = gguf_pool(bytes, layer_base_, options_.elastic_columns);
         gguf_slot_bytes_ = bytes;
-        if (options_.gguf_stream_min_tokens > 0 && options_.base_chunk > 0 &&
-            options_.prompt_workspace_bytes > 0) {
+        // Without a prompt workspace (causal scoring) the ring alone.
+        if (options_.gguf_stream_min_tokens > 0 && options_.base_chunk > 0) {
             // The prefill ring: the last Text layers (as the NVFP4 ring), the borrowed workspace
             // below it; the planner lends with the same rule (startup.cpp).
             const std::int64_t ring_bytes = gguf_ring_bytes(bytes, text_layers_, partitions_);

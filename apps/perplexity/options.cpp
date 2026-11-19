@@ -30,13 +30,16 @@ Integer parse_integer(std::string_view text, const char* label) {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N] [--device N] [--tp 1|2 --devices A,B]\n"
+           "       [--context N] [--stride N] [--prefill-chunk N] [--device N]\n"
+           "       [--tp 1|2 --devices A,B]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--embedding-host]\n"
            "       [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "--tp 2 --devices A,B scores on two GPUs (rank 0 on A); it needs --kv-dtype "
            "bf16|int8|nvfp4.\n"
-           "--embedding-host reads the token embedding table in place from pinned host memory.\n";
+           "--embedding-host reads the token embedding table in place from pinned host memory.\n"
+           "--prefill-chunk N tokens per prefill step (multiple of 128, default 1024); a wider\n"
+           "chunk reads each offloaded expert once for more tokens.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -65,6 +68,9 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--prefill-chunk") {
+            out.prefill_chunk =
+                parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill-chunk");
         } else if (option == "--device") {
             out.device      = parse_integer<int>(value("--device"), "device");
             device_explicit = true;
@@ -90,6 +96,9 @@ Options parse_options(int argc, char** argv) {
     if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
     if (out.context < 2 || out.stride == 0 || out.stride >= out.context) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
+    }
+    if (out.prefill_chunk == 0 || out.prefill_chunk % 128 != 0) {
+        usage_error("--prefill-chunk must be a positive multiple of 128");
     }
     ninfer::product::resolve_tensor_parallel_devices(out.tp, out.devices, out.device,
                                                      device_explicit);

@@ -1463,6 +1463,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     break;
                 }
             }
+        } else if (text.qwen4_routed_experts() && impl->inputs.causal_scoring && gguf_lend &&
+                   experts.slots_per_layer > 0) {
+            // Scoring reads every column of its chunk's hidden, so its chunk stays on the
+            // Program's arena (no lent workspace); the prefill ring alone still copies each
+            // layer's streamed experts into VRAM once per chunk, where the in-place read
+            // fetches them over PCIe for every tile of columns.
+            impl->qwen4_base_chunk = base;
         }
     }
     impl->persistent = persistent_layout(*impl, 0);

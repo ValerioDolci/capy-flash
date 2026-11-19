@@ -123,6 +123,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.tp               = options.tp;
     engine_options.devices          = options.devices;
     engine_options.max_context      = options.context;
+    engine_options.prefill_chunk    = options.prefill_chunk;
     engine_options.kv_cache         = options.kv;
     engine_options.embedding_host   = options.embedding_host;
     engine_options.startup_observer = startup_log.observer();
@@ -275,9 +276,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         domain_reports.push_back(std::move(item));
     }
 
-    json execution{{"purpose", "causal_scoring"},       {"device", options.device},
-                   {"context_tokens", options.context}, {"stride_tokens", options.stride},
-                   {"prefill_chunk_tokens", 1024},      {"score_tile_tokens", 1024},
+    json execution{{"purpose", "causal_scoring"},
+                   {"device", options.device},
+                   {"context_tokens", options.context},
+                   {"stride_tokens", options.stride},
+                   {"prefill_chunk_tokens", options.prefill_chunk},
+                   {"score_tile_tokens", 1024},
                    {"kv_dtype", kv_name(options.kv)}};
     if (options.tp != 1) {
         execution["tp"]      = options.tp;
