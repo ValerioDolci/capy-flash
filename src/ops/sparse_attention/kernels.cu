@@ -770,10 +770,14 @@ constexpr std::int32_t kPartialWords = kHeadDim + 2;
 // FP32 online softmax, then O += P V with FP16 MMA where P is rounded to FP16.
 //   BF16 cache (BF16 K, FP16 V): S uses BF16 MMA on the stored rows; K/V tiles are double-buffered
 //   through cp.async.
-//   Quantized caches (K always Hadamard-rotated): the codes are double-buffered through cp.async
-//   and widened to FP16 tiles; Q is rotated like K and rounded to FP16 and S uses FP16 MMA. A
+//   Quantized caches (K always Hadamard-rotated): one codes buffer, widened to FP16 tiles and
+//   refilled through cp.async with the next tile right after the widening, so the copies overlap
+//   S, the softmax and PV. S stays in registers; the four warps exchange only their row maxima
+//   and sums. Q is rotated like K and rounded to FP16 and S uses FP16 MMA. A
 //   row-scaled E4M3 plane widens exactly and applies its per-key scale afterwards (K to S, V folded
-//   into P before rounding); an int8 G64 plane widens with its group scales (one FP16 rounding);
+//   into P before rounding); an int8 G64 plane widens with its group scales (one FP16 rounding),
+//   which are staged with the codes, eight codes per item so that a warp's stores are
+//   conflict-free;
 //   an NVFP4 G16 plane widens exactly with its group scales. A rotated V leaves O in the rotated
 //   domain, so the epilogue rotates each head's row back (the rotation is its own inverse).
 // With `partial` null the CTA owns the whole selection and writes normalized output; otherwise it
@@ -827,30 +831,29 @@ struct Shared<false> {
     __device__ float* s_ptr() { return s; }
 };
 
-// Quantized caches: 49,856 bytes, so that two CTAs share an SM (78,016 before: one CTA of
-// four warps, 8 % occupancy, no eligible warp 85 % of the cycles). Regions in use at the same time
-// stay apart: Q (prologue only, then in registers) and P (written after S has read K) live in the K
-// tile; S (written after the widening has read the codes, read by the softmax before the next
-// stage) lives in the single codes buffer.
+// Quantized caches: 50,048 bytes, so that two CTAs share an SM. Regions in use at the same time
+// stay apart: Q (prologue only, then in registers), P and the row sums (written after S has read
+// K) live in the K tile; the codes buffer takes the next tile once the widening has read it. An
+// int8 G64 cache stages its keys' group scales into `rows` (K) and the row-scale arrays (V), which
+// that codec does not otherwise use.
 template <>
 struct Shared<true> {
     static constexpr int kTiles = 1;
     alignas(16) std::uint8_t k[kTiles][kTileBytes];
     alignas(16) std::uint8_t v[kTiles][kTileBytes];
     alignas(16) std::uint8_t codes[1][2][kKeys * kHeadDim];
-    KeyRow rows[1][kKeys];
-    float m[kRows], l[kRows], alpha[kRows];
-    float k_scale[kKeys], v_scale[kKeys];
+    alignas(16) KeyRow rows[1][kKeys];
+    float m[kRows], l[kRows];
+    float red_max[kThreads / 32][kRows];
+    alignas(16) float k_scale[kKeys];
+    float v_scale[kKeys];
 
     __device__ std::uint8_t* q_ptr() { return k[0]; }
 
     __device__ __half* p_ptr() { return reinterpret_cast<__half*>(k[0]); }
-
-    __device__ float* s_ptr() { return reinterpret_cast<float*>(codes[0][0]); }
 };
 
-static_assert(kRows * kRowBytes <= kTileBytes && kRows * kPStride * 2 <= kTileBytes &&
-              kRows * kKeys * 4 <= kKeys * kHeadDim);
+static_assert(kRows * kRowBytes <= kTileBytes && kRows * kPStride * 2 <= kTileBytes);
 // Two CTAs per SM on sm_120 (102,400 bytes of shared memory, 1,024 reserved per CTA).
 static_assert(2 * (sizeof(Shared<true>) + 1024) <= 102400,
               "the quantized layout must leave room for two CTAs");
@@ -929,6 +932,32 @@ __device__ __forceinline__ void widen_tile(const std::uint8_t* codes, const KeyR
     }
 }
 
+// Int8 G64 widening from the group scales staged in shared memory (four FP16 scales per key, zero
+// for a missing key). Eight codes per item: the 32 lanes of a warp store 32 different 16-byte
+// chunks of one row, which the swizzle spreads over all banks.
+__device__ __forceinline__ void widen_int8_staged(const std::uint8_t* codes, const __half* scales,
+                                                  std::uint8_t* target, int tid) {
+    static_assert((kKeys * 32) % kThreads == 0);
+#pragma unroll
+    for (int item = tid; item < kKeys * 32; item += kThreads) {
+        const int j       = item / 32;
+        const int chunk   = item % 32;
+        const uint2 bytes = *reinterpret_cast<const uint2*>(&codes[j * kHeadDim + chunk * 8]);
+        const __half s    = scales[j * kKVCacheInt8Groups + chunk / 8];
+        const __half2 s2  = __halves2half2(s, s);
+        const auto* ints  = reinterpret_cast<const std::int8_t*>(&bytes);
+        uint4 wide;
+        auto* halves = reinterpret_cast<__half2*>(&wide);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const __half2 x =
+                __halves2half2(__short2half_rn(ints[2 * q]), __short2half_rn(ints[2 * q + 1]));
+            halves[q] = __hmul2(x, s2);
+        }
+        *reinterpret_cast<uint4*>(&target[swizzle(j, chunk)]) = wide;
+    }
+}
+
 } // namespace mma_attention
 
 struct AttentionArgs {
@@ -961,6 +990,10 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
     constexpr bool kKeyRowScale    = kQuantized && codecs.k == Codec::Fp8Row;
     constexpr bool kValueRowScale  = kQuantized && codecs.v == Codec::Fp8Row;
     constexpr bool kRotatedValue   = kQuantized && codecs.v_rotated;
+    // Int8 G64 K and V: the group scales are staged with the codes (K's into `rows`, V's into the
+    // row-scale arrays, both unused by this codec).
+    constexpr bool kStagedScales =
+        kQuantized && codecs.k == Codec::Int8G64 && codecs.v == Codec::Int8G64;
     extern __shared__ __align__(16) std::uint8_t raw_shared[];
     Shared<kQuantized>& sh = *reinterpret_cast<Shared<kQuantized>*>(raw_shared);
 
@@ -1008,7 +1041,24 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
             }
         } else {
             // Each row's codes in 16-byte chunks, unswizzled; the widening pass swizzles.
-            if (tid < kKeys) { sh.rows[buf][tid] = key_row(base, tid); }
+            if constexpr (kStagedScales) {
+                static_assert(sizeof(sh.rows[0]) == kKeys * kKVCacheInt8Groups * 2 &&
+                              sizeof(sh.k_scale) + sizeof(sh.v_scale) ==
+                                  kKeys * kKVCacheInt8Groups * 2);
+                if (tid < 2 * kKeys) {
+                    const int j       = tid % kKeys;
+                    const KeyRow key  = key_row(base, j);
+                    const void* pages = tid < kKeys ? a.k_scales : a.v_scales;
+                    auto* dst         = tid < kKeys ? reinterpret_cast<std::uint8_t*>(sh.rows[buf])
+                                                    : reinterpret_cast<std::uint8_t*>(sh.k_scale);
+                    const __half* src = key.row >= 0 ? key_row_data<__half>(pages, key, page_rows,
+                                                                            kKVCacheInt8Groups)
+                                                     : static_cast<const __half*>(pages);
+                    cp_async_zfill<8>(dst + j * 8, src, key.row >= 0 ? 8 : 0);
+                }
+            } else {
+                if (tid < kKeys) { sh.rows[buf][tid] = key_row(base, tid); }
+            }
             const auto plane = [&](std::uint8_t* dst, const void* pages, int row_bytes) {
                 const int chunks = row_bytes / 16;
 #pragma unroll 4
@@ -1090,29 +1140,28 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
 #pragma unroll
     for (int t = 0; t < 8; ++t) { acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0F; }
 
-    int buf = 0;
-    for (int base = first; base < count; base += kKeys, buf ^= 1) {
-        if constexpr (kQuantized) {
-            buf = 0; // one codes buffer: tile t + 1 is staged after the softmax of tile t
+    if constexpr (kQuantized) {
+        // Per 32-key tile: widen the codes, then stage the next tile into the freed codes buffer
+        // while S (in registers), the softmax and PV run. The four warps exchange only their
+        // row maxima (red_max) and row sums (after P in the K tile).
+        float* red_sum = reinterpret_cast<float*>(sh.k[0] + kRows * kPStride * 2);
+        static_assert(kRows * kPStride * 2 + (kThreads / 32) * kRows * 4 <= kTileBytes);
+        for (int base = first; base < count; base += kKeys) {
             cp_wait<0>();
-        } else if (base + kKeys < count) {
-            stage(buf ^ 1, base + kKeys);
-            cp_commit();
-            cp_wait<1>();
-        } else {
-            cp_wait<0>();
-        }
-        __syncthreads();
-        const int tile = kQuantized ? 0 : buf;
-
-        if constexpr (kQuantized) {
-            // Widen this tile's codes to FP16 (swizzled) and read the keys' row scales.
-            widen_tile<codecs.k>(sh.codes[buf][0], sh.rows[buf], a.k_scales, page_rows, sh.k[0],
-                                 tid);
-            widen_tile<codecs.v>(sh.codes[buf][1], sh.rows[buf], a.v_scales, page_rows, sh.v[0],
-                                 tid);
+            __syncthreads(); // tile codes landed; every warp is done with the previous P and V
+            if constexpr (kStagedScales) {
+                widen_int8_staged(sh.codes[0][0], reinterpret_cast<const __half*>(sh.rows[0]),
+                                  sh.k[0], tid);
+                widen_int8_staged(sh.codes[0][1], reinterpret_cast<const __half*>(sh.k_scale),
+                                  sh.v[0], tid);
+            } else {
+                widen_tile<codecs.k>(sh.codes[0][0], sh.rows[0], a.k_scales, page_rows, sh.k[0],
+                                     tid);
+                widen_tile<codecs.v>(sh.codes[0][1], sh.rows[0], a.v_scales, page_rows, sh.v[0],
+                                     tid);
+            }
             if (tid < kKeys) {
-                const KeyRow key = sh.rows[buf][tid];
+                const KeyRow key = sh.rows[0][tid];
                 if constexpr (kKeyRowScale) {
                     sh.k_scale[tid] =
                         key.row >= 0
@@ -1126,99 +1175,88 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                             : 0.0F;
                 }
             }
-            __syncthreads();
-        }
+            __syncthreads(); // K, V and the scales visible; the codes buffer and rows are free
+            if (base + kKeys < count) { stage(0, base + kKeys); }
+            cp_commit();
 
-        // S for keys [8 * warp, +8).
-        {
-            float c[4]    = {0.0F, 0.0F, 0.0F, 0.0F};
-            const int key = warp * 8 + (lane_id & 7);
+            // S for keys [8 * warp, +8), rows gid and gid + 8.
+            float c[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+            {
+                const int key = warp * 8 + (lane_id & 7);
 #pragma unroll
-            for (int pair = 0; pair < kHeadDim / 32; ++pair) {
-                unsigned b[4];
-                ldmatrix_x4(b[0], b[1], b[2], b[3],
-                            smem_addr(&sh.k[tile][swizzle(key, 4 * pair + (lane_id >> 3))]));
-                if constexpr (kQuantized) {
+                for (int pair = 0; pair < kHeadDim / 32; ++pair) {
+                    unsigned b[4];
+                    ldmatrix_x4(b[0], b[1], b[2], b[3],
+                                smem_addr(&sh.k[0][swizzle(key, 4 * pair + (lane_id >> 3))]));
                     mma_f16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
                             qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
                     mma_f16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
                             qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
-                } else {
-                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
-                             qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
-                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
-                             qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
                 }
             }
-            const int col                 = warp * 8 + 2 * lid;
-            const float s0                = kKeyRowScale ? a.scale * sh.k_scale[col] : a.scale;
-            const float s1                = kKeyRowScale ? a.scale * sh.k_scale[col + 1] : a.scale;
-            sh.s_ptr()[gid * kKeys + col] = c[0] * s0;
-            sh.s_ptr()[gid * kKeys + col + 1]       = c[1] * s1;
-            sh.s_ptr()[(gid + 8) * kKeys + col]     = c[2] * s0;
-            sh.s_ptr()[(gid + 8) * kKeys + col + 1] = c[3] * s1;
-        }
-        __syncthreads();
+            const int col    = warp * 8 + 2 * lid;
+            const bool live0 = base + col < count, live1 = base + col + 1 < count;
+            const float s0 = kKeyRowScale ? a.scale * sh.k_scale[col] : a.scale;
+            const float s1 = kKeyRowScale ? a.scale * sh.k_scale[col + 1] : a.scale;
+            float x[4]     = {live0 ? c[0] * s0 : -CUDART_INF_F, live1 ? c[1] * s1 : -CUDART_INF_F,
+                          live0 ? c[2] * s0 : -CUDART_INF_F, live1 ? c[3] * s1 : -CUDART_INF_F};
+            float max_lo = fmaxf(x[0], x[1]), max_hi = fmaxf(x[2], x[3]);
+#pragma unroll
+            for (int offset = 1; offset < 4; offset <<= 1) {
+                max_lo = fmaxf(max_lo, __shfl_xor_sync(0xffffffffu, max_lo, offset));
+                max_hi = fmaxf(max_hi, __shfl_xor_sync(0xffffffffu, max_hi, offset));
+            }
+            if (lid == 0) {
+                sh.red_max[warp][gid]     = max_lo;
+                sh.red_max[warp][gid + 8] = max_hi;
+            }
+            __syncthreads(); // tile maxima visible; every warp is done reading K (P overwrites it)
+            const float old_lo = sh.m[gid], old_hi = sh.m[gid + 8];
+            float new_lo = old_lo, new_hi = old_hi;
+#pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) {
+                new_lo = fmaxf(new_lo, sh.red_max[w][gid]);
+                new_hi = fmaxf(new_hi, sh.red_max[w][gid + 8]);
+            }
+            const float p0 = __expf(x[0] - new_lo), p1 = __expf(x[1] - new_lo);
+            const float p2 = __expf(x[2] - new_hi), p3 = __expf(x[3] - new_hi);
+            float sum_lo = p0 + p1, sum_hi = p2 + p3;
+#pragma unroll
+            for (int offset = 1; offset < 4; offset <<= 1) {
+                sum_lo += __shfl_xor_sync(0xffffffffu, sum_lo, offset);
+                sum_hi += __shfl_xor_sync(0xffffffffu, sum_hi, offset);
+            }
+            const float v0 = kValueRowScale ? sh.v_scale[col] : 1.0F;
+            const float v1 = kValueRowScale ? sh.v_scale[col + 1] : 1.0F;
+            *reinterpret_cast<unsigned*>(&sh.p_ptr()[gid * kPStride + col]) =
+                pack_half2(p0 * v0, p1 * v1);
+            *reinterpret_cast<unsigned*>(&sh.p_ptr()[(gid + 8) * kPStride + col]) =
+                pack_half2(p2 * v0, p3 * v1);
+            if (lid == 0) {
+                red_sum[warp * kRows + gid]     = sum_lo;
+                red_sum[warp * kRows + gid + 8] = sum_hi;
+            }
+            const float a_lo = __expf(old_lo - new_lo);
+            const float a_hi = __expf(old_hi - new_hi);
+            __syncthreads(); // P and the row sums visible (every warp read m before this)
+            if (tid < kRows) {
+                float sum = 0.0F, row_max = sh.m[tid];
+#pragma unroll
+                for (int w = 0; w < kThreads / 32; ++w) {
+                    sum += red_sum[w * kRows + tid];
+                    row_max = fmaxf(row_max, sh.red_max[w][tid]);
+                }
+                sh.l[tid] = sh.l[tid] * __expf(sh.m[tid] - row_max) + sum;
+                sh.m[tid] = row_max;
+            }
 
-        // Online softmax: eight threads per row, four keys apiece.
-        {
-            const int row  = tid >> 3;
-            const int col0 = (tid & 7) * 4;
-            float s[4];
-            float tile_max = -CUDART_INF_F;
+            // O = alpha O + P V over this warp's 64 features.
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                s[i] = base + col0 + i < count ? sh.s_ptr()[row * kKeys + col0 + i] : -CUDART_INF_F;
-                tile_max = fmaxf(tile_max, s[i]);
-            }
-#pragma unroll
-            for (int offset = 1; offset < 8; offset <<= 1) {
-                tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, offset));
-            }
-            const float m_old = sh.m[row];
-            const float m_new = fmaxf(m_old, tile_max);
-            float sum         = 0.0F;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                s[i] = base + col0 + i < count ? __expf(s[i] - m_new) : 0.0F;
-                sum += s[i];
-            }
-#pragma unroll
-            for (int offset = 1; offset < 8; offset <<= 1) {
-                sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-            }
-            float pv[4] = {s[0], s[1], s[2], s[3]};
-            if constexpr (kValueRowScale) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) { pv[i] *= sh.v_scale[col0 + i]; }
-            }
-            *reinterpret_cast<uint2*>(&sh.p_ptr()[row * kPStride + col0]) =
-                make_uint2(pack_half2(pv[0], pv[1]), pack_half2(pv[2], pv[3]));
-            __syncwarp();
-            if ((tid & 7) == 0) {
-                const float alpha = __expf(m_old - m_new);
-                sh.alpha[row]     = alpha;
-                sh.l[row]         = sh.l[row] * alpha + sum;
-                sh.m[row]         = m_new;
-            }
-        }
-        __syncthreads();
-
-        if constexpr (kQuantized) {
-            if (base + kKeys < count) { stage(0, base + kKeys); }
-            cp_commit();
-        }
-
-        // O = alpha O + P V over this warp's 64 features.
-        {
-            const float a_lo = sh.alpha[gid];
-            const float a_hi = sh.alpha[gid + 8];
-#pragma unroll
-            for (int t = 0; t < 8; ++t) {
-                acc[t][0] *= a_lo;
-                acc[t][1] *= a_lo;
-                acc[t][2] *= a_hi;
-                acc[t][3] *= a_hi;
+            for (int tt = 0; tt < 8; ++tt) {
+                acc[tt][0] *= a_lo;
+                acc[tt][1] *= a_lo;
+                acc[tt][2] *= a_hi;
+                acc[tt][3] *= a_hi;
             }
 #pragma unroll
             for (int step = 0; step < kKeys / 16; ++step) {
@@ -1232,8 +1270,7 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                 for (int pair = 0; pair < 4; ++pair) {
                     const int chunk = warp * 8 + pair * 2 + (lane_id >> 4);
                     unsigned b[4];
-                    ldmatrix_x4_t(b[0], b[1], b[2], b[3],
-                                  smem_addr(&sh.v[tile][swizzle(key, chunk)]));
+                    ldmatrix_x4_t(b[0], b[1], b[2], b[3], smem_addr(&sh.v[0][swizzle(key, chunk)]));
                     mma_f16(acc[2 * pair][0], acc[2 * pair][1], acc[2 * pair][2], acc[2 * pair][3],
                             af[0], af[1], af[2], af[3], b[0], b[1]);
                     mma_f16(acc[2 * pair + 1][0], acc[2 * pair + 1][1], acc[2 * pair + 1][2],
@@ -1241,12 +1278,126 @@ __global__ void __launch_bounds__(mma_attention::kThreads)
                 }
             }
         }
-        // No barrier here: P, V and alpha are next written after the loop-top barrier of the next
-        // tile. The codes buffer the next stage fills also holds the scores, which the softmax
-        // reads: the stage is safe because it is issued after the post-softmax barrier, so it must
-        // stay below that barrier. The BF16 path stages at the loop top into the buffer this
-        // tile's MMAs read, so it keeps the barrier.
-        if constexpr (!kQuantized) { __syncthreads(); }
+        cp_wait<0>();
+        __syncthreads(); // the last m and l updates are visible to the epilogue
+    } else {
+        int buf = 0;
+        for (int base = first; base < count; base += kKeys, buf ^= 1) {
+            if (base + kKeys < count) {
+                stage(buf ^ 1, base + kKeys);
+                cp_commit();
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
+            __syncthreads();
+            const int tile = buf;
+
+
+            // S for keys [8 * warp, +8).
+            {
+                float c[4]    = {0.0F, 0.0F, 0.0F, 0.0F};
+                const int key = warp * 8 + (lane_id & 7);
+#pragma unroll
+                for (int pair = 0; pair < kHeadDim / 32; ++pair) {
+                    unsigned b[4];
+                    ldmatrix_x4(b[0], b[1], b[2], b[3],
+                                smem_addr(&sh.k[tile][swizzle(key, 4 * pair + (lane_id >> 3))]));
+                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair][0], qf[2 * pair][1],
+                             qf[2 * pair][2], qf[2 * pair][3], b[0], b[1]);
+                    mma_bf16(c[0], c[1], c[2], c[3], qf[2 * pair + 1][0], qf[2 * pair + 1][1],
+                             qf[2 * pair + 1][2], qf[2 * pair + 1][3], b[2], b[3]);
+                }
+                const int col  = warp * 8 + 2 * lid;
+                const float s0 = kKeyRowScale ? a.scale * sh.k_scale[col] : a.scale;
+                const float s1 = kKeyRowScale ? a.scale * sh.k_scale[col + 1] : a.scale;
+                sh.s_ptr()[gid * kKeys + col]           = c[0] * s0;
+                sh.s_ptr()[gid * kKeys + col + 1]       = c[1] * s1;
+                sh.s_ptr()[(gid + 8) * kKeys + col]     = c[2] * s0;
+                sh.s_ptr()[(gid + 8) * kKeys + col + 1] = c[3] * s1;
+            }
+            __syncthreads();
+
+            // Online softmax: eight threads per row, four keys apiece.
+            {
+                const int row  = tid >> 3;
+                const int col0 = (tid & 7) * 4;
+                float s[4];
+                float tile_max = -CUDART_INF_F;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    s[i]     = base + col0 + i < count ? sh.s_ptr()[row * kKeys + col0 + i]
+                                                       : -CUDART_INF_F;
+                    tile_max = fmaxf(tile_max, s[i]);
+                }
+#pragma unroll
+                for (int offset = 1; offset < 8; offset <<= 1) {
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, offset));
+                }
+                const float m_old = sh.m[row];
+                const float m_new = fmaxf(m_old, tile_max);
+                float sum         = 0.0F;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    s[i] = base + col0 + i < count ? __expf(s[i] - m_new) : 0.0F;
+                    sum += s[i];
+                }
+#pragma unroll
+                for (int offset = 1; offset < 8; offset <<= 1) {
+                    sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+                }
+                float pv[4] = {s[0], s[1], s[2], s[3]};
+                if constexpr (kValueRowScale) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { pv[i] *= sh.v_scale[col0 + i]; }
+                }
+                *reinterpret_cast<uint2*>(&sh.p_ptr()[row * kPStride + col0]) =
+                    make_uint2(pack_half2(pv[0], pv[1]), pack_half2(pv[2], pv[3]));
+                __syncwarp();
+                if ((tid & 7) == 0) {
+                    const float alpha = __expf(m_old - m_new);
+                    sh.alpha[row]     = alpha;
+                    sh.l[row]         = sh.l[row] * alpha + sum;
+                    sh.m[row]         = m_new;
+                }
+            }
+            __syncthreads();
+
+
+            // O = alpha O + P V over this warp's 64 features.
+            {
+                const float a_lo = sh.alpha[gid];
+                const float a_hi = sh.alpha[gid + 8];
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    acc[t][0] *= a_lo;
+                    acc[t][1] *= a_lo;
+                    acc[t][2] *= a_hi;
+                    acc[t][3] *= a_hi;
+                }
+#pragma unroll
+                for (int step = 0; step < kKeys / 16; ++step) {
+                    unsigned af[4];
+                    ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                smem_addr(&sh.p_ptr()[(lane_id & 15) * kPStride + step * 16 +
+                                                      (lane_id >> 4) * 8]));
+                    const int key = step * 16 + (lane_id & 7) + ((lane_id >> 3) & 1) * 8;
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const int chunk = warp * 8 + pair * 2 + (lane_id >> 4);
+                        unsigned b[4];
+                        ldmatrix_x4_t(b[0], b[1], b[2], b[3],
+                                      smem_addr(&sh.v[tile][swizzle(key, chunk)]));
+                        mma_f16(acc[2 * pair][0], acc[2 * pair][1], acc[2 * pair][2],
+                                acc[2 * pair][3], af[0], af[1], af[2], af[3], b[0], b[1]);
+                        mma_f16(acc[2 * pair + 1][0], acc[2 * pair + 1][1], acc[2 * pair + 1][2],
+                                acc[2 * pair + 1][3], af[0], af[1], af[2], af[3], b[2], b[3]);
+                    }
+                }
+            }
+            // The next loop-top stage writes the buffer this tile's MMAs read.
+            __syncthreads();
+        }
     }
     cp_wait<0>();
 
