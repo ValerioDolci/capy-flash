@@ -328,7 +328,9 @@ void ProgramImpl::prepare_graphs() {
             }
         }
         // The one execution that follows (eager warm-up or graph launch) does not stage n-gram
-        // rows: release its PLE layer at once (ForwardRuntime::decode_ple_staged).
+        // rows: release its PLE layer at once (ForwardRuntime::decode_ple_staged). A pending early
+        // run is dropped first: the next round must not find its words raised before its rows.
+        qwen4_ple.settle_early();
         qwen4_ple.raise_staged();
     };
     const auto execution_core = [&] {

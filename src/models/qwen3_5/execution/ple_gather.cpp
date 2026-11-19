@@ -301,6 +301,7 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         out.size() < static_cast<std::size_t>(width_) * count) {
         throw std::invalid_argument("PLE gather range is invalid");
     }
+    const std::lock_guard gather_lock(gather_mutex_);
     const std::uint32_t heads = hash_.heads();
     row_scratch_.resize(count * heads);
     std::vector<std::uint64_t>& rows = row_scratch_;

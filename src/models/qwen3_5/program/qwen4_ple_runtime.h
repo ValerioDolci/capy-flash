@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "models/qwen3_5/execution/ple_gather.h"
 #include "models/qwen3_5/execution/forward_runtime.h"
+#include "models/qwen3_5/program/qwen4_ple_early.h"
 #include "models/qwen3_5/program/qwen4_ple_stager.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -48,7 +49,23 @@ public:
     // stage_round() gathers the queued rows into the pinned staging and raises the
     // words (also on failure). raise_staged() alone releases an execution whose rows
     // do not matter (warm-up, graph preparation) or that failed after its launch.
-    void begin_round();
+    void begin_round(bool keep_early = false);
+    // Early staging of graph MTP rounds. start_early(), right after a graph round synchronized,
+    // gathers the next round's rows on the stager thread from a snapshot of their context (the
+    // licensed tokens are not committed yet). begin_round(true) then collects the rows the next
+    // round queues, and resolve_early() keeps the early rows when they are exactly those
+    // (qwen4_ple_early_matches; `round_prestaged`), else settles the early run and queues the
+    // round's own. settle_early() waits for a pending early run and drops it, its rows and any
+    // exception (the round gathers its own rows); forget_early() clears the state after a failed
+    // round (the caller has finished the stager); drop_early() waits for the stager without
+    // throwing, for the Program's destructor (an early run reads the Program).
+    // early_source() is what they read from the Program.
+    [[nodiscard]] static Qwen4PleEarlySource early_source(const ProgramImpl& program);
+    void start_early(const Qwen4PleEarlySource& source, std::span<const std::uint32_t> lanes);
+    void resolve_early(const Qwen4PleEarlySource& source);
+    void settle_early();
+    void forget_early() noexcept;
+    void drop_early() noexcept;
     void queue_rows(std::uint32_t lane, std::uint32_t frontier, std::span<const TokenId> tokens,
                     std::size_t first_column);
     void stage_round(const ProgramImpl& program);
@@ -68,15 +85,15 @@ public:
     std::optional<PinnedHostBuffer> staged_words;
     std::array<std::uint32_t*, 2> staged{};
 
-    struct Stage {
-        std::uint32_t lane       = 0;
-        std::uint32_t frontier   = 0;
-        std::uint32_t count      = 0;
-        std::size_t first_column = 0;
-        std::array<TokenId, qwen3_5::kMtpDecodeMaximumWidth> tokens{};
-    };
+    using Stage = Qwen4PleStage;
 
     std::vector<Stage> queue;
+    // Early staging: the rows started after the last graph MTP round, the rows the current round
+    // queues (compared with them), and whether the round found its rows staged.
+    std::vector<Stage> early, expected;
+    bool early_pending   = false;
+    bool collecting      = false;
+    bool round_prestaged = false;
     // Runs stage_round() of a graph round after its launch (created with the words).
     std::unique_ptr<Qwen4PleStager> stager;
 };

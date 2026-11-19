@@ -548,6 +548,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             qwen4_ple.raise_staged(); // a launched round may wait for its n-gram rows
             synchronize_devices();
             if (qwen4_ple.stager) { qwen4_ple.stager->finish(); }
+            qwen4_ple.forget_early();
         } catch (...) {}
         timing.end_wait();
         qwen4_routed.abandon_window(*this);
@@ -606,7 +607,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             envelopes  = mtp_causal_attention_envelopes(graph.profile.max_execution_frontier,
                                                         draft_window, capacity);
         }
-        if (qwen4_ple.gather) { qwen4_ple.begin_round(); }
+        if (qwen4_ple.gather) { qwen4_ple.begin_round(executable != nullptr); }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
@@ -676,6 +677,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
         }
 
+        if (qwen4_ple.gather) { qwen4_ple.resolve_early(Qwen4PleRuntime::early_source(*this)); }
+
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -707,19 +710,24 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            // The n-gram rows are gathered on the stager thread while the device runs the layers
-            // before the PLE layer, which waits for them (ForwardRuntime::decode_ple_staged).
+            // The n-gram rows are gathered on the stager thread: right after the previous round
+            // (start_early, when resolve_early kept them), or now, while the device runs the
+            // layers before the PLE layer, which waits for them
+            // (ForwardRuntime::decode_ple_staged).
             const bool ple_staging = qwen4_ple.gather && executable != nullptr && qwen4_ple.stager;
-            if (ple_staging) { qwen4_ple.stager->start(); }
+            if (ple_staging && !qwen4_ple.round_prestaged) { qwen4_ple.stager->start(); }
             // The expert cache policy reads the round's routing while the device runs it.
             qwen4_routed.observe_window(*this);
             synchronize_devices();
             if (ple_staging) { qwen4_ple.stager->finish(); }
+            qwen4_ple.round_prestaged = false;
+            // The next round's rows are known now: gather them while the host commits.
+            if (ple_staging) { qwen4_ple.start_early(Qwen4PleRuntime::early_source(*this), lanes); }
         }
         timing.end_wait();
         // Eager rounds: the next round's n-gram rows are known now; their page reads
         // overlap the window end, the commit and the next round's preparation. A graph round
-        // gathers them after its launch, off the host's critical path, so it skips this.
+        // gathers them on the stager thread (start_early above), so it skips this.
         if (executable == nullptr) { qwen4_ple.prefetch_next_round(*this, lanes, true); }
         qwen4_routed.end_window(*this);
         if (validation) {
@@ -782,6 +790,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             qwen4_ple.raise_staged(); // a launched round may wait for its n-gram rows
             synchronize_devices();
             if (qwen4_ple.stager) { qwen4_ple.stager->finish(); }
+            qwen4_ple.forget_early();
         } catch (...) {}
         timing.end_wait();
         qwen4_routed.abandon_window(*this);

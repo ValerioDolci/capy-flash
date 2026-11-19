@@ -140,10 +140,133 @@ void Qwen4PleRuntime::queue_rows(std::uint32_t lane, std::uint32_t frontier,
     stage.count        = static_cast<std::uint32_t>(tokens.size());
     stage.first_column = first_column;
     std::copy(tokens.begin(), tokens.end(), stage.tokens.begin());
-    queue.push_back(stage);
+    (collecting ? expected : queue).push_back(stage);
 }
 
-void Qwen4PleRuntime::begin_round() {
+void Qwen4PleRuntime::settle_early() {
+    if (!early_pending) { return; }
+    early_pending = false;
+    if (stager) {
+        try {
+            stager->finish();
+        } catch (...) {
+            // The discarded run's rows are not used: the round gathers its own, and a failure
+            // that is not specific to the early run surfaces there.
+        }
+    }
+    for (std::uint32_t* word : staged) {
+        if (word != nullptr) { ops::host::lower_host_flag(word); }
+    }
+    queue.clear();
+}
+
+void Qwen4PleRuntime::forget_early() noexcept {
+    early_pending   = false;
+    collecting      = false;
+    round_prestaged = false;
+}
+
+void Qwen4PleRuntime::drop_early() noexcept {
+    if (stager) {
+        try {
+            stager->finish();
+        } catch (...) {}
+    }
+    forget_early();
+}
+
+Qwen4PleEarlySource Qwen4PleRuntime::early_source(const ProgramImpl& program) {
+    Qwen4PleEarlySource source;
+    const auto& ple        = program.parameters.model.config().text.ple;
+    source.context         = ple ? ple->ngram_size - 1U : 0;
+    source.draft_window    = program.draft_window;
+    source.max_concurrency = program.max_concurrency;
+    source.egress          = program.mtp_host_egress;
+    source.ledger          = [&program](std::uint32_t lane) -> std::span<const TokenId> {
+        return program.active_sequence(lane).ledger;
+    };
+    return source;
+}
+
+void Qwen4PleRuntime::resolve_early(const Qwen4PleEarlySource& source) {
+    if (!collecting) { return; }
+    collecting      = false;
+    const bool same = qwen4_ple_early_matches(expected, early, source.context, source.ledger);
+    if (same) {
+        round_prestaged = true;
+        early_pending   = false; // the round's wait finishes the run
+    } else {
+        settle_early();
+        queue           = expected;
+        round_prestaged = false;
+    }
+}
+
+void Qwen4PleRuntime::start_early(const Qwen4PleEarlySource& source,
+                                  std::span<const std::uint32_t> lanes) {
+    const auto* egress = source.egress;
+    if (!stager || egress == nullptr || early_pending) { return; }
+    const std::size_t context           = source.context;
+    const std::uint32_t draft_window    = source.draft_window;
+    const std::uint32_t max_concurrency = source.max_concurrency;
+    const std::uint32_t width           = draft_window + 1U;
+    std::vector<Stage> next;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::span<const TokenId> committed = source.ledger(lanes[row]);
+        const std::int32_t count                 = egress->licensed_counts[row];
+        if (count <= 0 || static_cast<std::uint32_t>(count) > width ||
+            context > Stage{}.context.size()) {
+            return;
+        }
+        // The next round as prefetch_next_round sees it: the ledger after the commit is the
+        // current one + the licensed tokens; the anchor (the last licensed token), then the
+        // drafts (padding columns repeat the anchor).
+        const TokenId* licensed  = egress->licensed_tokens.data() + row * width;
+        const std::size_t ledger = committed.size();
+        const std::size_t total  = ledger + static_cast<std::size_t>(count) - 1U;
+        const std::size_t before = std::min(context, total);
+        Stage s;
+        s.lane          = lanes[row];
+        s.frontier      = static_cast<std::uint32_t>(total);
+        s.count         = width;
+        s.first_column  = row * width;
+        s.snapshot      = true;
+        s.context_count = static_cast<std::uint32_t>(before);
+        std::size_t k   = 0;
+        for (std::size_t i = total - before; i < total; ++i) {
+            s.context[k++] = i < ledger ? committed[i] : licensed[i - ledger];
+        }
+        const TokenId anchor = licensed[count - 1];
+        s.tokens[0]          = anchor;
+        const std::int32_t nd =
+            std::clamp(egress->next_extents[row], 0, static_cast<std::int32_t>(draft_window));
+        for (std::uint32_t j = 0; j < draft_window; ++j) {
+            s.tokens[j + 1] = static_cast<std::int32_t>(j) < nd
+                                  ? egress->next_drafts[j * max_concurrency + row]
+                                  : anchor;
+        }
+        next.push_back(s);
+    }
+    for (std::uint32_t* word : staged) {
+        if (word != nullptr) { ops::host::lower_host_flag(word); }
+    }
+    early         = next;
+    queue         = std::move(next);
+    early_pending = true;
+    stager->start();
+}
+
+void Qwen4PleRuntime::begin_round(bool keep_early) {
+    round_prestaged = false;
+    if (early_pending) {
+        if (keep_early) {
+            expected.clear();
+            collecting = true;
+            return;
+        }
+        settle_early();
+    }
+    collecting = false;
     queue.clear();
     // No stream waits on the words now (the previous round has synchronized): a raise that no
     // round consumed (a failed round) must not release this one before its rows are written.
@@ -162,6 +285,14 @@ void Qwen4PleRuntime::stage_round(const ProgramImpl& program) {
     } raise{this};
 
     for (const Stage& stage : queue) {
+        if (stage.snapshot) {
+            // An early stage: its context was taken before the commit.
+            stage_rows(program, std::span<const TokenId>(stage.context.data(), stage.context_count),
+                       stage.context_count,
+                       std::span<const TokenId>(stage.tokens.data(), stage.count),
+                       stage.first_column);
+            continue;
+        }
         stage_rows(program, program.active_sequence(stage.lane).ledger, stage.frontier,
                    std::span<const TokenId>(stage.tokens.data(), stage.count), stage.first_column);
     }

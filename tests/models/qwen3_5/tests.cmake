@@ -297,6 +297,10 @@ ninfer_add_test(ninfer_qwen3_5_ple_gather_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ple_gather.cpp"
   LIBRARIES ninfer_model_runtime)
 
+ninfer_add_test(ninfer_qwen4_ple_early_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_ple_early.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # Qwen4Exp validation driver (not a CTest): Engine scoring / greedy generation over fixed ids for
 # a teacher-forcing harness (tfdump/1 format, src/models/qwen3_5/execution/qwen4_tfdump.h).
 add_executable(ninfer_qwen4_tf_driver "${CMAKE_CURRENT_LIST_DIR}/qwen4_tf_driver.cpp")

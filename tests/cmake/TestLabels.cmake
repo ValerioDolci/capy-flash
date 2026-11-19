@@ -57,6 +57,7 @@ set(NINFER_CPU_TESTS
   ninfer_qwen3_5_frontend_test
   ninfer_qwen3_5_loading_test
   ninfer_qwen3_5_ple_gather_test
+  ninfer_qwen4_ple_early_test
   ninfer_qwen3_5_runtime_mechanisms_test
   ninfer_qwen3_5_shard_map_test
   ninfer_qwen3_5_state_image_layout_test

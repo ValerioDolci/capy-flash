@@ -561,6 +561,9 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
+    // An early n-gram gather may still run on the stager thread and read members destroyed
+    // before qwen4_ple (forward_runtime_record): wait for it first.
+    qwen4_ple.drop_early();
     if (peer) {
         if (peer->device.transfer_stream != nullptr) {
             (void)cudaStreamSynchronize(peer->device.transfer_stream);

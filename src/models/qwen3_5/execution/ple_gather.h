@@ -17,6 +17,7 @@
 // nothing of that table is resident.
 
 #include <array>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -73,6 +74,8 @@ struct PleHashConfig {
 };
 
 class PleGather {
+    std::mutex gather_mutex_; // the stager's early run may overlap a prefill gather
+
 public:
     // `prefetch` issues MADV_WILLNEED for every row page before decoding.
     PleGather(PleTableView table, PleHashConfig hash, bool prefetch = true);
