@@ -227,8 +227,8 @@ The Qwen4Exp (Qwen3.8-Flash-Next) loading and Engine tests run on synthetic arti
 per-layer geometry that the build does not generate (a random checkpoint of about 11 GB, from the
 config and tokenizer of a real Qwen3.8-Flash-Next checkpoint, converted on the CPU into about 8 GB):
 write them once with `tools/capy_flash/make_test_artifact.sh` (and `--vision`) and configure their
-paths, after which CTest runs `ninfer_qwen4_(tp2_)?loading`, `ninfer_qwen4_(tp2|mtp)_engine` and
-`ninfer_qwen4_vision_engine` with them:
+paths, after which CTest runs `ninfer_qwen4_(tp2_)?loading`, `ninfer_qwen4_(tp2|mtp)_engine`,
+`ninfer_qwen4_tp2_moe_abandon` and `ninfer_qwen4_vision_engine` with them:
 
 ```bash
 cmake -B build -DNINFER_TEST_QWEN4_ARTIFACT=$PWD/out/fn4.ninfer \

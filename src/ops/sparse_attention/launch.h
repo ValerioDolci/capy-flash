@@ -55,4 +55,8 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
                           float* partial, Tensor& out, cudaStream_t stream,
                           std::int32_t split_columns);
 
+// The decode staging cache's ways for a region of `cache_blocks` blocks per layer: 4, or 1 (direct
+// mapped) when they do not divide into whole sets.
+[[nodiscard]] int qsa_staging_ways(std::int32_t cache_blocks);
+
 } // namespace ninfer::ops::detail

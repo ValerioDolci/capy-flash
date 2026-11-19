@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.14.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.14.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -355,6 +355,12 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.14.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.14.1)), a fix and two pull requests by @Mici81; same tokens
+- Flash-Next with MTP no longer stops the server when the same prompt comes back a third time and its draft frontier
+  ends on a KV page boundary (the trim of a shared full page is a no-op again, as for idle conversations).
+- Flash-Next Q6 output head at tp 2 on a 32x8 tile for 2-8 columns ([PR #88](https://github.com/ValerioDolci/capy-flash/pull/88))
+  and a 4-way set-associative QSA staging cache ([PR #91](https://github.com/ValerioDolci/capy-flash/pull/91)); same bits.
 
 **v0.14.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.14.0)), a cleanup release; same speed, greedy text can differ from v0.13.3
 - Two-GPU 27B keeps the active conversation in its context cache: coding-agent replay 303-337 s → 109 s, prefix reuse

@@ -164,9 +164,11 @@ int run_eager_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::u
 
 // `sites` exchanges of the same buffers in one two-device graph, replayed with fresh inputs: the
 // first site leaves s = fl(a + b), every later one doubles it exactly. A captured memset on rank 1
-// skews the ranks so a stale publication would be combined (see test_allreduce.cpp).
+// skews the ranks so a stale publication would be combined (see test_allreduce.cpp). The mailbox's
+// exchange count proves the transport; a mailbox capture also holds one kernel node per device
+// per exchange.
 int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int sites,
-                      std::size_t expect_nodes_per_site, const ExecutionContext& ec,
+                      bool expect_mailbox, const ExecutionContext& ec,
                       const ops::PeerEvents& events, const ops::PeerMailbox* mailbox) {
     constexpr int kReplays           = 4;
     constexpr int kBackToBack        = 3;
@@ -179,6 +181,7 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
 
     const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
     DecodeGraphDefinition definition;
+    const std::uint64_t before = mailbox != nullptr ? mailbox->captured_exchanges() : 0;
     capture_two_devices(ec, bridge, definition, [&] {
         set_device(ec, 1);
         cuda_check(cudaMemsetAsync(skew.p, 0, skew.bytes, ec.dev[1]->stream), "skew memset");
@@ -187,13 +190,16 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
                                    events);
         }
     });
-    int failures                = 0;
-    const std::size_t nodes     = definition.node_count();
-    const bool mailbox_expected = expect_nodes_per_site == 2;
-    if (mailbox_expected ? nodes != 1 + 2 * static_cast<std::size_t>(sites)
-                         : nodes <= 1 + 2 * static_cast<std::size_t>(sites)) {
-        std::cerr << label << ": " << nodes << " graph nodes do not match the "
-                  << (mailbox_expected ? "mailbox" : "staged") << " transport\n";
+    int failures              = 0;
+    const std::uint64_t taken = mailbox != nullptr ? mailbox->captured_exchanges() - before : 0;
+    const std::size_t nodes   = definition.node_count();
+    if (taken != (expect_mailbox ? static_cast<std::uint64_t>(sites) : 0)) {
+        std::cerr << label << ": " << taken << " of " << sites << " sites took the mailbox, "
+                  << "expected the " << (expect_mailbox ? "mailbox" : "staged") << " transport\n";
+        ++failures;
+    } else if (expect_mailbox && nodes != 1 + 2 * static_cast<std::size_t>(sites)) {
+        std::cerr << label << ": " << nodes << " graph nodes, not one kernel node per device per "
+                  << "mailbox exchange\n";
         ++failures;
     }
     DecodeGraphExecutable executable;
@@ -226,7 +232,8 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
 // carries BF16 and FP32 payloads (different lane counts) within the capture whatever slot the
 // round robin starts at. Replayed with fresh inputs: both ranks' FP32 sums and BF16 outputs against
 // the exact oracle (every FP32 exchange after the first doubles the sum exactly), the BF16 buffers
-// of both ranks against the same graph on the staged path; node counts prove each transport.
+// of both ranks against the same graph on the staged path; the mailbox's exchange count proves
+// each transport, and the mailbox graph holds one kernel node per device per exchange.
 int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& staged,
                          const ops::PeerEvents& mailbox_events, const ops::PeerMailbox& mailbox) {
     constexpr std::int32_t kTokens = 4;
@@ -238,7 +245,7 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
     const double sum_scale = std::ldexp(1.0, 2 * kSites - 1);
     const double out_scale = std::ldexp(1.0, 2 * kSites - 2);
     const auto run = [&](const ops::PeerEvents& events, const char* transport, std::size_t& nodes,
-                         int& failures) {
+                         std::uint64_t& taken, int& failures) {
         RankBuffers moe(ec, kHidden, kTokens);
         std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> attention, attention_staging;
         std::array<Tensor, 2> attention_t, attention_staging_t;
@@ -253,6 +260,7 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
         }
         const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
         DecodeGraphDefinition definition;
+        const std::uint64_t before = mailbox.captured_exchanges();
         capture_two_devices(ec, bridge, definition, [&] {
             for (int site = 0; site < kSites; ++site) {
                 ops::allreduce_sum(attention_t, attention_staging_t, ec, events);
@@ -260,6 +268,7 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
                 ops::allreduce_sum_f32(moe.partial_t, moe.staging_t, nullptr, ec, events);
             }
         });
+        taken = mailbox.captured_exchanges() - before;
         nodes = definition.node_count();
         DecodeGraphExecutable executable;
         executable.instantiate(definition);
@@ -294,11 +303,12 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
     };
     int failures              = 0;
     std::size_t mailbox_nodes = 0, staged_nodes = 0;
-    const auto via_mailbox = run(mailbox_events, "mailbox", mailbox_nodes, failures);
-    const auto via_staged  = run(staged, "staged", staged_nodes, failures);
-    if (mailbox_nodes != 2 * 3 * kSites || staged_nodes <= 2 * 3 * kSites) {
-        std::cerr << "interleaved: " << mailbox_nodes << " / " << staged_nodes
-                  << " graph nodes do not match the mailbox / staged transports\n";
+    std::uint64_t mailbox_taken = 0, staged_taken = 0;
+    const auto via_mailbox = run(mailbox_events, "mailbox", mailbox_nodes, mailbox_taken, failures);
+    const auto via_staged  = run(staged, "staged", staged_nodes, staged_taken, failures);
+    if (mailbox_taken != 3 * kSites || mailbox_nodes != 2 * 3 * kSites) {
+        std::cerr << "interleaved: " << mailbox_taken << " mailbox exchanges in " << mailbox_nodes
+                  << " graph nodes, expected " << 3 * kSites << " in " << 2 * 3 * kSites << '\n';
         ++failures;
     }
     for (std::size_t i = 0; i < via_mailbox.size(); ++i) {
@@ -935,18 +945,19 @@ int main(int argc, char** argv) {
     ops::PeerEvents mailbox_events(ec);
     mailbox_events.attach_mailbox(&mailbox);
 
-    failures += run_captured_case("captured staged [2560]", kHidden, 1, 5, 0, ec, events, nullptr);
-    failures += run_captured_case("captured mailbox [2560]", kHidden, 1, 5, 2, ec, mailbox_events,
-                                  &mailbox);
-    failures += run_captured_case("captured mailbox [2560,4]", kHidden, 4, 5, 2, ec, mailbox_events,
-                                  &mailbox);
-    failures += run_captured_case("captured mailbox [2560,3]", kHidden, 3, 3, 2, ec, mailbox_events,
-                                  &mailbox);
-    failures += run_captured_case("captured mailbox [4,1] minimal", 4, 1, 3, 2, ec, mailbox_events,
-                                  &mailbox);
-    failures += run_captured_case("captured oversized [2560,5] stays staged", kHidden, 5, 3, 0, ec,
+    failures +=
+        run_captured_case("captured staged [2560]", kHidden, 1, 5, false, ec, events, nullptr);
+    failures += run_captured_case("captured mailbox [2560]", kHidden, 1, 5, true, ec,
                                   mailbox_events, &mailbox);
-    failures += run_captured_case("captured [5,1] unaligned stays staged", 5, 1, 3, 0, ec,
+    failures += run_captured_case("captured mailbox [2560,4]", kHidden, 4, 5, true, ec,
+                                  mailbox_events, &mailbox);
+    failures += run_captured_case("captured mailbox [2560,3]", kHidden, 3, 3, true, ec,
+                                  mailbox_events, &mailbox);
+    failures += run_captured_case("captured mailbox [4,1] minimal", 4, 1, 3, true, ec,
+                                  mailbox_events, &mailbox);
+    failures += run_captured_case("captured oversized [2560,5] stays staged", kHidden, 5, 3, false,
+                                  ec, mailbox_events, &mailbox);
+    failures += run_captured_case("captured [5,1] unaligned stays staged", 5, 1, 3, false, ec,
                                   mailbox_events, &mailbox);
     failures += run_interleaved_case(ec, events, mailbox_events, mailbox);
 
@@ -976,8 +987,8 @@ int main(int argc, char** argv) {
             ++failures;
         }
         // A capture ignores the HostExchange: the staged nodes, as without it.
-        failures += run_captured_case("captured with host exchange stays staged", kHidden, 1, 5, 0,
-                                      ec, host_events, nullptr);
+        failures += run_captured_case("captured with host exchange stays staged", kHidden, 1, 5,
+                                      false, ec, host_events, nullptr);
         // Default chunk (8 MiB), a prefill-sized partial: [2560,1024] FP32 = 10 MiB, two chunks.
         ops::HostExchange wide(ec);
         ops::PeerEvents wide_events(ec);
@@ -1037,7 +1048,7 @@ int main(int argc, char** argv) {
         failures +=
             report("captured with peer lanes + host exchange stays staged",
                    run_captured_case("captured with peer lanes + host exchange stays staged",
-                                     kHidden, 1, 5, 0, ec, mixed, nullptr));
+                                     kHidden, 1, 5, false, ec, mixed, nullptr));
         if (p2p) {
             ops::PeerEvents direct(ec);
             direct.attach_peer_lanes(&lanes);
@@ -1066,7 +1077,7 @@ int main(int argc, char** argv) {
             }
             failures += report("captured with peer lanes direct stays staged",
                                run_captured_case("captured with peer lanes direct stays staged",
-                                                 kHidden, 1, 5, 0, ec, direct, nullptr));
+                                                 kHidden, 1, 5, false, ec, direct, nullptr));
             for (const auto& [ne0, ne1, split, rounds, seed] :
                  {std::array<int, 5>{kHidden, 96, 32, 3, 221},
                   std::array<int, 5>{5120, 2048, 1024, 4, 223}}) {

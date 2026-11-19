@@ -278,10 +278,11 @@ staging at stock clocks (chunk 2048).
 
 Right after creating the mailbox, before any decode graph is captured,
 `ProgramImpl::probe_peer_mailbox` captures a two-device graph holding one 4 KiB `allreduce_sum` on
-scratch buffers, checks that the capture selected the mailbox (`node_count() == 2`), launches it
-once and times the round trip. If the hang word is set, the mailbox was not selected, or the round
-trip exceeds 50 ms (`kMaxRoundTripMs`), the probe detaches and destroys the mailbox, records the
-reason, and the transport becomes `copies`. `NINFER_TP_MAILBOX_PROBE=off` skips the probe; `=fail`
+scratch buffers, checks that the capture selected the mailbox (the call took a mailbox slot:
+`PeerMailbox::captured_exchanges()` advanced by one), launches it once and times the round trip.
+If the hang word is set, the mailbox was not selected, or the round trip exceeds 50 ms
+(`kMaxRoundTripMs`), the probe detaches and destroys the mailbox, records the reason, and the
+transport becomes `copies`. `NINFER_TP_MAILBOX_PROBE=off` skips the probe; `=fail`
 makes only rank 0 enqueue its half, so the poller must give up, which exercises the real fallback.
 The probe proves one exchange shape only; a mailbox that passes it and hangs later is handled by
 §4.5 during startup and by §4.5.1 after it.
@@ -619,7 +620,7 @@ in [`tests/ops/tests.cmake`](../../tests/ops/tests.cmake), `tests/artifact/tests
 
 | Test | Checks |
 |---|---|
-| `ninfer_{allreduce,linear_split,output_head_split,proposal_head_split,attention_headlocal,attn_input_proj_split,gdn_projections_split,gdn_headsplit,linear_swiglu_split,linear_add_split}_test` | each split form at its shard shapes against the single-device Op; the all-reduce against FP64 and exact oracles; the mailbox inside a replayed graph, its selection by node count, staged and mailbox transports bit for bit, and the hang report within the watchdog bound |
+| `ninfer_{allreduce,linear_split,output_head_split,proposal_head_split,attention_headlocal,attn_input_proj_split,gdn_projections_split,gdn_headsplit,linear_swiglu_split,linear_add_split}_test` | each split form at its shard shapes against the single-device Op; the all-reduce against FP64 and exact oracles; the mailbox inside a replayed graph, its selection by the mailbox's exchange count (`PeerMailbox::captured_exchanges()`) with one kernel node per device per exchange, staged and mailbox transports bit for bit, and the hang report within the watchdog bound |
 | `ninfer_artifact_sharded_materialization_tp2_test` (+ one-device plan tests, `ninfer_qwen3_5_shard_map_test`) | Replicated, Rows, Columns, PrimaryOnly and SingleDevice parents on both devices, byte-compared with host-applied slices |
 | `ninfer_decode_graph_test`, `ninfer_kv_cache_test` | two-device capture and the update diagnostic; mirror replay of page and row mutations (on one device) |
 | `ninfer_qwen3_5_sharded_load_real_test` (+ `_mtp_real`) | per-device placement and bytes of the loaded artifact |
@@ -630,6 +631,7 @@ in [`tests/ops/tests.cmake`](../../tests/ops/tests.cmake), `tests/artifact/tests
 | `ninfer_qwen3_5_engine_dflash2_tp2_real_test` | DFlash2 K=4 `--lm-head-draft` (split drafter): token ids identical to plain tp 2 on three prompts, ≥ 30% acceptance, two-lane rounds, prefix reuse |
 | `ninfer_proposal_topk_split_test`, `ninfer_dflash2_head_blocks_test` | the split top sixteen against `linear_topk` over the whole head (ids and score bits, eager and through the mailbox, planted ties); the drafter's head-block Ops (16/4 attention, H4 context K/V, the Q8 QKV shard, 16/4 norm-RoPE) against the complete profiles' heads bit for bit, the convolution finish and `n5120_k2048` against FP64 |
 | `ninfer_qwen3_5_engine_vision_tp2_real_test` (+ `_mtp_real`, `_dflash2_real`) | `vision_device` outside `devices` rejected, text identical with and without Vision, colors of synthetic images with the tower on device 0, same token ids with it on device 1, second turn resumed |
+| `ninfer_qwen4_tp2_moe_abandon_test` | Qwen4Exp on `NINFER_TEST_QWEN4_ARTIFACT`, CausalScoring over the HostExchange: a prompt chunk that throws inside its open MoE exchange (injected by wrapping `ops::moe_accumulate_shared`) abandons the call, and the next scoring reproduces the scores before the failure bit for bit |
 | `ninfer_serve_engine_failure_real_test` | a thrown decode-round failure (injected by wrapping `cudaStreamSynchronize`) stops the server with `engine_failed()` set, so it exits 2 |
 | `ninfer_serve_tp_transport_recovery_real_test` | MTP K=3: a mailbox hang (injected by wrapping `PeerMailbox::hang_reported()`) mid-stream in a streamed answer's decode, and again at the first check of a later request, fails each request with `service_unavailable` (503), the server keeps serving, and after each step-down (copies everywhere at the end) the greedy answer, reasoning included, is the one the mailbox gave; on `NINFER_TEST_ARTIFACT` and on `NINFER_TEST_QWEN4_ARTIFACT` (Qwen4Exp, routed-expert residency frozen with `NINFER_QWEN4_VALIDATION=1 NINFER_QWEN4_EXPERT_FREEZE=all`), each when set |
 

@@ -94,6 +94,12 @@ public:
     // site, for both ranks together.
     [[nodiscard]] int take_capture_slot(std::size_t bytes = 0) noexcept;
 
+    // The exchanges this mailbox has carried: one per take_capture_slot() call, in either set.
+    // Read before and after a capture, the difference is the number of the capture's all-reduces
+    // that took the mailbox (a call on the staged path takes no slot): the transport
+    // discriminator, independent of how many graph nodes an exchange or its neighbours add.
+    [[nodiscard]] std::uint64_t captured_exchanges() const noexcept { return captured_exchanges_; }
+
     // Enqueues rank `rank`'s half of the summing exchange of `bytes` (a multiple of 16, at most
     // max_bytes()) at the 16-byte aligned `data`, resident on that rank's device, onto `stream`,
     // in the set that carries `bytes`. The caller issues both ranks' halves for one slot taken by
@@ -171,6 +177,8 @@ private:
     int devices_[2]                 = {0, 0};
     bool release_dependents_        = false;
     std::size_t l2_prefetch_budget_ = 0;
+
+    std::uint64_t captured_exchanges_ = 0; // take_capture_slot() calls
 
     // Per rank: the hint the next enqueue consumes. Mutable: enqueueing is const (it changes no
     // transport state), the hint is a one-shot argument of that launch.

@@ -1537,11 +1537,18 @@ public:
                 throw std::logic_error("KV truncate would partially release a protected page");
             }
         }
+        // A tail whose coverage already ends at the frontier is not mutated, so it may stay shared:
+        // an aligned frontier can end on an immutable full page also referenced by a checkpoint.
+        std::optional<LogicalKVPageHandle> changed_tail;
+        std::uint32_t tail_columns = 0;
         if (target != 0) {
-            const std::uint32_t columns =
-                frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
-            if (!pages_->can_destructive_truncate(membership(address, target - 1U), columns)) {
-                throw std::logic_error("KV truncate would overwrite protected coverage");
+            const LogicalKVPageHandle tail = membership(address, target - 1U);
+            tail_columns = frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
+            if (tail_columns != pages_->committed_columns(tail)) {
+                if (!pages_->can_destructive_truncate(tail, tail_columns)) {
+                    throw std::logic_error("KV truncate would overwrite protected coverage");
+                }
+                changed_tail = tail;
             }
         }
         while (address.page_count > target) {
@@ -1551,11 +1558,7 @@ public:
             pages_->release_active_reference(page);
             pages_->dematerialize(page, address.reservation);
         }
-        if (target != 0) {
-            const std::uint32_t columns =
-                frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
-            pages_->destructive_truncate(membership(address, target - 1U), columns);
-        }
+        if (changed_tail) { pages_->destructive_truncate(*changed_tail, tail_columns); }
         address.committed_frontier = frontier;
     }
 

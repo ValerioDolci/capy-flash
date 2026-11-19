@@ -1,6 +1,7 @@
 #!/bin/bash
 # capy-flash: the small Qwen3.8-Flash-Next test artifact of the Engine integration tests
-# (NINFER_TEST_QWEN4_ARTIFACT: ninfer_qwen4_tp2_engine_test, ninfer_qwen4_mtp_engine_test).
+# (NINFER_TEST_QWEN4_ARTIFACT: ninfer_qwen4_tp2_engine_test, ninfer_qwen4_tp2_moe_abandon_test,
+# ninfer_qwen4_mtp_engine_test).
 #
 #   tools/capy_flash/make_test_artifact.sh [--fp4-local|--vision] <NVIDIA Qwen3.8-Flash-Next checkpoint dir> <out dir>
 #

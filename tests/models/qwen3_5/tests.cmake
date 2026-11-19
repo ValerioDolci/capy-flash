@@ -120,6 +120,23 @@ set_tests_properties(
   ninfer_qwen4_tp2_engine_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# Qwen4Exp at tp 2: a prompt chunk that fails inside its MoE host exchange leaves the exchange free,
+# and the next scoring reproduces the scores before it. Link-time wrappers around
+# ops::moe_accumulate_shared and HostExchange::{begin,finish,abandon}_sum_f32 inject the failure, no
+# production hooks. Skips (77) without NINFER_TEST_QWEN4_ARTIFACT or without two devices.
+ninfer_add_test(ninfer_qwen4_tp2_moe_abandon_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_qwen4_tp2_moe_abandon.cpp"
+  LIBRARIES ninfer_engine ninfer_core CUDA::cudart)
+target_link_options(ninfer_qwen4_tp2_moe_abandon_test PRIVATE
+  "LINKER:--wrap=_ZN6ninfer3ops21moe_accumulate_sharedERKNS_6TensorES3_RS1_P11CUstream_st"
+  "LINKER:--wrap=_ZN6ninfer3ops12HostExchange13begin_sum_f32ERKSt5arrayINS_6TensorELm2EES6_PS5_NS1_7PayloadERKNS_16ExecutionContextE"
+  "LINKER:--wrap=_ZN6ninfer3ops12HostExchange14finish_sum_f32Ev"
+  "LINKER:--wrap=_ZN6ninfer3ops12HostExchange15abandon_sum_f32Ev")
+
+set_tests_properties(
+  ninfer_qwen4_tp2_moe_abandon_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 # Qwen4Exp MTP rounds through the Engine: MTP == no-draft == oracle drafts with mapped and
 # offloaded experts, and a cancelled row. Skips (77) without NINFER_TEST_QWEN4_ARTIFACT (a
 # synthetic artifact with an MTP layer: tools/capy_flash/make_test_artifact.sh).
@@ -143,7 +160,8 @@ set_tests_properties(
   PROPERTIES SKIP_RETURN_CODE 77)
 
 if(NINFER_TEST_QWEN4_ARTIFACT)
-  set_tests_properties(ninfer_qwen4_tp2_engine_test ninfer_qwen4_mtp_engine_test PROPERTIES
+  set_tests_properties(ninfer_qwen4_tp2_engine_test ninfer_qwen4_tp2_moe_abandon_test
+    ninfer_qwen4_mtp_engine_test PROPERTIES
     ENVIRONMENT "NINFER_TEST_QWEN4_ARTIFACT=${NINFER_TEST_QWEN4_ARTIFACT}")
 endif()
 if(NINFER_TEST_QWEN4_VISION_ARTIFACT)

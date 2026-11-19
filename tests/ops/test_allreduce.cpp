@@ -288,9 +288,10 @@ void launch_two_devices(const ExecutionContext& ec, DecodeGraphExecutable& execu
 // serving loop may, and must double the value 'sites' times each. One eager call afterwards
 // checks that the staged path composes with the captured history on the same buffers and events.
 //
-// `mailbox` names the mailbox attached to `events`, or null. The node count proves the selected
-// transport: the mailbox exchange is one kernel node per device per site, the staged path at
-// least two per device per site.
+// `mailbox` names the mailbox attached to `events`, or null. The mailbox's exchange count proves
+// the selected transport: every site took a slot, or none did. A mailbox capture also holds the
+// transport's performance invariant, one kernel node per device per exchange (peer_mailbox.h):
+// the skew memset plus two nodes per site.
 int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int sites,
                       bool expect_mailbox, const ExecutionContext& ec,
                       const ops::PeerEvents& events, const ops::PeerMailbox* mailbox) {
@@ -317,6 +318,7 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
 
     const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
     DecodeGraphDefinition definition;
+    const std::uint64_t before = mailbox != nullptr ? mailbox->captured_exchanges() : 0;
     capture_two_devices(ec, bridge, definition, [&] {
         set_device(ec, 1);
         cuda_check(cudaMemsetAsync(skew.p, 0, skew.bytes, ec.dev[1]->stream), "skew memset");
@@ -325,12 +327,16 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
         }
     });
 
-    int failures                = 0;
-    const std::size_t nodes     = definition.node_count();
-    const std::size_t exchanges = 1 + 2 * static_cast<std::size_t>(sites);
-    if (expect_mailbox ? nodes != exchanges : nodes <= exchanges) {
-        std::cerr << label << ": " << nodes << " graph nodes do not match the "
-                  << (expect_mailbox ? "mailbox" : "staged") << " transport\n";
+    int failures              = 0;
+    const std::uint64_t taken = mailbox != nullptr ? mailbox->captured_exchanges() - before : 0;
+    const std::size_t nodes   = definition.node_count();
+    if (taken != (expect_mailbox ? static_cast<std::uint64_t>(sites) : 0)) {
+        std::cerr << label << ": " << taken << " of " << sites << " sites took the mailbox, "
+                  << "expected the " << (expect_mailbox ? "mailbox" : "staged") << " transport\n";
+        ++failures;
+    } else if (expect_mailbox && nodes != 1 + 2 * static_cast<std::size_t>(sites)) {
+        std::cerr << label << ": " << nodes << " graph nodes, not one kernel node per device per "
+                  << "mailbox exchange\n";
         ++failures;
     }
 
@@ -583,11 +589,12 @@ int run_prefetch_identity_case(const char* label, std::int32_t ne0, std::int32_t
 
 // One request's and a full batch's exchanges interleaved in one graph through a mailbox with
 // wide slots ([5120, 8] ordinary, [5120, 32] wide, three of each): every exchange must take the
-// mailbox (two kernel nodes each), each set alternating its own slots, and both buffers' bits must
-// equal the staged path's on the same operands.
+// mailbox (`taken`: its exchange count; two kernel nodes each), each set alternating its own
+// slots, and both buffers' bits must equal the staged path's on the same operands.
 std::array<std::vector<std::uint16_t>, 2> mixed_width_bits(const ExecutionContext& ec,
                                                            const ops::PeerEvents& events,
-                                                           std::size_t& nodes, int& failures) {
+                                                           std::size_t& nodes, std::uint64_t& taken,
+                                                           int& failures) {
     constexpr int kSites = 3;
     constexpr std::array<std::int32_t, 2> kColumns{8, 32};
     std::array<std::vector<std::uint16_t>, 2> out;
@@ -614,12 +621,15 @@ std::array<std::vector<std::uint16_t>, 2> mixed_width_bits(const ExecutionContex
     retire_staging(ec);
     const DecodeGraphPeerBridge bridge(ec.dev[0]->device, ec.dev[1]->device);
     DecodeGraphDefinition definition;
+    const ops::PeerMailbox* mailbox = events.mailbox();
+    const std::uint64_t before      = mailbox != nullptr ? mailbox->captured_exchanges() : 0;
     capture_two_devices(ec, bridge, definition, [&] {
         for (int site = 0; site < kSites; ++site) {
             ops::allreduce_sum(buffer[0], staging[0], ec, events);
             ops::allreduce_sum(buffer[1], staging[1], ec, events);
         }
     });
+    taken = mailbox != nullptr ? mailbox->captured_exchanges() - before : 0;
     nodes = definition.node_count();
     DecodeGraphExecutable executable;
     executable.instantiate(definition);
@@ -641,13 +651,16 @@ int run_mixed_width_case(const ExecutionContext& ec, const ops::PeerEvents& stag
                              5120 * 32 * sizeof(std::uint16_t));
     ops::PeerEvents events(ec);
     events.attach_mailbox(&mailbox);
-    std::size_t mailbox_nodes = 0;
-    std::size_t staged_nodes  = 0;
-    const auto mailbox_bits   = mixed_width_bits(ec, events, mailbox_nodes, failures);
-    const auto staged_bits    = mixed_width_bits(ec, staged, staged_nodes, failures);
-    if (mailbox_nodes != 12 || staged_nodes <= 12) {
-        std::cerr << "mixed widths: " << mailbox_nodes << " / " << staged_nodes
-                  << " graph nodes do not match the mailbox / staged transports\n";
+    std::size_t mailbox_nodes   = 0;
+    std::size_t staged_nodes    = 0;
+    std::uint64_t mailbox_taken = 0;
+    std::uint64_t staged_taken  = 0;
+    const auto mailbox_bits = mixed_width_bits(ec, events, mailbox_nodes, mailbox_taken, failures);
+    const auto staged_bits  = mixed_width_bits(ec, staged, staged_nodes, staged_taken, failures);
+    // Six exchanges, all on the mailbox; one kernel node per device per mailbox exchange.
+    if (mailbox_taken != 6 || mailbox_nodes != 12) {
+        std::cerr << "mixed widths: " << mailbox_taken << " mailbox exchanges in " << mailbox_nodes
+                  << " graph nodes, expected 6 in 12\n";
         ++failures;
     }
     failures +=

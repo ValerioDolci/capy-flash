@@ -562,8 +562,11 @@ NeededPages_s=
 \right\rceil
 \]
 
-Trailing mappings can be removed; the last partial page is kept. For an active address space, the
-removed Device leases return to the same active reservation, not to the global available capacity.
+Trailing mappings can be removed; the last partial page is kept. A kept tail page whose coverage
+already ends at the frontier is not rewritten, so it may remain a full page shared with a checkpoint;
+a tail whose coverage shrinks must be a private writer page outside protected coverage. For an
+active address space, the removed Device leases return to the same active reservation, not to the
+global available capacity.
 Stale bytes after the frontier inside a page do not enter the consumer valid domain.
 
 On speculative termination, the recurrent state, hidden and draft context are first brought up to

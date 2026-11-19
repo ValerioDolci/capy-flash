@@ -391,6 +391,65 @@ void test_kv_store(ninfer::DeviceContext& device) {
                pages.occupied() == 0,
            "active KV snapshot references close with both address spaces");
 
+    // A trim to an aligned frontier whose last page is a full page shared with a checkpoint:
+    // the speculative suffix page is released and the shared page is not written.
+    const auto aligned_trim_checkpoint = addresses.create_active(3, 0, device.stream);
+    const auto aligned_trim_active     = addresses.create_inactive();
+    expect(aligned_trim_checkpoint && aligned_trim_active,
+           "aligned shared-tail trim endpoints allocate");
+    addresses.ensure_mapped_to_tokens(*aligned_trim_checkpoint, 64, device.stream);
+    addresses.commit_frontier(*aligned_trim_checkpoint, 64);
+    auto aligned_trim_snapshot =
+        addresses.prepare_active_snapshot(*aligned_trim_checkpoint, *aligned_trim_active, 64);
+    expect(!aligned_trim_snapshot.needs_tail_copy(), "aligned snapshot requires no KV copy");
+    addresses.commit_active_snapshot(std::move(aligned_trim_snapshot), device.stream);
+    const auto aligned_shared_tail                = addresses.logical_page(*aligned_trim_active, 0);
+    const std::uint64_t aligned_shared_tail_epoch = pages.content_epoch(aligned_shared_tail);
+    const auto unchanged_aligned_shared_tail      = [&] {
+        return addresses.logical_page(*aligned_trim_checkpoint, 0) == aligned_shared_tail &&
+               pages.address_references(aligned_shared_tail) == 2 &&
+               pages.active_address_references(aligned_shared_tail) == 1 &&
+               pages.writer_references(aligned_shared_tail) == 0 &&
+               pages.committed_columns(aligned_shared_tail) == 64 &&
+               pages.protected_columns(aligned_shared_tail) == 64 &&
+               pages.content_epoch(aligned_shared_tail) == aligned_shared_tail_epoch;
+    };
+    expect(unchanged_aligned_shared_tail() &&
+               addresses.committed_frontier(*aligned_trim_active) == 64,
+           "aligned snapshot leaves the active address on a shared protected full page");
+    const auto aligned_shared_tail_allocated = physical_pages.allocated_pages();
+    addresses.ensure_mapped_to_tokens(*aligned_trim_active, 65, device.stream);
+    device.synchronize();
+    expect(addresses.mapped_pages(*aligned_trim_active) == 2 &&
+               physical_pages.allocated_pages() == aligned_shared_tail_allocated + 1U,
+           "speculative KV page maps past the shared full tail");
+    bool aligned_trim_rejected = false;
+    try {
+        addresses.destructive_truncate(*aligned_trim_active, 64);
+    } catch (const std::exception&) { aligned_trim_rejected = true; }
+    expect(!aligned_trim_rejected && addresses.mapped_pages(*aligned_trim_active) == 1 &&
+               addresses.committed_frontier(*aligned_trim_active) == 64 &&
+               addresses.entitlement(*aligned_trim_active) == 3 &&
+               physical_pages.allocated_pages() == aligned_shared_tail_allocated &&
+               unchanged_aligned_shared_tail(),
+           "aligned trim releases the speculative page and leaves the shared full tail untouched");
+    const store::KVActiveSnapshotShape trimmed_shape =
+        addresses.active_snapshot_shape(*aligned_trim_active, 64);
+    expect(trimmed_shape.immutable_full_pages == 1 && trimmed_shape.copied_pages() == 0,
+           "trimmed address publishes its aligned checkpoint by reference");
+    bool protected_trim_rejected = false;
+    try {
+        addresses.destructive_truncate(*aligned_trim_active, 63);
+    } catch (const std::logic_error&) { protected_trim_rejected = true; }
+    expect(protected_trim_rejected && addresses.mapped_pages(*aligned_trim_active) == 1 &&
+               addresses.committed_frontier(*aligned_trim_active) == 64 &&
+               unchanged_aligned_shared_tail(),
+           "trim into a shared full tail is rejected without mutation");
+    addresses.deactivate(*aligned_trim_active);
+    expect(addresses.release(*aligned_trim_active) && addresses.release(*aligned_trim_checkpoint) &&
+               pages.occupied() == 0,
+           "aligned shared-tail trim ownership closes");
+
     const auto alternating = addresses.create_active(4, 0, device.stream);
     expect(alternating.has_value(), "alternating Host release address allocation");
     addresses.ensure_mapped_to_tokens(*alternating, 193, device.stream);

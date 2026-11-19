@@ -440,6 +440,7 @@ void ProgramImpl::probe_peer_mailbox() {
                 const ScopedCurrentDevice peer_sync(rank1.device);
                 CUDA_CHECK(cudaDeviceSynchronize());
             }
+            const std::uint64_t exchanges = peer_mailbox->captured_exchanges();
             definition.capture(
                 rank0.stream,
                 [&] {
@@ -453,8 +454,8 @@ void ProgramImpl::probe_peer_mailbox() {
                     CUDA_CHECK(cudaSetDevice(rank0.device));
                 },
                 DecodeGraphPeerCapture{.bridge = &*graph_bridge, .stream = rank1.stream});
-            // The mailbox exchange is one kernel node per device; the staged path is more.
-            selected = definition.node_count() == 2;
+            // The all-reduce took the mailbox when it took a slot; the staged path takes none.
+            selected = peer_mailbox->captured_exchanges() == exchanges + 1;
             executable.instantiate(definition);
             const auto start = std::chrono::steady_clock::now();
             executable.launch(rank0.stream);

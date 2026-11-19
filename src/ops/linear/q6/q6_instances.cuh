@@ -16,6 +16,7 @@ using SlicedR32T64W2S1 = Q6A16SlicedKMmaSchedule<32, 64, 2, 1, Cache::cg, Cache:
 using SlicedR16T24W4S2 = Q6A16SlicedKMmaSchedule<16, 24, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR16T32W4S2 = Q6A16SlicedKMmaSchedule<16, 32, 4, 2, Cache::cg, Cache::ca, 2>;
 using SlicedR32T32W4S2 = Q6A16SlicedKMmaSchedule<32, 32, 4, 2, Cache::cg, Cache::ca, 2>;
+using SlicedR32T8W4S2  = Q6A16SlicedKMmaSchedule<32, 8, 4, 2, Cache::cg, Cache::ca, 2>;
 
 using MmaR64T40K128     = Q6A16MmaSchedule<64, 40, 128, 32, 8, 2, 2, Q6MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q6ScaleLoad::Pair32, 1>;

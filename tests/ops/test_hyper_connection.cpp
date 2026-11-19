@@ -771,9 +771,10 @@ int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, st
     return failures;
 }
 
-// Kernel launches of one mix / combine_mix call, counted on its captured CUDA Graph: the small-T
-// route is exactly two (Down, Up + mix); the general route is at least five (norm, Down linear,
-// gates, Up linear, collapse, plus the combine). It shows which route a geometry takes.
+// Kernel launches of one mix / combine_mix call, counted on its captured CUDA Graph. The count is
+// the Op's documented execution contract (hyper_connection.h, Execution: the small-T geometries
+// are exactly two launches, Down then Up + mix), not a transport probe; the general route is at
+// least five (norm, Down linear, gates, Up linear, collapse, plus the combine).
 std::size_t route_launches(const MixFixture& f, std::int32_t tokens, bool combine) {
     const std::size_t wide = static_cast<std::size_t>(kWide) * tokens;
     DeviceBuffer d_residual(wide * 2);

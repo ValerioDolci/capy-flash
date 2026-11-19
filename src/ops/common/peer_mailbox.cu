@@ -187,6 +187,7 @@ int PeerMailbox::take_capture_slot(std::size_t bytes) noexcept {
     SlotSet& set   = sets_[set_for(bytes)];
     const int slot = set.next_slot;
     set.next_slot  = (set.next_slot + 1) % slots_;
+    ++captured_exchanges_;
     return slot;
 }
 

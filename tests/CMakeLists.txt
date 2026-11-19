@@ -23,6 +23,7 @@ set_tests_properties(
   ninfer_qwen4_loading_test
   ninfer_qwen4_tp2_loading_test
   ninfer_qwen4_tp2_engine_test
+  ninfer_qwen4_tp2_moe_abandon_test
   ninfer_qwen4_mtp_engine_test
   ninfer_qwen4_vision_engine_test
   ninfer_qwen3_5_score_real_test
