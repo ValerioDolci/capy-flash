@@ -13,7 +13,6 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "ops/op_tester.h"
-#include "ops/sparse_attention/launch.h"
 
 #include <cuda_fp16.h>
 
@@ -813,20 +812,6 @@ int main() {
             }
         }
         failures += test_graph();
-        // The regions above (1024 / 2048 cache blocks, and the engine's multiples of 16) run the
-        // 4-way sets; a region that does not divide into sets falls back to direct mapping.
-        for (const std::int32_t blocks : {1024, 2048, 16, 4}) {
-            if (ninfer::ops::detail::qsa_staging_ways(blocks) != 4) {
-                std::cerr << "FAIL: " << blocks << " cache blocks do not take 4 ways\n";
-                ++failures;
-            }
-        }
-        for (const std::int32_t blocks : {1022, 2, 1}) {
-            if (ninfer::ops::detail::qsa_staging_ways(blocks) != 1) {
-                std::cerr << "FAIL: " << blocks << " cache blocks are not direct mapped\n";
-                ++failures;
-            }
-        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " qsa_staging\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

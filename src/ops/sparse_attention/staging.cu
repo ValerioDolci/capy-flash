@@ -2,8 +2,8 @@
 // qsa_count_selected_blocks, qsa_stage_selected_union)
 // Copies the K/V rows a QSA attention call reads from (Host-resident) paged planes into a device
 // staging region: whole pages for a prefill call (or, beyond the region, the union of the call's
-// selected blocks), selected 4-token blocks through a direct-mapped per-layer cache for a
-// decode/verify call. Design: docs/maintainer/active-kv-in-ram.md.
+// selected blocks), selected 4-token blocks through a 4-way set-associative per-layer cache for
+// a decode/verify call. Design: docs/maintainer/active-kv-in-ram.md.
 #include "ninfer/ops/sparse_attention.h"
 #include "ops/sparse_attention/launch.h"
 
@@ -141,12 +141,12 @@ __global__ void __launch_bounds__(kPageThreads) stage_pages_kernel(PageArgs a) {
     }
 }
 
-// The decode cache's set associativity. Direct mapped, the blocks of one call that share a slot
-// go to the overflow and are copied again every call, a large share of a long context's blocks.
+// The decode cache's set associativity: the blocks of one call that map to one set share its
+// ways. require_region keeps cache_blocks a multiple of 16, so the sets are whole.
 constexpr int kStagingWays = 4;
+static_assert(16 % kStagingWays == 0);
 
 struct BlockArgs {
-    int ways; // kStagingWays, or 1 (direct mapped) for a region qsa_staging_ways() rejects
     Planes planes;
     const std::int32_t* selected; // [max_selected, W, B]
     const std::int32_t* counts;   // [W, B]
@@ -213,7 +213,7 @@ __global__ void __launch_bounds__(kBlockThreads) stage_blocks_kernel(BlockArgs a
                 // Committed and complete: wholly before the lane's window.
                 const bool cacheable = kRatio * block + (kRatio - 1) < first_position;
                 int outcome          = kQsaStagingUncacheable;
-                if (cacheable && a.ways > 1) {
+                if (cacheable) {
                     // W-way set: a way claimed this call with this key (shared) or holding its
                     // tag (hit), else the least recently claimed way the call has not claimed
                     // (claims keep the epoch of their last call); overflow only when every way
@@ -295,41 +295,6 @@ __global__ void __launch_bounds__(kBlockThreads) stage_blocks_kernel(BlockArgs a
                             }
                         }
                     }
-                } else if (cacheable) {
-                    const auto key = (static_cast<std::uint32_t>(row) << kRowShift) |
-                                     static_cast<std::uint32_t>(block);
-                    // Rows start at different points of the layer's slots (row 0 at block 0).
-                    const std::int32_t h = static_cast<std::int32_t>(
-                        (static_cast<std::int64_t>(block) +
-                         static_cast<std::int64_t>(row) * (a.cache_blocks / 8)) %
-                        a.cache_blocks);
-                    const unsigned long long want =
-                        (static_cast<unsigned long long>(epoch) << 32) | key;
-                    unsigned long long* word = a.claims + h;
-                    unsigned long long current =
-                        *reinterpret_cast<volatile unsigned long long*>(word);
-                    for (;;) {
-                        if (static_cast<std::uint32_t>(current >> 32) == epoch) {
-                            outcome = static_cast<std::uint32_t>(current) == key
-                                          ? kQsaStagingShared
-                                          : kQsaStagingCollisions;
-                            break;
-                        }
-                        const unsigned long long previous = atomicCAS(word, current, want);
-                        if (previous == current) {
-                            const long long tag = static_cast<long long>(
-                                (static_cast<unsigned long long>(generation) << 32) | key);
-                            if (a.tags[h] == tag) {
-                                outcome = kQsaStagingHits;
-                            } else {
-                                outcome   = kQsaStagingMisses;
-                                a.tags[h] = tag;
-                            }
-                            break;
-                        }
-                        current = previous;
-                    }
-                    slot = a.cache_base + h;
                 }
                 if (outcome == kQsaStagingUncacheable || outcome == kQsaStagingCollisions) {
                     const std::int32_t k = atomicAdd(&a.counters[2], 1);
@@ -450,12 +415,6 @@ void qsa_stage_visible_pages(const PagedKVBatchLayerView& kv, const Tensor& cach
     CUDA_CHECK(cudaGetLastError());
 }
 
-namespace detail {
-int qsa_staging_ways(std::int32_t cache_blocks) {
-    return cache_blocks >= kStagingWays && cache_blocks % kStagingWays == 0 ? kStagingWays : 1;
-}
-} // namespace detail
-
 void qsa_stage_selected_blocks(const Tensor& selected, const Tensor& counts,
                                const Tensor& cache_positions, const Tensor& table_rows,
                                const PagedKVBatchLayerView& kv, const QsaStagingRegion& region,
@@ -510,7 +469,6 @@ void qsa_stage_selected_blocks(const Tensor& selected, const Tensor& counts,
     a.overflow_base          = region.layers * region.cache_blocks;
     a.overflow_blocks        = region.overflow_blocks;
     a.out                    = static_cast<std::int32_t*>(rewritten.data);
-    a.ways                   = detail::qsa_staging_ways(region.cache_blocks);
     const std::int64_t warps = static_cast<std::int64_t>(width) * groups;
     const auto blocks = static_cast<unsigned>((warps * 32 + kBlockThreads - 1) / kBlockThreads);
     stage_blocks_kernel<<<blocks, kBlockThreads, 0, stream>>>(a);
