@@ -1,7 +1,7 @@
 #pragma once
 
 // ninfer::ops::detail - private launch prototypes of the hyper-connection family.
-
+#include "ops/common/kernel_tensor_map.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 
@@ -83,9 +83,9 @@ struct HcFusedMix {
 
 // TMA descriptors of the small-T route (encoded per launch from HcFusedMix's weight pointers).
 struct HcFusedMaps {
-    CUtensorMap down_codes;
-    CUtensorMap down_scales;
-    CUtensorMap up_codes;
+    ::ninfer::ops::KernelTensorMap down_codes;
+    ::ninfer::ops::KernelTensorMap down_scales;
+    ::ninfer::ops::KernelTensorMap up_codes;
 };
 
 // Whether the current device runs the small-T route (thread block clusters, sm_90+).

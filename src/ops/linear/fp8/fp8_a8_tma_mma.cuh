@@ -1,5 +1,5 @@
 #pragma once
-
+#include "ops/common/kernel_tensor_map.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -16,9 +16,9 @@
 
 namespace ninfer::ops::detail {
 
-struct alignas(128) Fp8TmaDescriptors {
-    CUtensorMap activation;
-    CUtensorMap weight;
+struct NINFER_KERNEL_PARAM_ALIGNAS(128) Fp8TmaDescriptors {
+    ::ninfer::ops::KernelTensorMap activation;
+    ::ninfer::ops::KernelTensorMap weight;
 };
 
 struct Fp8TmaSplitKPlan {
