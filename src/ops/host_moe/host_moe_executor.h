@@ -152,6 +152,23 @@ struct HostCpuTopology {
                                                          std::span<const int> big);
 // Whether `cpus` (pool members) hold both big cores (in `big`) and small cores (not in it).
 [[nodiscard]] bool hybrid_members(std::span<const int> cpus, std::span<const int> big);
+// NINFER_HOST_MOE_CPUS (`env`; null or empty when unset) replaces `cpus` unless the caller's list
+// is explicit (--expert-cpus). Returns whether `cpus` is now an explicit list. Throws
+// std::invalid_argument, naming the variable, for a malformed list.
+[[nodiscard]] bool apply_cpu_env(std::vector<int>& cpus, bool explicit_list, const char* env);
+
+// The expert pool's cpus once NINFER_HOST_MOE_CPUS (`env`) is applied (apply_cpu_env), and
+// whether the chunk-sized gate/up items run (HostMoeExecutor::Options::gguf_fine): with
+// `fine_on_hybrid` they do when the final list holds both big cores (in `big`) and small ones;
+// otherwise `fine` is kept.
+struct PoolCpus {
+    std::vector<int> cpus;
+    bool explicit_list = false;
+    bool gguf_fine     = false;
+};
+
+[[nodiscard]] PoolCpus resolve_pool_cpus(std::vector<int> cpus, bool explicit_list, const char* env,
+                                         bool fine_on_hybrid, bool fine, std::span<const int> big);
 
 // Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest allowed SMT
 // sibling of each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...

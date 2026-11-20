@@ -281,6 +281,26 @@ std::vector<std::uint8_t> big_core_members(std::span<const int> cpus, std::span<
     return out;
 }
 
+bool apply_cpu_env(std::vector<int>& cpus, bool explicit_list, const char* env) {
+    if (explicit_list || env == nullptr || *env == 0) { return explicit_list; }
+    // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
+    try {
+        cpus = parse_cpu_list(env);
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument(std::string("NINFER_HOST_MOE_CPUS: ") + error.what());
+    }
+    return true;
+}
+
+PoolCpus resolve_pool_cpus(std::vector<int> cpus, bool explicit_list, const char* env,
+                           bool fine_on_hybrid, bool fine, std::span<const int> big) {
+    PoolCpus out;
+    out.explicit_list = apply_cpu_env(cpus, explicit_list, env);
+    out.gguf_fine     = fine_on_hybrid ? hybrid_members(cpus, big) : fine;
+    out.cpus          = std::move(cpus);
+    return out;
+}
+
 bool hybrid_members(std::span<const int> cpus, std::span<const int> big) {
     const std::vector<std::uint8_t> members = big_core_members(cpus, big);
     return std::find(members.begin(), members.end(), 1) != members.end() &&
