@@ -57,42 +57,61 @@ struct MtpRoundView {
     const ops::SamplingConfig* sampling = nullptr;
 };
 
-MtpRoundView slice_mtp_frame(qwen3_5::MtpDecodeState& frame, std::int32_t batch_size) {
+// A dense view of `shape` over the leading elements of `full`. The frame's verified-window tensors
+// are laid out for the widest window; a round of `width` columns uses their first width x B
+// columns as one dense [.., width, B] tensor. Nothing in them outlives the round, so any width
+// may follow any other. With the widest window this is the exact-B prefix itself.
+Tensor dense_prefix(const Tensor& full, std::initializer_list<std::int32_t> shape) {
+    Tensor out(full.data, full.dtype, shape);
+    if (out.bytes() > full.bytes()) {
+        throw std::logic_error("MTP round view exceeds its frame tensor");
+    }
+    return out;
+}
+
+// One rank's window into its MtpDecodeState for `batch_size` rows that verify `width` columns and
+// then draft `drafts` (an MTP round: width == drafts + 1; a prompt-lookup round: wider).
+MtpRoundView slice_mtp_frame(qwen3_5::MtpDecodeState& frame, std::int32_t batch_size,
+                             std::int32_t width, std::int32_t drafts) {
+    const std::int32_t b      = batch_size;
+    const std::int32_t hidden = frame.target_hidden.ne[0];
+    const std::int32_t rows   = frame.target_logits.ne[0];
+    const std::int32_t steps  = std::max(drafts - 1, 1);
     MtpRoundView out;
-    out.anchors             = frame.anchors.slice(0, 0, batch_size);
-    out.frontiers           = frame.base_frontiers.slice(0, 0, batch_size);
-    out.budgets             = frame.remaining_budgets.slice(0, 0, batch_size);
-    out.current_extents     = frame.current_extents.slice(0, 0, batch_size);
-    out.target_valid        = frame.target_valid_columns.slice(0, 0, batch_size);
-    out.current_drafts      = frame.current_drafts.slice(1, 0, batch_size);
-    out.target_rope         = frame.target_rope_positions.slice(1, 0, batch_size);
-    out.text_rows           = frame.text_kv_table_rows.slice(0, 0, batch_size);
-    out.mtp_rows            = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-    out.state_sources       = frame.state_source_slots.slice(0, 0, batch_size);
-    out.state_destinations  = frame.state_destination_slots.slice(0, 0, batch_size);
-    out.rope_deltas         = frame.rope_deltas.slice(0, 0, batch_size);
-    out.verify_ids          = frame.verify_ids.slice(1, 0, batch_size);
-    out.target_positions    = frame.target_positions.slice(1, 0, batch_size);
-    out.target_tokens       = frame.target_argmax.slice(1, 0, batch_size);
-    out.target_logits       = frame.target_logits.slice(2, 0, batch_size);
-    out.target_hidden       = frame.target_hidden.slice(2, 0, batch_size);
-    out.selected_hidden     = frame.target_continuation_hidden.slice(1, 0, batch_size);
-    out.licensed_tokens     = frame.licensed_tokens.slice(1, 0, batch_size);
-    out.licensed_counts     = frame.licensed_counts.slice(0, 0, batch_size);
-    out.accepted            = frame.accepted_drafts.slice(0, 0, batch_size);
-    out.next_extents        = frame.next_extents.slice(0, 0, batch_size);
-    out.alignment_ids       = frame.alignment_ids.slice(1, 0, batch_size);
-    out.alignment_hidden    = frame.alignment_hidden.slice(2, 0, batch_size);
-    out.ar_hidden           = frame.ar_hidden.slice(1, 0, batch_size);
-    out.next_hidden         = frame.next_hidden.slice(1, 0, batch_size);
-    out.ar_positions        = frame.ar_positions.slice(0, 0, batch_size);
-    out.ar_rope_positions   = frame.ar_rope_positions.slice(0, 0, batch_size);
-    out.ar_valid_columns    = frame.ar_valid_columns.slice(0, 0, batch_size);
-    out.next_drafts         = frame.next_drafts.slice(0, 0, batch_size);
-    out.next_draft_logprobs = frame.next_draft_logprobs.slice(0, 0, batch_size);
-    out.proposal_logits     = frame.proposal_logits.slice(1, 0, batch_size);
+    out.anchors             = frame.anchors.slice(0, 0, b);
+    out.frontiers           = frame.base_frontiers.slice(0, 0, b);
+    out.budgets             = frame.remaining_budgets.slice(0, 0, b);
+    out.current_extents     = frame.current_extents.slice(0, 0, b);
+    out.target_valid        = frame.target_valid_columns.slice(0, 0, b);
+    out.current_drafts      = dense_prefix(frame.current_drafts, {width - 1, b});
+    out.target_rope         = dense_prefix(frame.target_rope_positions, {width, b});
+    out.text_rows           = frame.text_kv_table_rows.slice(0, 0, b);
+    out.mtp_rows            = frame.mtp_kv_table_rows.slice(0, 0, b);
+    out.state_sources       = frame.state_source_slots.slice(0, 0, b);
+    out.state_destinations  = frame.state_destination_slots.slice(0, 0, b);
+    out.rope_deltas         = frame.rope_deltas.slice(0, 0, b);
+    out.verify_ids          = dense_prefix(frame.verify_ids, {width, b});
+    out.target_positions    = dense_prefix(frame.target_positions, {width, b});
+    out.target_tokens       = dense_prefix(frame.target_argmax, {width, b});
+    out.target_logits       = dense_prefix(frame.target_logits, {rows, width, b});
+    out.target_hidden       = dense_prefix(frame.target_hidden, {hidden, width, b});
+    out.selected_hidden     = frame.target_continuation_hidden.slice(1, 0, b);
+    out.licensed_tokens     = dense_prefix(frame.licensed_tokens, {width, b});
+    out.licensed_counts     = frame.licensed_counts.slice(0, 0, b);
+    out.accepted            = frame.accepted_drafts.slice(0, 0, b);
+    out.next_extents        = frame.next_extents.slice(0, 0, b);
+    out.alignment_ids       = dense_prefix(frame.alignment_ids, {width, b});
+    out.alignment_hidden    = dense_prefix(frame.alignment_hidden, {hidden, width, b});
+    out.ar_hidden           = frame.ar_hidden.slice(1, 0, b);
+    out.next_hidden         = frame.next_hidden.slice(1, 0, b);
+    out.ar_positions        = frame.ar_positions.slice(0, 0, b).slice(1, 0, steps);
+    out.ar_rope_positions   = frame.ar_rope_positions.slice(0, 0, b).slice(1, 0, steps);
+    out.ar_valid_columns    = frame.ar_valid_columns.slice(0, 0, b).slice(1, 0, steps);
+    out.next_drafts         = frame.next_drafts.slice(0, 0, b);
+    out.next_draft_logprobs = frame.next_draft_logprobs.slice(0, 0, b);
+    out.proposal_logits     = frame.proposal_logits.slice(1, 0, b);
     if (qwen4_replay_enabled()) {
-        out.forced_targets = frame.forced_targets.slice(1, 0, batch_size);
+        out.forced_targets = dense_prefix(frame.forced_targets, {width, b});
     }
     out.sampling = frame.sampling;
     return out;
@@ -124,7 +143,8 @@ TargetVerifyFrameView verify_view(const MtpRoundView& view, const GdnReplayRecor
     };
 }
 
-void prepare_next_round(const MtpRoundView& view, std::int32_t max_context, cudaStream_t stream) {
+void prepare_next_round(const MtpRoundView& view, std::int32_t max_context, std::int32_t drafts,
+                        cudaStream_t stream) {
     Tensor alignment_ids     = view.alignment_ids;
     Tensor next_extents      = view.next_extents;
     Tensor ar_positions      = view.ar_positions;
@@ -133,7 +153,7 @@ void prepare_next_round(const MtpRoundView& view, std::int32_t max_context, cuda
     ops::mtp_prepare_next_round(view.verify_ids, view.anchors, view.accepted, view.frontiers,
                                 view.budgets, view.licensed_counts, view.rope_deltas, alignment_ids,
                                 next_extents, ar_positions, ar_rope_positions, ar_valid_columns,
-                                max_context, stream);
+                                max_context, drafts, stream);
 }
 
 // The bridge over both ranks (program/tp2/mtp_bridge_tp2.inc).
@@ -213,16 +233,19 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
 }
 
-auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                           MtpCausalAttentionEnvelopes envelopes) {
-    return [&state, batch_size, k, envelopes] {
+// A round that verifies `columns` columns (the anchor and its drafts) and then drafts `k`: an MTP
+// round verifies its own k drafts (columns == k + 1), a prompt-lookup round a wider window.
+auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t columns,
+                           std::uint32_t k, MtpCausalAttentionEnvelopes envelopes) {
+    return [&state, batch_size, columns, k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kMtpDecodeMaximumDrafts) {
+            k == 0 || columns < k + 1U || columns > kMtpDecodeMaximumWidth) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
 
         qwen3_5::MtpDecodeState& frame = state.frame;
-        const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        const std::int32_t width       = static_cast<std::int32_t>(columns);
+        const auto drafts              = static_cast<std::int32_t>(k);
         // Rows of the carried hidden (Qwen4Exp: the wide residual).
         const std::int32_t hidden_size = frame.ar_hidden.ne[0];
         const auto max_context         = static_cast<std::int32_t>(state.text_cache.max_context());
@@ -270,7 +293,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             CUDA_CHECK(cudaMemcpyAsync(state.peer_frame->ingress.data, &state.host_ingress,
                                        sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                        rank1->stream));
-            peer.emplace(slice_mtp_frame(*state.peer_frame, batch_size));
+            peer.emplace(slice_mtp_frame(*state.peer_frame, batch_size, width, drafts));
         }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
@@ -278,7 +301,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache, tp);
         card.set_forward_runtime(state.execution.qwen4);
-        const MtpRoundView round = slice_mtp_frame(frame, batch_size);
+        const MtpRoundView round = slice_mtp_frame(frame, batch_size, width, drafts);
         {
             Tensor verify_ids       = round.verify_ids;
             Tensor target_positions = round.target_positions;
@@ -317,7 +340,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             // proposal logits to rank 0) with the MTP head's all-reduces.
             std::optional<ops::PeerEvents::StagedScope> staged_draft;
             if (peer && tp->staged_draft_collectives) { staged_draft.emplace(*tp->events); }
-            prepare_next_round(round, max_context, stream);
+            prepare_next_round(round, max_context, drafts, stream);
             if (peer) {
                 // Rank 0's acceptance updated anchors, frontiers and licensed counts in place;
                 // rank 1 pulls them and prepares its copy of the next round from the same inputs.
@@ -332,7 +355,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data,
                                                              source.bytes(), rank1->stream));
                 }
-                prepare_next_round(*peer, max_context, rank1->stream);
+                prepare_next_round(*peer, max_context, drafts, rank1->stream);
             }
 
             Tensor draft0 = round.next_drafts.slice(1, 0, 1).view({batch_size});
@@ -440,16 +463,18 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
     };
 }
 
-void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size,
+                              std::uint32_t columns, std::uint32_t k,
                               MtpCausalAttentionEnvelopes envelopes,
                               DecodeGraphDefinition& definition) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+    auto body = mtp_decode_batch_body(state, batch_size, columns, k, envelopes);
     capture_graph(state, definition, body);
 }
 
-void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable) {
-    auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
+void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t columns,
+                      std::uint32_t k, MtpCausalAttentionEnvelopes envelopes,
+                      DecodeGraphExecutable* executable) {
+    auto body = mtp_decode_batch_body(state, batch_size, columns, k, envelopes);
     run_prepared(state, executable, body);
 }
 

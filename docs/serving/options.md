@@ -57,6 +57,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144) and rotates as Hugging Face's `rope_type: "yarn"` does (the same inverse frequencies, cos and sin multiplied by 0.1 ln F + 1). It covers every text RoPE on every GPU: attention at one and two GPUs, text after an image (MRoPE), the Flash-Next QSA indexer and the MTP layer; the Vision tower and the DFlash2 drafter keep their RoPE. `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental: its quality past the native window is not measured. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
 | `--rope-original-max-position N` | the native window YaRN scales from (Hugging Face `original_max_position_embeddings`), used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--prompt-lookup` | with `--spec mtp`: prompt lookup ([below](#prompt-lookup)). A one-request round may verify up to 8 tokens copied from an earlier repeat of the request's own text instead of the MTP's drafts | off |
 | `--default-max-tokens N` | output limit when omitted by a request | the context left after the prompt |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -391,3 +392,26 @@ complete fields and full precision. Operational records never contain prompts, g
 request bodies, credentials, or arbitrary client error messages.
 If a tool marker is returned to text because its structure or tool identity cannot be represented,
 Serve emits one warning with only the failure classification, never the generated markup.
+
+## Prompt lookup
+
+`--prompt-lookup` (with `--spec mtp`) adds a second source of drafts beside the MTP layer: the
+tokens that followed the longest earlier occurrence of the request's current suffix (prompt and
+output so far, matches of 3 to 64 tokens). When the output quotes its input (edits, rewrites,
+code returned with changes), that continuation is usually exact and one wider verify window
+accepts more tokens than the MTP's own drafts.
+
+A per-process policy decides each round whether to verify the MTP's window (`--draft-tokens` + 1
+columns) or a lookup window of one or two columns more, or of 8 columns. It compares expected
+committed tokens per millisecond: for the MTP, the mean tokens its windows commit; for the lookup,
+`1 + q + q^2 + ...` with `q` the acceptance of lookup drafts of a similar match length (learned,
+decayed), each at the measured round time of that width. A lookup window is taken only when it
+beats the MTP's by 3 %, and only when the lookup's first token agrees with the MTP's first draft.
+Rounds of two requests at once and constrained (structured output) rounds always verify the MTP's
+window. The suffix drafter and the policy are ported from
+[Strata](https://github.com/Niko1221/Strata) (MIT License).
+
+Verification keeps the method: every committed token is the target model's own. A wider window
+is a different verifier batch, so the rounding, and with it greedy text, can differ from a run
+without `--prompt-lookup`; the windows follow measured round times, so two runs can differ too.
+The lookup widths have their own one-request CUDA Graphs (more startup time and graph memory).

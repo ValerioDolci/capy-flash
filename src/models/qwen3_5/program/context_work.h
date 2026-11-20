@@ -65,6 +65,12 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 
 execution::MtpCausalAttentionEnvelopes
 mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std::uint32_t capacity);
+// A round that verifies `width` columns and then drafts `drafts` (an MTP round: width ==
+// drafts + 1; a prompt-lookup round verifies a wider window).
+execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
+                                                                      std::uint32_t width,
+                                                                      std::uint32_t drafts,
+                                                                      std::uint32_t capacity);
 
 execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
                                             std::uint32_t k);

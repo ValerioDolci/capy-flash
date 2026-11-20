@@ -317,7 +317,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--q8-a8 32|128] [--attn-pv-f16acc] [--tp-ar-payload fp16|int8] "
            "[--reasoning-close-retry|--no-reasoning-close-retry] "
            "[--reasoning-eos-guard|--no-reasoning-eos-guard] "
-           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--chat-template FILE] [--lm-head-draft] [--prompt-lookup] [--no-thinking] "
+           "[--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] "
@@ -584,6 +585,9 @@ std::string serve_usage_text(const char* argv0) {
            "    Draft tokens per speculative step: 1..5 with mtp, 1..15 with dflash2.\n"
            "  --lm-head-draft\n"
            "    Propose with the artifact's optimized proposal head.\n"
+           "  --prompt-lookup\n"
+           "    With --spec mtp: verify windows copied from an earlier repeat of the text\n"
+           "    (prompt lookup) when they pay; changes rounding, not the method.\n"
            "\n"
            "Prefill and response store:\n"
            "  --prefill-chunk <N>\n"
@@ -1199,6 +1203,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.reasoning_eos_guard = true;
         } else if (arg == "--no-reasoning-eos-guard") {
             options.reasoning_eos_guard = false;
+        } else if (arg == "--prompt-lookup") {
+            options.speculative.prompt_lookup = true;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--chat-template") {

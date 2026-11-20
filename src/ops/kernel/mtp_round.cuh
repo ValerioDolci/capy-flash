@@ -1,7 +1,8 @@
 #pragma once
 
 // Implements: include/ninfer/ops/mtp_round.h
-// Match: request-major fixed K=1..5 autoregressive MTP round transition.
+// Match: request-major autoregressive MTP round transition: k+1 verified columns, `drafts` next
+// drafts (k == drafts for an MTP round, k > drafts for a prompt-lookup round).
 
 #include <cstdint>
 
@@ -13,7 +14,7 @@ __global__ void mtp_prepare_next_round_kernel(
     const std::int32_t* licensed_counts, const std::int32_t* rope_deltas,
     std::int32_t* alignment_ids, std::int32_t* next_extents, std::int32_t* ar_positions,
     std::int32_t* ar_rope_positions, std::int32_t* ar_valid_columns, std::int32_t k,
-    std::int32_t ar_step_stride, std::int32_t max_context) {
+    std::int32_t drafts, std::int32_t ar_step_stride, std::int32_t max_context) {
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int a         = accepted[row];
@@ -28,9 +29,9 @@ __global__ void mtp_prepare_next_round_kernel(
         const int budget_extent  = remaining > 1 ? remaining - 1 : 0;
         const int context_extent = max_context - updated_frontiers[row] - 1;
         int next                 = budget_extent < context_extent ? budget_extent : context_extent;
-        next                     = next < 0 ? 0 : (next > k ? k : next);
+        next                     = next < 0 ? 0 : (next > drafts ? drafts : next);
         next_extents[row]        = next;
-        const int steps          = k > 1 ? k - 1 : 1;
+        const int steps          = drafts > 1 ? drafts - 1 : 1;
         for (int s = 0; s < steps; ++s) {
             const int offset          = s * ar_step_stride + row;
             const int position        = updated_frontiers[row] + s;

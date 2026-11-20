@@ -1295,7 +1295,7 @@ void validate_target_options(const execution::Parameters& parameters,
         break;
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
-            options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
+            options.speculative.draft_tokens > kMtpMaximumProposalDrafts) {
             throw std::invalid_argument("MTP draft window must be in [1,5]");
         }
         break;
@@ -1518,24 +1518,44 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(per_batch, impl->inputs.max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->inputs.speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles =
-                mtp_graph_profiles(impl->inputs.capacity, impl->inputs.draft_window);
-            // Per device; tp 2 uses its measured class allowance (core/tp2/device_tuning.h).
-            const std::size_t per_batch_allowance = graph_topology_allowance(
-                profiles,
-                [&](GraphExecutionProfile profile) -> std::size_t {
-                    if (impl->inputs.tp != 1) {
-                        return tp2::device_tuning(impl->inputs.device)
-                            .tp2_mtp_graph_class_allowance_bytes;
-                    }
-                    const std::uint64_t final_visible = std::min<std::uint64_t>(
-                        impl->inputs.capacity,
-                        static_cast<std::uint64_t>(profile.max) + 2ULL * impl->inputs.draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                },
-                "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(
-                per_batch_allowance, impl->inputs.max_concurrency, "MTP exact-b graph allowance");
+            // One family per verified width: the MTP's own (mtp_drafts + 1, every batch size) and,
+            // with prompt lookup, each lookup window (one row).
+            const std::uint32_t drafts =
+                impl->inputs.mtp_drafts != 0 ? impl->inputs.mtp_drafts : impl->inputs.draft_window;
+            const auto family_allowance = [&](std::uint32_t width) {
+                const auto profiles = mtp_graph_profiles(impl->inputs.capacity, width, drafts);
+                // Per device; tp 2 uses its measured class allowance (core/tp2/device_tuning.h).
+                return graph_topology_allowance(
+                    profiles,
+                    [&](GraphExecutionProfile profile) -> std::size_t {
+                        if (impl->inputs.tp != 1) {
+                            return tp2::device_tuning(impl->inputs.device)
+                                .tp2_mtp_graph_class_allowance_bytes;
+                        }
+                        const std::uint64_t final_visible = std::min<std::uint64_t>(
+                            impl->inputs.capacity,
+                            static_cast<std::uint64_t>(profile.max) + (width - 1ULL) + drafts);
+                        return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    },
+                    "MTP graph allowance");
+            };
+            const std::uint32_t t_mtp = drafts + 1U;
+            impl->graph_allowance_bytes =
+                checked_mul(family_allowance(t_mtp), impl->inputs.max_concurrency,
+                            "MTP exact-b graph allowance");
+            if (impl->inputs.draft_window > drafts) {
+                // The lookup widths of ProgramImpl (t_mtp + 1, t_mtp + 2 and the widest).
+                unsigned widths           = 0;
+                const std::uint32_t t_max = impl->inputs.draft_window + 1U;
+                for (const std::uint32_t w : {t_mtp + 1U, t_mtp + 2U, t_max}) {
+                    if (w > t_mtp && w <= t_max) { widths |= 1U << w; }
+                }
+                for (std::uint32_t w = t_mtp + 1U; w <= t_max; ++w) {
+                    if (((widths >> w) & 1U) == 0) { continue; }
+                    impl->graph_allowance_bytes = checked_add(
+                        impl->graph_allowance_bytes, family_allowance(w), "lookup graph allowance");
+                }
+            }
         } else {
             const auto profiles =
                 dflash_graph_profiles(impl->inputs.capacity, impl->inputs.draft_window);
@@ -1584,6 +1604,18 @@ void apply_lossy_prefill(const LossyPrefillOptions& lossy) {
     if (lossy.tp_ar_payload_int8) { execution::qwen4_force_prefill_moe_int8(); }
 }
 
+// The widest window a round verifies past its anchor. MTP with --prompt-lookup: lookup windows up
+// to kMaximumMtpDraftTokens, the MTP's own drafts stay at --draft-tokens. Otherwise
+// --draft-tokens.
+std::uint32_t verified_draft_window(const EngineOptions& options) {
+    if (options.speculative.prompt_lookup &&
+        options.speculative.backend == SpeculativeBackend::Mtp &&
+        options.purpose != EnginePurpose::CausalScoring) {
+        return std::max(options.speculative.draft_tokens, kMaximumMtpDraftTokens);
+    }
+    return options.speculative.draft_tokens;
+}
+
 } // namespace
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
@@ -1604,7 +1636,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .max_concurrency        = options.max_concurrency,
         .prefill_chunk          = std::min(options.prefill_chunk, options.max_context),
         .kv_lease_window_tokens = options.kv_lease_window_tokens,
-        .draft_window           = options.speculative.draft_tokens,
+        .draft_window           = verified_draft_window(options),
+        .mtp_drafts             = options.speculative.draft_tokens,
         .speculative_backend    = options.speculative.backend,
         .kv_storage             = options.kv_cache,
         .proposal_head          = options.speculative.proposal_head,
@@ -1791,10 +1824,11 @@ std::uint64_t active_kv_host_pinned_bytes(const Config& config, const EngineOpti
     const bool mtp            = options.speculative.backend == SpeculativeBackend::Mtp;
     const std::uint64_t lanes = std::max(options.max_concurrency, 1U);
     const std::uint64_t mtp_pages64 =
-        pages64 + (mtp ? lanes * ((static_cast<std::uint64_t>(options.speculative.draft_tokens) +
-                                   static_cast<std::uint64_t>(kPagedKVPageSize) - 2U) /
-                                  static_cast<std::uint64_t>(kPagedKVPageSize))
-                       : 0U);
+        pages64 +
+        (mtp ? lanes * ((static_cast<std::uint64_t>(detail::verified_draft_window(options)) +
+                         static_cast<std::uint64_t>(kPagedKVPageSize) - 2U) /
+                        static_cast<std::uint64_t>(kPagedKVPageSize))
+             : 0U);
     if (mtp_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("active KV in RAM: the MTP pool's page count exceeds uint32");
     }

@@ -284,6 +284,26 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    // --prompt-lookup: off unless given, MTP only.
+    const ServeOptions lookup_off =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});
+    const ServeOptions lookup_on = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                          "--draft-tokens", "3", "--prompt-lookup"});
+    failures +=
+        check(!lookup_off.speculative.prompt_lookup && lookup_on.speculative.prompt_lookup &&
+                  lookup_on.speculative.draft_tokens == 3,
+              "--prompt-lookup was not parsed");
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--prompt-lookup"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                   "--draft-tokens", "4", "--lm-head-draft", "--prompt-lookup"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--prompt-lookup without --spec mtp was accepted");
+    }
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",
