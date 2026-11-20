@@ -23,6 +23,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# MSVC: C17 for the C sources, UTF-8 sources, the conforming preprocessor and front end, and
+# __cplusplus reporting the real standard. No effect on other compilers.
+if(MSVC)
+  set(CMAKE_C_STANDARD 17)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/Zc:preprocessor;/permissive-;/Zc:__cplusplus>"
+                      "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:preprocessor,/Zc:__cplusplus>")
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
