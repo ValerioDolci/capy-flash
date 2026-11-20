@@ -593,6 +593,46 @@ void test_hybrid_members() {
     expect(!hybrid_members(std::vector<int>{}, big), "hybrid: no members");
 }
 
+// The pool's cpus once NINFER_HOST_MOE_CPUS is applied, which is the list the hybrid check of the
+// chunk-sized gate/up items must see: an explicit list of P-cores only is not a hybrid pool.
+void test_pool_cpus_env() {
+    using ninfer::ops::host::apply_cpu_env;
+    using ninfer::ops::host::hybrid_members;
+    const std::vector<int> big    = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    const std::vector<int> spread = {0, 2, 16, 17};
+    std::vector<int> cpus         = spread;
+    expect(apply_cpu_env(cpus, false, "0-7") && cpus == std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7}),
+           "cpu env: the variable replaces the spread and makes the list explicit");
+    expect(!hybrid_members(cpus, big), "cpu env: a P-core list is not a hybrid pool");
+    cpus = spread;
+    expect(!apply_cpu_env(cpus, false, nullptr) && cpus == spread,
+           "cpu env: unset keeps the spread");
+    expect(!apply_cpu_env(cpus, false, "") && cpus == spread, "cpu env: empty keeps the spread");
+    expect(hybrid_members(cpus, big), "cpu env: the spread over both kinds stays hybrid");
+    cpus = {0, 1};
+    expect(apply_cpu_env(cpus, true, "16-19") && cpus == std::vector<int>({0, 1}),
+           "cpu env: an explicit caller list (--expert-cpus) wins over the variable");
+    bool threw = false;
+    try {
+        cpus = spread;
+        (void)apply_cpu_env(cpus, false, "3-1");
+    } catch (const std::invalid_argument& e) {
+        threw = std::string(e.what()).rfind("NINFER_HOST_MOE_CPUS: ", 0) == 0;
+    }
+    expect(threw, "cpu env: a malformed list throws and names the variable");
+
+    // The mailbox's decision (resolve_pool_cpus): the hybrid check sees the list the variable left.
+    using ninfer::ops::host::resolve_pool_cpus;
+    expect(!resolve_pool_cpus(spread, false, "0-7", true, false, big).gguf_fine,
+           "pool: a P-core variable list takes no chunk-sized items");
+    expect(resolve_pool_cpus(spread, false, nullptr, true, false, big).gguf_fine,
+           "pool: the spread over both kinds takes them");
+    expect(resolve_pool_cpus({0, 1, 16}, true, "0-7", true, false, big).gguf_fine,
+           "pool: an explicit hybrid list wins over a P-core variable");
+    expect(resolve_pool_cpus(spread, false, nullptr, false, true, big).gguf_fine,
+           "pool: without the tp-2 rule the caller's choice is kept");
+}
+
 } // namespace
 
 int main() {
@@ -607,6 +647,7 @@ int main() {
     test_cpu_list();
     test_big_core_members();
     test_hybrid_members();
+    test_pool_cpus_env();
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape
     test_layer(rng, 5, 256, 128, false);  // small shape: one row tile, odd expert count

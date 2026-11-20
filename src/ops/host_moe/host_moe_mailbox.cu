@@ -444,16 +444,13 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     if (const char* v = std::getenv("NINFER_HOST_GGUF_ECORE_TAIL"); v != nullptr && *v != 0) {
         config_.executor.gguf_ecore_tail = std::max(std::atoi(v), 0); // with BIG_GATHER
     }
-    const char* cpus_env = std::getenv("NINFER_HOST_MOE_CPUS");
-    if (!config_.cpus_explicit && cpus_env != nullptr && *cpus_env != 0) {
-        // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
-        try {
-            config_.cpus = parse_cpu_list(cpus_env);
-        } catch (const std::invalid_argument& error) {
-            throw std::invalid_argument(std::string("NINFER_HOST_MOE_CPUS: ") + error.what());
-        }
-        config_.cpus_explicit = true;
-    }
+    // gguf_fine on the final list: an explicit list of P-cores only is not a hybrid pool.
+    PoolCpus pool = resolve_pool_cpus(
+        std::move(config_.cpus), config_.cpus_explicit, std::getenv("NINFER_HOST_MOE_CPUS"),
+        config_.gguf_fine_on_hybrid, config_.executor.gguf_fine, big_core_cpus());
+    config_.cpus               = std::move(pool.cpus);
+    config_.cpus_explicit      = pool.explicit_list;
+    config_.executor.gguf_fine = pool.gguf_fine;
     if (config_.cpus_explicit) {
         // A cpu outside the affinity used to abort in a worker thread ("cannot pin a thread").
         for (const int cpu : config_.cpus) {
