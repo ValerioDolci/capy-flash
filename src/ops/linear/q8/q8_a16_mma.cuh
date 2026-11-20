@@ -225,7 +225,10 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
         }
     };
 
-    const int nkt = padded_k / BK;
+    // K tiles that hold a column of K. A tile wholly inside the padding (K = 320 is padded to 384)
+    // contracts zero weights with zero-filled activations and leaves every accumulator as it is
+    // (an accumulator starts at +0 and is never -0), so it is skipped: the bits of the full loop.
+    const int nkt = FullK ? padded_k / BK : (k + BK - 1) / BK;
     stage_x(0, 0);
     stage_w(0);
     ninfer::ops::cp_commit();

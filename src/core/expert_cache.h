@@ -358,6 +358,15 @@ public:
     void reclaim_front(std::int32_t count, std::span<const std::vector<std::int32_t>> profile,
                        std::span<const std::int32_t> rank = {});
 
+    /**
+     * Between windows: completes `layer` from `profile` (hottest first, as reclaim_layers:
+     * ExpertCachePolicy::top_up fills its free capacity with the profile's experts it does not
+     * hold), e.g. after set_active_columns() gave columns back. The insertions are staged: the next
+     * submit_fills() or reclaim queues them. Nothing for a frozen cache or a lent layer (its
+     * reclaim completes it).
+     */
+    void top_up(std::int32_t layer, std::span<const std::int32_t> profile);
+
     [[nodiscard]] bool lending() const noexcept { return lent_count_ > 0; }
 
     [[nodiscard]] std::int32_t lent_first() const noexcept { return lent_first_; }

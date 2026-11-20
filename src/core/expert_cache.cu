@@ -772,6 +772,15 @@ void ExpertCache::reclaim_front(std::int32_t count,
     poll();
 }
 
+void ExpertCache::top_up(std::int32_t layer, std::span<const std::int32_t> profile) {
+    if (fenced_ != launched_) { throw std::logic_error("expert cache: top_up inside a window"); }
+    if (frozen_ || lent(layer)) { return; }
+    std::vector<Insert> inserts;
+    policy_.top_up(layer, profile, inserts);
+    for (const Insert& ins : inserts) { stage(ins, layer); }
+    counters_.inserts += static_cast<std::int64_t>(inserts.size());
+}
+
 void ExpertCache::set_active_columns(std::int32_t columns, std::span<const cudaStream_t> streams) {
     check_streams(streams);
     if (fenced_ != launched_) {

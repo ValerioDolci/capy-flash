@@ -25,6 +25,7 @@ struct QsaSelectPlan {
     std::int32_t tiles_per_lane; // ceil(W / tile_columns)
     std::int32_t pass_tiles;     // tiles per pass
     std::int32_t max_blocks;     // score row length
+    std::int32_t max_row_blocks; // longest row the envelope holds: max_visible_keys / ratio
 };
 
 [[nodiscard]] QsaSelectPlan qsa_select_plan(std::uint32_t max_visible_keys, std::int32_t ratio,
@@ -55,8 +56,13 @@ void qsa_attention_launch(const Tensor& q, const Tensor& selected, const Tensor&
                           float* partial, Tensor& out, cudaStream_t stream,
                           std::int32_t split_columns);
 
-// The decode staging cache's ways for a region of `cache_blocks` blocks per layer: 4, or 1 (direct
-// mapped) when they do not divide into whole sets.
-[[nodiscard]] int qsa_staging_ways(std::int32_t cache_blocks);
+// The top-k stage of qsa_select alone, over score rows the caller wrote at the start of `scratch`
+// (qsa_select_scratch_bytes(plan) bytes; one pass's rows, [kTileColumns slots per
+// tile][max_blocks], reused by every pass as qsa_select reuses them): the same routes and scratch
+// as qsa_select.
+void qsa_topk_launch(const QsaSelectPlan& plan, std::int32_t ratio, std::int32_t budget,
+                     const std::int32_t* cache_positions, const std::int32_t* valid_columns,
+                     std::int32_t width, std::int32_t lanes, float* scratch, std::int32_t* selected,
+                     std::int32_t max_selected, std::int32_t* counts, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

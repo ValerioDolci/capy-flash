@@ -28,4 +28,20 @@ void launch_q8_a16_warp_row_r2_w2_p5(const Tensor& x, const Weight& w, Tensor& o
                                                             LinearIdentityEpilogue{}, stream);
     });
 }
+
+void launch_q8_a16_warp_row_r4_p10_t8(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream) {
+    q8_with_output(out, out.ne[0], [&](auto output) {
+        launch_q8_a16_warp_row<q8_instances::WarpRowR4P10T8>(q8_linear_operands(x, w), output,
+                                                             LinearIdentityEpilogue{}, stream);
+    });
+}
+
+void launch_q8_a16_warp_row_r4_p3_t8(const Tensor& x, const Weight& w, Tensor& out,
+                                     cudaStream_t stream) {
+    q8_with_output(out, out.ne[0], [&](auto output) {
+        launch_q8_a16_warp_row<q8_instances::WarpRowR4P3T8>(q8_linear_operands(x, w), output,
+                                                            LinearIdentityEpilogue{}, stream);
+    });
+}
 } // namespace ninfer::ops::detail

@@ -39,6 +39,9 @@ render_tool_call_parse(const RequestLogContext& context, const GenerationOutcome
 [[nodiscard]] OperationalRecord render_response_failure(std::uint64_t request_id,
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);
+// The cause of an Engine-wide failure, reported by the first request it failed.
+[[nodiscard]] OperationalRecord render_engine_failure_cause(std::uint64_t request_id,
+                                                            std::string_view detail);
 
 class OperationalLog {
 public:
@@ -63,6 +66,7 @@ public:
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
     void engine_failure() const;
+    void engine_failure_cause(std::uint64_t request_id, std::string_view detail) const;
 
 private:
     void write(OperationalRecord record) const;

@@ -576,6 +576,14 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
+    // An internal generation failure that left the Engine unavailable is the Engine-wide failure
+    // (the worker threw and failed every request): its text is the Engine's own diagnostic, the
+    // reason the server stops, so the first request it failed logs it once.
+    if (failure.phase == RequestFailurePhase::Generation &&
+        failure.classification == RequestFailureClass::Internal && service_ != nullptr &&
+        !service_->is_available() && !engine_failure_cause_logged_.exchange(true)) {
+        operational_log_.engine_failure_cause(context.id, failure.machine_message);
+    }
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {

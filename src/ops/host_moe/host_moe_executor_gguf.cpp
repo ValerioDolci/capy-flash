@@ -16,6 +16,9 @@ namespace {
 
 constexpr std::int32_t kGgufRows  = 32; // rows per item: one 32-value block of h, 32 outputs
 constexpr std::int32_t kGgufChunk = 8;  // rows decoded per decode_rows call (stay in L1)
+// Options::gguf_fine: calls of at most this many tokens take the chunk-sized gate/up items.
+constexpr std::int32_t kGgufFineTokens = 8;
+constexpr std::int32_t kGgufFineItems = 2 * kGgufRows / kGgufChunk; // gate and up chunks of a slice
 
 std::size_t align64(std::size_t v) { return (v + 63) / 64 * 64; }
 
@@ -81,6 +84,35 @@ void HostMoeExecutor::gguf_call() {
             }
         }
     }
+    gguf_fine_call_ = options_.gguf_fine && job_->tokens <= kGgufFineTokens;
+    // A slice buffer holds kGgufFineTokens pairs: an expert routed twice by one token keeps the
+    // slice items.
+    for (std::int32_t u = 0; gguf_fine_call_ && u < unique_count_; ++u) {
+        if (pair_begin_[static_cast<std::size_t>(u) + 1] -
+                pair_begin_[static_cast<std::size_t>(u)] >
+            kGgufFineTokens) {
+            gguf_fine_call_ = false;
+        }
+    }
+    if (gguf_fine_call_) {
+        ++gguf_fine_calls_;
+        const std::size_t slices =
+            static_cast<std::size_t>(max_top_k_) * kGgufFineTokens * (intermediate_ / kGgufRows);
+        if (gguf_fine_slices_ < slices) {
+            const std::size_t floats = slices * kGgufRows * kGgufFineTokens;
+            gguf_fine_gate_.assign(floats, 0.0F);
+            gguf_fine_up_.assign(floats, 0.0F);
+            gguf_fine_done_   = std::make_unique<std::atomic<std::int32_t>[]>(slices);
+            gguf_fine_slices_ = slices;
+        }
+        const auto used = static_cast<std::size_t>(unique_count_) * (intermediate_ / kGgufRows);
+        if (used > gguf_fine_slices_) {
+            throw std::logic_error("host MoE executor: fine gate/up slices out of range");
+        }
+        for (std::size_t i = 0; i < used; ++i) {
+            gguf_fine_done_[i].store(0, std::memory_order_relaxed);
+        }
+    }
     for (auto& n : gguf_next_) n.store(0, std::memory_order_relaxed);
     pool_.run(&HostMoeExecutor::gguf_body, this);
 }
@@ -124,7 +156,57 @@ void HostMoeExecutor::gguf_member(std::int32_t member) {
     // Gate/up: items (expert u, 32 intermediate rows s); h of each of its pairs.
     const std::int32_t U = unique_count_, slices = I / kGgufRows;
     const std::int32_t items = U * slices;
-    for (std::int32_t it; (it = claim(gguf_next_[1], items)) < items;) {
+    if (gguf_fine_call_) {
+        // One item = one 8-row chunk of the gate or the up half of slice (u, s); the slice's
+        // results land in shared buffers laid out as the slice item's own (rows x pairs).
+        const std::int32_t fine_items = items * kGgufFineItems;
+        for (std::int32_t it; (it = claim(gguf_next_[1], fine_items)) < fine_items;) {
+            const std::int32_t us = it / kGgufFineItems, sub = it % kGgufFineItems;
+            const std::int32_t u = us / slices, s = us % slices;
+            const std::int32_t half = sub / (kGgufRows / kGgufChunk);
+            const std::int32_t c    = sub % (kGgufRows / kGgufChunk);
+            const std::int32_t e    = unique_[static_cast<std::size_t>(u)];
+            const std::int32_t p0   = pair_begin_[static_cast<std::size_t>(u)];
+            const std::int32_t n    = pair_begin_[static_cast<std::size_t>(u) + 1] - p0;
+            for (std::int32_t i = 0; i < n; ++i) {
+                me.acts[static_cast<std::size_t>(i)] =
+                    gguf_x_.get() +
+                    gguf_x_bytes_ *
+                        static_cast<std::size_t>(pair_token_[static_cast<std::size_t>(p0 + i)]);
+            }
+            const std::int32_t row_e = g.host_slots != nullptr ? g.host_slots[e] : e;
+            const std::uint8_t* base = g.gate_up_rows + (static_cast<std::size_t>(row_e) * 2 * I +
+                                                         static_cast<std::size_t>(half) * I +
+                                                         static_cast<std::size_t>(s) * kGgufRows +
+                                                         static_cast<std::size_t>(c) * kGgufChunk) *
+                                                            g.gate_up_row_bytes;
+            float* fg =
+                gguf_fine_gate_.data() + static_cast<std::size_t>(us) * kGgufRows * kGgufFineTokens;
+            float* fu =
+                gguf_fine_up_.data() + static_cast<std::size_t>(us) * kGgufRows * kGgufFineTokens;
+            decode_rows(g.gate_up, base, g.gate_up_row_bytes, kGgufChunk, H, me.dec.get());
+            K.gemm_decoded(g.gate_up, me.dec.get(), kGgufChunk, H, me.acts.data(), n,
+                           (half == 0 ? fg : fu) + static_cast<std::size_t>(c) * kGgufChunk * n,
+                           static_cast<std::size_t>(n));
+            // The slice's last chunk (acq_rel: it sees the other members' chunks) finishes it.
+            if (gguf_fine_done_[static_cast<std::size_t>(us)].fetch_add(
+                    1, std::memory_order_acq_rel) != kGgufFineItems - 1) {
+                continue;
+            }
+            for (std::int32_t i = 0; i < n; ++i) {
+                alignas(64) float gv[kGgufRows], uv[kGgufRows], hv[kGgufRows];
+                for (std::int32_t r = 0; r < kGgufRows; ++r) {
+                    gv[r] = fg[static_cast<std::size_t>(r) * n + i];
+                    uv[r] = fu[static_cast<std::size_t>(r) * n + i];
+                }
+                K.silu_mul(gv, uv, hv, kGgufRows);
+                K.quantize_pack_q8_0_half_q8f32(
+                    hv, s / 2, s % 2,
+                    gguf_h_.get() + gguf_h_bytes_ * static_cast<std::size_t>(p0 + i));
+            }
+        }
+    }
+    for (std::int32_t it; !gguf_fine_call_ && (it = claim(gguf_next_[1], items)) < items;) {
         const std::int32_t u = it / slices, s = it % slices;
         const std::int32_t e  = unique_[static_cast<std::size_t>(u)];
         const std::int32_t p0 = pair_begin_[static_cast<std::size_t>(u)];

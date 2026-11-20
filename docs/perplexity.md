@@ -40,6 +40,13 @@ report is `report.json` under `profiles/perplexity/` unless `--output` supplies 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`.
 
+Each window is prefilled in chunks of 1,024 tokens. `--prefill-chunk N` (a multiple of 128)
+takes wider chunks. With offloaded experts (the 64 GB edition) a chunk copies each layer's
+non-resident experts to the GPU once, so a wider chunk copies them for more tokens at a time:
+on two 16 GB GPUs the quick long-context profile scores about 3,900 tokens per second at 8,192
+and about 700 at 1,024. The chunk width can change the last digits of a score, so compare runs
+with the same chunk; the report's `execution` block records it as `prefill_chunk_tokens`.
+
 ## Two GPUs
 
 An artifact too large for one board is scored across two with the `--tp 2 --devices A,B` of

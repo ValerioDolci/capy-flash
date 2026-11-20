@@ -395,8 +395,9 @@ int run(const Options& o) {
     for (const KvCacheStorage storage : o.storages) {
         const PagedKVStorageLayout layout = paged_kv_storage_layout(storage, kHeadDim);
         for (const int depth : o.depths) {
-            const int capacity = depth + 64;
-            const int pages    = (capacity + kPage - 1) / kPage;
+            const int capacity =
+                depth + std::max(64, *std::max_element(o.widths.begin(), o.widths.end()));
+            const int pages = (capacity + kPage - 1) / kPage;
             std::vector<int> table(pages);
             for (int p = 0; p < pages; ++p) { table[p] = pages - 1 - p; } // reversed physical pages
             DeviceBuffer d_table(pages * 4), d_rows(4);

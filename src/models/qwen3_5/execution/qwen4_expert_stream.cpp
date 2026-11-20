@@ -11,13 +11,11 @@ namespace ninfer::models::qwen3_5::execution {
 
 Qwen4ExpertStream::Qwen4ExpertStream(Config config) : config_(std::move(config)) {
     const Config& c = config_;
-    if (c.layers <= 0 || c.experts <= 0 || c.partitions < 1 ||
-        c.ring_slots < (c.experts + c.partitions - 1) / c.partitions || c.ring_first < 0 ||
-        c.tables == nullptr || c.bank_base.size() != static_cast<std::size_t>(c.layers) * 4 ||
-        c.partitions < 1 || c.partition < 0 || c.partition >= c.partitions ||
+    if (c.layers <= 0 || c.experts <= 0 || c.partitions < 1 || c.tables == nullptr ||
+        c.bank_base.size() != static_cast<std::size_t>(c.layers) * 4 || c.partitions < 1 ||
+        c.partition < 0 || c.partition >= c.partitions ||
         (!c.streamable.empty() && c.streamable.size() != static_cast<std::size_t>(c.layers))) {
-        throw std::invalid_argument("Qwen4Exp expert stream: invalid configuration (the ring needs "
-                                    "at least one layer of this device's partition)");
+        throw std::invalid_argument("Qwen4Exp expert stream: invalid configuration");
     }
     for (std::size_t q = 0; q < 4; ++q) {
         if (config_.pool_stride[q] == 0) { config_.pool_stride[q] = c.plane_bytes[q]; }
@@ -31,12 +29,15 @@ Qwen4ExpertStream::Qwen4ExpertStream(Config config) : config_(std::move(config))
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
     ready_.assign(static_cast<std::size_t>(c.layers), nullptr);
     done_.assign(static_cast<std::size_t>(c.layers), nullptr);
+    mixed_.assign(static_cast<std::size_t>(c.layers), nullptr);
     exchanged_.assign(static_cast<std::size_t>(c.layers), nullptr);
     for (std::int32_t l = 0; l < c.layers; ++l) {
         CUDA_CHECK(
             cudaEventCreateWithFlags(&ready_[static_cast<std::size_t>(l)], cudaEventDisableTiming));
         CUDA_CHECK(
             cudaEventCreateWithFlags(&done_[static_cast<std::size_t>(l)], cudaEventDisableTiming));
+        CUDA_CHECK(
+            cudaEventCreateWithFlags(&mixed_[static_cast<std::size_t>(l)], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&exchanged_[static_cast<std::size_t>(l)],
                                             cudaEventDisableTiming));
     }
@@ -46,9 +47,9 @@ Qwen4ExpertStream::Qwen4ExpertStream(Config config) : config_(std::move(config))
                              cudaHostAllocPortable));
     host_tables_ = static_cast<std::int32_t*>(host);
     issued_.assign(static_cast<std::size_t>(c.layers), 0);
+    next_.assign(static_cast<std::size_t>(c.layers), 0);
     recorded_.assign(static_cast<std::size_t>(c.layers), 0);
     selection_.assign(static_cast<std::size_t>(c.layers), nullptr);
-    owner_.assign(static_cast<std::size_t>(c.ring_slots), -1);
 }
 
 Qwen4ExpertStream::~Qwen4ExpertStream() {
@@ -60,6 +61,9 @@ Qwen4ExpertStream::~Qwen4ExpertStream() {
     for (cudaEvent_t e : done_) {
         if (e != nullptr) { (void)cudaEventDestroy(e); }
     }
+    for (cudaEvent_t e : mixed_) {
+        if (e != nullptr) { (void)cudaEventDestroy(e); }
+    }
     for (cudaEvent_t e : exchanged_) {
         if (e != nullptr) { (void)cudaEventDestroy(e); }
     }
@@ -67,10 +71,17 @@ Qwen4ExpertStream::~Qwen4ExpertStream() {
     if (host_tables_ != nullptr) { (void)cudaFreeHost(host_tables_); }
 }
 
-void Qwen4ExpertStream::begin_window(const expert_cache::ExpertCache* cache,
-                                     cudaEvent_t wait_first) {
+void Qwen4ExpertStream::begin_window(const expert_cache::ExpertCache* cache, cudaEvent_t wait_first,
+                                     std::int32_t ring_first, std::int32_t ring_slots) {
+    if (ring_first < 0 ||
+        ring_slots < (config_.experts + config_.partitions - 1) / config_.partitions) {
+        throw std::invalid_argument("Qwen4Exp expert stream: the ring needs at least one layer of "
+                                    "this device's partition");
+    }
     cache_      = cache;
     wait_first_ = wait_first;
+    ring_first_ = ring_first;
+    ring_slots_ = ring_slots;
     // The previous window's last expert kernel (stream order covers the earlier ones) still owns
     // the ring until it completes.
     if (last_recorded_ >= 0) {
@@ -80,9 +91,10 @@ void Qwen4ExpertStream::begin_window(const expert_cache::ExpertCache* cache,
     }
     open_ = true;
     std::fill(issued_.begin(), issued_.end(), 0);
+    std::fill(next_.begin(), next_.end(), 0);
     std::fill(recorded_.begin(), recorded_.end(), 0);
     std::fill(selection_.begin(), selection_.end(), nullptr);
-    std::fill(owner_.begin(), owner_.end(), -1);
+    owner_.assign(static_cast<std::size_t>(ring_slots), -1);
     cursor_    = 0;
     waited_    = -1;
     wait_next_ = nullptr;
@@ -106,7 +118,7 @@ void Qwen4ExpertStream::wait_for(std::int32_t owner) {
     waited_ = owner;
 }
 
-void Qwen4ExpertStream::issue(std::int32_t layer) {
+void Qwen4ExpertStream::issue(std::int32_t layer, bool enqueued_owners_only) {
     if (!open_) { throw std::logic_error("Qwen4Exp expert stream: no open window"); }
     if (!streams(layer)) {
         throw std::logic_error("Qwen4Exp expert stream: layer " + std::to_string(layer) +
@@ -135,7 +147,7 @@ void Qwen4ExpertStream::issue(std::int32_t layer) {
             const std::int64_t dpitch = c.pool_stride[q];
             const std::int64_t spitch = bytes * c.partitions;
             std::byte* dst =
-                c.pool_base[q] + static_cast<std::int64_t>(c.ring_first + run_slot) * dpitch;
+                c.pool_base[q] + static_cast<std::int64_t>(ring_first_ + run_slot) * dpitch;
             const std::byte* src = c.bank_base[static_cast<std::size_t>(layer) * 4 + q] +
                                    static_cast<std::int64_t>(run_expert) * bytes;
             if (dpitch == bytes && spitch == bytes) {
@@ -154,7 +166,9 @@ void Qwen4ExpertStream::issue(std::int32_t layer) {
         stats_.bytes += expert_bytes_ * run_length;
         run_length = 0;
     };
-    for (std::int32_t e = 0; e < c.experts; ++e) {
+    issued_[static_cast<std::size_t>(layer)] = 1;
+    std::int32_t e                           = next_[static_cast<std::size_t>(layer)];
+    for (; e < c.experts; ++e) {
         if (e % c.partitions != c.partition) {
             table[e] = -1; // the other GPU's expert: no copy, the run continues past it
             continue;
@@ -171,8 +185,11 @@ void Qwen4ExpertStream::issue(std::int32_t layer) {
             continue;
         }
         const std::int32_t position = cursor_;
-        cursor_                     = cursor_ + 1 == c.ring_slots ? 0 : cursor_ + 1;
         const std::int32_t owner    = owner_[static_cast<std::size_t>(position)];
+        if (enqueued_owners_only && owner >= 0 && recorded_[static_cast<std::size_t>(owner)] == 0) {
+            break;
+        }
+        cursor_               = cursor_ + 1 == ring_slots_ ? 0 : cursor_ + 1;
         const bool contiguous = run_length > 0 && run_expert + run_length * c.partitions == e &&
                                 run_slot + run_length == position;
         if (!contiguous) { flush(); }
@@ -183,14 +200,15 @@ void Qwen4ExpertStream::issue(std::int32_t layer) {
             run_slot   = position;
         }
         ++run_length;
-        table[e] = c.ring_first + position;
+        table[e] = ring_first_ + position;
     }
     flush();
+    next_[static_cast<std::size_t>(layer)] = e;
+    if (e < c.experts) { return; }
     CUDA_CHECK(cudaMemcpyAsync(config_.tables + static_cast<std::size_t>(layer) * c.experts, table,
                                sizeof(std::int32_t) * static_cast<std::size_t>(c.experts),
                                cudaMemcpyHostToDevice, copy_));
     CUDA_CHECK(cudaEventRecord(ready_[static_cast<std::size_t>(layer)], copy_));
-    issued_[static_cast<std::size_t>(layer)] = 1;
     ++stats_.layers;
 }
 
@@ -198,7 +216,7 @@ void Qwen4ExpertStream::acquire(std::int32_t layer, cudaStream_t compute) {
     if (layer < 0 || layer >= config_.layers) {
         throw std::out_of_range("Qwen4Exp expert stream: layer " + std::to_string(layer));
     }
-    if (!issued(layer)) { issue(layer); }
+    if (!complete(layer)) { issue(layer); }
     CUDA_CHECK(cudaStreamWaitEvent(compute, ready_[static_cast<std::size_t>(layer)], 0));
 }
 
@@ -210,11 +228,22 @@ void Qwen4ExpertStream::release(std::int32_t layer, cudaStream_t compute) {
     // The next streamed layer (a pageable layer in between runs on the CPU path, no copies).
     std::int32_t next = layer + 1;
     while (next < config_.layers && !streams(next)) { ++next; }
-    if (next < config_.layers && !issued(next)) { issue(next); }
+    if (next < config_.layers && !complete(next)) { issue(next); }
+}
+
+void Qwen4ExpertStream::mixer_exchanged(std::int32_t layer, cudaStream_t compute) {
+    if (!defer_ || !open_ || layer < 0 || layer + 1 >= config_.layers || issued(layer + 1) ||
+        !streams(layer + 1)) {
+        return;
+    }
+    const ScopedCurrentDevice scope(config_.device);
+    CUDA_CHECK(cudaEventRecord(mixed_[static_cast<std::size_t>(layer)], compute));
+    wait_next_ = mixed_[static_cast<std::size_t>(layer)];
+    issue(layer + 1, /*enqueued_owners_only=*/true);
 }
 
 void Qwen4ExpertStream::exchanged(std::int32_t layer, cudaStream_t compute) {
-    if (!defer_ || !open_ || layer < 0 || layer + 1 >= config_.layers || issued(layer + 1) ||
+    if (!defer_ || !open_ || layer < 0 || layer + 1 >= config_.layers || complete(layer + 1) ||
         !streams(layer + 1)) {
         return;
     }

@@ -307,4 +307,54 @@ bool PeerMailbox::hang_reported() const noexcept {
 
 void PeerMailbox::report_hang() noexcept { *static_cast<volatile std::uint32_t*>(hang_) = 1u; }
 
+namespace {
+struct WideL2Prefetch {
+    const void* data[kL2PrefetchKernelRanges]    = {};
+    std::uint32_t bytes[kL2PrefetchKernelRanges] = {};
+    int ranges                                   = 0;
+};
+
+// Worker w issues chunks w, w + workers, ... of every range (detail::peer_prefetch_l2's loop).
+__global__ void l2_prefetch_kernel(WideL2Prefetch prefetch) {
+    const std::uint64_t worker  = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::uint64_t workers = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (int r = 0; r < prefetch.ranges; ++r) {
+        const auto* base = static_cast<const std::uint8_t*>(prefetch.data[r]);
+        for (std::uint64_t offset = worker * detail::kPeerPrefetchChunk; offset < prefetch.bytes[r];
+             offset += workers * detail::kPeerPrefetchChunk) {
+            const auto bytes = static_cast<std::uint32_t>(
+                min(static_cast<std::uint64_t>(detail::kPeerPrefetchChunk),
+                    prefetch.bytes[r] - offset));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + offset),
+                         "r"(bytes)
+                         : "memory");
+        }
+    }
+}
+} // namespace
+
+void l2_prefetch(std::span<const PeerL2Range> ranges, cudaStream_t stream) {
+    WideL2Prefetch prefetch{};
+    std::uint64_t chunks = 0;
+    for (const PeerL2Range& range : ranges) {
+        if (prefetch.ranges == kL2PrefetchKernelRanges) { break; }
+        const auto begin           = reinterpret_cast<std::uintptr_t>(range.data);
+        const std::uintptr_t first = (begin + 15u) & ~std::uintptr_t{15};
+        const std::uintptr_t last  = (begin + range.bytes) & ~std::uintptr_t{15};
+        if (range.data == nullptr || last <= first) { continue; }
+        const std::size_t bytes         = std::min<std::size_t>(last - first, std::size_t{1} << 30);
+        prefetch.data[prefetch.ranges]  = reinterpret_cast<const void*>(first);
+        prefetch.bytes[prefetch.ranges] = static_cast<std::uint32_t>(bytes);
+        chunks += (bytes + detail::kPeerPrefetchChunk - 1) / detail::kPeerPrefetchChunk;
+        ++prefetch.ranges;
+    }
+    if (prefetch.ranges == 0) { return; }
+    constexpr int kThreads = 256;
+    const auto blocks      = static_cast<int>(
+        std::min<std::uint64_t>((chunks + kThreads - 1) / kThreads,
+                                     static_cast<std::uint64_t>(detail::kPeerPrefetchMaxBlocks)));
+    l2_prefetch_kernel<<<blocks, kThreads, 0, stream>>>(prefetch);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops

@@ -711,7 +711,8 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
                        ops::HostExchange::Payload payload,
                        const std::array<std::vector<std::int32_t>, 2>& groups, int calls,
                        bool mixed, std::uint32_t seed, const ExecutionContext& ec,
-                       ops::HostExchange& exchange, const ops::PeerEvents& events) {
+                       ops::HostExchange& exchange, const ops::PeerEvents& events,
+                       const std::vector<std::int32_t>& combines = {}) {
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
     auto a                  = make_partial(count, seed);
     auto b                  = make_partial(count, seed + 1);
@@ -743,6 +744,14 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
             for (const std::int32_t n : groups[rank]) {
                 exchange.columns_ready(rank, first, n);
                 first += n;
+            }
+        }
+        // Early combines of leading columns (combine_columns); finish combines the rest.
+        for (const std::int32_t n : combines) {
+            if (exchange.combine_columns(n) !=
+                (payload == ops::HostExchange::Payload::FP16 || ne0 % 32 != 0)) {
+                std::cerr << label << ": combine_columns accepted the wrong payload\n";
+                return 1;
             }
         }
         exchange.finish_sum_f32();
@@ -1122,6 +1131,15 @@ int main(int argc, char** argv) {
         failures +=
             run_pipelined_case("pipelined int8 [17,5] falls back to fp16", 17, 5, Payload::INT8,
                                {{{0, 5}, {2, 3}}}, 1, false, 317u, ec, exchange, host_events);
+        failures += run_pipelined_case("pipelined fp16 [2560,100] early combines 30+34, rest",
+                                       kHidden, 100, Payload::FP16, {{{10, 40, 50}, {64, 36}}}, 3,
+                                       false, 321u, ec, exchange, host_events, {30, 34});
+        failures += run_pipelined_case("pipelined fp16 [2560,96] early combines of every column",
+                                       kHidden, 96, Payload::FP16, {{{32, 64}, {96}}}, 2, true,
+                                       323u, ec, exchange, host_events, {32, 0, 64});
+        failures += run_pipelined_case("pipelined int8 [2560,100] early combines refused", kHidden,
+                                       100, Payload::INT8, {{{10, 40, 50}, {64, 36}}}, 2, false,
+                                       325u, ec, exchange, host_events, {50});
         failures += run_int8_special_case(ec, exchange);
         failures += run_abandoned_case(ec, exchange, host_events);
         ops::HostExchange wide(ec);

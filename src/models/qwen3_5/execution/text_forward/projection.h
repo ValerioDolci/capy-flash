@@ -14,6 +14,8 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/tp2/linear_add.h"
 
+#include <algorithm>
+
 namespace ninfer::models::qwen3_5::execution {
 
 // Abandons the HostExchange sum a forward opened (null: none) when the work before its
@@ -47,6 +49,20 @@ Qwen4Taps* TextForward<Arena>::exchange_taps() const {
 }
 
 template <class Arena>
+void TextForward<Arena>::mixer_exchanged(std::int32_t layer) {
+    // The routed-expert backend of a Text layer may start the next layer's expert copies.
+    if constexpr (kExecute) {
+        if (moe_ffn() && layer >= 0 && static_cast<std::size_t>(layer) < mtp_layer()) {
+            each([&](int r) {
+                routed_experts(r, static_cast<std::size_t>(layer))->mixer_exchanged(layer, s(r));
+            });
+        }
+    } else {
+        (void)layer;
+    }
+}
+
+template <class Arena>
 void TextForward<Arena>::output_projection(const RankTensors& x,
                                            std::array<const LinearParameters*, 2> p, RankTensors& y,
                                            const RankTensors& staging, std::int32_t layer,
@@ -63,6 +79,52 @@ void TextForward<Arena>::output_projection(const RankTensors& x,
         auto scope           = scopes();
         RankTensors part     = alloc(DType::FP32, {hidden(), T});
         RankTensors stage    = alloc(DType::FP32, {hidden(), T});
+        if (mixer_tail_ != nullptr && last_ > kPrefillOutputSliceColumns) {
+            // The FFN mixer of one slice (prefill_output_slice: under 1.5 slices) runs above the
+            // partials.
+            const std::int32_t widest =
+                std::min(last_, kPrefillOutputSliceColumns + kPrefillOutputSliceColumns / 2 - 1);
+            reserve(ops::hyper_connection_mix_workspace_bytes(std::min(first_, widest), widest,
+                                                              true, hidden(), hc_rank()));
+        }
+        if constexpr (kExecute) {
+            // A prompt chunk wider than one slice projects and sends by column slices, so the
+            // exchange of a slice travels while the next ones are projected (a Linear's columns
+            // are independent, and narrowing and combining are elementwise: the bits of one
+            // call). The teacher-forcing taps read whole partials and keep the one call.
+            ops::HostExchange* sliced =
+                c(0).prefill && T > kPrefillOutputSliceColumns && exchange_taps() == nullptr
+                    ? tp_.events->host_exchange()
+                    : nullptr;
+            if (sliced != nullptr &&
+                sliced->begin_sum_f32(part, stage, &y, prefill_moe_exchange().payload,
+                                      *tp_.execution)) {
+                const OpenExchangeSum open_sum{sliced};
+                each([&](int r) {
+                    for (std::int32_t first = 0, n = 0; first < T; first += n) {
+                        n                = prefill_output_slice(first, T);
+                        auto slice_scope = scopes();
+                        Tensor out       = part[at(r)].slice(1, first, n);
+                        linear(r, x[at(r)].slice(1, first, n), *p[at(r)], out);
+                        sliced->columns_ready(r, first, n);
+                    }
+                });
+                // A hyper-connection block's mixer output: the work that follows it up to the
+                // FFN (combine into the residual, FFN mixer) is per column, so each slice goes on
+                // as soon as it has arrived instead of the ranks idling until the last one has.
+                if (MixerTail* tail = mixer_tail_) {
+                    for (std::int32_t first = 0, n = 0; first < T; first += n) {
+                        n = prefill_output_slice(first, T);
+                        if (!sliced->combine_columns(n)) { break; } // INT8 payload: one combine
+                        hc_mix_columns(*tail, first, n);
+                        tail->ran = true;
+                    }
+                }
+                sliced->finish_sum_f32();
+                mixer_exchanged(layer);
+                return;
+            }
+        }
         each([&](int r) { linear(r, x[at(r)], *p[at(r)], part[at(r)]); });
         if constexpr (kExecute) {
             (void)staging;
@@ -82,6 +144,7 @@ void TextForward<Arena>::output_projection(const RankTensors& x,
                 pipe->columns_ready(0, 0, T);
                 pipe->columns_ready(1, 0, T);
                 pipe->finish_sum_f32();
+                mixer_exchanged(layer);
             } else {
                 ops::allreduce_sum_f32(part, stage, &y, *tp_.execution, *tp_.events);
             }

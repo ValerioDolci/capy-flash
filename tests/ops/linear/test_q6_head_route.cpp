@@ -1,5 +1,6 @@
 // The tp-2 Q6 output head half [124160, 2560]: the shape's selector routes 2..8 columns to the
-// 32 x 8 sliced-K tile, which gives the same bits as the 32 x 16 route it replaced.
+// 32 x 8 sliced-K tile, which gives the same bits as the 32 x 16 tile (the two share the K split
+// and the reduction).
 #include "ops/linear/linear_test_common.h"
 #include "ops/linear/q6/q6_launch.h"
 #include "ops/linear/q6/q6_shapes.h"

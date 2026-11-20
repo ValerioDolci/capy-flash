@@ -209,6 +209,7 @@ private:
     std::thread watch_thread_;
     bool watch_stopping_ = false;
     std::atomic<bool> engine_failed_{false};
+    std::atomic<bool> engine_failure_cause_logged_{false};
 };
 
 } // namespace ninfer::serve

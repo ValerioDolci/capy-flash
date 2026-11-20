@@ -50,6 +50,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <future>
 #include <thread>
 #include <utility>
 
@@ -75,6 +77,15 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// One NINFER_QWEN4_PLE_TIMING line: `what` over columns [first, first + count), since t0.
+void log_ple_timing(const char* what, std::size_t first, std::size_t count,
+                    std::chrono::steady_clock::time_point t0) {
+    if (ple_timing()) {
+        std::fprintf(stderr, "ple_timing %s first=%zu count=%zu ms=%.1f\n", what, first, count,
+                     ms_since(t0));
+    }
+}
+
 class NextChunkPlePrefetch {
 public:
     NextChunkPlePrefetch()                                       = default;
@@ -95,10 +106,7 @@ public:
             try {
                 const auto t0 = std::chrono::steady_clock::now();
                 gather.prefetch(history, first, count);
-                if (ple_timing()) {
-                    std::fprintf(stderr, "ple_timing prefetch first=%zu count=%zu ms=%.1f\n", first,
-                                 count, ms_since(t0));
-                }
+                log_ple_timing("prefetch", first, count, t0);
             } catch (...) {
                 // A hint: a failed prefetch leaves the next gather to read the rows itself.
             }
@@ -106,6 +114,66 @@ public:
     }
 
 private:
+    std::thread thread_;
+};
+
+// A tp 2 prompt chunk's PLE gather on a helper thread, started before the chunk's first device
+// work: the PLE layer is not the first one, so the devices run the layers before it while the
+// rows are read and decoded, and the PLE layer waits for them and uploads (PendingPleRows). The
+// thread then issues the next chunk's prefetch, as NextChunkPlePrefetch does after a gather on
+// the calling thread. The bytes gathered and uploaded are those of the synchronous order.
+// Joined on scope exit: the staging is free for the next chunk.
+class ChunkPleGather final : public PendingPleRows {
+public:
+    ChunkPleGather()                                 = default;
+    ChunkPleGather(const ChunkPleGather&)            = delete;
+    ChunkPleGather& operator=(const ChunkPleGather&) = delete;
+
+    ~ChunkPleGather() {
+        if (thread_.joinable()) { thread_.join(); }
+    }
+
+    // Gathers columns [first, first + count) of `history` into `out`, then prefetches up to
+    // `next` columns after them.
+    void start(PleGather& gather, std::span<const std::int32_t> history, std::size_t first,
+               std::size_t count, std::span<std::uint16_t> out, std::size_t next) {
+        host    = out.data();
+        done_   = gathered_.get_future();
+        thread_ = std::thread([this, &gather, history, first, count, out, next] {
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                gather.gather(history, first, count, out);
+                log_ple_timing("gather", first, count, t0);
+                gathered_.set_value();
+            } catch (...) {
+                gathered_.set_exception(std::current_exception());
+                return;
+            }
+            const std::size_t begin = first + count;
+            if (next == 0 || begin >= history.size()) { return; }
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                gather.prefetch(history, begin, std::min(next, history.size() - begin));
+                log_ple_timing("prefetch", begin, std::min(next, history.size() - begin), t0);
+            } catch (...) {
+                // A hint: a failed prefetch leaves the next gather to read the rows itself.
+            }
+        });
+    }
+
+    [[nodiscard]] bool started() const noexcept { return host != nullptr; }
+
+    // Returns once the rows are in the staging; the first call rethrows the gather's error.
+    void wait() override {
+        if (!done_.valid()) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        done_.get();
+        log_ple_timing("wait", 0, 0, t0);
+    }
+
+private:
+    std::promise<void> gathered_;
+    std::future<void> done_;
     std::thread thread_;
 };
 
@@ -466,7 +534,8 @@ auto TextContext::qwen4_chunk_inputs(std::span<const int> ids, int len, int base
                                      std::span<const std::int32_t> rope_rows,
                                      std::span<const std::int32_t> visual_columns,
                                      std::int32_t merged_begin, const VisionChunk& vision_chunk,
-                                     std::uint32_t ple_width) -> Qwen4ChunkInputs {
+                                     std::uint32_t ple_width, PendingPleRows* pending_ple)
+    -> Qwen4ChunkInputs {
     const int width   = qwen4_width();
     const auto arenas = qwen4_arenas();
     Qwen4ChunkInputs in;
@@ -503,16 +572,21 @@ auto TextContext::qwen4_chunk_inputs(std::span<const int> ids, int len, int base
             in.visual->embeddings[r] = merged.slice(1, merged_begin, visual_count);
             in.visual->indices[r]    = indices;
         }
-        if (config_.ple && width == 2) { upload_chunk_ple(in, rank, len, ple_width); }
+        if (config_.ple && width == 2) { upload_chunk_ple(in, rank, len, ple_width, pending_ple); }
     }
     return in;
 }
 
-// Rank `rank`'s copy of the chunk's PLE rows from rank 0's host staging.
-void TextContext::upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len,
-                                   std::uint32_t ple_width) {
+// Rank `rank`'s copy of the chunk's PLE rows from rank 0's host staging, or only its storage
+// when the gather is still running (`pending`).
+void TextContext::upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len, std::uint32_t ple_width,
+                                   PendingPleRows* pending) {
     const auto r = static_cast<std::size_t>(rank);
     in.ple[r] = qwen4_arenas()[r]->alloc(DType::BF16, {static_cast<std::int32_t>(ple_width), len});
+    if (pending != nullptr) {
+        pending->rows[r] = in.ple[r]; // the PLE layer uploads once the gather has ended
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(in.ple[r].data, forward_runtimes()[0]->ple_host, in.ple[r].bytes(),
                                cudaMemcpyHostToDevice, rank_stream(rank)));
 }
@@ -567,6 +641,11 @@ PrefillChunkResult TextContext::forward_prefill(std::span<const int> ids,
     const int split_rel          = has_split ? static_cast<int>(split_abs - base_i) : -1;
 
     int len = static_cast<int>(std::min<std::int64_t>(prefill_chunk_, T));
+    // A routed-expert backend lends the workspace of the wide chunks from memory it shares with
+    // the KV: no wider than it can lend now.
+    if (runtime[0]->experts != nullptr) {
+        len = std::min(len, runtime[0]->experts->prompt_chunk_columns());
+    }
     if (split_rel > 0 && len > split_rel) { len = split_rel; }
     // The Vision session caps the chunk at the next item and, on an item's first chunk, encodes it
     // (on the tower's rank, copying the merged embeddings to the other rank's handoff at tp 2),
@@ -598,6 +677,21 @@ PrefillChunkResult TextContext::forward_prefill(std::span<const int> ids,
                                                      width == 2 ? runtime[1]->experts : nullptr};
     std::array<ArenaLoan, 2> loans;
     const bool lent_arena = experts[0] != nullptr && len > experts[0]->prompt_arena_columns();
+    // tp 2: the chunk's PLE rows are gathered while the window opens and the first layers run.
+    ChunkPleGather ple_rows;
+    if (config_.ple && width == 2) {
+        if (runtime[0]->ple_gather == nullptr || runtime[0]->ple_host == nullptr) {
+            throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
+        }
+        // The prompt continues in `prompt` beyond this call's `ids` (one chunk per call).
+        ple_rows.start(
+            *runtime[0]->ple_gather, std::span<const std::int32_t>(prompt.data(), prompt.size()),
+            base, static_cast<std::size_t>(len),
+            std::span<std::uint16_t>(runtime[0]->ple_host,
+                                     static_cast<std::size_t>(runtime[0]->ple_gather->width()) *
+                                         static_cast<std::size_t>(len)),
+            prefill_chunk_);
+    }
     if (experts[0] != nullptr) {
         experts[0]->prepare_prompt(len, base, static_cast<std::int64_t>(prompt.size()));
     }
@@ -650,19 +744,18 @@ PrefillChunkResult TextContext::forward_prefill(std::span<const int> ids,
                 history, base, static_cast<std::size_t>(len),
                 std::span<std::uint16_t>(runtime[0]->ple_host,
                                          static_cast<std::size_t>(ple_width) * len));
-            if (ple_timing()) {
-                std::fprintf(stderr, "ple_timing gather first=%u count=%d ms=%.1f\n", base, len,
-                             ms_since(gather_t0));
-            }
+            log_ple_timing("gather", base, static_cast<std::size_t>(len), gather_t0);
             // The prompt continues in `history` beyond this call's `ids` (one chunk per call).
             next_ple.start(*runtime[0]->ple_gather, history, static_cast<std::size_t>(base) + len,
                            prefill_chunk_);
         };
-        // Each width keeps its own host order: at tp 2 the gather precedes every rank's uploads,
-        // at one device it follows the chunk's other uploads.
-        if (config_.ple && width == 2) { gather_ple(); }
+        // Each width keeps its own host order: at tp 2 the gather runs beside the chunk
+        // (ple_rows) and each rank's PLE layer uploads its rows, at one device the gather follows
+        // the chunk's other uploads.
+        if (ple_rows.started()) { ple_width = runtime[0]->ple_gather->width(); }
         Qwen4ChunkInputs in = qwen4_chunk_inputs(ids, len, base_i, visual.rope_rows, visual.columns,
-                                                 visual.merged_begin, vision_chunk, ple_width);
+                                                 visual.merged_begin, vision_chunk, ple_width,
+                                                 ple_rows.started() ? &ple_rows : nullptr);
         if (config_.ple && width == 1) {
             gather_ple();
             upload_chunk_ple(in, 0, len, ple_width);
@@ -699,6 +792,7 @@ PrefillChunkResult TextContext::forward_prefill(std::span<const int> ids,
         TextForward<WorkspaceArena> forward = text_forward(ranks, len);
         std::optional<Qwen4SinkTap> feature_tap;
         if (sink != nullptr) { forward.set_feature_tap(&feature_tap.emplace(*this, *sink)); }
+        if (ple_rows.started()) { forward.set_pending_ple(&ple_rows); }
         forward.run(in.ids, config_.ple ? &in.ple : nullptr, xf, in.visual ? &*in.visual : nullptr);
         if (sink != nullptr) {
             sink->capture_positions(in.positions[0], s);

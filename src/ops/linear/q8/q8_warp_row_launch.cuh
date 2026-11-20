@@ -44,8 +44,20 @@ void launch_q8_a16_warp_row(const Q8LinearOperands& operands, Output output, Epi
     case 3:
         launch_tokens.template operator()<3>();
         break;
-    default:
+    case 4:
         launch_tokens.template operator()<4>();
+        break;
+    case 5:
+        launch_tokens.template operator()<5>();
+        break;
+    case 6:
+        launch_tokens.template operator()<6>();
+        break;
+    case 7:
+        launch_tokens.template operator()<7>();
+        break;
+    default:
+        launch_tokens.template operator()<8>();
         break;
     }
 }

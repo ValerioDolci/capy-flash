@@ -137,7 +137,7 @@ public:
     // The ranges are consumed by that one launch (a later exchange prefetches nothing unless set
     // again); each is shrunk to whole 16-byte units, empty ones dropped. A hint never changes a
     // result bit.
-    static constexpr int kL2PrefetchRanges = 4;
+    static constexpr int kL2PrefetchRanges = 8; // a Q8 weight takes two (codes, scales)
     void set_l2_prefetch(int rank, std::span<const PeerL2Range> ranges);
 
     // Bytes per exchange the owner's hints should cover (0: the owner sets none). The Program sets
@@ -189,5 +189,12 @@ private:
 
     mutable L2Hint l2_hint_[2];
 };
+
+// Prefetches `ranges` (each shrunk to whole 16-byte units, at most kL2PrefetchKernelRanges, each
+// at most 1 GiB) into the L2 of the stream's device with one small kernel that issues bulk
+// prefetches and exits. Its blocks retire about as fast as DRAM serves the lines, so a caller that
+// must not wait for them issues it on a stream of its own. Timings only, never a result bit.
+inline constexpr int kL2PrefetchKernelRanges = 12;
+void l2_prefetch(std::span<const PeerL2Range> ranges, cudaStream_t stream);
 
 } // namespace ninfer::ops

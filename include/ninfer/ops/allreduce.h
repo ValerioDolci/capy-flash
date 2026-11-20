@@ -247,6 +247,11 @@ public:
 
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
+    // Sizes the pinned buffers for column-group exchanges (begin_sum_f32) of up to `elements`
+    // FP32 values, so the widest prompt chunk does not stop both devices to grow them on its
+    // first exchange. Call with both devices idle (startup).
+    void reserve_sum_f32(std::size_t elements, const ExecutionContext& ec);
+
     // ---- The TP2 prefill MoE exchange, by column groups, with a narrow payload ----------------
     //
     // One FP32 summing all-reduce of the per-rank partials P_r (contiguous FP32 [H, T], H = ne[0],
@@ -293,6 +298,14 @@ public:
                                      const std::array<Tensor, 2>* bf16_out, Payload payload,
                                      const ExecutionContext& ec);
     void columns_ready(int rank, std::int64_t first, std::int64_t count);
+    // Combines the next `count` columns of the open call (the ones after those already combined)
+    // on both ranks' streams, each behind the arrival of the peer's groups that hold them, so the
+    // caller can enqueue work that reads these columns of the result while later groups are
+    // still on the links. Both ranks have reported them. The combine is elementwise: the bits of
+    // finish_sum_f32, which then combines only the columns left and closes the call as before
+    // (it still waits for the peer's reads of each rank's host buffer). FP16 payload only:
+    // returns false, enqueuing nothing, for an INT8 call.
+    [[nodiscard]] bool combine_columns(std::int64_t count);
     void finish_sum_f32();
     // Closes the open call without combining, for a caller that failed between begin_sum_f32 and
     // finish_sum_f32: each rank's stream waits for the copies already enqueued, after which
@@ -361,6 +374,9 @@ private:
         std::int64_t rows = 0, columns = 0;
         std::array<std::int64_t, 2> done{0, 0};
         std::array<std::size_t, 2> groups{0, 0}, chunks{0, 0};
+        // Columns already combined (combine_columns), and where each rank's groups end.
+        std::int64_t combined = 0;
+        std::array<std::vector<std::int64_t>, 2> group_end;
     };
 
     Pending pending_;
@@ -371,6 +387,8 @@ private:
     std::array<cudaEvent_t, 2> begun_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> received_{nullptr, nullptr};
     std::array<std::vector<cudaEvent_t>, 2> group_ready_, pipe_chunk_;
+    // group_arrived_[r][g]: the peer's group g is in staging[r] (recorded on receive_[r]).
+    std::array<std::vector<cudaEvent_t>, 2> group_arrived_;
 
     // Split-phase lanes. The send/receive streams are shared by the lanes (their calls are
     // issued in time order); everything else is per lane.

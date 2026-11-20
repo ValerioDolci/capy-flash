@@ -23,6 +23,7 @@
 #include "models/qwen3_5/program/qwen4_ple_runtime.h"
 #include "models/qwen3_5/program/qwen4_routed_expert_runtime.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
+#include "models/qwen3_5/program/planning/prompt_steps.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
 #include "models/qwen3_5/execution/qwen4_experts.h"
@@ -1393,6 +1394,16 @@ private:
     [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
         return kv_lease_window_tokens == 0 ? std::numeric_limits<std::uint32_t>::max()
                                            : std::max(prefill_chunk, kv_lease_window_tokens);
+    }
+
+    // The tokens of the next prefill step, `segment` tokens before the next capture frontier or
+    // the end of the prompt (runtime_support::prompt_step_tokens): equal widths for routed experts
+    // while their cache lends a whole chunk.
+    [[nodiscard]] std::uint32_t prompt_step_tokens(std::uint32_t segment) const noexcept {
+        const bool equal_widths =
+            qwen4_routed.experts != nullptr && qwen4_routed.experts->prompt_chunk_columns() >=
+                                                   static_cast<std::int64_t>(prefill_chunk);
+        return runtime_support::prompt_step_tokens(segment, prefill_chunk, equal_widths);
     }
 
     // One round's Backend requirement can sit a whole draft window above the frontier the

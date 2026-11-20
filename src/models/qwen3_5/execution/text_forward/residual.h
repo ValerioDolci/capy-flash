@@ -17,6 +17,9 @@
 #include "ninfer/ops/scatter.h"
 #include "ops/host_moe/host_moe_mailbox.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -124,16 +127,38 @@ void TextForward<Arena>::hc_block(std::size_t layer, const RankTensors* ple_embe
         ple(layer, *ple_embedding, st.wide);
     }
     hc_mix(st, &Qwen4BlockParameters::attention_hc, layer);
-    // A hyper-connection model's attention is QSA (qwen4_extensions binds both).
-    if (!attention) {
-        gdn(layer, st.mixed, st.y[at(st.next)], compact, st.staging_bf16);
-    } else {
-        qsa(layer, st.mixed, &st.y[at(st.next)], static_cast<std::uint32_t>(compact),
-            st.staging_bf16);
+    const std::size_t hc_prefetch = hc_exchange_prefetch();
+    if (hc_prefetch != 0) { hc_stage_prefetch(hc_ffn_hint(layer, hc_prefetch)); }
+    // The mixer's output projection is its last work; a sliced one (tp 2 prompt chunk) runs the
+    // FFN mixer slice by slice inside its exchange (MixerTail).
+    MixerTail tail{&st, &Qwen4BlockParameters::ffn_hc, layer};
+    {
+        struct Offer {
+            MixerTail*& slot;
+
+            ~Offer() { slot = nullptr; }
+        } offer{mixer_tail_};
+
+        mixer_tail_ = &tail;
+        // A hyper-connection model's attention is QSA (qwen4_extensions binds both).
+        if (!attention) {
+            gdn(layer, st.mixed, st.y[at(st.next)], compact, st.staging_bf16);
+        } else {
+            qsa(layer, st.mixed, &st.y[at(st.next)], static_cast<std::uint32_t>(compact),
+                st.staging_bf16);
+        }
     }
     st.pending = st.next;
     st.next ^= 1;
-    hc_mix(st, &Qwen4BlockParameters::ffn_hc, layer); // commits the mixer output in the same pass
+    if (tail.ran) {
+        st.pending = -1; // committed and mixed by the output projection
+    } else {
+        hc_mix(st, &Qwen4BlockParameters::ffn_hc, layer); // commits the mixer output too
+    }
+    if (hc_prefetch != 0) {
+        hc_stage_prefetch(hc_next_hint(layer));
+        stage_wait_prefetch(layer);
+    }
     ffn(layer, st.mixed, st.y[at(st.next)], st.staging_bf16, st.staging_fp32);
     st.pending = st.next;
     st.next ^= 1;
@@ -142,6 +167,118 @@ void TextForward<Arena>::hc_block(std::size_t layer, const RankTensors* ple_embe
             hc_commit(st);
             capture_taps(*taps, static_cast<std::int32_t>(layer), st.wide);
         }
+    }
+}
+
+// The hyper-connection block's decode prefetch (graph decode at tp 2 through the mailbox; eager
+// rounds, staged exchanges and NINFER_TP_EXCHANGE_PREFETCH_KIB=0 leave all of it off). Rank 1
+// spins in the MoE exchange and rank 0 waits there for the host's experts; each prefetches the
+// next layer's HC mixer and mixer input meanwhile, up to half its L2 (rank 0's join waits for
+// the rest of the prefetch only when the host is quicker).
+inline std::size_t hc_half_l2(int device) {
+    static std::array<std::atomic<std::size_t>, 16> cached{};
+    if (device < 0 || device >= static_cast<int>(cached.size())) { return 0; }
+    std::size_t bytes = cached[static_cast<std::size_t>(device)].load(std::memory_order_relaxed);
+    if (bytes == 0) {
+        int l2 = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
+        bytes = static_cast<std::size_t>(std::max(l2, 0)) / 2;
+        cached[static_cast<std::size_t>(device)].store(bytes, std::memory_order_relaxed);
+    }
+    return bytes;
+}
+
+inline std::size_t hc_append_tensor(const Tensor& t, std::size_t bytes, ExchangePrefetch& out) {
+    const std::size_t n = std::min<std::size_t>(t.bytes(), bytes);
+    if (t.data != nullptr && n != 0) { out.push_back({t.data, n}); }
+    return n;
+}
+
+// The leading whole rows of `w` within `bytes` (codes, then scales); returns their bytes.
+inline std::size_t hc_append_weight(const Weight& w, std::size_t bytes, ExchangePrefetch& out) {
+    const std::size_t row = prefetch_row_bytes(w, PrefetchFormats::HyperConnection);
+    if (row == 0) { return 0; }
+    const auto rows = std::min<std::int64_t>(w.n, static_cast<std::int64_t>(bytes / row));
+    append_prefetch_rows(w, 0, rows, out, PrefetchFormats::HyperConnection);
+    return static_cast<std::size_t>(rows) * row;
+}
+
+template <class Arena>
+std::size_t TextForward<Arena>::hc_exchange_bytes() const {
+    return static_cast<std::size_t>(hidden()) * static_cast<std::size_t>(columns()) * sizeof(float);
+}
+
+// The mailbox budget (NINFER_TP_EXCHANGE_PREFETCH_KIB) of the block's FP32 exchanges, 0 when off.
+template <class Arena>
+std::size_t TextForward<Arena>::hc_exchange_prefetch() const {
+    if constexpr (kExecute) {
+        if (width_ == 2 && !c(0).prefill) {
+            return exchange_prefetch_budget(*tp_.events, *tp_.execution, hc_exchange_bytes());
+        }
+    }
+    return 0;
+}
+
+template <class Arena>
+void TextForward<Arena>::hc_stage_prefetch(const std::array<ExchangePrefetch, 2>& hint) {
+    if constexpr (kExecute) {
+        stage_exchange_prefetch(*tp_.events, *tp_.execution, hc_exchange_bytes(), hint);
+    } else {
+        (void)hint;
+    }
+}
+
+template <class Arena>
+std::array<ExchangePrefetch, 2> TextForward<Arena>::hc_ffn_hint(std::size_t layer,
+                                                                std::size_t bytes) const {
+    std::array<ExchangePrefetch, 2> hint;
+    for (int r = 0; r < width_; ++r) {
+        ExchangePrefetch& out = hint[at(r)];
+        if (const auto* moe = std::get_if<Qwen4MoeParameters>(&block(r, layer).ffn)) {
+            std::size_t left = bytes;
+            left -= hc_append_tensor(moe->router, left, out);
+            if (moe->shared) { (void)hc_append_weight(moe->shared->gate_up.weight, left, out); }
+        }
+    }
+    return hint;
+}
+
+// Rank r's next HC mixer weights, then the leading rows of that layer's mixer input projection.
+template <class Arena>
+void TextForward<Arena>::append_hc_next(int r, std::size_t layer, std::size_t bytes,
+                                        ExchangePrefetch& out) const {
+    const Qwen4BlockParameters& next = block(r, layer);
+    std::size_t left                 = bytes;
+    left -= hc_append_weight(next.attention_hc.weights.down, left, out);
+    left -= hc_append_weight(next.attention_hc.weights.up, left, out);
+    if (const auto* g = std::get_if<GdnParameters>(&next.mixer)) {
+        append_mixer_input_prefetch(*g, left, out, PrefetchFormats::HyperConnection);
+    } else if (const auto* q = std::get_if<QsaParameters>(&next.mixer)) {
+        append_prefetch_prefix(q->projection.weight, left, out, PrefetchFormats::HyperConnection);
+    }
+}
+
+template <class Arena>
+std::array<ExchangePrefetch, 2> TextForward<Arena>::hc_next_hint(std::size_t layer) const {
+    std::array<ExchangePrefetch, 2> hint;
+    if (layer + 1 >= config_.layer_types.size()) { return hint; }
+    for (int r = 0; r < width_; ++r) {
+        // Rank 0's own wait covers its part (stage_wait_prefetch).
+        append_hc_next(r, layer + 1, r == 0 ? 0 : hc_half_l2(r_[at(r)].device), hint[at(r)]);
+    }
+    return hint;
+}
+
+template <class Arena>
+void TextForward<Arena>::stage_wait_prefetch(std::size_t layer) {
+    if constexpr (kExecute) {
+        const std::size_t bytes = hc_half_l2(r_[at(0)].device);
+        if (bytes == 0 || !moe_ffn() || layer + 1 >= config_.layer_types.size()) { return; }
+        ExchangePrefetch out;
+        append_hc_next(0, layer + 1, bytes, out);
+        routed_experts(0, layer)->set_wait_prefetch(out);
+    } else {
+        (void)layer;
     }
 }
 
@@ -178,6 +315,23 @@ void TextForward<Arena>::hc_mix(HcStreams& st,
         }
     });
     st.pending = -1;
+}
+
+template <class Arena>
+void TextForward<Arena>::hc_mix_columns(const MixerTail& tail, std::int32_t first, std::int32_t n) {
+    HcStreams& st = *tail.st;
+    each([&](int r) {
+        if constexpr (kExecute) {
+            const HyperConnectionParameters& hc = block(r, tail.layer).*tail.member;
+            Tensor wide                         = st.wide[at(r)].slice(1, first, n);
+            Tensor mixed                        = st.mixed[at(r)].slice(1, first, n);
+            Tensor inject        = st.inject[at(st.next ^ 1)][at(r)].slice(1, first, n);
+            const Tensor y       = st.y[at(st.next)][at(r)].slice(1, first, n);
+            const Tensor pending = st.inject[at(st.next)][at(r)].slice(1, first, n);
+            ops::hyper_connection_combine_mix(wide, y, pending, hc.weights, config_.rms_norm_eps,
+                                              mixed, &inject, work(r), s(r));
+        }
+    });
 }
 
 template <class Arena>
@@ -231,6 +385,12 @@ void TextForward<Arena>::ple(std::size_t layer, const RankTensors& embedding, Ra
                 rows.data == runtime->decode_ple_rows.data) {
                 ops::host::consume_host_flag(s(r), runtime->decode_ple_staged);
                 CUDA_CHECK(cudaMemcpyAsync(rows.data, runtime->decode_ple_host, rows.bytes(),
+                                           cudaMemcpyHostToDevice, s(r)));
+            }
+            // A prompt chunk's deferred rows: the host gather ends, then this rank uploads.
+            if (pending_ple_ != nullptr && rows.data == pending_ple_->rows[at(r)].data) {
+                pending_ple_->wait();
+                CUDA_CHECK(cudaMemcpyAsync(rows.data, pending_ple_->host, rows.bytes(),
                                            cudaMemcpyHostToDevice, s(r)));
             }
         }

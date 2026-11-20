@@ -260,7 +260,16 @@ One rule per prefill chunk: a text chunk of at least 768 tokens without a batche
 the half-chunk overlap (lanes 0 and 1); a shorter, multimodal or batched-tap chunk runs the column
 slices (one lane per slice, up to eight); a chunk under 256 tokens runs one call per all-reduce.
 The rule and both schedules belong to the plain residual (`TextForward::run_plain`, `prefill_overlap`, `prefill_slices`); the
-hyper-connection residual of Qwen4Exp runs one call per exchange. Under the overlap the chunk's two
+hyper-connection residual of Qwen4Exp has its own: the MoE exchange by column groups of the routed
+experts, the mixer output projected and exchanged by slices of 2048 columns (`output_projection`,
+chunks wider than one slice; each slice travels while the next ones are projected; once all are
+projected, each slice is combined as it arrives (`HostExchange::combine_columns`) and the FFN mixer
+runs on its columns while the later slices are still on the links, `MixerTail`: 15k / 54k tokens
+NVFP4 +4.4 / +3.8 %, GSQ-RCO +1.3 / +2.3 %, identical greedy texts), both through
+`HostExchange::begin_sum_f32`, whose pinned buffers the Program reserves at startup for the widest
+prompt chunk; and the chunk's PLE rows gathered on a helper thread while the layers before the PLE
+layer run (`PendingPleRows`). Measured on two RTX 5070 Ti, A B B A, cold prompts of 3.5k / 15k / 54k
+tokens: NVFP4 +3.6 / +8.7 / +4.0 %, GSQ-RCO +4.9 / +6.8 / +5.1 %, identical greedy texts. Under the overlap the chunk's two
 halves (`PlainHalf`: column views of the residual and staging, positions, RoPE, causal envelope)
 are two consecutive prompt chunks issued block by block, mixer A, mixer B, FFN A, FFN B, next
 layer's mixer A: each block binds its half's columns (half B's GDN source slot is the destination
@@ -391,7 +400,12 @@ is the `concat_rows` kernel: a 2D memcpy node, whose column count and buffers di
 profiles of one class, would fail the update with `ParametersChanged` only when a swap crossed such
 profiles, hence late and intermittently. Graph updates are never retried: a rejected update throws
 at both widths, and `update()` keeps a diagnostic that names the update result and the rejected
-node.
+node. One tier boundary changes the topology: on Qwen4Exp the decode tiers past
+`kQsaSplitTopkMinKeys` (81,920 visible keys, the longest row the one-CTA QSA top-k stages; the
+causal tiers end one tier there) also launch the split top-k (`ops/sparse_attention/kernels.cu`),
+and each column picks the split or the one-CTA kernel by its own length. A swap across that
+boundary re-instantiates the executable once (the update is rejected and `decode_graph.cpp` rebuilds it) instead of keeping a second
+topology class, whose graph allowance would take an expert slot per layer on one GPU.
 
 **Graph allowance.** At tp 1 the planner budgets graph classes from fixed constants. At tp 2 it
 uses the measured per-GPU values of [`core/tp2/device_tuning.h`](../../src/core/tp2/device_tuning.h):

@@ -61,5 +61,17 @@ int main() {
     failures +=
         check(ninfer::perplexity::usage_text().find("--tp 1|2 --devices A,B") != std::string::npos,
               "help omits --tp and --devices");
+    failures += check(single.prefill_chunk == 1024, "default prefill chunk is not 1024");
+    failures += check(parse({"--prefill-chunk", "8192"}).prefill_chunk == 8192,
+                      "--prefill-chunk did not set the chunk");
+    failures += check(rejects([] { (void)parse({"--prefill-chunk", "0"}); }),
+                      "--prefill-chunk 0 was accepted");
+    failures += check(rejects([] { (void)parse({"--prefill-chunk", "1000"}); }),
+                      "--prefill-chunk that is not a multiple of 128 was accepted");
+    failures += check(rejects([] { (void)parse({"--prefill-chunk"}); }),
+                      "--prefill-chunk without a value was accepted");
+    failures +=
+        check(ninfer::perplexity::usage_text().find("--prefill-chunk N") != std::string::npos,
+              "help omits --prefill-chunk");
     return failures == 0 ? 0 : 1;
 }

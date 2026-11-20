@@ -37,6 +37,7 @@
 // begin_window: the execution fails instead of returning logits without the CPU experts.
 
 #include "core/arena.h"
+#include "ninfer/ops/peer_mailbox.h"
 #include "core/expert_cache.h"
 #include "models/qwen3_5/execution/qwen4_expert_stream.h"
 #include "core/tensor.h"
@@ -125,6 +126,10 @@ public:
                      const Tensor& ids, const Tensor& weights, Tensor& partial,
                      WorkspaceArena& work, cudaStream_t stream) = 0;
 
+    // Decode at tp 2: L2 prefetch ranges the next run() issues once this rank's device experts are
+    // enqueued, while it waits for the host's experts. Timings only; the default ignores them.
+    virtual void set_wait_prefetch(std::span<const ops::PeerL2Range> ranges) { (void)ranges; }
+
     // True when routed()/run() only enqueue device work (no host synchronization), so a decode
     // round that calls them can be captured in a CUDA Graph.
     [[nodiscard]] virtual bool graph_capturable() const noexcept = 0;
@@ -145,14 +150,25 @@ public:
         return std::numeric_limits<std::int32_t>::max();
     }
 
+    // The widest prompt chunk the backend can run now: the workspace it can lend depends on the
+    // memory the KV leaves it, so the caller caps every chunk at this before prepare_prompt.
+    [[nodiscard]] virtual std::int32_t prompt_chunk_columns() const noexcept {
+        return std::numeric_limits<std::int32_t>::max();
+    }
+
     [[nodiscard]] virtual std::array<DeviceSpan, 2>
     prompt_workspace(std::span<const cudaStream_t> streams) {
         (void)streams;
         throw std::logic_error("Qwen4Exp routed experts: no lent prompt workspace");
     }
 
-    // tp 2: after `layer`'s MoE all-reduce was enqueued on `stream` (this rank's compute stream).
-    // The offload backend's prefill streamer issues the next layer's expert copies here.
+    // tp 2: after `layer`'s mixer all-reduce (mixer_exchanged) or MoE all-reduce (exchanged) was
+    // enqueued on `stream` (this rank's compute stream). The offload backend's prefill streamer
+    // issues the next layer's expert copies here (Qwen4ExpertStream::set_defer_to_exchange).
+    virtual void mixer_exchanged(std::int32_t layer, cudaStream_t stream) {
+        (void)layer, (void)stream;
+    }
+
     virtual void exchanged(std::int32_t layer, cudaStream_t stream) { (void)layer, (void)stream; }
 
     // Window hooks (header comment), on the execution thread.
@@ -261,7 +277,8 @@ struct Qwen4OffloadOptions {
     double gguf_link_us       = 100.0;
     // Borrowed prompt workspace: prompt chunks of more than `base_chunk` columns run on
     // `prompt_workspace_bytes` per GPU lent from the gate/up code plane of the cache layers just
-    // below the streaming ring, for the duration of the prompt
+    // below the streaming ring (the last Text layers when the ring holds elastic columns,
+    // Qwen4OffloadExperts::ring_columns), for the duration of the prompt
     // (reclaimed and refilled before the first decode window, as the ring). 0 = off.
     std::int32_t base_chunk             = 0;
     std::int64_t prompt_workspace_bytes = 0;
@@ -443,10 +460,18 @@ public:
 
     void prepare_prompt(std::int32_t columns, std::int64_t begin,
                         std::int64_t prompt_tokens) override;
+    void mixer_exchanged(std::int32_t layer, cudaStream_t stream) override;
     void exchanged(std::int32_t layer, cudaStream_t stream) override;
-    // Rank 1's exchanged() (Qwen4OffloadPeerExperts): rank 1's streamer.
+
+    void set_wait_prefetch(std::span<const ops::PeerL2Range> ranges) override {
+        wait_prefetch_.assign(ranges.begin(), ranges.end());
+    }
+
+    // Rank 1's mixer_exchanged() and exchanged() (Qwen4OffloadPeerExperts): rank 1's streamer.
+    void mixer_exchanged_peer(std::int32_t layer, cudaStream_t stream);
     void exchanged_peer(std::int32_t layer, cudaStream_t stream);
     [[nodiscard]] std::int32_t prompt_arena_columns() const noexcept override;
+    [[nodiscard]] std::int32_t prompt_chunk_columns() const noexcept override;
     [[nodiscard]] std::array<DeviceSpan, 2>
     prompt_workspace(std::span<const cudaStream_t> streams) override;
 
@@ -479,12 +504,18 @@ public:
     // ExpertCache::publish_lag in force.
     [[nodiscard]] std::int32_t publish_lag() const noexcept { return cache_->publish_lag(); }
 
-    // Elastic columns: ExpertCache::set_active_columns on every GPU of the cache, between
+    // Elastic columns: the first `columns` stay backed (the KV took the others), between
     // windows with the device idle. One column of plane q is elastic_column_bytes(q) contiguous
-    // bytes of every GPU's plane q.
+    // bytes of every GPU's plane q. The cache keeps them (ExpertCache::set_active_columns on
+    // every GPU) except the last ones while the prefill ring holds them (ring_columns): the ring
+    // keeps those of its columns that stay backed, or none when they no longer hold a layer of
+    // experts (the next prompt chunk places the ring again).
     void set_active_columns(std::int32_t columns);
 
-    [[nodiscard]] std::int32_t active_columns() const noexcept { return cache_->active_columns(); }
+    // The backed columns: the cache's and the ring's.
+    [[nodiscard]] std::int32_t active_columns() const noexcept {
+        return cache_->active_columns() + ring_columns_;
+    }
 
     [[nodiscard]] std::int32_t elastic_columns() const noexcept { return options_.elastic_columns; }
 
@@ -566,7 +597,8 @@ public:
     // Whether a prompt may lend the last `layers` Text layers (ring + workspace): they hold at most
     // a fraction of the Text layers' base slots (`layer_base`, layer_slot_profile), so the other
     // layers keep the rest of the residents: three quarters at tp 2, 0.9 at one GPU (room
-    // for a 8192-column prompt chunk next to the ring).
+    // for a 8192-column prompt chunk next to the ring). With the ring in elastic columns
+    // (workspace_layers) the workspace may take every Text layer.
     [[nodiscard]] static bool may_lend(std::span<const std::int32_t> layer_base,
                                        std::int32_t text_layers, std::int32_t layers,
                                        std::int32_t partitions);
@@ -597,6 +629,28 @@ public:
     // layers [0, end) do not; 1 when `end` <= 0).
     [[nodiscard]] static std::int32_t layers_below(std::span<const std::int32_t> layer_base,
                                                    std::int32_t end, std::int64_t slots);
+    // The prefill ring in elastic columns (one GPU, NVFP4 banks, ElasticKvOptions), for the
+    // prompts whose chunks borrow a workspace: instead of the
+    // base slots of the last Text layers the ring takes the last backed elastic columns (`layers`
+    // contiguous pool slots each, one per cache layer), which the cache gives up for the prompt
+    // (it keeps each layer's hottest experts in the other columns), so the base slots of every
+    // Text layer can hold the prompt workspace. Returns the columns the ring takes of `columns`
+    // backed ones: enough for two layers of experts plus the margin `ring_slots`
+    // (stream_ring_slots) has over one, so no layer's copies wait for the layer before it; fewer
+    // when the KV left fewer; 0 when they do not hold one layer of experts (the ring then
+    // takes the last Text layers, ring_layers).
+    [[nodiscard]] static std::int32_t ring_columns(std::int32_t ring_slots, std::int32_t layers,
+                                                   std::int32_t columns);
+    // Whole Text layers whose base slots hold a prompt chunk's workspace of `slots` slots of the
+    // lend plane: the layers just below the ring's `ring_layers` Text layers, where may_lend
+    // must allow both, or with `column_ring` (the ring in elastic columns, ring_columns) the last
+    // Text layers, any number of them (every layer keeps the residents of the cache's elastic
+    // columns). 0 when the workspace does not fit. The startup planner and the backend size the
+    // prompt chunks with this one rule.
+    [[nodiscard]] static std::int32_t workspace_layers(std::span<const std::int32_t> layer_base,
+                                                       std::int32_t text_layers,
+                                                       std::int32_t ring_layers, std::int64_t slots,
+                                                       std::int32_t partitions, bool column_ring);
 
 private:
     [[nodiscard]] Tensor layer_table(std::int32_t layer) const;
@@ -630,14 +684,33 @@ private:
     // Lends layers [first, text_layers_) (ring + borrowed workspace) for a prompt, growing an
     // existing smaller lending; between windows only.
     void lend_prompt_layers(std::int32_t first);
+    // The ring in elastic columns, between windows. ring_columns_now(): the columns it would
+    // take of those backed now (0: it takes the last Text layers). place_ring(columns) gives the
+    // ring that many (0: none): the cache shrinks to the other backed columns, after the residency
+    // of every layer was saved as its refill profile (keep_decode_residency); layers lent for the
+    // other placement of the ring are reclaimed first. release_ring_columns() returns them to the
+    // cache and completes the layers that are not lent from their saved residency (the lent ones
+    // are completed by their reclaim).
+    [[nodiscard]] std::int32_t ring_columns_now() const noexcept;
+    void place_ring(std::int32_t columns);
+    void release_ring_columns();
+
+    // The layer the borrowed workspace ends below: the ring's first layer, or with the ring in
+    // elastic columns the end of the Text layers.
+    [[nodiscard]] std::int32_t workspace_end() const noexcept {
+        return ring_columns_ > 0 ? text_layers_ : lend_first_;
+    }
+
     // Ends the lending (between windows) of the first `count` lent layers: they refill from
     // lent_profile_ (in profile-rank order across layers).
     void reclaim_lent(std::int32_t count);
     void refill_lent(std::int32_t count);
     // keep_decode_residency: saves the residency of layers [first, first + count) as their
     // refill profile (lent_profile_), most recently used first, before they are lent; a layer
-    // that already holds a saved profile (lent earlier in the same prompt) keeps it.
+    // that already holds a saved profile (lent earlier in the same prompt, or saved when the ring
+    // took elastic columns) keeps it. save_residency: the same without marking the layers lent.
     void save_lent_residency(std::int32_t first, std::int32_t count);
+    void save_residency(std::int32_t first, std::int32_t count);
     // Lent workspace layers a prompt chunk of `columns` needs.
     [[nodiscard]] std::int32_t workspace_layers_for(std::int32_t columns) const noexcept;
     // Chooses, per Text layer, the non-resident experts left to the CPU while streaming a chunk
@@ -751,20 +824,40 @@ private:
     cudaStream_t side_            = nullptr; // device reads of host experts
     cudaEvent_t fork_             = nullptr;
     cudaEvent_t join_             = nullptr;
+    // set_wait_prefetch(): consumed by the next run(), issued on prefetch_stream_ (on the compute
+    // stream its kernel would outlast a short host wait) and joined back into the
+    // compute stream by exchanged(), after the MoE exchange.
+    std::vector<ops::PeerL2Range> wait_prefetch_;
+    cudaStream_t prefetch_stream_        = nullptr;
+    cudaEvent_t prefetch_fork_           = nullptr;
+    cudaEvent_t prefetch_join_           = nullptr;
+    bool prefetch_pending_               = false;
+    unsigned long long prefetch_capture_ = 0; // capture id of the pending fork (0: not capturing)
     Tensor side_partial_; // routed() -> run(): FP32 [2560,T] of the device reads
 
     // Prefill streaming (null when off): the ring is the slots of the cache layers
-    // [lend_first_, lend_first_ + lend_count_), lent while prompts stream.
+    // [lend_first_, lend_first_ + lend_count_), lent while prompts stream, or the last
+    // ring_columns_ backed elastic columns (ring_columns; column_ring_: this backend may place
+    // it there). lent_for_column_ring_: the lent layers hold a workspace that ends at the last
+    // Text layer. column_residency_saved_: every layer's residency was saved when the ring took
+    // its columns and the layers not lent since still wait for their top-up.
     std::unique_ptr<Qwen4ExpertStream> stream_;
     std::unique_ptr<Qwen4ExpertStream> peer_stream_obj_; // tp 2: rank 1's partition
-    std::int32_t lend_first_ = 0; // the ring's layers [lend_first_, lend_first_ + lend_count_)
-    std::int32_t lend_count_ = 0;
-    bool streaming_          = false; // the open window streams
-    // Borrowed prompt workspace: the layers below the ring that hold it (0 = off), the
+    std::int32_t lend_first_     = 0; // the ring's layers [lend_first_, lend_first_ + lend_count_)
+    std::int32_t lend_count_     = 0;
+    bool column_ring_            = false;
+    std::int32_t ring_columns_   = 0;
+    bool lent_for_column_ring_   = false;
+    bool column_residency_saved_ = false;
+    bool streaming_              = false; // the open window streams
+    // Borrowed prompt workspace: the layers below the ring that hold the widest chunk planned
+    // next to a ring in the last Text layers (0 = none), the widest planned chunk whose
+    // workspace fits with the ring in the last Text layers / in elastic columns (0 = none), the
     // prepared width of the next prompt chunk, and whether each GPU's compute stream has waited
     // for the current lending.
     std::int32_t workspace_layers_ = 0;
-    std::int32_t prompt_columns_   = 0;
+    std::array<std::int32_t, 2> wide_columns_{};
+    std::int32_t prompt_columns_ = 0;
     std::array<bool, 2> lend_waited_{};
     std::array<std::byte*, 4> peer_pool_{};
     float* peer_divisors_ = nullptr;
@@ -852,6 +945,10 @@ public:
              cudaStream_t stream) override;
 
     [[nodiscard]] bool graph_capturable() const noexcept override { return true; }
+
+    void mixer_exchanged(std::int32_t layer, cudaStream_t stream) override {
+        if (owner_ != nullptr) { owner_->mixer_exchanged_peer(layer, stream); }
+    }
 
     void exchanged(std::int32_t layer, cudaStream_t stream) override {
         if (owner_ != nullptr) { owner_->exchanged_peer(layer, stream); }

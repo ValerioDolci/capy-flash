@@ -8,6 +8,9 @@
 // input at width 4. The columns are distinct and dense (random NVFP4 codes, random BF16
 // activations), so a different reduction order over K, a different activation precision or a
 // different K partition changes the rounding of many outputs.
+//
+// The dense Q8 projections of Flash-Next (A16Only before and after the prefill) are held to the
+// same rule at every registered Qwen4Exp shape, the two-device shards and the one-device problems.
 #include "core/device.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
@@ -39,8 +42,11 @@ using namespace ninfer::test;
 constexpr ops::LinearPolicy kPolicy = ops::LinearPolicy::AllowA4Decode;
 constexpr std::int32_t kAnchorWidth = 4;
 constexpr std::int32_t kMaxWidth    = 7;
-// Input columns 0..6: width w reads [0,w), the two anchor passes read [0,4) and [3,7).
-constexpr std::int32_t kColumns = kMaxWidth;
+// The widest call of the Flash-Next dense Q8 cases (A16Only keeps the T=4 bits up to T=16).
+constexpr std::int32_t kQ8MaxWidth = 16;
+// Input columns 0..15: width w reads [0,w), the anchor passes of width 4 read [0,4), [4,8), ...
+// and, when the widest call is not a multiple of 4, [max_width-4, max_width).
+constexpr std::int32_t kColumns = kQ8MaxWidth;
 // Independent input draws. A reduction-order change moves an A16 output across a BF16 rounding
 // boundary on only a few rows of 5120 per draw, so each width is compared over several draws.
 constexpr std::int32_t kDraws = 8;
@@ -78,8 +84,8 @@ quantized_weight::PackedWeight random_nvfp4(std::int32_t n, std::int32_t k, std:
     return packed;
 }
 
-struct DeviceNvfp4 {
-    explicit DeviceNvfp4(const quantized_weight::PackedWeight& packed)
+struct DeviceWeight {
+    explicit DeviceWeight(const quantized_weight::PackedWeight& packed)
         : buffer(packed.payload.size()) {
         buffer.copy_from_host(packed.payload.data(), packed.payload.size());
         weight = packed.device_weight(buffer.data());
@@ -88,6 +94,13 @@ struct DeviceNvfp4 {
     GuardedDeviceBuffer buffer;
     Weight weight{};
 };
+
+// A registered Q8 problem with pseudo-random codes and scales.
+quantized_weight::PackedWeight random_q8(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, n, k, seed,
+                                                   {quantized_weight::RowSplitScalePattern::Small,
+                                                    quantized_weight::RowSplitCodePattern::Hashed});
+}
 
 // kDraws sets of kColumns input columns [k] on the device; view(first, width) is
 // x[:, first:first+width] of the current draw.
@@ -143,6 +156,7 @@ struct Case {
     std::vector<OutputSpec> outputs;
     DeviceColumns* x;
     Pass pass;
+    std::int32_t max_width = kMaxWidth;
 };
 
 // Host bytes of every output, [output][column][row bytes].
@@ -180,34 +194,48 @@ std::size_t differing_elements(const std::vector<std::uint8_t>& a,
 }
 
 int check(const Case& c) {
-    int failures = 0;
-    std::vector<std::size_t> differing(kMaxWidth + 1, 0), values(kMaxWidth + 1, 0);
+    int failures                 = 0;
+    const std::int32_t max_width = c.max_width;
+    std::vector<std::int32_t> firsts;
+    for (std::int32_t first = 0; first + kAnchorWidth <= max_width; first += kAnchorWidth)
+        firsts.push_back(first);
+    const auto aligned = static_cast<std::int32_t>(firsts.size());
+    if (max_width % kAnchorWidth != 0) firsts.push_back(max_width - kAnchorWidth);
+    std::vector<std::size_t> differing(max_width + 1, 0), values(max_width + 1, 0);
     for (std::int32_t draw = 0; draw < kDraws; ++draw) {
         c.x->draw = draw;
-        // Column j's anchor: width 4 over [0,4) for j < 4, over [3,7) for j >= 4. Column 3 is
-        // computed in both passes, at token 3 and at token 0, and must agree.
-        const Columns low  = run(c, 0, kAnchorWidth, failures);
-        const Columns high = run(c, kMaxWidth - kAnchorWidth, kAnchorWidth, failures);
+        // Column j's anchor: the width-4 pass that holds it, [4*(j/4), 4*(j/4)+4) while that
+        // fits, the last pass otherwise. A column computed by two passes (at max_width 7, column 3
+        // at token 3 and at token 0) must agree.
+        std::vector<Columns> passes;
+        for (const std::int32_t first : firsts)
+            passes.push_back(run(c, first, kAnchorWidth, failures));
         Columns anchor(c.outputs.size());
         for (std::size_t o = 0; o < c.outputs.size(); ++o) {
-            for (std::int32_t j = 0; j < kColumns; ++j) {
-                anchor[o].push_back(j < kAnchorWidth ? low[o][j]
-                                                     : high[o][j - (kMaxWidth - kAnchorWidth)]);
+            for (std::int32_t j = 0; j < max_width; ++j) {
+                const std::int32_t p =
+                    std::min(j / kAnchorWidth, static_cast<std::int32_t>(firsts.size()) - 1);
+                anchor[o].push_back(passes[p][o][j - firsts[p]]);
             }
-            if (low[o][kAnchorWidth - 1] != high[o][0]) {
-                std::cerr << c.name << " " << c.outputs[o].name
-                          << ": T=4 column 3 changes with its token position\n";
-                ++failures;
+            if (aligned < static_cast<std::int32_t>(firsts.size())) {
+                const std::int32_t last = firsts.back();
+                for (std::int32_t j = last; j < aligned * kAnchorWidth; ++j) {
+                    if (passes.back()[o][j - last] != anchor[o][j]) {
+                        std::cerr << c.name << " " << c.outputs[o].name << ": T=4 column " << j
+                                  << " changes with its token position\n";
+                        ++failures;
+                    }
+                }
             }
-            const std::size_t nonzero =
-                differing_elements(low[o][0], std::vector<std::uint8_t>(low[o][0].size(), 0),
-                                   c.outputs[o].element_bytes);
+            const std::size_t nonzero = differing_elements(
+                passes[0][o][0], std::vector<std::uint8_t>(passes[0][o][0].size(), 0),
+                c.outputs[o].element_bytes);
             if (nonzero < static_cast<std::size_t>(c.outputs[o].rows) / 2) {
                 std::cerr << c.name << " " << c.outputs[o].name << ": T=4 output is mostly zero\n";
                 ++failures;
             }
         }
-        for (std::int32_t width = 1; width <= kMaxWidth; ++width) {
+        for (std::int32_t width = 1; width <= max_width; ++width) {
             if (width == kAnchorWidth) continue;
             const Columns got = run(c, 0, width, failures);
             for (std::size_t o = 0; o < c.outputs.size(); ++o) {
@@ -220,7 +248,7 @@ int check(const Case& c) {
         }
     }
     std::string changed;
-    for (std::int32_t width = 1; width <= kMaxWidth; ++width) {
+    for (std::int32_t width = 1; width <= max_width; ++width) {
         if (differing[width] == 0) continue;
         std::cerr << c.name << " T=" << width << ": " << differing[width] << " of " << values[width]
                   << " values differ from the T=4 columns\n";
@@ -228,14 +256,15 @@ int check(const Case& c) {
         ++failures;
     }
     std::cout << c.name << ": "
-              << (changed.empty() ? std::string("every column of T=1..7 has the T=4 bits")
-                                  : "T=" + changed + " differ from T=4")
+              << (changed.empty()
+                      ? "every column of T=1.." + std::to_string(max_width) + " has the T=4 bits"
+                      : "T=" + changed + " differ from T=4")
               << " (" << kDraws << " input draws)\n";
     return failures;
 }
 
 // Rank 0 of a row-parallel projection: linear_add over the input-column half, residual included.
-Case linear_add_half(std::int32_t k, DeviceNvfp4& weight, DeviceColumns& x,
+Case linear_add_half(std::int32_t k, DeviceWeight& weight, DeviceColumns& x,
                      const std::vector<std::uint16_t>& residual) {
     Case c;
     c.name    = "linear_add NVFP4 [5120," + std::to_string(k) + "]";
@@ -255,7 +284,7 @@ Case linear_add_half(std::int32_t k, DeviceNvfp4& weight, DeviceColumns& x,
 }
 
 // Rank 1 of the same projection: linear() over the other half.
-Case linear_half(std::int32_t k, DeviceNvfp4& weight, DeviceColumns& x) {
+Case linear_half(std::int32_t k, DeviceWeight& weight, DeviceColumns& x) {
     Case c;
     c.name    = "linear NVFP4 [5120," + std::to_string(k) + "]";
     c.outputs = {{"y", 5120, 2}};
@@ -270,8 +299,27 @@ Case linear_half(std::int32_t k, DeviceNvfp4& weight, DeviceColumns& x) {
     return c;
 }
 
+// A Flash-Next dense Q8 projection [n,k] through linear() under A16Only, FP32 output (BF16
+// rounding would hide most reduction-order changes on the narrow a|b rows).
+Case linear_q8(std::int32_t n, std::int32_t k, DeviceWeight& weight, DeviceColumns& x) {
+    Case c;
+    c.name      = "linear Q8 [" + std::to_string(n) + "," + std::to_string(k) + "]";
+    c.outputs   = {{"y", n, 4}};
+    c.x         = &x;
+    c.max_width = kQ8MaxWidth;
+    c.pass      = [&weight, &x, n, k](std::int32_t first, std::int32_t width, Outputs& out) {
+        constexpr ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
+        Tensor y                           = out.tensor(0, DType::FP32);
+        const std::size_t capacity =
+            ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, n, k, policy, width, width);
+        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::linear(x.view(first, width), weight.weight, y, policy, workspace, nullptr);
+    };
+    return c;
+}
+
 // The attention q|k|gate|v projection: one rank's head-local shard [7168,5120].
-Case attn_input_shard(DeviceNvfp4& weight, DeviceColumns& x) {
+Case attn_input_shard(DeviceWeight& weight, DeviceColumns& x) {
     Case c;
     c.name    = "attn_input_proj NVFP4 shard [7168,5120]";
     c.outputs = {{"q", 3072, 2}, {"gate", 3072, 2}, {"k", 512, 2}, {"v", 512, 2}};
@@ -293,7 +341,7 @@ Case attn_input_shard(DeviceNvfp4& weight, DeviceColumns& x) {
 // The GDN q|k|v|z projection of one rank's shard [8192,5120] as the conv snapshot and record forms
 // run it (ops/wrapper/gdn_input_proj.cpp, project_conv_shard): quantized exactly where the
 // single-parent snapshot form is, through the shard dispatch.
-Case gdn_input_conv_shard(DeviceNvfp4& weight, DeviceColumns& x) {
+Case gdn_input_conv_shard(DeviceWeight& weight, DeviceColumns& x) {
     Case c;
     c.name    = "gdn_input_proj conv NVFP4 shard [8192,5120]";
     c.outputs = {{"qkv", 5120, 2}, {"z", 3072, 2}};
@@ -356,7 +404,7 @@ Case gdn_gating_shard(GatingOperands& operands, DeviceColumns& x) {
 }
 
 // The MLP gate|up projection with SwiGLU: one rank's output-row half [17408,5120].
-Case swiglu_half(DeviceNvfp4& weight, DeviceColumns& x) {
+Case swiglu_half(DeviceWeight& weight, DeviceColumns& x) {
     Case c;
     c.name    = "linear_swiglu NVFP4 half [17408,5120]";
     c.outputs = {{"out", 8704, 2}};
@@ -382,7 +430,7 @@ int main() {
     // The attention and GDN output projection [5120,6144] and the MLP down projection [5120,17408]:
     // rank 0's linear_add and rank 1's linear() over their input-column halves.
     for (const std::int32_t k : {3072, 8704}) {
-        DeviceNvfp4 weight(random_nvfp4(5120, k, 4099U + static_cast<std::uint32_t>(k)));
+        DeviceWeight weight(random_nvfp4(5120, k, 4099U + static_cast<std::uint32_t>(k)));
         DeviceColumns x(k, 7919U + static_cast<std::uint32_t>(k));
         const std::vector<std::uint16_t> residual =
             random_bf16(static_cast<std::size_t>(5120) * kColumns * kDraws,
@@ -392,14 +440,33 @@ int main() {
     }
     {
         DeviceColumns x(5120, 7457U);
-        DeviceNvfp4 attn(random_nvfp4(7168, 5120, 5003U));
+        DeviceWeight attn(random_nvfp4(7168, 5120, 5003U));
         failures += check(attn_input_shard(attn, x));
-        DeviceNvfp4 gdn(random_nvfp4(8192, 5120, 5011U));
+        DeviceWeight gdn(random_nvfp4(8192, 5120, 5011U));
         failures += check(gdn_input_conv_shard(gdn, x));
         GatingOperands gating;
         failures += check(gdn_gating_shard(gating, x));
-        DeviceNvfp4 swiglu(random_nvfp4(17408, 5120, 5021U));
+        DeviceWeight swiglu(random_nvfp4(17408, 5120, 5021U));
         failures += check(swiglu_half(swiglu, x));
+    }
+
+    // Flash-Next dense Q8 (qwen3_8_flash_next_nvfp4 recipe): attention q|k|gate|v, GDN q|k|v|z and
+    // a|b, the attention and GDN output, the shared expert, the PLE key/value parent and the MTP
+    // stem, at tp 1 and as one rank's tp 2 shard.
+    struct Q8Shape {
+        std::int32_t n;
+        std::int32_t k;
+    };
+
+    for (const Q8Shape shape :
+         {Q8Shape{6656, 2560}, Q8Shape{8192, 2560}, Q8Shape{48, 2560}, Q8Shape{2560, 3072},
+          Q8Shape{13312, 2560}, Q8Shape{16384, 2560}, Q8Shape{96, 2560}, Q8Shape{2560, 6144},
+          Q8Shape{640, 2560}, Q8Shape{1280, 2560}, Q8Shape{2560, 640}, Q8Shape{12800, 2560},
+          Q8Shape{2560, 2560}}) {
+        const auto seed = static_cast<std::uint32_t>(shape.n * 31 + shape.k);
+        DeviceWeight weight(random_q8(shape.n, shape.k, 6007U + seed));
+        DeviceColumns x(shape.k, 7001U + seed);
+        failures += check(linear_q8(shape.n, shape.k, weight, x));
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " verify-width columns\n";
     return failures == 0 ? 0 : 1;

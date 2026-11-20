@@ -1218,20 +1218,29 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
+        // The prompt tokens before the next capture frontier, or before the end of the prompt: the
+        // segment whose chunks the request's service projection counts (a step stops at a capture).
+        const auto step_segment = [&staged]() -> std::uint32_t {
+            std::uint32_t end = staged.prompt_tokens;
+            if (staged.next_capture < staged.capture_groups.size()) {
+                const std::uint32_t frontier = staged.capture_groups[staged.next_capture].frontier;
+                if (frontier > staged.cursor) { end = std::min(end, frontier); }
+            }
+            return end - staged.cursor;
+        };
+
         // Structured output: the call that samples the first token binds the lane's mask into the
         // lane's sampling config (the matcher does not move during the prompt) and keeps the
         // reasoning EOS guard off, so nothing redraws outside the mask.
         if (row_constrained(0)) {
             schedule_state.reasoning_guard = false;
-            if (staged.cursor + std::min(prefill_chunk, staged.prompt_tokens - staged.cursor) >=
-                staged.prompt_tokens) {
+            if (staged.cursor + prompt_step_tokens(step_segment()) >= staged.prompt_tokens) {
                 bind_prefill_grammar_mask(sequence, request);
             }
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            const std::uint32_t nominal = prompt_step_tokens(step_segment());
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -1334,7 +1343,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // chunk: ending it there would cost every prompt one more prefill unit, and with
                 // it the decode round the scheduler owes after each unit.
                 if (content_frontier && staged.cursor == *split_frontier) {
-                    remaining = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                    remaining = prompt_step_tokens(step_segment());
                     if (row_constrained(0) && staged.cursor + remaining >= staged.prompt_tokens) {
                         bind_prefill_grammar_mask(sequence, request);
                     }

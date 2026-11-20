@@ -87,6 +87,20 @@ public:
                                        std::int32_t first) = 0;
 };
 
+// A prompt chunk's PLE rows still being gathered on the host (tp 2: the gather runs on a helper
+// thread while the devices run the layers before the PLE layer). The PLE layer calls wait(),
+// which returns once `host` holds the chunk's rows (or throws the gather's error), and then
+// uploads them into each rank's `rows` itself, on that rank's stream.
+struct PendingPleRows {
+    virtual void wait() = 0;
+
+    std::array<Tensor, 2> rows;
+    const std::uint16_t* host = nullptr;
+
+protected:
+    ~PendingPleRows() = default;
+};
+
 // Program-owned inputs a TextContext reads (bound per execution core). At tp 2 each rank
 // has its own: rank 0's is the ExecutionCore's, rank 1's TpExecution::qwen4. The PLE gather, its
 // staging and the decode host rows are rank 0's (one host gather, uploaded to both ranks); the

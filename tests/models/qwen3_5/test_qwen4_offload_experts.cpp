@@ -712,6 +712,42 @@ void test_ring_layers() {
           "uniform layers, one GPU: at most 43 of 48 lent (0.9)");
 }
 
+// The prefill ring in elastic columns and the workspace the planner and the backend size with it,
+// at the one-GPU Flash-Next pool of the largest context (49 cache layers of 38 base slots + 36
+// elastic columns): next to a ring in the last Text layers a prompt lends an 8192-column
+// workspace (920 lend-plane slots) and not the 16384-column one (1712); with the ring in the
+// columns the latter fits in the Text layers, the 32768-column one (3383) does not.
+void test_column_ring() {
+    using E = Qwen4OffloadExperts;
+    check(E::ring_columns(576, 49, 36) == 23 && E::ring_columns(576, 49, 23) == 23,
+          "ring columns: two layers of experts plus the margin");
+    check(E::ring_columns(576, 49, 22) == 22 && E::ring_columns(576, 49, 11) == 11,
+          "ring columns: the backed columns when the KV left fewer");
+    check(E::ring_columns(576, 49, 10) == 0 && E::ring_columns(576, 49, 0) == 0,
+          "ring columns: none when they do not hold one layer of experts");
+    check(E::ring_columns(512, 48, 36) == 22 && E::ring_columns(576, 0, 36) == 0,
+          "ring columns: no margin, no layers");
+    const std::vector<std::int32_t> base(49, 38);
+    const std::int32_t ring = E::ring_layers(576, base, 48, 1);
+    check(ring == 16, "one GPU: the ring lends 16 layers of 38 slots");
+    check(E::workspace_layers(base, 48, ring, 920, 1, false) == 25,
+          "ring in layers: the 8192-column workspace lends 25 more");
+    check(E::workspace_layers(base, 48, ring, 1712, 1, false) == 0,
+          "ring in layers: no 16384-column workspace");
+    check(E::workspace_layers(base, 48, ring, 1712, 1, true) == 46 &&
+              E::workspace_layers(base, 48, ring, 920, 1, true) == 25,
+          "ring in columns: the workspace takes the last Text layers");
+    check(E::workspace_layers(base, 48, ring, 48 * 38, 1, true) == 48 &&
+              E::workspace_layers(base, 48, ring, 48 * 38 + 1, 1, true) == 0 &&
+              E::workspace_layers(base, 48, ring, 3383, 1, true) == 0,
+          "ring in columns: at most every Text layer (never the MTP layer)");
+    check(E::workspace_layers(base, 48, ring, 0, 1, true) == 0, "no workspace, no layers");
+    // tp 2 keeps the ring in the layers: the planner's and the backend's former rule.
+    const auto b = E::layer_slot_profile(49, 48, 66, 21, 2, 0);
+    check(E::workspace_layers(b, 48, E::ring_layers(576, b, 48, 2), 24 * 66, 2, false) == 28,
+          "tp 2: ring + workspace as before");
+}
+
 // The per-layer slot profile keeps the pool (layers * slots_per_layer base slots),
 // stays within a partition's experts next to the elastic columns, applies to Flash-Next at tp 2
 // only, and still lends the production prompt workspace.
@@ -779,6 +815,7 @@ void test_slot_profile_exclusive_floor() {
 
 int main() {
     test_ring_layers();
+    test_column_ring();
     test_slot_profile();
     test_slot_profile_exclusive_floor();
     int count             = 0;

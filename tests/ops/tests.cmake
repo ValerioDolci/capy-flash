@@ -124,6 +124,10 @@ ninfer_add_op_test(ninfer_sparse_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_attention.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_qsa_topk_split_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_topk_split.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_qsa_staging_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_staging.cpp"
   LIBRARIES ninfer_ops ninfer_core)

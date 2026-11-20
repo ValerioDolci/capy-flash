@@ -107,7 +107,10 @@ paths and are necessary to diagnose the operation. A component that cannot prove
 value safe emits an identity/count/digest or omits it. Serve request/response/HTTP operational
 records never include raw `ApiError.message`, arbitrary `exception.what()`, a request body, or an
 unclassified request path. Trusted startup/configuration errors and the local one-shot CLI's own
-input diagnostics may retain their detailed exception text. The protocol response and request
+input diagnostics may retain their detailed exception text. So may the cause of an Engine-wide
+failure (`engine failed during req#N | ...`, logged once by the first request it failed): the text
+of the exception the Engine worker threw is the Engine's own diagnostic, not request data, and
+it is the reason the server stops. The protocol response and request
 JSONL may retain an exact error string when their independent contracts require it.
 
 ## 6. Producer rules

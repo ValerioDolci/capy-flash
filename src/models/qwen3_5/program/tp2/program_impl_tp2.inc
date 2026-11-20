@@ -204,6 +204,15 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             if (eager.host_exchange) {
                 host_exchange.emplace(*execution_context);
                 peer_events->attach_host_exchange(&*host_exchange);
+                // The hyper-connection residual exchanges whole prompt chunks by column groups:
+                // their pinned buffers exist before the first prompt (growing them stops both
+                // devices and pins ~0.2 s per 100 MiB in the middle of a chunk).
+                if (parameters.model.config().text.hyper_connection) {
+                    host_exchange->reserve_sum_f32(
+                        static_cast<std::size_t>(parameters.model.config().text.hidden_size) *
+                            std::min(plan.prefill_chunk, plan.inputs.capacity),
+                        *execution_context);
+                }
             }
             if (eager.peer_lanes) {
                 peer_lanes.emplace(*execution_context, eager.peer_lanes_direct);
@@ -212,7 +221,8 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             tp_transport_status.eager_transport =
                 eager.host_exchange ? "pinned host exchange" : "direct peer copies";
             // The plain residual (dense Qwen3.5) overlaps each prefill chunk's exchanges
-            // (TextForward::run_plain); the hyper-connection residual does not.
+            // (TextForward::run_plain); the hyper-connection residual exchanges by column
+            // groups and slices of its own (moe_combine, output_projection).
             // Chunks the halves do not take run sliced on the same lanes.
             if (!parameters.model.config().text.hyper_connection) {
                 tp_transport_status.prefill_overlap =

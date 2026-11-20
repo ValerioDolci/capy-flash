@@ -472,8 +472,14 @@ void Qwen4OffloadExperts::set_active_columns(std::int32_t columns) {
     if (open_) {
         throw std::logic_error("Qwen4Exp offload experts: elastic resize inside a window");
     }
-    const auto streams = window_streams(streams_[0]);
-    cache_->set_active_columns(columns, streams);
+    // The ring's columns that stay backed: those past the cache's.
+    std::int32_t ring = 0;
+    if (ring_columns_ > 0) {
+        ring = ring_columns(options_.stream_ring_slots, layers_,
+                            columns - std::min(cache_->active_columns(), columns));
+    }
+    ring_columns_ = ring;
+    cache_->set_active_columns(columns - ring, window_streams(streams_[0]));
 }
 
 std::int64_t Qwen4OffloadExperts::slot_bytes(std::int32_t layers) {
@@ -541,8 +547,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         for (const Qwen4ExpertBank& b : banks) { bytes.push_back(gguf_slot_bytes(b)); }
         gguf_pool_       = gguf_pool(bytes, layer_base_, options_.elastic_columns);
         gguf_slot_bytes_ = bytes;
-        if (options_.gguf_stream_min_tokens > 0 && options_.base_chunk > 0 &&
-            options_.prompt_workspace_bytes > 0) {
+        // Without a prompt workspace (causal scoring) the ring alone.
+        if (options_.gguf_stream_min_tokens > 0 && options_.base_chunk > 0) {
             // The prefill ring: the last Text layers (as the NVFP4 ring), the borrowed workspace
             // below it; the planner lends with the same rule (startup.cpp).
             const std::int64_t ring_bytes = gguf_ring_bytes(bytes, text_layers_, partitions_);
@@ -931,7 +937,14 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         options_.cpus.empty() ? ops::host::spread_cpus(options_.cpu_threads) : options_.cpus;
     config.cpus_explicit    = !options_.cpus.empty();
     config.route_log_tokens = log_tokens_;
-    config.gpu_stamps       = tracing;
+    // At tp 2 the cache holds twice the slots, so a decode call leaves the host few experts, often
+    // one or two. On a hybrid CPU a small core's slice item takes about three times a big core's,
+    // and the phase waits for the slowest: the chunk-sized gate/up items keep the big cores busy
+    // until it ends (HostMoeExecutor::Options::gguf_fine). With equal cores the slice items
+    // already spread evenly, and the finer items only add claims.
+    config.executor.gguf_fine =
+        partitions_ == 2 && ops::host::hybrid_members(config.cpus, ops::host::big_core_cpus());
+    config.gpu_stamps = tracing;
     // One record per publish: the Text layers once per window, every later (MTP) layer once per
     // call (a prompt chunk and its drafts, or an alignment and the AR drafts of a round).
     config.trace_capacity =
@@ -958,25 +971,49 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         lend_count_ =
             ring_layers(options_.stream_ring_slots, layer_base_, text_layers_, partitions_);
         lend_first_ = text_layers_ - lend_count_;
+        // The ring may take elastic columns instead (ring_columns): one GPU without the exclusive
+        // tier (whose shrinks write experts back to the host), every bank page-locked (a
+        // pageable layer among the many the workspace then takes would run on the CPU).
+        column_ring_ =
+            partitions_ == 1 && exclusive == 0 && pageable_layers_ == 0 &&
+            ring_columns(options_.stream_ring_slots, layers_, options_.elastic_columns) > 0;
         if (options_.base_chunk > 0 && options_.prompt_workspace_bytes > 0) {
-            workspace_layers_ = layers_below(
-                layer_base_, lend_first_,
-                (options_.prompt_workspace_bytes + kLendPlaneBytes - 1) / kLendPlaneBytes);
-            if (!may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_,
-                          partitions_)) {
+            // Per planned width, where its workspace fits (workspace_layers: the planner's rule).
+            for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
+                const std::int64_t slots = (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes;
+                const std::int32_t below = workspace_layers(layer_base_, text_layers_, lend_count_,
+                                                            slots, partitions_, false);
+                if (below > 0) {
+                    wide_columns_[0]  = width;
+                    workspace_layers_ = below;
+                }
+                if (column_ring_ && workspace_layers(layer_base_, text_layers_, lend_count_, slots,
+                                                     partitions_, true) > 0) {
+                    wide_columns_[1] = width;
+                }
+            }
+            if (wide_columns_[0] == 0 && wide_columns_[1] == 0) {
                 std::fprintf(stderr,
                              "Qwen4Exp offload experts: no room to lend a %lld-byte prompt "
                              "workspace (%d slots per layer); prompt chunks "
                              "stay at %d columns\n",
                              static_cast<long long>(options_.prompt_workspace_bytes), K,
                              options_.base_chunk);
-                workspace_layers_ = 0;
-            } else if (!options_.prompt_workspace_steps.empty()) {
+            } else {
                 std::fprintf(stderr,
                              "Qwen4Exp offload experts: prompt chunks up to %d columns, lending "
                              "%d workspace + %d ring layers of %d slots on average\n",
-                             options_.prompt_workspace_steps.back().first, workspace_layers_,
+                             std::max(wide_columns_[0], options_.base_chunk), workspace_layers_,
                              lend_count_, K);
+            }
+            if (wide_columns_[1] > wide_columns_[0]) {
+                std::fprintf(
+                    stderr,
+                    "Qwen4Exp offload experts: prompt chunks up to %d columns while the "
+                    "KV leaves the ring %d of the %d elastic columns or more (the ring "
+                    "takes up to %d)\n",
+                    wide_columns_[1], (kExperts + layers_ - 1) / layers_, options_.elastic_columns,
+                    ring_columns(options_.stream_ring_slots, layers_, options_.elastic_columns));
             }
         }
         const auto any_pageable = [&](std::int32_t first, std::int32_t end) {
@@ -1032,9 +1069,6 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                     }
                 }
                 sc.pool_base  = rank == 0 ? memory_.pool : peer->pool;
-                sc.ring_first = static_cast<std::int32_t>(base_offset(lend_first_));
-                sc.ring_slots =
-                    static_cast<std::int32_t>(base_offset(text_layers_) - base_offset(lend_first_));
                 sc.tables     = rank == 0 ? memory_.stream_tables : peer->stream_tables;
                 sc.partitions = partitions_;
                 sc.partition  = rank;
@@ -1058,12 +1092,18 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                 // would have to cover both GPUs' tables).
                 options_.stream_cpu_tail = false;
             }
-            lent_profile_.assign(static_cast<std::size_t>(text_layers_), {});
+            // One per cache layer: the ring in elastic columns saves the later layers' too.
+            lent_profile_.assign(static_cast<std::size_t>(layers_), {});
             prompt_counts_.assign(static_cast<std::size_t>(text_layers_),
                                   std::vector<std::int32_t>(kExperts, 0));
             prompt_counts_tokens_.assign(static_cast<std::size_t>(text_layers_), 0);
             stream_select_.assign(static_cast<std::size_t>(text_layers_),
                                   std::vector<std::uint8_t>(kExperts, 1));
+        }
+        if (stream_ == nullptr) {
+            column_ring_      = false;
+            workspace_layers_ = 0;
+            wide_columns_     = {};
         }
     }
     if (gguf_ && gguf_ring_slots_ > 0) {
@@ -1134,6 +1174,12 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     CUDA_CHECK(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&fork_, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&join_, cudaEventDisableTiming));
+    if (peer != nullptr) { // tp 2: the hyper-connection block's wait prefetch (set_wait_prefetch)
+        const ScopedCurrentDevice scope(device); // rank 0's, as the compute stream it forks from
+        CUDA_CHECK(cudaStreamCreateWithFlags(&prefetch_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_fork_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&prefetch_join_, cudaEventDisableTiming));
+    }
     if (!options_.routing_path.empty()) {
         routing_ = std::fopen(options_.routing_path.c_str(), "wb");
         if (routing_ == nullptr) {
@@ -1389,10 +1435,12 @@ Qwen4OffloadExperts::~Qwen4OffloadExperts() {
     stream_.reset();
     mailbox_.reset();
     if (side_ != nullptr) { (void)cudaStreamSynchronize(side_); }
-    for (cudaEvent_t e : {enqueued_, fork_, join_}) {
+    if (prefetch_stream_ != nullptr) { (void)cudaStreamSynchronize(prefetch_stream_); }
+    for (cudaEvent_t e : {enqueued_, fork_, join_, prefetch_fork_, prefetch_join_}) {
         if (e != nullptr) { (void)cudaEventDestroy(e); }
     }
     if (side_ != nullptr) { (void)cudaStreamDestroy(side_); }
+    if (prefetch_stream_ != nullptr) { (void)cudaStreamDestroy(prefetch_stream_); }
 }
 
 Tensor Qwen4OffloadExperts::layer_table(std::int32_t layer) const {
@@ -1471,6 +1519,8 @@ void Qwen4OffloadExperts::routed(std::int32_t layer, const Qwen4ExpertBank& bank
     }
 }
 
+static unsigned long long qwen4_capture_id(cudaStream_t stream);
+
 void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
                               const Tensor& ids, const Tensor& weights, Tensor& partial,
                               WorkspaceArena& work, cudaStream_t stream) {
@@ -1479,6 +1529,14 @@ void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, c
         throw std::invalid_argument("Qwen4Exp offload experts: layer out of range");
     }
     const std::int32_t T = x.ne[1];
+
+    // set_wait_prefetch() covers this call alone, whichever path it takes.
+    struct ClearOnExit {
+        std::vector<ops::PeerL2Range>& v;
+
+        ~ClearOnExit() { v.clear(); }
+    } clear_wait_prefetch{wait_prefetch_};
+
     if (gguf_) {
         run_gguf(layer, bank, x, ids, weights, partial, work, stream);
         return;
@@ -1722,6 +1780,14 @@ void Qwen4OffloadExperts::run_gguf(std::int32_t layer, const Qwen4ExpertBank& ba
         published_layer_ = -1;
         gguf_partial(x, ids, weights, view, partial, work, stream);
         mailbox_->stamp(stream, layer, ops::host::kStampDevice);
+        if (!wait_prefetch_.empty() && prefetch_stream_ != nullptr) {
+            CUDA_CHECK(cudaEventRecord(prefetch_fork_, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream_, prefetch_fork_, 0));
+            ops::l2_prefetch(wait_prefetch_, prefetch_stream_);
+            CUDA_CHECK(cudaEventRecord(prefetch_join_, prefetch_stream_));
+            prefetch_pending_ = true; // joined by exchanged(), after the MoE exchange
+            prefetch_capture_ = qwen4_capture_id(stream);
+        }
         mailbox_->accumulate(stream, layer, T, static_cast<float*>(partial.data), nullptr);
         return;
     }
@@ -1747,17 +1813,32 @@ void Qwen4OffloadExperts::open_stream(std::int32_t tokens) {
     // The first streamed call of the window: lend the ring when the prompt has not lent it yet
     // (mid-window: no kernel of this window reads the lent layers through the cache table, every
     // Text layer of a chunk takes this path), then open each GPU's stream window.
-    if (!cache_->lending()) {
+    // With the ring in elastic columns (placed by begin_window) nothing is lent for it.
+    std::int32_t ring_first = static_cast<std::int32_t>(base_offset(lend_first_));
+    std::int32_t ring_slots =
+        static_cast<std::int32_t>(base_offset(text_layers_) - base_offset(lend_first_));
+    if (ring_columns_ > 0) {
+        // Column-major after every layer's base slots (ExpertCachePolicy::pool_slot).
+        ring_first =
+            static_cast<std::int32_t>(base_offset(layers_)) + cache_->active_columns() * layers_;
+        ring_slots = ring_columns_ * layers_;
+    } else if (!cache_->lending()) {
         save_lent_residency(lend_first_, lend_count_);
         (void)cache_->lend_layers(lend_first_, lend_count_, /*keep_elastic=*/true);
+        lent_for_column_ring_ = false;
+    } else if (lent_for_column_ring_) {
+        throw std::logic_error("Qwen4Exp offload experts: the lent layers hold a workspace where "
+                               "the ring goes (prepare_prompt before begin_window)");
     }
     // The copies into the ring wait for every fill issued before the lend (begin_window may have
     // lent the layers already, for this chunk or an earlier one of the prompt).
     std::array<cudaEvent_t, 2> wait{};
     const auto events = cache_->lend_events();
     for (std::size_t p = 0; p < events.size(); ++p) { wait[p] = events[p]; }
-    stream_->begin_window(cache_.get(), wait[0]);
-    if (peer_stream_obj_) { peer_stream_obj_->begin_window(cache_.get(), wait[1]); }
+    stream_->begin_window(cache_.get(), wait[0], ring_first, ring_slots);
+    if (peer_stream_obj_) {
+        peer_stream_obj_->begin_window(cache_.get(), wait[1], ring_first, ring_slots);
+    }
     streaming_ = true;
     if (options_.stream_cpu_tail && tokens <= options_.stream_cpu_max_tokens) {
         select_cpu_tail(tokens);
@@ -1838,7 +1919,34 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     if (host_experts) { mailbox_->accumulate(stream, layer, T, static_cast<float*>(partial.data)); }
 }
 
+void Qwen4OffloadExperts::mixer_exchanged(std::int32_t layer, cudaStream_t stream) {
+    if (streaming_ && layer < text_layers_) { stream_->mixer_exchanged(layer, stream); }
+}
+
+void Qwen4OffloadExperts::mixer_exchanged_peer(std::int32_t layer, cudaStream_t stream) {
+    if (streaming_ && peer_stream_obj_ && layer < text_layers_) {
+        peer_stream_obj_->mixer_exchanged(layer, stream);
+    }
+}
+
+// The id of the capture `stream` takes part in, 0 when it is not capturing.
+static unsigned long long qwen4_capture_id(cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    unsigned long long id          = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &id));
+    return status == cudaStreamCaptureStatusActive ? id : 0;
+}
+
 void Qwen4OffloadExperts::exchanged(std::int32_t layer, cudaStream_t stream) {
+    if (prefetch_pending_) {
+        // A fork of the same capture (or of the same eager round) is joined; one left by a
+        // capture that failed before reaching here is dropped: waiting for an event recorded in
+        // another capture would invalidate this one.
+        prefetch_pending_ = false;
+        if (qwen4_capture_id(stream) == prefetch_capture_) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, prefetch_join_, 0));
+        }
+    }
     if (streaming_ && layer < text_layers_) { stream_->exchanged(layer, stream); }
 }
 
@@ -1996,6 +2104,27 @@ std::int32_t Qwen4OffloadExperts::layers_below(std::span<const std::int32_t> lay
     return n;
 }
 
+std::int32_t Qwen4OffloadExperts::ring_columns(std::int32_t ring_slots, std::int32_t layers,
+                                               std::int32_t columns) {
+    if (layers < 1) { return 0; }
+    const std::int32_t least  = (kExperts + layers - 1) / layers;
+    const std::int32_t wanted = (kExperts + std::max(ring_slots, kExperts) + layers - 1) / layers;
+    return columns < least ? 0 : std::min(columns, wanted);
+}
+
+std::int32_t Qwen4OffloadExperts::workspace_layers(std::span<const std::int32_t> layer_base,
+                                                   std::int32_t text_layers,
+                                                   std::int32_t ring_layers, std::int64_t slots,
+                                                   std::int32_t partitions, bool column_ring) {
+    if (slots < 1) { return 0; }
+    if (column_ring) {
+        const std::int32_t layers = layers_below(layer_base, text_layers, slots);
+        return layers <= text_layers ? layers : 0;
+    }
+    const std::int32_t layers = layers_below(layer_base, text_layers - ring_layers, slots);
+    return may_lend(layer_base, text_layers, ring_layers + layers, partitions) ? layers : 0;
+}
+
 std::int64_t Qwen4OffloadExperts::gguf_ring_bytes(std::span<const std::int64_t> slot_bytes,
                                                   std::int32_t text_layers,
                                                   std::int32_t partitions) {
@@ -2126,19 +2255,65 @@ Qwen4OffloadExperts::layer_slot_profile(std::int32_t layers, std::int32_t text_l
 }
 
 std::int32_t Qwen4OffloadExperts::workspace_layers_for(std::int32_t columns) const noexcept {
+    if (!gguf_) {
+        // Where the ring is now; 0 for a chunk wider than that placement lends
+        // (prompt_chunk_columns).
+        for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
+            if (columns <= width) {
+                return workspace_layers(layer_base_, text_layers_, lend_count_,
+                                        (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes,
+                                        partitions_, ring_columns_ > 0);
+            }
+        }
+        return 0;
+    }
     if (workspace_layers_ == 0) { return workspace_layers_; }
     for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
-        if (gguf_ && columns <= width) {
+        if (columns <= width) {
             return std::min(workspace_layers_,
                             gguf_layers_below(layer_base_, gguf_slot_bytes_, lend_first_, bytes));
         }
-        if (columns <= width) {
-            return std::min(workspace_layers_,
-                            layers_below(layer_base_, lend_first_,
-                                         (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes));
-        }
     }
     return workspace_layers_;
+}
+
+std::int32_t Qwen4OffloadExperts::ring_columns_now() const noexcept {
+    return column_ring_ ? ring_columns(options_.stream_ring_slots, layers_, active_columns()) : 0;
+}
+
+void Qwen4OffloadExperts::place_ring(std::int32_t columns) {
+    if (cache_->lending() && lent_for_column_ring_ != (columns > 0)) {
+        reclaim_lent(cache_->lent_count());
+    }
+    if (columns == ring_columns_) { return; }
+    if (columns == 0) {
+        release_ring_columns();
+        return;
+    }
+    if (!column_residency_saved_) {
+        save_residency(0, layers_);
+        column_residency_saved_ = true;
+    }
+    const std::int32_t backed = active_columns();
+    ring_columns_             = columns;
+    cache_->set_active_columns(backed - columns, window_streams(streams_[0]));
+}
+
+void Qwen4OffloadExperts::release_ring_columns() {
+    if (ring_columns_ > 0) {
+        const std::int32_t backed = active_columns();
+        ring_columns_             = 0;
+        cache_->set_active_columns(backed, window_streams(streams_[0]));
+    }
+    if (!column_residency_saved_) { return; }
+    column_residency_saved_ = false;
+    for (std::int32_t l = 0; l < layers_; ++l) {
+        if (cache_->lent(l)) { continue; }
+        auto& profile = lent_profile_[static_cast<std::size_t>(l)];
+        cache_->top_up(l, profile);
+        profile.clear();
+    }
+    if (!cache_->lending()) { cache_->submit_fills(); }
 }
 
 void Qwen4OffloadExperts::lend_prompt_layers(std::int32_t first) {
@@ -2157,11 +2332,17 @@ void Qwen4OffloadExperts::lend_prompt_layers(std::int32_t first) {
     }
     const auto events = cache_->lend_layers(first, text_layers_ - first, /*keep_elastic=*/true);
     for (std::size_t p = 0; p < events.size(); ++p) { lend_waited_[p] = false; }
+    lent_for_column_ring_ = ring_columns_ > 0;
 }
 
 void Qwen4OffloadExperts::save_lent_residency(std::int32_t first, std::int32_t count) {
     if (!options_.keep_decode_residency) { return; }
-    prompt_lent_from_                             = std::min(prompt_lent_from_, first);
+    prompt_lent_from_ = std::min(prompt_lent_from_, first);
+    save_residency(first, count);
+}
+
+void Qwen4OffloadExperts::save_residency(std::int32_t first, std::int32_t count) {
+    if (!options_.keep_decode_residency) { return; }
     const expert_cache::ExpertCachePolicy& policy = cache_->policy();
     for (std::int32_t l = first; l < first + count; ++l) {
         auto& profile = lent_profile_[static_cast<std::size_t>(l)];
@@ -2222,15 +2403,25 @@ void Qwen4OffloadExperts::apply_pending_prompt() {
 }
 
 std::int32_t Qwen4OffloadExperts::prompt_arena_columns() const noexcept {
-    return workspace_layers_ > 0 ? options_.base_chunk : std::numeric_limits<std::int32_t>::max();
+    return workspace_layers_ > 0 || wide_columns_[1] > 0 ? options_.base_chunk
+                                                         : std::numeric_limits<std::int32_t>::max();
+}
+
+std::int32_t Qwen4OffloadExperts::prompt_chunk_columns() const noexcept {
+    // ggml block banks lend every planned width next to their ring.
+    if (gguf_ || (wide_columns_[0] == 0 && wide_columns_[1] == 0)) {
+        return std::numeric_limits<std::int32_t>::max();
+    }
+    return std::max(options_.base_chunk, wide_columns_[ring_columns_now() > 0 ? 1 : 0]);
 }
 
 std::array<DeviceSpan, 2>
 Qwen4OffloadExperts::prompt_workspace(std::span<const cudaStream_t> streams) {
-    if (!open_ || kind_ != Qwen4Window::Prompt || workspace_layers_ == 0) {
+    if (!open_ || kind_ != Qwen4Window::Prompt ||
+        (workspace_layers_ == 0 && wide_columns_[1] == 0)) {
         throw std::logic_error("Qwen4Exp offload experts: no prompt workspace to lend");
     }
-    const std::int32_t first = lend_first_ - chunk_workspace_layers_;
+    const std::int32_t first = workspace_end() - chunk_workspace_layers_;
     if (chunk_workspace_layers_ == 0 || !cache_->lending() || cache_->lent_first() > first) {
         throw std::logic_error("Qwen4Exp offload experts: the prompt workspace is not lent "
                                "(prepare_prompt before begin_window)");
@@ -2238,10 +2429,10 @@ Qwen4OffloadExperts::prompt_workspace(std::span<const cudaStream_t> streams) {
     if (streams.size() != static_cast<std::size_t>(partitions_)) {
         throw std::invalid_argument("Qwen4Exp offload experts: one compute stream per GPU");
     }
-    // The workspace: the base slots of layers [first, lend_first_) in each GPU's gate/up code
+    // The workspace: the base slots of layers [first, workspace_end()) in each GPU's gate/up code
     // plane (planar pool: one contiguous region), the lent layers below the ring.
     std::int64_t begin = base_offset(first) * kLendPlaneBytes;
-    std::int64_t end   = base_offset(lend_first_) * kLendPlaneBytes;
+    std::int64_t end   = base_offset(workspace_end()) * kLendPlaneBytes;
     if (gguf_) {
         // ggml block banks: the arena bytes of those base slots (base slots are layer-ordered).
         const auto at = [&](std::int32_t layer) {
@@ -2306,8 +2497,11 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         text_prompt_seen_ = false;
         prompt_new_       = false;
     }
+    // The prompt is over: the ring's elastic columns go back to the cache first, so the lent
+    // layers refill to their whole capacity.
+    if (kind == Qwen4Window::Decode) { release_ring_columns(); }
     if (kind == Qwen4Window::Decode && cache_->lending()) {
-        // The prompt is over: the ring (and the borrowed workspace) goes back to the cache, its
+        // The ring (and the borrowed workspace) goes back to the cache, its
         // layers refilled with the last prompt window's most routed experts.
         reclaim_lent(cache_->lent_count());
         // Validation: under NINFER_QWEN4_EXPERT_FREEZE=1 the refill lands before the first
@@ -2333,9 +2527,21 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         const bool wide     = prompt_columns_ > prompt_arena_columns();
         const bool streamed = prompt_columns_ >= options_.stream_min_tokens &&
                               prompt_columns_ > ops::kMoeSlotsMaxTokens;
-        if (wide) { chunk_workspace_layers_ = workspace_layers_for(prompt_columns_); }
-        const std::int32_t needed = wide       ? lend_first_ - chunk_workspace_layers_
-                                    : streamed ? lend_first_
+        // A chunk that borrows a workspace moves the ring to the elastic columns the KV leaves
+        // it (else to the last Text layers); a narrower streamed chunk keeps the ring where the
+        // prompt has it, so a prompt of narrow chunks alone lends the last Text layers only.
+        place_ring(wide || (streamed && ring_columns_ > 0) ? ring_columns_now() : 0);
+        if (wide) {
+            chunk_workspace_layers_ = workspace_layers_for(prompt_columns_);
+            if (chunk_workspace_layers_ == 0) {
+                throw std::logic_error("Qwen4Exp offload experts: a prompt chunk of " +
+                                       std::to_string(prompt_columns_) +
+                                       " columns is wider than the workspace the cache lends now "
+                                       "(prompt_chunk_columns)");
+            }
+        }
+        const std::int32_t needed = wide       ? workspace_end() - chunk_workspace_layers_
+                                    : streamed ? workspace_end()
                                                : text_layers_;
         if (cache_->lending() && cache_->lent_first() < needed) {
             // Layers lent for an earlier, wider chunk that this one does not need (e.g. the
@@ -2347,7 +2553,7 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         }
         if (wide) {
             lend_prompt_layers(needed);
-        } else if (streamed && !cache_->lending()) {
+        } else if (streamed && ring_columns_ == 0 && !cache_->lending()) {
             lend_prompt_layers(lend_first_);
         }
     }

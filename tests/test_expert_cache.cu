@@ -1040,6 +1040,96 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
     }
 }
 
+// The prefill ring in elastic columns: 4 layers x 64 experts, base 8 slots per layer + 4 elastic
+// columns on one GPU. The cache shrinks to one column (the ring holds the other three), layers
+// 1..3 lend their base slots as workspace, the user overwrites every slot of the ring's columns
+// and every lent base slot, then the columns come back: top_up completes the layer that was not
+// lent and the reclaim the lent ones, each from the residency saved before the shrink. Every
+// layer holds that residency again (tables == policy, exact slot bytes).
+void column_ring_scenario(int device, const Banks& banks4) {
+    PolicyConfig pc;
+    pc.layers          = 4;
+    pc.experts         = 64;
+    pc.partitions      = 1;
+    pc.slots_per_layer = 8;
+    pc.elastic_columns = 4;
+    GpuPool pool(device, ExpertCache::pool_slots(pc, 0), ExpertCache::table_entries(pc), false);
+    std::vector<GpuPool*> pools{&pool};
+    std::vector<GpuBinding> bindings{pool.binding};
+    ExpertCache cache(pc, make_layout(banks4, false), bindings, 4 * kSlotBytes);
+    std::vector<std::vector<std::int32_t>> profile(4);
+    for (std::int32_t l = 0; l < 4; ++l) {
+        for (std::int32_t e = 0; e < 64; ++e) {
+            profile[static_cast<std::size_t>(l)].push_back((e * 5 + l) % 64);
+        }
+    }
+    cache.initialize(profile);
+    const ExpertCachePolicy& pol = cache.policy();
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaStream_t stream = nullptr, ring = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ring, cudaStreamNonBlocking));
+    const std::vector<cudaStream_t> streams{stream};
+    cache.begin_window(streams);
+    cache.end_window(streams);
+    // Most recently used first, as the backend saves it.
+    std::vector<std::vector<std::int32_t>> saved(4);
+    for (std::int32_t l = 0; l < 4; ++l) {
+        const auto lru = pol.recency(l, 0);
+        saved[static_cast<std::size_t>(l)].assign(lru.rbegin(), lru.rend());
+        check(saved[static_cast<std::size_t>(l)].size() == 12, "column ring: layers start full");
+    }
+    cache.set_active_columns(1, streams);
+    const std::int32_t base_end = pc.layers * pol.base_slots(0);
+    for (std::int32_t l = 0; l < 4; ++l) {
+        for (std::int32_t e = 0; e < 64; ++e) {
+            check(pol.slot_of(l, e) < base_end + pc.layers,
+                  "column ring: no resident in the ring's columns");
+        }
+    }
+    const auto events = cache.lend_layers(1, 3, /*keep_elastic=*/true);
+    CUDA_CHECK(cudaStreamWaitEvent(ring, events[0], 0));
+    const auto scribble = [&](std::int64_t first, std::int64_t end) {
+        for (int q = 0; q < kPlanes; ++q) {
+            for (std::int64_t sl = first; sl < end; ++sl) {
+                scribble_kernel<<<64, 256, 0, ring>>>(
+                    reinterpret_cast<std::uint64_t*>(pool.binding.pool_base[q] +
+                                                     sl * (kPlaneBytes[q] + kPoolGap)),
+                    kPlaneBytes[q] / 8);
+            }
+        }
+    };
+    scribble(pol.base_offset(0, 1), base_end);                // the workspace
+    scribble(base_end + pc.layers, base_end + 4 * pc.layers); // the ring: columns 1..3
+    cache.begin_window(streams);
+    cache.end_window(streams);
+    CUDA_CHECK(cudaStreamSynchronize(ring));
+    cache.set_active_columns(4, streams);
+    cache.top_up(0, saved[0]);
+    cache.top_up(2, saved[2]); // a lent layer: left to its reclaim
+    cache.reclaim_layers(std::span<const std::vector<std::int32_t>>(saved.data() + 1, 3));
+    check(!cache.lending(), "column ring: reclaimed");
+    cache.flush();
+    cache.begin_window(streams); // publish
+    cache.end_window(streams);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::int64_t restored = 0;
+    for (std::int32_t l = 0; l < 4; ++l) {
+        check(pol.occupied(l, 0) == pol.capacity(l, 0) && pol.capacity(l, 0) == 12,
+              "column ring: every layer is full again");
+        for (const std::int32_t e : saved[static_cast<std::size_t>(l)]) {
+            restored += cache.published_slot(l, e) >= 0;
+        }
+    }
+    check(restored == 4 * 12, "column ring: every layer holds its saved residency (" +
+                                  std::to_string(restored) + " of 48)");
+    check_final_state(cache, banks4, pools);
+    std::printf("  ring in elastic columns: %lld residents restored\n",
+                static_cast<long long>(restored));
+    (void)cudaStreamDestroy(stream);
+    (void)cudaStreamDestroy(ring);
+}
+
 // --bench: fill bandwidth. Layer 0 only; each repetition routes a fresh set of experts that
 // misses everywhere, so every slot of every GPU is refilled (`per_gpu` experts per GPU).
 void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
@@ -1236,6 +1326,7 @@ int main(int argc, char** argv) {
             Banks banks4(4, 64);
             lend_scenario(0, banks4);
             lend_keep_scenario({0}, banks4);
+            column_ring_scenario(0, banks4);
             if (count >= 2) { lend_keep_scenario({0, 1}, banks4); }
         }
     } catch (const std::exception& e) {

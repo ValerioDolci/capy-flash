@@ -39,10 +39,11 @@ struct Q8A16SimtSchedule {
 };
 
 // One output row per warp (or WarpsPerRow warps split at scale pairs), the warp's whole K slice
-// (Phases 256-wide phases) loaded into registers before the contraction; T <= TokenCapacity.
+// (Phases 256-wide phases) loaded into registers before the contraction; T <= TokenCapacity (a
+// column adds one accumulator register per lane).
 template <int BlockRows, int TokenCapacity, int WarpsPerRow, int Phases, int MinBlocksPerSm>
 struct Q8A16WarpRowSchedule {
-    static_assert(BlockRows > 0 && TokenCapacity > 0 && TokenCapacity <= 4);
+    static_assert(BlockRows > 0 && TokenCapacity > 0 && TokenCapacity <= 8);
     static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
     static_assert(Phases > 0 && Phases <= 16 && MinBlocksPerSm > 0);
     static constexpr int kBlockRows      = BlockRows;

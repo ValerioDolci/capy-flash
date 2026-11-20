@@ -15,7 +15,7 @@ struct RowGeometry {
     std::int64_t scale_tile  = 1; // rows per scale tile
 };
 
-RowGeometry row_geometry(const Weight& w) noexcept {
+RowGeometry row_geometry(const Weight& w, PrefetchFormats formats) noexcept {
     const auto k = static_cast<std::size_t>(w.k);
     if (w.qdata == nullptr || w.n <= 0 || w.k <= 0) { return {}; }
     if (w.qtype == QType::NVFP4 && w.layout == QuantLayout::BlockScaleK16M128x4) {
@@ -28,6 +28,11 @@ RowGeometry row_geometry(const Weight& w) noexcept {
         return {k, 0, 1};
     }
     if (w.qtype == QType::BF16) { return {2 * k, 0, 1}; }
+    if (formats == PrefetchFormats::HyperConnection && w.qtype == QType::Q8_G32_FP16 &&
+        w.layout == QuantLayout::RowSplit) {
+        const auto padded = static_cast<std::size_t>(w.padded_shape[1]); // K aligned to 128
+        return {padded, w.scales != nullptr ? padded / 32 * 2 : 0, 1};
+    }
     if (w.qtype == QType::Q3_G128_FP16 && w.layout == QuantLayout::RowSplit) { // 27b-16gb profile
         const std::size_t groups = static_cast<std::size_t>(w.padded_shape[1]) / 128;
         return {groups * 48, w.scales != nullptr ? groups * 2 : 0, 1};
@@ -50,14 +55,14 @@ void append_clipped(const Weight& w, const void* data, std::size_t bytes, Exchan
 
 } // namespace
 
-std::size_t prefetch_row_bytes(const Weight& w) noexcept {
-    const RowGeometry g = row_geometry(w);
+std::size_t prefetch_row_bytes(const Weight& w, PrefetchFormats formats) noexcept {
+    const RowGeometry g = row_geometry(w, formats);
     return g.code_stride + g.scale_stride;
 }
 
 void append_prefetch_rows(const Weight& w, std::int64_t row, std::int64_t rows,
-                          ExchangePrefetch& out) {
-    const RowGeometry g = row_geometry(w);
+                          ExchangePrefetch& out, PrefetchFormats formats) {
+    const RowGeometry g = row_geometry(w, formats);
     if (g.code_stride == 0) { return; }
     const std::int64_t first = std::clamp<std::int64_t>(row, 0, w.n);
     const std::int64_t last  = std::clamp<std::int64_t>(row + rows, first, w.n);
@@ -75,10 +80,11 @@ void append_prefetch_rows(const Weight& w, std::int64_t row, std::int64_t rows,
     }
 }
 
-void append_prefetch_prefix(const Weight& w, std::size_t bytes, ExchangePrefetch& out) {
-    const std::size_t row_bytes = prefetch_row_bytes(w);
+void append_prefetch_prefix(const Weight& w, std::size_t bytes, ExchangePrefetch& out,
+                            PrefetchFormats formats) {
+    const std::size_t row_bytes = prefetch_row_bytes(w, formats);
     if (row_bytes == 0) { return; }
-    append_prefetch_rows(w, 0, static_cast<std::int64_t>(bytes / row_bytes), out);
+    append_prefetch_rows(w, 0, static_cast<std::int64_t>(bytes / row_bytes), out, formats);
 }
 
 void append_prefetch_paired_prefix(const Weight& w, std::size_t bytes, ExchangePrefetch& out) {
@@ -107,19 +113,19 @@ void append_mixer_input_prefetch(const AttentionParameters& attention, std::size
     }
 }
 
-void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes,
-                                 ExchangePrefetch& out) {
+void append_mixer_input_prefetch(const GdnParameters& gdn, std::size_t bytes, ExchangePrefetch& out,
+                                 PrefetchFormats formats) {
     std::size_t left = bytes;
     if (const Weight* control = single_projection(gdn.control)) {
         const std::size_t whole =
-            prefetch_row_bytes(*control) * static_cast<std::size_t>(control->n);
+            prefetch_row_bytes(*control, formats) * static_cast<std::size_t>(control->n);
         if (whole != 0 && whole <= bytes / 2) {
-            append_prefetch_rows(*control, 0, control->n, out);
+            append_prefetch_rows(*control, 0, control->n, out, formats);
             left -= whole;
         }
     }
     if (const Weight* w = single_projection(gdn.projection)) {
-        append_prefetch_prefix(*w, left, out);
+        append_prefetch_prefix(*w, left, out, formats);
     }
 }
 

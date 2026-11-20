@@ -64,6 +64,7 @@ struct DFlashFeatureSink {
 class VisionPrefillSession;
 struct VisionChunk;
 struct ForwardRuntime;
+struct PendingPleRows;
 struct ForwardColumns;
 struct ForwardState;
 template <class Arena>
@@ -326,8 +327,10 @@ private:
                                                       std::span<const std::int32_t> visual_columns,
                                                       std::int32_t merged_begin,
                                                       const VisionChunk& vision_chunk,
-                                                      std::uint32_t ple_width);
-    void upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len, std::uint32_t ple_width);
+                                                      std::uint32_t ple_width,
+                                                      PendingPleRows* pending_ple = nullptr);
+    void upload_chunk_ple(Qwen4ChunkInputs& in, int rank, int len, std::uint32_t ple_width,
+                          PendingPleRows* pending = nullptr);
     void qwen4_prompt_token(TextForward<WorkspaceArena>& forward, const RankTensors& xf, int len,
                             int total, std::span<const int> prompt);
     void qwen4_retain_chunk(const RankTensors& xf, int len, bool rewrite, DFlashFeatureSink* sink);

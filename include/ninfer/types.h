@@ -303,7 +303,11 @@ struct RoutedExpertOptions {
     // Unset: NINFER_GGUF_HYBRID_COST if set, else {35, 3.6, 100} (Qwen4OffloadOptions).
     // ninfer-serve --gguf-hybrid-cost.
     std::optional<std::array<double, 3>> gguf_hybrid_cost;
-    // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
+    // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512). With
+    // elastic KV at one GPU the ring of a prompt whose chunks borrow a workspace (prompt_chunk)
+    // takes elastic columns the KV does not use instead, 512 more slots when they are there (two
+    // layers of experts: no layer's copies wait for the layer before it), and falls back to the
+    // lent layers as the KV grows past them.
     std::uint32_t stream_ring_slots = 576;
     // While streaming, leave the experts the previous prompt chunk routed least to the CPU (in
     // parallel with the copies of the others) as long as the CPU's estimated time stays within the
@@ -320,7 +324,9 @@ struct RoutedExpertOptions {
     // prefill_chunk run on workspace lent from the expert slot pool for the prompt's duration
     // (the slots of the layers below the streaming ring, reclaimed before decode), so the decode
     // cache keeps its slots. The planner takes the largest of prompt_chunk, prompt_chunk / 2, ...
-    // (> prefill_chunk) whose workspace fits, with the ring, in half the Text layers' slots.
+    // (> prefill_chunk) whose workspace fits, with the ring, in the Text layers' slots a prompt may
+    // lend; with the ring in elastic columns (stream_ring_slots) the workspace may take every Text
+    // layer, and a chunk is as wide as the KV's extent lets the cache lend at that moment.
     // 0 or <= prefill_chunk: off (every chunk is prefill_chunk wide, on the Program's arena).
     // A wider chunk spreads the per-chunk expert copies and dequantization over more tokens and
     // does not change the bits; where 32768 does not fit, the planner falls back to 16384, 8192...

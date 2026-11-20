@@ -428,6 +428,13 @@ OperationalRecord render_request_failure(const RequestLogContext& context,
     return {.severity = failure_severity(failure.classification), .message = out.str()};
 }
 
+OperationalRecord render_engine_failure_cause(std::uint64_t request_id, std::string_view detail) {
+    std::ostringstream out;
+    out << "engine failed during req#" << request_id << " | "
+        << product::format_pretty_text(detail);
+    return {.severity = OperationalSeverity::Error, .message = out.str()};
+}
+
 OperationalRecord render_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
     std::ostringstream out;
     out << "req#" << request_id << " response failed during " << phase_name(failure.phase);
@@ -650,6 +657,10 @@ void OperationalLog::server_stopped() const { logger_->info("server stopped"); }
 void OperationalLog::server_failure(bool serving, std::string_view detail) const {
     logger_->critical("server failed during {} | {}", serving ? "serving" : "startup",
                       product::format_pretty_text(detail));
+}
+
+void OperationalLog::engine_failure_cause(std::uint64_t request_id, std::string_view detail) const {
+    write(render_engine_failure_cause(request_id, detail));
 }
 
 void OperationalLog::engine_failure() const {

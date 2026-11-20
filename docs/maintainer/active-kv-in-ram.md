@@ -110,13 +110,16 @@ Ops for a pool that has a region; the Program (one lane) calls them per layer.
   columns of the batch's B lanes. One warp per 4-entry group of a column's selection (one block, by
   `qsa_select`'s contract):
   - **Cacheable blocks.** A block wholly before its lane's window (first position `p0` of the
-    lane) is cacheable. It maps to slot `(block + row x cache_blocks / 8) % cache_blocks` (`row` =
-    the lane's table row; the lanes share the layer's slots). A 64-bit claim
-    `(epoch << 32 | key)` taken with `atomicCAS` lets the columns of an MTP window share the
-    block. The winner compares the slot's tag `(generation << 32 | row << 20 | block)` and copies
-    the block only when it differs; the row in the key keeps the lanes' blocks apart.
-  - **Overflow.** A cacheable block whose slot another block claimed in the same call goes to the
-    overflow area, and so does every uncacheable block (the growing tail, the positions of the
+    lane) is cacheable. It maps to a set of 4 slots (ways), set
+    `(block + row x cache_blocks / 32) % (cache_blocks / 4)` (`row` = the lane's table row; the
+    lanes share the layer's sets; `cache_blocks` is a multiple of 16, so the sets are whole). A
+    64-bit claim `(epoch << 32 | key)` taken with `atomicCAS` on a way lets the columns of an MTP
+    window share the block. A block takes the way already claimed with its key, else the way
+    holding its tag `(generation << 32 | row << 20 | block)`, else the way of the set least
+    recently claimed, and copies the block only when the way's tag differs; the row in the key
+    keeps the lanes' blocks apart.
+  - **Overflow.** A cacheable block whose set's four ways other blocks all claimed in the same
+    call goes to the overflow area, and so does every uncacheable block (the growing tail, the positions of the
     window).
   - **Rewrite.** The selection is rewritten to `slot * 4 + (position & 3)`. The attention reads the
     region with the same counts.

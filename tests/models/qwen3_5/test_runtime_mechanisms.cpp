@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/planning/prompt_steps.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context_work.h"
 
@@ -452,6 +453,94 @@ void test_rebuild_work_prompt_frontier_boundary() {
            "continuation growth did not preserve the prompt-frontier rebuild split");
 }
 
+// Prefill steps of a prompt whose expert cache lends `lent(step)` columns when each step starts
+// (the elastic KV takes columns between steps). Returns the steps, or 0 after a failed check.
+template <class Lent>
+std::uint32_t prompt_steps(std::uint32_t prompt_tokens, const std::vector<std::uint32_t>& captures,
+                           std::uint32_t prefill_chunk, bool routed, Lent lent,
+                           std::vector<std::uint32_t>* widths = nullptr) {
+    std::uint32_t cursor = 0, steps = 0;
+    std::size_t next = 0;
+    while (cursor < prompt_tokens) {
+        while (next < captures.size() && captures[next] <= cursor) { ++next; }
+        const std::uint32_t end =
+            next < captures.size() ? std::min(captures[next], prompt_tokens) : prompt_tokens;
+        const std::uint32_t segment = end - cursor;
+        const bool equal_widths     = routed && lent(steps) >= prefill_chunk;
+        const std::uint32_t tokens =
+            q36::runtime_support::prompt_step_tokens(segment, prefill_chunk, equal_widths);
+        if (tokens == 0 || tokens > segment || tokens > prefill_chunk) {
+            expect(false, "a prompt step is empty, crosses a capture or exceeds a chunk");
+            return 0;
+        }
+        if (widths != nullptr) { widths->push_back(tokens); }
+        cursor += tokens;
+        ++steps;
+    }
+    return steps;
+}
+
+// The prefill quanta a request's service projection counts: one per chunk of each segment between
+// capture frontiers.
+std::uint32_t projected_prompt_steps(std::uint32_t prompt_tokens,
+                                     const std::vector<std::uint32_t>& captures,
+                                     std::uint32_t prefill_chunk) {
+    std::uint32_t steps = 0, begin = 0;
+    for (const std::uint32_t frontier : captures) {
+        if (frontier <= begin || frontier >= prompt_tokens) { continue; }
+        steps += 1 + (frontier - begin - 1) / prefill_chunk;
+        begin = frontier;
+    }
+    return steps + 1 + (prompt_tokens - begin - 1) / prefill_chunk;
+}
+
+// Every prefill step consumes one quantum of the service work projected at admission, so a prompt
+// never takes more steps than the projection counted, whatever the expert cache lends when each
+// step starts. A 13.7k-token prompt with a 16 384 chunk whose cache lends 8 192 columns (one GPU,
+// elastic KV grown over the ring's columns) and max_tokens 1 is projected one quantum: two
+// equal-width steps under the lent width failed it and stopped the Engine.
+void test_prompt_steps_within_service_projection() {
+    constexpr std::uint32_t chunk  = 16384;
+    constexpr std::uint32_t narrow = 8192;
+    const auto always = [](std::uint32_t lent) { return [lent](std::uint32_t) { return lent; }; };
+    expect(prompt_steps(13737, {}, chunk, true, always(narrow)) == 1,
+           "a one-chunk prompt takes more than one step while the cache lends less than a chunk");
+    std::vector<std::uint32_t> widths;
+    expect(prompt_steps(53930, {}, chunk, true, always(chunk), &widths) == 4 &&
+               widths == std::vector<std::uint32_t>{13568, 13568, 13440, 13354},
+           "equal-width steps of a 54k prompt changed");
+    widths.clear();
+    expect(prompt_steps(53930, {}, chunk, false, always(chunk), &widths) == 4 &&
+               widths == std::vector<std::uint32_t>{16384, 16384, 16384, 4778},
+           "full-chunk steps of a model without routed experts changed");
+    // A capture inside the prompt: equal widths over the whole prompt would split the segment
+    // before it in two steps where the projection counts one.
+    expect(prompt_steps(30000, {16000}, chunk, true, always(chunk)) == 2,
+           "equal-width steps crossed a capture frontier the projection counts");
+
+    const std::vector<std::vector<std::uint32_t>> capture_sets{
+        {}, {4096}, {16000}, {16384}, {20000, 40000}, {32768, 32769}, {1, 70000}};
+    for (std::uint32_t prompt_tokens = 1; prompt_tokens <= 90000; prompt_tokens += 997) {
+        for (const auto& captures : capture_sets) {
+            const std::uint32_t projected = projected_prompt_steps(prompt_tokens, captures, chunk);
+            for (const bool routed : {false, true}) {
+                // The cache lends a whole chunk, never one, or alternately one and not.
+                expect(prompt_steps(prompt_tokens, captures, chunk, routed, always(chunk)) ==
+                           projected,
+                       "steps with a whole chunk lent differ from the service projection");
+                expect(prompt_steps(prompt_tokens, captures, chunk, routed, always(narrow)) ==
+                           projected,
+                       "steps with half a chunk lent differ from the service projection");
+                expect(prompt_steps(prompt_tokens, captures, chunk, routed,
+                                    [=](std::uint32_t step) {
+                                        return step % 2 == 0 ? chunk : narrow;
+                                    }) == projected,
+                       "steps with a lent width changing between steps differ from the projection");
+            }
+        }
+    }
+}
+
 } // namespace
 
 // An underflow report names the accounting step and the dimension that disagreed.
@@ -597,6 +686,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_prompt_steps_within_service_projection();
     test_resource_difference_names_the_failing_ledger();
     test_fused_route_queries_match_capacity();
     if (failures != 0) {

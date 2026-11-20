@@ -281,6 +281,12 @@ std::vector<std::uint8_t> big_core_members(std::span<const int> cpus, std::span<
     return out;
 }
 
+bool hybrid_members(std::span<const int> cpus, std::span<const int> big) {
+    const std::vector<std::uint8_t> members = big_core_members(cpus, big);
+    return std::find(members.begin(), members.end(), 1) != members.end() &&
+           std::find(members.begin(), members.end(), 0) != members.end();
+}
+
 // ------------------------------------------------------------------ pool
 HostCpuPool::HostCpuPool(std::span<const int> cpus, double spin_ms)
     : size_(static_cast<std::int32_t>(cpus.size())), spin_ms_(spin_ms),

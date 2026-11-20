@@ -35,6 +35,13 @@ inline constexpr std::int32_t kQsaIndexKeyDim = 128;
 inline constexpr std::int32_t kQsaIndexRecordWords = 136;
 /** Pooled block-key plane: each of a block's `ratio`=4 token slots holds 32 of its 128 words. */
 inline constexpr std::int32_t kQsaBlockKeyWords = 32;
+/**
+ * Decode and verify top-k of qsa_select: a call whose envelope holds at most this many visible keys
+ * (rows of at most kQsaSplitTopkMinKeys / 4 blocks, the one-CTA kernel's staging) runs only the
+ * one-CTA kernel; a longer envelope also launches the split top-k for its longer rows, which
+ * changes the call's graph topology. The causal decode graph tiers end one tier here.
+ */
+inline constexpr std::uint32_t kQsaSplitTopkMinKeys = 81920;
 
 struct QsaGeometry {
     std::int32_t query_heads = 0;
@@ -292,11 +299,13 @@ void qsa_stage_selected_union(const Tensor& selected, const Tensor& counts,
  * equals qsa_attention(q, selected, counts, table_rows, kv, ...) bit for bit.
  *
  * State: a block of lane b wholly before its window's first position p0(b) = cache_positions[0, b]
- * is cacheable. It maps to slot (block + row * (cache_blocks / 8)) % cache_blocks of the layer
- * (row = table_rows[b]; lanes share the layer's slots) and is copied only when the slot's tag
- * differs from (generation << 32 | key); columns of the call asking for the same block of the
- * same row share its slot; a cacheable block whose slot another block claimed in this call, and
- * every block that is not cacheable, is copied into the overflow
+ * is cacheable. It maps to the set of 4 slots (ways) starting at slot 4 * ((block + row *
+ * (cache_blocks / 32)) % (cache_blocks / 4)) of the layer (row = table_rows[b]; lanes share the
+ * layer's sets). Columns of the call asking for the same block of the same row share its way;
+ * otherwise the block takes the way holding its tag (generation << 32 | key), else the way of the
+ * set least recently claimed, and is copied only when that way's tag differs. A cacheable block
+ * whose set's ways other blocks all claimed in this call, and every block that is not cacheable,
+ * is copied into the overflow
  * (W * B * ceil(max_selected / 4) <= overflow_blocks). The call advances the layer's epoch,
  * records each lane's p0 for its row, and starts a new generation (forgetting every cached block
  * of the layer) when some lane's p0 is below its row's previous call's (the caller may then have

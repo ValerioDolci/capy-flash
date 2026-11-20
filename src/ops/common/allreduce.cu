@@ -456,6 +456,7 @@ HostExchange::~HostExchange() {
         for (cudaEvent_t e : chunk_done_[rank]) { (void)cudaEventDestroy(e); }
         for (cudaEvent_t e : group_ready_[rank]) { (void)cudaEventDestroy(e); }
         for (cudaEvent_t e : pipe_chunk_[rank]) { (void)cudaEventDestroy(e); }
+        for (cudaEvent_t e : group_arrived_[rank]) { (void)cudaEventDestroy(e); }
         for (cudaEvent_t e : {begun_[rank], received_[rank]}) {
             if (e != nullptr) { (void)cudaEventDestroy(e); }
         }
@@ -524,6 +525,13 @@ void HostExchange::reserve(std::size_t bytes, std::size_t chunks, const Executio
             events.push_back(e);
         }
     }
+}
+
+void HostExchange::reserve_sum_f32(std::size_t elements, const ExecutionContext& ec) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    require(!pending_.active, "HostExchange: reserve_sum_f32 while a call is open");
+    const CurrentDeviceGuard guard;
+    reserve(elements * 2, 0, ec); // the 16-bit payload; the int8 payload is narrower
 }
 
 void HostExchange::pull(const std::array<const void*, 2>& source,
@@ -859,7 +867,46 @@ void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t coun
         receive_to_device(destination + o, host_[r] + offset + o, m, receive_[peer],
                           receive_by_kernel_);
     }
+    grow(group_arrived_[peer], p.groups[r], ec.dev[1 - rank]->device);
+    CurrentDeviceGuard::set(ec.dev[1 - rank]->device);
+    CUDA_CHECK(cudaEventRecord(group_arrived_[peer][p.groups[r] - 1], receive_[peer]));
     p.done[r] += count;
+    p.group_end[r].push_back(p.done[r]);
+}
+
+bool HostExchange::combine_columns(std::int64_t count) {
+    Pending& p = pending_;
+    require(p.active, "HostExchange: combine_columns without begin_sum_f32");
+    const std::int64_t end = p.combined + count;
+    require(count >= 0 && end <= p.done[0] && end <= p.done[1],
+            "HostExchange: combine_columns before both ranks reported the columns");
+    if (p.payload != Payload::FP16) { return false; }
+    if (count == 0) { return true; }
+    const ExecutionContext& ec = *p.ec;
+    const CurrentDeviceGuard guard;
+    const std::size_t total = static_cast<std::size_t>(p.rows * p.columns);
+    const std::size_t begin = static_cast<std::size_t>(p.rows * p.combined);
+    const std::size_t n     = static_cast<std::size_t>(p.rows * count);
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r    = static_cast<std::size_t>(rank);
+        const auto peer = static_cast<std::size_t>(1 - rank);
+        // The peer's first group that ends at or past these columns: its arrival, on the same
+        // receive stream, follows every earlier group's.
+        const auto group = static_cast<std::size_t>(
+            std::lower_bound(p.group_end[peer].begin(), p.group_end[peer].end(), end) -
+            p.group_end[peer].begin());
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        const cudaStream_t stream = ec.dev[rank]->stream;
+        CUDA_CHECK(cudaStreamWaitEvent(stream, group_arrived_[r][group], 0));
+        auto* out = p.has_out ? static_cast<__nv_bfloat16*>(p.out[r].data) + begin : nullptr;
+        exchange_narrow_combine_kernel<<<grid_for(n), 256, 0, stream>>>(
+            static_cast<float*>(p.partial[r].data) + begin,
+            static_cast<const std::uint16_t*>(p.staging[r].data) + total + begin, out, n,
+            ldexpf(1.0F, -kExchangeShift), ldexpf(1.0F, kExchangeShift));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    p.combined = end;
+    return true;
 }
 
 void HostExchange::finish_sum_f32() {
@@ -875,6 +922,8 @@ void HostExchange::finish_sum_f32() {
                                    receive_[static_cast<std::size_t>(rank)]));
     }
     const std::size_t count = static_cast<std::size_t>(p.rows * p.columns);
+    // Columns combine_columns left (all of them without it; FP16 whenever some were combined).
+    const std::size_t begin = static_cast<std::size_t>(p.rows * p.combined);
     for (int rank = 0; rank < 2; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
         CurrentDeviceGuard::set(ec.dev[rank]->device);
@@ -883,7 +932,8 @@ void HostExchange::finish_sum_f32() {
         // follow rank r's device-to-host copies): partial[r] and the buffers may be reused.
         CUDA_CHECK(cudaStreamWaitEvent(stream, received_[r], 0));
         CUDA_CHECK(cudaStreamWaitEvent(stream, received_[1 - r], 0));
-        auto* out = p.has_out ? static_cast<__nv_bfloat16*>(p.out[r].data) : nullptr;
+        if (begin == count) { continue; }
+        auto* out = p.has_out ? static_cast<__nv_bfloat16*>(p.out[r].data) + begin : nullptr;
         if (p.payload == Payload::INT8) {
             const auto* staged = static_cast<const std::byte*>(p.staging[r].data);
             exchange_int8_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
@@ -891,10 +941,10 @@ void HostExchange::finish_sum_f32() {
                 count);
             CUDA_CHECK(cudaGetLastError());
         } else {
-            exchange_narrow_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
-                static_cast<float*>(p.partial[r].data),
-                static_cast<const std::uint16_t*>(p.staging[r].data) + count, out, count,
-                ldexpf(1.0F, -kExchangeShift), ldexpf(1.0F, kExchangeShift));
+            exchange_narrow_combine_kernel<<<grid_for(count - begin), 256, 0, stream>>>(
+                static_cast<float*>(p.partial[r].data) + begin,
+                static_cast<const std::uint16_t*>(p.staging[r].data) + count + begin, out,
+                count - begin, ldexpf(1.0F, -kExchangeShift), ldexpf(1.0F, kExchangeShift));
             CUDA_CHECK(cudaGetLastError());
         }
     }

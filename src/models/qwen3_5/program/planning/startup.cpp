@@ -1370,6 +1370,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // layer_slot_profile). The sizing probe (no slots yet) plans prefill_chunk only. The ring
     // counts as the runtime lends it (Qwen4OffloadExperts::ring_layers: half a layer of experts per
     // GPU at tp 2); counting the full 1-GPU ring at tp 2 can halve the chunk on a small slot pool.
+    // With elastic KV at one GPU the ring can take elastic columns instead
+    // (Qwen4OffloadExperts::ring_columns) and the workspace every Text layer: the planned chunk
+    // is the widest that fits either way, and the backend caps each chunk at what the KV's
+    // extent lets it lend (Qwen4RoutedExperts::prompt_chunk_columns).
     std::size_t prompt_workspace = 0;
     std::vector<std::pair<std::uint32_t, std::size_t>> prompt_steps;
     {
@@ -1420,6 +1424,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     execution::Qwen4OffloadExperts::gguf_ring_bytes(gguf_bytes, text_layers,
                                                                     impl->inputs.tp));
             }
+            // The backend's rule (Qwen4OffloadExperts constructor).
+            const bool column_ring =
+                !gguf_lend && impl->inputs.tp == 1 &&
+                qwen4_exclusive_layers(impl->inputs.qwen4_experts.exclusive_layers) == 0 &&
+                execution::Qwen4OffloadExperts::ring_columns(
+                    static_cast<std::int32_t>(
+                        std::max<std::uint32_t>(experts.stream_ring_slots, 512)),
+                    static_cast<std::int32_t>(layer_base.size()),
+                    static_cast<std::int32_t>(experts.elastic_columns)) > 0;
             // The workspace is the lent layers' slots of the gate/up code plane (one contiguous
             // region of the planar pool), the layers just below the ring.
             constexpr auto lend_bytes = execution::Qwen4OffloadExperts::kLendPlaneBytes;
@@ -1439,17 +1452,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 const std::uint32_t width = std::min(chunk, impl->inputs.capacity);
                 if (width <= base || width % kPrefillChunkAlignment != 0) { continue; }
                 const std::size_t need = need_for(width);
-                const std::int32_t layers =
-                    gguf_lend
-                        ? execution::Qwen4OffloadExperts::gguf_layers_below(
-                              layer_base, gguf_bytes, text_layers - ring_layers,
-                              static_cast<std::int64_t>(need))
-                        : execution::Qwen4OffloadExperts::layers_below(
-                              layer_base, text_layers - ring_layers,
-                              static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes));
-                if (execution::Qwen4OffloadExperts::may_lend(
+                bool fits              = false;
+                if (gguf_lend) {
+                    const std::int32_t layers = execution::Qwen4OffloadExperts::gguf_layers_below(
+                        layer_base, gguf_bytes, text_layers - ring_layers,
+                        static_cast<std::int64_t>(need));
+                    fits = execution::Qwen4OffloadExperts::may_lend(
                         layer_base, text_layers, ring_layers + layers,
-                        static_cast<std::int32_t>(impl->inputs.tp))) {
+                        static_cast<std::int32_t>(impl->inputs.tp));
+                } else {
+                    const auto slots =
+                        static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes);
+                    for (const bool columns : {false, true}) {
+                        fits =
+                            fits || ((!columns || column_ring) &&
+                                     execution::Qwen4OffloadExperts::workspace_layers(
+                                         layer_base, text_layers, ring_layers, slots,
+                                         static_cast<std::int32_t>(impl->inputs.tp), columns) > 0);
+                    }
+                }
+                if (fits) {
                     impl->qwen4_base_chunk = base;
                     impl->prefill_chunk    = width;
                     prompt_workspace       = need;
@@ -1463,6 +1485,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     break;
                 }
             }
+        } else if (text.qwen4_routed_experts() && impl->inputs.causal_scoring && gguf_lend &&
+                   experts.slots_per_layer > 0) {
+            // Scoring reads every column of its chunk's hidden, so its chunk stays on the
+            // Program's arena (no lent workspace); the prefill ring alone still copies each
+            // layer's streamed experts into VRAM once per chunk, where the in-place read
+            // fetches them over PCIe for every tile of columns.
+            impl->qwen4_base_chunk = base;
         }
     }
     impl->persistent = persistent_layout(*impl, 0);

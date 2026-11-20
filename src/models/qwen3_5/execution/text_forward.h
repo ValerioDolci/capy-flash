@@ -192,6 +192,10 @@ public:
     // A drafter's layer-output taps for the next run() (plain residual only; null = none).
     void set_feature_tap(Qwen4FeatureTap* tap) { feature_tap_ = tap; }
 
+    // The PLE rows of the next run()'s prompt chunk when the host is still gathering them
+    // (null = the rows are on the devices already): the PLE layer waits for them and uploads.
+    void set_pending_ple(PendingPleRows* pending) { pending_ple_ = pending; }
+
     // The visual columns of a multimodal prefill chunk, per rank: the merged Vision embeddings
     // BF16 [H, V] and the chunk-relative columns I32 [V] whose token embedding they replace before
     // the residual is widened (inputs_embeds.masked_scatter, then one copy per stream). The hidden
@@ -386,6 +390,8 @@ private:
     // Linear; at tp 2 each rank contracts its head block through its column shard and one BF16
     // all-reduce leaves the identical sum on both. `site` labels the exchange for
     // Qwen4Taps::capture_exchange (0 = mixer output, 1 = dense FFN down).
+    // tp 2 prompt chunk: after the mixer all-reduce of `layer` (Qwen4RoutedExperts).
+    void mixer_exchanged(std::int32_t layer);
     void output_projection(const RankTensors& x, std::array<const LinearParameters*, 2> p,
                            RankTensors& y, const RankTensors& staging, std::int32_t layer = -1,
                            int site = 0);
@@ -443,6 +449,19 @@ private:
 
     [[nodiscard]] std::array<ExchangePrefetch, 2> next_input_hint(std::size_t layer,
                                                                   std::size_t bytes) const;
+
+    // The hyper-connection block's decode L2 prefetch (graph decode at tp 2; residual.h):
+    // the mixer exchange prefetches the layer's router (and shared gate|up on its owner rank), the
+    // MoE exchange the next layer's HC mixer and mixer input, and rank 0, while it waits for the
+    // host's experts, the same for itself.
+    [[nodiscard]] std::size_t hc_exchange_bytes() const;
+    [[nodiscard]] std::size_t hc_exchange_prefetch() const;
+    void hc_stage_prefetch(const std::array<ExchangePrefetch, 2>& hint);
+    [[nodiscard]] std::array<ExchangePrefetch, 2> hc_ffn_hint(std::size_t layer,
+                                                              std::size_t bytes) const;
+    [[nodiscard]] std::array<ExchangePrefetch, 2> hc_next_hint(std::size_t layer) const;
+    void append_hc_next(int r, std::size_t layer, std::size_t bytes, ExchangePrefetch& out) const;
+    void stage_wait_prefetch(std::size_t layer);
 
     // The width of the first half of a tp 2 prompt chunk under the half-chunk overlap, or 0:
     // prefill_overlap_split's widths, the split exchange available, a one-axis RoPE chunk (a
@@ -643,6 +662,37 @@ private:
 
     static PrefillMoeExchange prefill_moe_exchange();
 
+    // Columns per slice of a prompt chunk's mixer output projection at tp 2 (output_projection):
+    // each slice's partial starts its host exchange while the following slices are projected.
+    static constexpr std::int32_t kPrefillOutputSliceColumns = 2048;
+
+    // Columns of the slice that starts at `first` of a T-column chunk: a tail shorter than half a
+    // slice joins the slice before it, so every slice of a sliced chunk is wide enough for the
+    // routes of the whole chunk (a column's bits do not depend on the slicing).
+    [[nodiscard]] static constexpr std::int32_t prefill_output_slice(std::int32_t first,
+                                                                     std::int32_t T) noexcept {
+        const std::int32_t rest = T - first;
+        return rest < kPrefillOutputSliceColumns + kPrefillOutputSliceColumns / 2
+                   ? rest
+                   : kPrefillOutputSliceColumns;
+    }
+
+    // The FFN mixer of a hyper-connection block, offered to the mixer's sliced output projection
+    // (hc_block): the projection combines each slice as it arrives and runs the mixer on that
+    // slice's columns while the later slices are still on the links. `ran`: it did.
+    struct MixerTail {
+        HcStreams* st;
+        HyperConnectionParameters Qwen4BlockParameters::* member;
+        std::size_t layer;
+        bool ran = false;
+    };
+
+    MixerTail* mixer_tail_ = nullptr;
+
+    // hc_mix (with the pending combine of the mixer output st.y[st.next]) on columns
+    // [first, first + n) only; the same Ops on the same columns as the whole-chunk call.
+    void hc_mix_columns(const MixerTail& tail, std::int32_t first, std::int32_t n);
+
     // The routed-expert backend and bank of `layer` on rank r (execution only).
     [[nodiscard]] Qwen4RoutedExperts* routed_experts(int r, std::size_t layer) const;
 
@@ -675,6 +725,7 @@ private:
     // overlap's half_block), or -1: the all-reduce completes in the call.
     int lane_                     = -1;
     Qwen4FeatureTap* feature_tap_ = nullptr;
+    PendingPleRows* pending_ple_  = nullptr;
 };
 
 extern template class TextForward<WorkspaceArena>;

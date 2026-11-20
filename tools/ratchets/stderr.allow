@@ -13,7 +13,7 @@
 1 src/core/paged_kv_cache.cpp
 1 src/core/tp2/decode_graph_tp2.inc
 19 src/models/qwen3_5/execution/qwen4_experts.cpp
-2 src/models/qwen3_5/execution/text_forward_context.cpp
+1 src/models/qwen3_5/execution/text_forward_context.cpp
 1 src/models/qwen3_5/execution/qwen4_tfdump.cpp
 3 src/models/qwen3_5/execution/reasoning_eos_guard.cpp
 1 src/models/qwen3_5/program/grammar_masks.cpp

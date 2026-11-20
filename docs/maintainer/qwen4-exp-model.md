@@ -388,7 +388,10 @@ Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
     runs the shared expert and the resident experts; a stream memory wait (no SM held) and an
     accumulate kernel add the CPU's FP32 partial; `moe_combine_shared` rounds once. A prefill chunk
     is one handshake per layer for all its columns (the CPU reads each missing expert once per
-    chunk, in dot groups of <= 8 tokens), the resident experts in calls of <= 8 columns. Optionally
+    chunk, in dot groups of <= 8 tokens), the resident experts in calls of <= 8 columns. At tp 2 on a
+    hybrid CPU (P- and E-cores, `/sys/devices/cpu_core/cpus`) the GGUF executor splits a decode call's
+    gate/up phase into items of one 8-row chunk of the gate or the up half of a slice, so a call of
+    one or two experts keeps every thread busy (same bits). Optionally
     (`--miss-split auto|calibrate`, decode calls) the GPU copies part of the missing experts from
     the host bank over PCIe into scratch slots on a second stream and computes them there while the
     CPU computes the rest.
@@ -413,6 +416,28 @@ Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
     Prompt chunks of at least `routed_experts.stream_min_tokens` tokens (`--stream-min-tokens`)
     stream the non-resident experts over PCIe and run every routed expert on the GPU; shorter
     chunks leave them to the CPU.
+    With elastic KV at one GPU (NVFP4 banks, every bank page-locked) the ring of a prompt whose
+    chunks borrow a workspace takes the last backed
+    elastic columns instead of the last Text layers (`Qwen4OffloadExperts::ring_columns`: up to
+    two layers of experts, so no layer's copies wait for the layer before it; the cache keeps
+    each layer's hottest experts in the other columns and gets the residency it gave up back
+    before the first decode window), and the workspace may take the base slots of every Text
+    layer: prompt chunks are then twice as wide. The KV takes the ring's columns first when it
+    grows; a chunk is as wide as the cache can lend when it starts
+    (`Qwen4RoutedExperts::prompt_chunk_columns`), so once the KV leaves the ring less than one
+    layer of experts the prompt goes on with the ring in the last Text layers and the narrower
+    chunks.
+    A prompt longer than one chunk runs in chunks of equal width (whole 128-column tiles:
+    `runtime_support::prompt_step_tokens`): every chunk pays one expert
+    pass whatever its width, so a short tail chunk is the most expensive per token (53 930 tokens
+    are four chunks of 13 568, not three of 16 384 and one of 4 778). At tp 2, 54k / 58k tokens,
+    cold: NVFP4 +3.9 %, GSQ-RCO +1.3 % (A B B A, n = 4), identical greedy texts with frozen
+    experts. Prompts of one chunk and CausalScoring keep their chunks.
+    The widths divide each segment between capture frontiers into the number of `prefill_chunk`
+    steps the request's service projection counted at admission (every prefill step consumes one
+    quantum; a step that the projection did not count fails the request and stops the Engine).
+    While the cache lends less than a whole chunk the steps are full chunks, each run as chunks
+    as wide as the cache lends.
   - Slots per layer: `routed_experts.slots_per_layer`, or 0 = the device memory the rest of the
     Program leaves minus `slot_headroom_bytes` (Engine resolves it before the final plan;
     `MemorySummary::routed_expert_slots`).

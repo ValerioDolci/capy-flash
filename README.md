@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.14.1**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.15.0**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -355,6 +355,16 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.15.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.15.0)), faster Flash-Next prompts and seven pull requests by @Mici81; the 27B's tokens are unchanged, Flash-Next's greedy text can differ
+- Flash-Next on one GPU: 16,384-token prompt chunks with the expert streaming ring in the elastic columns the KV is not
+  using (a cold 15k prompt 2,656 → 4,678 tokens/s); after long conversations fill the KV, chunks fall back to 8,192.
+- Flash-Next at two GPUs: more of the prompt overlaps (PLE gather, sliced mixer exchange, equal-width chunks, earlier
+  expert copies) and the QSA block selection runs on FP16 tensor cores ([PR #98](https://github.com/ValerioDolci/capy-flash/pull/98),
+  [PR #102](https://github.com/ValerioDolci/capy-flash/pull/102)): +18 % at 15k, +24 % at 54k, +25 % at 114k (NVFP4).
+- MTP verification at any width from 1 to 16 gives a token the same bits, so `--draft-tokens` 3, 4 and 5 give the same
+  text, and wider rounds cost less. Pull requests [#89](https://github.com/ValerioDolci/capy-flash/pull/89), [#90](https://github.com/ValerioDolci/capy-flash/pull/90),
+  [#92](https://github.com/ValerioDolci/capy-flash/pull/92), [#99](https://github.com/ValerioDolci/capy-flash/pull/99) and [#104](https://github.com/ValerioDolci/capy-flash/pull/104), same bits.
 
 **v0.14.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.14.1)), a fix and two pull requests by @Mici81; same tokens
 - Flash-Next with MTP no longer stops the server when the same prompt comes back a third time and its draft frontier

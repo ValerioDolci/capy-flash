@@ -26,9 +26,12 @@ using SlicedR16T16W4S2 = Q8A16SlicedKMmaSchedule<16, 4, 2, 1, Q8ScaleAccess::Sha
 using SlicedR16T32W4S2 = Q8A16SlicedKMmaSchedule<32, 4, 2, 1, Q8ScaleAccess::Shared>;
 
 // Register-resident decode rows (T <= 4): K 2560 (one warp per row; 8 CTAs/SM caps registers
-// at 64), K 640 (one warp per row), K 2560 split over two warps per row.
-using WarpRowR4P10  = Q8A16WarpRowSchedule<4, 4, 1, 10, 8>;
-using WarpRowR4P3   = Q8A16WarpRowSchedule<4, 4, 1, 3, 1>;
-using WarpRowR2W2P5 = Q8A16WarpRowSchedule<2, 4, 2, 5, 1>;
+// at 64), K 640 (one warp per row), K 2560 split over two warps per row. The T8 schedules run the
+// one-warp-per-row problems at T = 5..8 in one pass over the weights.
+using WarpRowR4P10   = Q8A16WarpRowSchedule<4, 4, 1, 10, 8>;
+using WarpRowR4P3    = Q8A16WarpRowSchedule<4, 4, 1, 3, 1>;
+using WarpRowR4P10T8 = Q8A16WarpRowSchedule<4, 8, 1, 10, 4>;
+using WarpRowR4P3T8  = Q8A16WarpRowSchedule<4, 8, 1, 3, 1>;
+using WarpRowR2W2P5  = Q8A16WarpRowSchedule<2, 4, 2, 5, 1>;
 } // namespace q8_instances
 } // namespace ninfer::ops::detail
