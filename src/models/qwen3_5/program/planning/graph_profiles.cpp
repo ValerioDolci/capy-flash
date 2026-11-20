@@ -55,6 +55,13 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
     return causal_resource_profiles(capacity, 2 * draft_window);
 }
 
+std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity, std::uint32_t width,
+                                                      std::uint32_t drafts) {
+    if (width < 2 || drafts == 0 || capacity == 0) { return {}; }
+    // The final AR call can see E + (width - 1) + drafts (2K for an MTP round of K drafts).
+    return causal_resource_profiles(capacity, (width - 1U) + drafts);
+}
+
 std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                          std::uint32_t draft_window) {
     if (capacity == 0 || draft_window == 0 || draft_window > 15) {

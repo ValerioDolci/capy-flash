@@ -20,6 +20,7 @@ set(NINFER_CPU_TESTS
   ninfer_device_sync_empty_test
   ninfer_device_sync_invalid_test
   ninfer_disk_kv_cache_test
+  ninfer_draft_policy_test
   ninfer_expert_cache_policy_test
   ninfer_expert_host_pool_test
   ninfer_gdn_replay_records_test
@@ -71,6 +72,7 @@ set(NINFER_CPU_TESTS
   ninfer_resource_manager_test
   ninfer_sampling_defaults_test
   ninfer_serve_options_test
+  ninfer_suffix_drafter_test
   ninfer_tensor_test
   ninfer_tool_call_parser_test
   ninfer_tp2_eager_transport_test

@@ -112,7 +112,7 @@ private:
     bool mtp_no_drafts = false;
     // NINFER_QWEN4_MTP_EXTENT_CAP=<k> (validation/measurement): verify at most k proposals per
     // round in the K-wide window (the cost of a column at fixed drafting work).
-    std::uint32_t mtp_extent_cap = qwen3_5::kMtpDecodeMaximumDrafts;
+    std::uint32_t mtp_extent_cap = qwen3_5::kMtpMaximumProposalDrafts;
     // NINFER_QWEN4_MTP_CALIB=<file> (measurement): one line per verified MTP round, "extent
     // accepted logp_1 .. logp_K" (the proposals' own softmax log-probabilities).
     std::FILE* calib_file = nullptr;

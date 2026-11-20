@@ -12,8 +12,12 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
-inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
+// Columns of a verified MTP window past its anchor: the MTP's own drafts (--draft-tokens, at most
+// 5) or a prompt-lookup window.
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts = 7;
+inline constexpr std::uint32_t kMtpDecodeMaximumWidth  = kMtpDecodeMaximumDrafts + 1;
+// The MTP layer's own drafts per round (--draft-tokens).
+inline constexpr std::uint32_t kMtpMaximumProposalDrafts  = 5;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 

@@ -93,6 +93,10 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
+    // MTP only: prompt lookup (Strata's suffix drafter and draft policy). A one-row round may
+    // verify a window of up to 8 tokens copied from an earlier repeat of its own text instead
+    // of the MTP's drafts, when the measured acceptance and round costs say it pays.
+    bool prompt_lookup         = false;
     ProposalHead proposal_head = ProposalHead::Full;
     // Qwen4Exp MTP only: a draft token shortlist file (whitespace-separated token IDs in
     // priority order, '#' comment lines). The proposal heads score only these rows of the Text

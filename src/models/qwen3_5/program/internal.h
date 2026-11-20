@@ -7,8 +7,10 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+// The widest verified MTP window minus its anchor: --draft-tokens (at most 5) or a prompt-lookup
+// window (the host experts and expert slots take at most 8 tokens per call).
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 7;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 
 } // namespace ninfer::models::qwen3_5
