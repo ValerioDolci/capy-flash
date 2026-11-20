@@ -79,8 +79,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
     const auto install_and_upload = [&](DecodeGraphTopology& topology, std::size_t profile_index) {
         if (topology.installed_profile != profile_index) {
-            topology.executable.update(family.profiles[profile_index].definition);
-            topology.installed_profile = profile_index;
+            install_graph_definition(family, topology, profile_index);
         }
         topology.executable.upload(device.stream);
         synchronize();
@@ -361,9 +360,12 @@ void ProgramImpl::prepare_graphs() {
         }
         synchronize_devices();
     };
+    const TextConfig& text_config = parameters.model.config().text;
+    const bool qsa_split_topk =
+        text_config.qwen4() && static_cast<bool>(text_config.sparse_attention);
     const auto capture_and_instantiate = [&] {
         if (speculative_backend == SpeculativeBackend::None) {
-            const auto ordinary_profiles = ordinary_graph_profiles(capacity);
+            const auto ordinary_profiles = ordinary_graph_profiles(capacity, qsa_split_topk);
             validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
             const std::uint32_t ordinary_batch_limit = max_concurrency;
             execution::OrdinaryBatchContext ordinary_state{
@@ -398,6 +400,7 @@ void ProgramImpl::prepare_graphs() {
                     profile.max_execution_frontier = planned.max;
                     profile.topology_class =
                         planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                    profile.split_topk = planned.split_topk;
                     const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
                                                                          planned.max + 1};
                     execution::capture_ordinary_decode_batch(ordinary_state,
@@ -408,7 +411,8 @@ void ProgramImpl::prepare_graphs() {
         }
 
         if (speculative_backend == SpeculativeBackend::Mtp) {
-            const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
+            const auto planned_profiles =
+                mtp_graph_profiles(capacity, draft_window, qsa_split_topk);
             validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
             execution::MtpBatchContext mtp_state{
                 execution_core(),
@@ -444,6 +448,7 @@ void ProgramImpl::prepare_graphs() {
                     profile.max_execution_frontier = planned.max;
                     profile.topology_class =
                         planned.topology_class * max_concurrency + (batch_size - 1U);
+                    profile.split_topk = planned.split_topk;
                     execution::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
                         mtp_causal_attention_envelopes(planned.max, draft_window, capacity),

@@ -121,6 +121,20 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 namespace ninfer::models::qwen3_5::detail {
 
+void install_graph_definition(DecodeGraphFamily& family, DecodeGraphTopology& topology,
+                              std::size_t profile_index) {
+    const DecodeGraphProfile& profile = family.profiles[profile_index];
+    const bool same_topology =
+        topology.installed_profile &&
+        family.profiles[*topology.installed_profile].split_topk == profile.split_topk;
+    if (same_topology) {
+        topology.executable.update(profile.definition);
+    } else {
+        topology.executable.instantiate(profile.definition);
+    }
+    topology.installed_profile = profile_index;
+}
+
 namespace {
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
@@ -162,8 +176,7 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
     DecodeGraphTopology& topology   = select_graph_topology(family, profile.topology_class, label);
     const std::size_t profile_index = static_cast<std::size_t>(&profile - family.profiles.data());
     if (topology.installed_profile != profile_index) {
-        topology.executable.update(profile.definition);
-        topology.installed_profile = profile_index;
+        install_graph_definition(family, topology, profile_index);
     }
     return topology.executable;
 }

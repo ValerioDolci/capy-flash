@@ -350,6 +350,7 @@ struct DecodeGraphProfile {
     std::uint32_t min_execution_frontier = 0;
     std::uint32_t max_execution_frontier = 0;
     std::uint32_t topology_class         = 0;
+    bool split_topk                      = false; // GraphExecutionProfile::split_topk
     DecodeGraphDefinition definition;
 };
 
@@ -358,6 +359,13 @@ struct DecodeGraphTopology {
     DecodeGraphExecutable executable;
     std::optional<std::size_t> installed_profile;
 };
+
+struct DecodeGraphFamily;
+// Installs profile `profile_index` of `family` in `topology`'s executable: an update, or a
+// re-instantiation where the QSA split top-k changes the node topology (split_topk differs from
+// the installed profile's), which an update would only try and fail.
+void install_graph_definition(DecodeGraphFamily& family, DecodeGraphTopology& topology,
+                              std::size_t profile_index);
 
 struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;

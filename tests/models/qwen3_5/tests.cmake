@@ -307,3 +307,8 @@ target_link_libraries(ninfer_qwen4_tf_driver PRIVATE ninfer_engine)
 ninfer_add_test(ninfer_qwen4_gguf_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_gguf_pool.cpp"
   LIBRARIES ninfer_model_runtime)
+
+# Graph profile planning: the QSA split top-k tiers (CPU only).
+ninfer_add_test(ninfer_qwen3_5_graph_profiles_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_graph_profiles.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
