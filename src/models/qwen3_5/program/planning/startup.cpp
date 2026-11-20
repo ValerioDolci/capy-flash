@@ -109,6 +109,12 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 std::size_t dflash2_candidates_workspace_tp2(const SequencePlanImpl& plan, std::int32_t columns);
 bool dflash2_drafter_split_tp2(const SequencePlanImpl& plan);
 
+// A Qwen4Exp model with QSA: its rounds past ops::kQsaSplitTopkMinKeys launch the split top-k.
+bool qsa_split_topk(const SequencePlanImpl& plan) {
+    const TextConfig& config = plan.inputs.parameters->model.config().text;
+    return config.qwen4() && static_cast<bool>(config.sparse_attention);
+}
+
 // Active KV in RAM: the 4-token groups of one column's QSA selection.
 std::int32_t qsa_selection_groups(const TextConfig& config) {
     if (!config.qwen4() || !config.sparse_attention) { return 0; }
@@ -1518,8 +1524,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(per_batch, impl->inputs.max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->inputs.speculative_backend == SpeculativeBackend::Mtp) {
-            const auto profiles =
-                mtp_graph_profiles(impl->inputs.capacity, impl->inputs.draft_window);
+            const auto profiles = mtp_graph_profiles(
+                impl->inputs.capacity, impl->inputs.draft_window, qsa_split_topk(*impl));
             // Per device; tp 2 uses its measured class allowance (core/tp2/device_tuning.h).
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,

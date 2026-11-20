@@ -86,6 +86,9 @@ struct GraphExecutionProfile {
     std::uint32_t min            = 0;
     std::uint32_t max            = 0;
     std::uint32_t topology_class = 0;
+    // Qwen4Exp with QSA: the tier past ops::kQsaSplitTopkMinKeys, whose rounds also launch the
+    // split top-k. Same topology class; switching to or from it re-instantiates the executable.
+    bool split_topk = false;
 };
 
 // Program-minted shortlist metadata. It only narrows catalog inspection; Program still performs
