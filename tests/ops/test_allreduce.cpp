@@ -21,6 +21,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -540,7 +541,7 @@ int run_transport_identity_case(const char* label, std::int32_t ne0, std::int32_
 int run_prefetch_identity_case(const char* label, std::int32_t ne0, std::int32_t ne1,
                                std::uint32_t seed, const ExecutionContext& ec,
                                const ops::PeerEvents& staged, const ops::PeerEvents& pipelined,
-                               ops::PeerMailbox& mailbox) {
+                               ops::PeerMailbox& mailbox, int hint_ranges = 4) {
     constexpr std::size_t kWeightBytes = 24u << 20;
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
     std::vector<float> a(count), b(count);
@@ -560,19 +561,34 @@ int run_prefetch_identity_case(const char* label, std::int32_t ne0, std::int32_t
         for (int rank = 0; rank < 2; ++rank) {
             auto* base =
                 static_cast<const std::uint8_t*>(weights[static_cast<std::size_t>(rank)]->data());
-            const std::array<ops::PeerL2Range, 4> ranges{{{base, 6u << 20},
+            // A prefix of `hint_ranges`: 4 valid ranges (the plain block's widest hint, the
+            // narrow launch), 5 (the narrowest wide launch) or all 8, whose last one is shorter
+            // than a 16-byte unit and dropped (7 valid).
+            const std::array<ops::PeerL2Range, 8> ranges{{{base, 6u << 20},
                                                           {base + (12u << 20) + 3, (5u << 20) + 7},
-                                                          {base + (20u << 20), 8},
-                                                          {base + (18u << 20), 1u << 20}}};
-            mailbox.set_l2_prefetch(rank, ranges);
+                                                          {base + (18u << 20), 1u << 20},
+                                                          {base + (6u << 20), 64u << 10},
+                                                          {base + (7u << 20) + 5, 3u << 20},
+                                                          {base + (21u << 20), 2u << 20},
+                                                          {base + (23u << 20), 16},
+                                                          {base + (20u << 20), 8}}};
+            mailbox.set_l2_prefetch(rank, {ranges.data(), static_cast<std::size_t>(hint_ranges)});
         }
     };
     int failures = 0;
     const std::string base(label);
     const auto staged_bits =
         captured_bits((base + " staged").c_str(), ne0, ne1, a_bits, b_bits, ec, staged, failures);
+    const std::int64_t wide_before = mailbox.wide_prefetch_launches();
     const auto prefetch_bits = captured_bits((base + " prefetch").c_str(), ne0, ne1, a_bits, b_bits,
                                              ec, pipelined, failures, hint);
+    // Up to four ranges keep the four-range launch argument of the plain block (v0.14.1).
+    const bool wide = mailbox.wide_prefetch_launches() > wide_before;
+    if (wide != (hint_ranges > 4)) {
+        std::printf("FAIL: %s: %d-range hint took the %s launch\n", label, hint_ranges,
+                    wide ? "eight-range" : "four-range");
+        ++failures;
+    }
     failures += verify_exact((base + " prefetching mailbox equals staged").c_str(), prefetch_bits,
                              staged_bits);
     const std::vector<std::uint8_t> pattern(kWeightBytes, 0x5a);
@@ -775,6 +791,10 @@ int main() {
                                            mailbox_events, mailbox);
     failures += run_prefetch_identity_case("prefetch identity [5120,4]", 5120, 4, 423u, ec, events,
                                            mailbox_events, mailbox);
+    failures += run_prefetch_identity_case("prefetch identity [5120], five ranges", 5120, 1, 425u,
+                                           ec, events, mailbox_events, mailbox, 5);
+    failures += run_prefetch_identity_case("prefetch identity [5120,4], eight ranges", 5120, 4,
+                                           427u, ec, events, mailbox_events, mailbox, 8);
 
     // A slot of a full batch's width: DFlash2 K=7 at four requests, [5120, 8 x 4] = 320 KiB (160
     // blocks of the exchange kernel), carrying every narrower exchange too; one column more stays
