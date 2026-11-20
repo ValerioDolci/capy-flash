@@ -18,6 +18,7 @@
 //  - informative: relative L2 error of the kernel against FP64 products with the unquantized BF16
 //    activations (the cost of the Q8 activation codec), printed per format.
 #include "ops/host_moe/host_gguf.h"
+#include "ops/host_moe/host_gguf_isa.h"
 #include "ops/host_moe/host_q8.h"
 
 #include "nlohmann/json.hpp"
@@ -43,6 +44,7 @@ namespace {
 
 constexpr int kMaxT = 8;
 int g_failures      = 0;
+int g_vnni_tiles    = 0; // row tiles whose AVX-VNNI dots were compared
 
 #define CHECK(cond, ...)                                                                           \
     do {                                                                                           \
@@ -263,6 +265,20 @@ void check_rows(const RowSet& s, std::mt19937_64& rng) {
         g::decode_rows(s.fmt, rows, s.row_bytes, nr, k, dec.p);
         float out8[8 * kMaxT];
         g::gemm_decoded(s.fmt, dec.p, nr, k, acts, kMaxT, out8, kMaxT);
+        if (g::host_gguf_avxvnni_supported()) {
+            // The AVX-VNNI form of the AVX2 dots against the vpmaddubsw form: the same bits for
+            // every T and this row tile.
+            for (int T = 1; T <= kMaxT; ++T) {
+                float plain[8 * kMaxT], vnni[8 * kMaxT];
+                g::detail::avx2::gemm_decoded(s.fmt, dec.p, nr, k, acts, T, plain, kMaxT);
+                g::detail::avx2::gemm_decoded_vnni(s.fmt, dec.p, nr, k, acts, T, vnni, kMaxT);
+                for (int r = 0; r < nr; ++r) {
+                    CHECK(std::memcmp(plain + r * kMaxT, vnni + r * kMaxT, sizeof(float) * T) == 0,
+                          "%s: AVX-VNNI dots differ (rows %d, T %d)", s.label.c_str(), nr, T);
+                }
+            }
+            ++g_vnni_tiles;
+        }
         for (int r = 0; r < nr; ++r) {
             const std::uint8_t* row = rows + std::size_t(r) * s.row_bytes;
             // Single-row tile and every T must give the same bits.
@@ -419,6 +435,11 @@ int main(int argc, char** argv) {
     if (g_failures) {
         std::printf("FAILED: %d check(s)\n", g_failures);
         return 1;
+    }
+    if (g::host_gguf_avxvnni_supported()) {
+        std::printf("AVX-VNNI dots: %d row tiles, the same bits as the AVX2 form\n", g_vnni_tiles);
+    } else {
+        std::printf("(no AVX-VNNI on this CPU: its dots not checked)\n");
     }
     std::printf("PASS\n");
     return 0;

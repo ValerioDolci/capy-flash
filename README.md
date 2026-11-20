@@ -19,7 +19,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.15.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.15.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -355,6 +355,13 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.15.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.15.1)), two pull requests; same tokens
+- GGUF expert dots in AVX-VNNI on AVX2 CPUs that have it (Intel since Alder Lake), same bits: decode +0.6 to +1.0 % on an
+  i9-14900KF ([PR #105](https://github.com/ValerioDolci/capy-flash/pull/105) by @Mici81). CPUs with AVX-512 keep their kernels.
+- First step of the native Windows build ([#43](https://github.com/ValerioDolci/capy-flash/issues/43)): the sources compile
+  with MSVC, no OS code yet, so Windows does not build on its own; Linux builds the same machine code
+  ([PR #106](https://github.com/ValerioDolci/capy-flash/pull/106) by @mirifiuto135-debug).
 
 **v0.15.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.15.0)), faster Flash-Next prompts and seven pull requests by @Mici81; the 27B's tokens are unchanged, Flash-Next's greedy text can differ
 - Flash-Next on one GPU: 16,384-token prompt chunks with the expert streaming ring in the elastic columns the KV is not

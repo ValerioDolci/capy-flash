@@ -1,6 +1,9 @@
 // Modified for fngine from llama.cpp/ggml:ggml/src/ggml-common.h, ggml/src/ggml-impl.h, ggml/src/ggml-quants.h @ 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
 // SPDX-License-Identifier: MIT (see LICENSE in this directory)
 #pragma once
+#if defined(_MSC_VER) && !defined(__clang__)
+#define __restrict__ __restrict  // MSVC spelling
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>

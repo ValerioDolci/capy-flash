@@ -108,8 +108,9 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
     if ((!kRowTail && !full_rows) || p.k % Schedule::kBlockK)
         throw std::invalid_argument("BF16 sliced-K requires complete row/K tiles");
     const auto launch = [&]<bool FullRows>() {
-        constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, FullRows>;
-        const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
+        static constexpr auto kernel =
+            bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, FullRows>;
+        const int bytes = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
         for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
             const dim3 grid(div_up(p.rows, Schedule::kBlockRows),
                             div_up(count, Schedule::kBlockTokens));

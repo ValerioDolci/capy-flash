@@ -68,6 +68,9 @@ NINFER_GGUF_ISA_ENTRY_POINTS
 
 namespace avx2 {
 NINFER_GGUF_ISA_ENTRY_POINTS
+// gemm_decoded with AVX-VNNI (host_gguf_avxvnni_supported): the same bits.
+void gemm_decoded_vnni(WeightFormat fmt, const void* wdec, std::int32_t nrows, std::int32_t k,
+                       const void* const* acts, std::int32_t T, float* out, std::size_t ldo);
 } // namespace avx2
 
 #undef NINFER_GGUF_ISA_ENTRY_POINTS

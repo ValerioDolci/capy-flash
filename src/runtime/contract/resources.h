@@ -1,5 +1,8 @@
 #pragma once
 
+#if !defined(__SIZEOF_INT128__)
+#    include "core/wide_math.h" // saturating_mul/add for the no-__int128 branch below (MSVC)
+#endif
 #include "runtime/contract/request.h"
 #include "core/transfer_work.h"
 #include <array>
@@ -33,9 +36,10 @@ struct PrefillWork {
     PrefillWork result;
     result.chunks =
         suffix_tokens == 0 || prefill_chunk == 0 ? 0 : 1U + (suffix_tokens - 1U) / prefill_chunk;
-    result.tokens                       = suffix_tokens;
-    result.vision_items                 = vision_items;
-    result.vision_patches               = vision_patches;
+    result.tokens         = suffix_tokens;
+    result.vision_items   = vision_items;
+    result.vision_patches = vision_patches;
+#if defined(__SIZEOF_INT128__)
     const unsigned __int128 suffix      = suffix_tokens;
     const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
     const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
@@ -45,6 +49,14 @@ struct PrefillWork {
     result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
                                  ? std::numeric_limits<std::uint64_t>::max()
                                  : static_cast<std::uint64_t>(attention);
+#else
+    // Same value, saturated in 64 bits (no 128-bit integer on MSVC).
+    const std::uint64_t suffix = suffix_tokens;
+    const std::uint64_t linear = saturating_mul(static_cast<std::uint64_t>(prefix_tokens), suffix);
+    const std::uint64_t triangular = suffix % 2U == 0U ? saturating_mul(suffix / 2U, suffix + 1U)
+                                                       : saturating_mul(suffix, suffix / 2U + 1U);
+    result.attention_pairs         = saturating_add(linear, triangular);
+#endif
     return result;
 }
 

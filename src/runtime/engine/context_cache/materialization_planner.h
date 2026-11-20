@@ -1,5 +1,8 @@
 #pragma once
 
+#if !defined(__SIZEOF_INT128__)
+#    include "core/wide_math.h" // wide_mul for the no-__int128 branch below (MSVC)
+#endif
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/materialization_budget.h"
@@ -924,8 +927,13 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
+#if defined(__SIZEOF_INT128__)
             const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
             const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+#else
+            const auto left  = wide_mul(delta(cost), b); // the exact products as (high, low) words
+            const auto right = wide_mul(delta(prior), a);
+#endif
             if (left != right) { return left < right; }
         }
         return cost.key() < prior.key();

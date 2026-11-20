@@ -73,6 +73,9 @@ struct FormatInfo {
 [[nodiscard]] bool host_gguf_avx512_supported() noexcept;
 // Avx2: AVX2 + FMA + F16C (= host_isa_supported(HostIsa::Avx2)); Avx512Vnni: the set above.
 [[nodiscard]] bool host_gguf_isa_supported(HostIsa isa) noexcept;
+// True when the CPU runs AVX-VNNI (vpdpbusd on 256-bit registers): the AVX2 kernels then take its
+// gemm_decoded form, which gives the same bits.
+[[nodiscard]] bool host_gguf_avxvnni_supported() noexcept;
 // The GGUF kernels used for the host ISA `isa` (empty = host_isa(): the widest the CPU runs, or the
 // one named by NINFER_HOST_ISA): Avx512Vnni when that is the host ISA and the CPU runs the whole
 // AVX-512 GGUF set, else Avx2. Throws std::runtime_error as host_isa() does.

@@ -14,6 +14,10 @@
 
 #include <unistd.h>
 
+#if !defined(__SIZEOF_INT128__)
+#    include "core/wide_math.h" // the no-__int128 branch below (MSVC)
+#endif
+
 namespace ninfer::runtime {
 
 const std::array<ContextTransferCost, 3>& generic_context_transfer_cost();
@@ -23,7 +27,9 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
+#if defined(__SIZEOF_INT128__)
 using U128 = unsigned __int128;
+#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -35,6 +41,7 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
                : left + right;
 }
 
+#if defined(__SIZEOF_INT128__)
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
     const U128 product = static_cast<U128>(left) * right;
     return product > std::numeric_limits<std::uint64_t>::max()
@@ -49,6 +56,28 @@ std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noe
     if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
     return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
 }
+#else
+// The same two functions on the (high, low) words of the exact product (no 128-bit integer on
+// MSVC).
+std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
+    const WideProduct product = wide_mul(left, right);
+    return product.high != 0 ? std::numeric_limits<std::uint64_t>::max() : product.low;
+}
+
+std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
+    static_assert(kContextCostQ32One == 1ULL << 32U);
+    if (coefficient == 0 || units == 0) { return 0; }
+    const WideProduct product = wide_mul(coefficient, units);
+    // product >= (2^64 - 1) << 32, i.e. (high, low) >= (2^32 - 1, 0xFFFFFFFF00000000)
+    if (product.high > 0xFFFFFFFFULL ||
+        (product.high == 0xFFFFFFFFULL && product.low >= 0xFFFFFFFF00000000ULL)) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const std::uint64_t low  = product.low + (kContextCostQ32One - 1U);
+    const std::uint64_t high = product.high + (low < product.low ? 1U : 0U);
+    return (high << 32U) | (low >> 32U);
+}
+#endif
 
 void require_object(const Json& value, std::string_view context) {
     if (!value.is_object()) {
