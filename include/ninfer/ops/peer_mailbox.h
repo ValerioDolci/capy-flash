@@ -146,6 +146,12 @@ public:
 
     [[nodiscard]] std::size_t l2_prefetch_budget() const noexcept { return l2_prefetch_budget_; }
 
+    // Test aid: exchanges enqueued with the eight-range prefetch argument (a hint of more than
+    // four ranges). A hint of up to four keeps the four-range launch of the plain block.
+    [[nodiscard]] std::int64_t wide_prefetch_launches() const noexcept {
+        return wide_prefetch_launches_;
+    }
+
     // Test aid: sets the sticky hang word from the host, as a poller that gave up would, so the
     // owner's recovery can be exercised on hardware where no exchange ever hangs.
     void report_hang() noexcept;
@@ -188,6 +194,7 @@ private:
     };
 
     mutable L2Hint l2_hint_[2];
+    mutable std::int64_t wide_prefetch_launches_ = 0;
 };
 
 // Prefetches `ranges` (each shrunk to whole 16-byte units, at most kL2PrefetchKernelRanges, each
