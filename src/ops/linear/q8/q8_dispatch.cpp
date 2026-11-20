@@ -43,22 +43,22 @@ constexpr std::array kShapes{
     ShapeEntry{324, 10240, select_q8_few_rows_wide_k},
     ShapeEntry{320, 10240, select_q8_few_rows_wide_k},
     ShapeEntry{10240, 320, select_q8_generic},
-    ShapeEntry{12800, 2560, select_q8_qwen4_rows_k2560},
+    ShapeEntry{12800, 2560, select_q8_qwen4_n12800_k2560},
     // Qwen4Exp dense projections of the `qwen3_8_flash_next_nvfp4` recipe (Q8): QSA q|k|gate|v,
     // QSA indexer q|k, attention and GDN output, GDN q|k|v|z and a|b, shared-expert gate|up and
     // down (ninfer-ext's registration, untuned on the RTX 5070 Ti).
     ShapeEntry{13312, 2560, select_q8_qwen4_n13312_k2560},
     ShapeEntry{640, 2560, select_q8_qwen4_n640_k2560},
     ShapeEntry{2560, 6144, select_q8_qwen4_n2560_k6144},
-    ShapeEntry{16384, 2560, select_q8_qwen4_rows_k2560},
+    ShapeEntry{16384, 2560, select_q8_qwen4_n16384_k2560},
     ShapeEntry{96, 2560, select_q8_qwen4_n96_k2560},
-    ShapeEntry{1280, 2560, select_q8_qwen4_rows_k2560},
+    ShapeEntry{1280, 2560, select_q8_qwen4_n1280_k2560},
     ShapeEntry{2560, 640, select_q8_qwen4_n2560_k640},
     // Qwen4Exp at tp 2 (models/qwen3_5/load/sharding.h), one rank's shard: the Q8 recipe's
     // attention q|k|gate|v (12 query + 1 KV heads), GDN q|k|v|z (8 key + 24 value heads) and a|b
     // (24 + 24 rows) and the row-parallel attention and GDN outputs.
     ShapeEntry{6656, 2560, select_q8_qwen4_n6656_k2560},
-    ShapeEntry{8192, 2560, select_q8_qwen4_rows_k2560},
+    ShapeEntry{8192, 2560, select_q8_qwen4_n8192_k2560},
     ShapeEntry{48, 2560, select_q8_qwen4_n48_k2560},
     ShapeEntry{2560, 3072, select_q8_qwen4_n2560_k3072},
     // Hyper-connection Down(+inject) [R + I, 4*5120] and Up [4*5120, R] at H = 5120, on the same
@@ -74,7 +74,7 @@ constexpr std::array kShapes{
     ShapeEntry{640, 20480, select_q8_few_rows_wide_k},
     ShapeEntry{20480, 640, select_q8_generic},
     // Qwen4Exp MTP stem: fc_embedding and fc_hidden (the latter over S columns per token).
-    ShapeEntry{2560, 2560, select_q8_qwen4_rows_k2560},
+    ShapeEntry{2560, 2560, select_q8_qwen4_n2560_k2560},
     // Qwen4Exp Vision merger output (the Qwen3.5 tower's [4608 -> H] projection at H = 2560): the
     // 27B merger's K and T selection (its MMA and SIMT routes are generic over 64-row multiples).
     ShapeEntry{2560, 4608, select_q8_n5120_k4608},

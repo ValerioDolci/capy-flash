@@ -55,6 +55,8 @@ int q8_a16_conformance() {
                       64, 65, 79, 80, 81, 95, 96, 97, 127, 128, 129, 256, 1024}) {
             calls.push_back({t});
         }
+        // Qwen4Exp decode widths 5..8 (two MTP rows, prompt-lookup windows): the 8-token routes.
+        if (shape.k == 2560) calls.push_back({6});
         if (shape.n == 6144 && shape.k == 5120) {
             for (int t : {191, 192, 193}) calls.push_back({t});
         }

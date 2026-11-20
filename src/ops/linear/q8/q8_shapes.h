@@ -58,6 +58,12 @@ using Q8N124160K5120 = Q8LinearGeometry<124160, 5120>;
 [[nodiscard]] Q8Launch select_q8_qwen4_n2560_k3072(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_qwen4_n640_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_qwen4_n96_k2560(std::int32_t tokens);
+// The K = 2560 row projections: warp-row at T <= 4, the MMA schedule above at T 5..8.
+[[nodiscard]] Q8Launch select_q8_qwen4_n16384_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n12800_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n8192_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n2560_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n1280_k2560(std::int32_t tokens);
 
 // Qwen4Exp decode rows on the register-resident warp-row pipeline (shapes/qwen4_warp_row.cpp).
 [[nodiscard]] Q8Launch select_q8_qwen4_rows_k2560(std::int32_t tokens);
