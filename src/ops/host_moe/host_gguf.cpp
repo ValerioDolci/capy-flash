@@ -130,6 +130,10 @@ bool host_gguf_avx512_supported() noexcept {
            __builtin_cpu_supports("bmi2");
 }
 
+bool host_gguf_avxvnni_supported() noexcept {
+    return host_isa_supported(HostIsa::Avx2) && __builtin_cpu_supports("avxvnni");
+}
+
 bool host_gguf_isa_supported(HostIsa isa) noexcept {
     switch (isa) {
     case HostIsa::Avx2:
@@ -163,8 +167,13 @@ namespace {
             detail::NS::quantize_row_q8_0_f32                                                      \
     }
 
-constexpr HostGgufKernels kAvx512Kernels = NINFER_GGUF_KERNELS(HostIsa::Avx512Vnni, avx512);
-constexpr HostGgufKernels kAvx2Kernels   = NINFER_GGUF_KERNELS(HostIsa::Avx2, avx2);
+constexpr HostGgufKernels kAvx512Kernels   = NINFER_GGUF_KERNELS(HostIsa::Avx512Vnni, avx512);
+constexpr HostGgufKernels kAvx2Kernels     = NINFER_GGUF_KERNELS(HostIsa::Avx2, avx2);
+constexpr HostGgufKernels kAvx2VnniKernels = [] {
+    HostGgufKernels k = kAvx2Kernels;
+    k.gemm_decoded    = detail::avx2::gemm_decoded_vnni;
+    return k;
+}();
 
 #undef NINFER_GGUF_KERNELS
 
@@ -182,7 +191,9 @@ const HostGgufKernels& host_gguf_kernels(HostIsa isa) {
                                       ? "AVX2 + FMA + F16C"
                                       : "AVX-512 F/BW/VL/DQ/VNNI/VBMI/BITALG/VPOPCNTDQ/BF16"));
     }
-    return isa == HostIsa::Avx512Vnni ? kAvx512Kernels : kAvx2Kernels;
+    if (isa == HostIsa::Avx512Vnni) return kAvx512Kernels;
+    static const bool vnni = host_gguf_avxvnni_supported();
+    return vnni ? kAvx2VnniKernels : kAvx2Kernels;
 }
 
 // ------------------------------------------------------------------ dispatched entry points

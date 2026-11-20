@@ -1052,3 +1052,113 @@ void silu_mul(const float* g, const float* u, float* h, int32_t n) {
 } // namespace ninfer::ops::host::gguf::detail::avx2
 
 #pragma GCC pop_options
+
+// gemm_decoded with AVX-VNNI (vpdpbusd on 256-bit registers), for CPUs that have it
+// (host_gguf_avxvnni_supported): the lane sums start at the activation's ACORR and add
+// vpdpbusd(w + 128, q) per chunk, the AVX-512 kernel's integer sequence. They are the exact sums
+// sum(w * q) the vpmaddubsw form computes, and the float steps are the same: the same bits.
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,f16c,avxvnni")
+
+namespace ninfer::ops::host::gguf::detail::avx2 {
+namespace {
+
+template <int C, int R, int N>
+void micro_vnni(const uint8_t* w, std::size_t ws, const uint8_t* const* a, int G, float* out,
+                std::size_t ldo) {
+    constexpr int WG = wgroup_bytes(C), AG = agroup_bytes(C);
+    __m256 lo[R][N];
+    for (int h = 0; h < 2; ++h) {
+        __m256 acc[R][N];
+#pragma GCC unroll 16
+        for (int r = 0; r < R; ++r)
+#pragma GCC unroll 16
+            for (int t = 0; t < N; ++t) acc[r][t] = _mm256_setzero_ps();
+        for (int g = 0; g < G; ++g) {
+            const std::size_t wo = std::size_t(g) * WG + 32 * h, ao = std::size_t(g) * AG + 32 * h;
+            __m256i is[R][N];
+#pragma GCC unroll 16
+            for (int t = 0; t < N; ++t) {
+                const __m256i corr = ld(a[t] + ao + C * kChunk + 64);
+#pragma GCC unroll 16
+                for (int r = 0; r < R; ++r) is[r][t] = corr;
+            }
+#pragma GCC unroll 4
+            for (int c = 0; c < C; ++c) {
+                __m256i q[N];
+#pragma GCC unroll 16
+                for (int t = 0; t < N; ++t) q[t] = ld(a[t] + ao + c * kChunk);
+#pragma GCC unroll 16
+                for (int r = 0; r < R; ++r) {
+                    const __m256i wv = ld(w + r * ws + wo + c * kChunk); // w + 128 as u8
+#pragma GCC unroll 16
+                    for (int t = 0; t < N; ++t)
+                        is[r][t] = _mm256_dpbusd_avx_epi32(is[r][t], wv, q[t]);
+                }
+            }
+#pragma GCC unroll 16
+            for (int r = 0; r < R; ++r) {
+                const __m256 f = ldf(w + r * ws + wo + C * kChunk);
+#pragma GCC unroll 16
+                for (int t = 0; t < N; ++t) {
+                    const __m256 s = _mm256_mul_ps(f, ldf(a[t] + ao + C * kChunk));
+                    acc[r][t]      = _mm256_fmadd_ps(_mm256_cvtepi32_ps(is[r][t]), s, acc[r][t]);
+                }
+            }
+        }
+#pragma GCC unroll 16
+        for (int r = 0; r < R; ++r)
+#pragma GCC unroll 16
+            for (int t = 0; t < N; ++t) {
+                if (h == 0)
+                    lo[r][t] = acc[r][t];
+                else
+                    out[r * ldo + t] = reduce_add16(lo[r][t], acc[r][t]);
+            }
+    }
+}
+
+// The tiles of kMicro.
+template <int C>
+constexpr MicroFn kMicroVnni[5][3] = {
+    {nullptr, nullptr, nullptr},
+    {nullptr, &micro_vnni<C, 1, 1>, &micro_vnni<C, 1, 2>},
+    {nullptr, &micro_vnni<C, 2, 1>, &micro_vnni<C, 2, 2>},
+    {nullptr, &micro_vnni<C, 3, 1>, nullptr},
+    {nullptr, &micro_vnni<C, 4, 1>, nullptr},
+};
+
+template <int C>
+void gemm_impl_vnni(const uint8_t* w, std::size_t ws, int nrows, const uint8_t* const* a, int T,
+                    int G, float* out, std::size_t ldo) {
+    for (int t0 = 0; t0 < T;) {
+        const int nt   = T - t0 >= 2 ? 2 : 1;
+        const int rows = nt == 1 ? 4 : 2;
+        for (int r0 = 0; r0 < nrows; r0 += rows) {
+            const int nr = std::min(rows, nrows - r0);
+            kMicroVnni<C>[nr][nt](w + std::size_t(r0) * ws, ws, a + t0, G,
+                                  out + std::size_t(r0) * ldo + t0, ldo);
+        }
+        t0 += nt;
+    }
+}
+
+} // namespace
+
+void gemm_decoded_vnni(WeightFormat fmt, const void* wdec, int32_t nrows, int32_t k,
+                       const void* const* acts, int32_t T, float* out, std::size_t ldo) {
+    if (nrows <= 0 || T <= 0) return;
+    const ActFormat a    = format_info(fmt).act;
+    const int G          = groups_of(a, k);
+    const std::size_t ws = decoded_row_bytes(fmt, k);
+    const auto* w        = static_cast<const uint8_t*>(wdec);
+    const auto* ap       = reinterpret_cast<const uint8_t* const*>(acts);
+    if (a == ActFormat::Q8_K)
+        gemm_impl_vnni<4>(w, ws, nrows, ap, T, G, out, ldo);
+    else
+        gemm_impl_vnni<1>(w, ws, nrows, ap, T, G, out, ldo);
+}
+
+} // namespace ninfer::ops::host::gguf::detail::avx2
+
+#pragma GCC pop_options
