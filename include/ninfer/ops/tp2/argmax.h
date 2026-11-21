@@ -46,4 +46,27 @@ void argmax_split_pack(const Tensor& logits, const Tensor& local, int rank, Tens
 void argmax_split_select(const Tensor& candidates, std::int32_t rows_per_rank, Tensor& out,
                          cudaStream_t stream);
 
+/**
+ * Log-probability of the vocabulary-split argmax, in the same three steps: each rank packs the
+ * log-probability of its own candidate within its block (logprob_split_pack of
+ * target_logprobs(logits, local)), one allreduce_sum of the packed values gives both ranks both,
+ * and a rank computes the log-probability of the complete argmax over both blocks
+ * (argmax_split_logprob).
+ *
+ * logprob_split_pack: `local_logprob` is the contiguous FP32 [T] log-probability of rank `rank`'s
+ * candidate within its block, p_r = v_r - lse_r. Writes all of the contiguous BF16 `packed` [8,T]:
+ * column t is zero except elements [4 rank, 4 rank + 4), the base-256 digits of the FP32 bits of
+ * p_r[t]; as for argmax_split_pack, the allreduce_sum of both ranks' packed values is their exact
+ * union.
+ *
+ * argmax_split_logprob: from the summed `candidates` of argmax_split_pack (v_r) and the summed
+ * `packed` of logprob_split_pack (p_r), writes the contiguous FP32 `out` [T]:
+ *   out[t] = max(v_0, v_1) - log(exp(v_0 - p_0) + exp(v_1 - p_1)),
+ * the log-probability of the complete argmax over both blocks, evaluated in FP32 about the
+ * larger log-normalizer. No workspace or other state; outputs do not overlap inputs.
+ */
+void logprob_split_pack(const Tensor& local_logprob, int rank, Tensor& packed, cudaStream_t stream);
+void argmax_split_logprob(const Tensor& candidates, const Tensor& packed, Tensor& out,
+                          cudaStream_t stream);
+
 } // namespace ninfer::ops

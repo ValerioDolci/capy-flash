@@ -187,6 +187,10 @@ ninfer_add_op_test(ninfer_mtp_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_round.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_logprob_split_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_logprob_split.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)

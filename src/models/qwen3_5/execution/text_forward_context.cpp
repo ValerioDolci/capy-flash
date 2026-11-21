@@ -35,7 +35,9 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "ninfer/ops/tp2/argmax.h"
 
 #include <cuda_runtime.h>
 
@@ -1406,11 +1408,9 @@ void TextContext::qwen4_mtp_propose(const RankTensors& hidden, Tensor& logits, T
             return;
         }
         // Split shortlist: each rank scores its half, one exchange of the packed candidates,
-        // rank 0 selects (lower row on ties) and maps the row to its token, per column. It has no
-        // log-probabilities: a calibration run keeps the head on rank 0 (startup.cpp).
-        if (draft_logprobs != nullptr) {
-            throw std::logic_error("the split draft shortlist has no log-probabilities");
-        }
+        // rank 0 selects (lower row on ties) and maps the row to its token, per column. With
+        // log-probabilities (the adaptive draft window), each rank's log-probability of its own
+        // candidate travels in a second packed exchange, and rank 0 combines the two blocks.
         const auto ws = workspaces();
         for (std::int32_t b = 0; b < B; ++b) {
             auto column0 = ws[0]->scope();
@@ -1424,6 +1424,31 @@ void TextContext::qwen4_mtp_propose(const RankTensors& hidden, Tensor& logits, T
                 column, {&draft.prefix, &draft.peer}, {roots[0].partial, roots[1].partial},
                 {roots[0].local, roots[1].local}, {roots[0].candidates, roots[1].candidates},
                 {roots[0].staging, roots[1].staging}, token, ws, *tp_->execution, *tp_->events);
+            if (draft_logprobs != nullptr) {
+                const std::array<workspace::TensorParallelProposalLogprobRoots, 2> lp{
+                    workspace::tp_proposal_logprob(*ws[0], 1),
+                    workspace::tp_proposal_logprob(*ws[1], 1)};
+                {
+                    const ScopedCurrentDevice restore;
+                    for (int rank = 0; rank < 2; ++rank) {
+                        const auto r               = static_cast<std::size_t>(rank);
+                        const DeviceContext& owner = *tp_->execution->dev[r];
+                        ScopedCurrentDevice::select(owner.device);
+                        const std::int32_t rows = roots[r].partial.ne[0];
+                        Tensor local_lp         = lp[r].local;
+                        ops::target_logprobs(roots[r].partial, roots[r].local, rows, local_lp,
+                                             owner.stream);
+                        Tensor packed = lp[r].packed;
+                        ops::logprob_split_pack(local_lp, rank, packed, owner.stream);
+                    }
+                }
+                ops::allreduce_sum({lp[0].packed, lp[1].packed}, {lp[0].staging, lp[1].staging},
+                                   *tp_->execution, *tp_->events);
+                const ScopedCurrentDevice rank0(tp_->execution->dev[0]->device);
+                Tensor out = draft_logprobs->slice(0, b, 1);
+                ops::argmax_split_logprob(roots[0].candidates, lp[0].packed, out,
+                                          tp_->execution->dev[0]->stream);
+            }
         }
         ops::proposal_remap_token_ids(draft_tokens, draft.token_ids, draft.rows(), ctx_.stream);
         return;

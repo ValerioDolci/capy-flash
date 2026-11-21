@@ -14,6 +14,8 @@ add_library(ninfer_core STATIC
   weight_view.cpp
   decode_graph.cpp
   expert_cache_policy.cpp
+  draft_policy.cpp
+  suffix_drafter.cpp
   expert_cache.cu
   elastic_arena.cu
   uva_copy.cu

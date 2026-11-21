@@ -6,6 +6,8 @@
 #include "models/qwen3_5/program/tp2/program_tp2.h"
 #include "models/qwen3_5/execution/tp2/gdn_gating_overlap.h"
 #include "core/gdn_replay_records.h"
+#include "core/draft_policy.h"
+#include "core/suffix_drafter.h"
 #include "core/host_kv_arena.h"
 #include "core/disk_kv_cache.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -667,7 +669,14 @@ public:
     // prefill_hidden holds this many columns (0 = off: prefill_hidden holds prefill_chunk).
     const std::uint32_t qwen4_prompt_base_chunk;
     const std::uint32_t kv_lease_window_tokens; // EngineOptions::kv_lease_window_tokens
+    // The widest verified window past its anchor: every round buffer, plan and lease is sized for
+    // it. MTP: mtp_drafts, or a wider prompt-lookup window when lookup is on.
     const std::uint32_t draft_window;
+    // MTP: the drafts the MTP layer proposes each round (--draft-tokens, or --adaptive-draft).
+    const std::uint32_t mtp_drafts;
+    // MTP: the columns a round verifies when the draft policy does not choose them (mtp_graphs):
+    // --draft-tokens + 1.
+    const std::uint32_t mtp_base_width;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -716,6 +725,12 @@ public:
     std::vector<DiskSaved> disk_saved;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // MTP backend: the records and their fold at every width a round may verify (index = verified
+    // columns): an MTP round mtp_drafts + 1, a prompt-lookup round wider.
+    std::array<std::optional<GdnReplayRecords>, qwen3_5::kMtpDecodeMaximumWidth + 1>
+        replay_records_at;
+    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_5::kMtpDecodeMaximumWidth + 1>
+        replay_fold_at;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -771,6 +786,51 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+
+    // The draft policy: MTP rounds verify mtp_base_width columns
+    // (mtp_graphs); a one-row round may verify another window of `lookup_widths` columns (bit w),
+    // each with its own one-row graphs: a prompt lookup window (--prompt-lookup; Strata's suffix
+    // drafter) or, with --adaptive-draft, the MTP's own drafts cut to the window their stated
+    // probabilities favour.
+    bool lookup_enabled    = false;
+    bool adaptive_enabled  = false;
+    unsigned lookup_widths = 0;
+    // The drafts a round makes for the next one. mtp_graphs and the narrow families draft
+    // mtp_low_drafts (--draft-tokens; mtp_drafts without the adaptive window), the policy's other
+    // windows (mtp_wide_graphs) draft mtp_drafts. With the adaptive window a one-row round drafts
+    // mtp_drafts after a round that kept every draft it verified (the window widens after
+    // windows whose drafts were all kept), or when its own window is wider than the base one.
+    std::uint32_t mtp_low_drafts = 0;
+    std::array<DecodeGraphFamily, qwen3_5::kMtpDecodeMaximumWidth + 1> mtp_low_graphs;
+    bool adaptive_draft_more = false;
+    std::optional<::ninfer::spec::DraftPolicy> lookup_policy;
+    // One suffix drafter per lane over its ledger, and the lane epoch it was built for (a new
+    // request in the lane starts it again).
+    std::array<std::unique_ptr<::ninfer::spec::SuffixDrafter>, kMaximumConcurrency> lookup_drafters;
+    std::array<std::uint64_t, kMaximumConcurrency> lookup_epochs{};
+    std::array<DecodeGraphFamily, qwen3_5::kMtpDecodeMaximumWidth + 1> mtp_wide_graphs;
+
+    // A one-row round's outcome, given to the policy when the next round starts: its time then
+    // covers verify, draft and its own commit (the replay fold runs at the next round's start),
+    // as Strata times a round.
+    struct LookupObservation {
+        bool pending       = false;
+        bool lookup        = false;
+        int t              = 0;
+        int accepted       = 0;
+        int match          = 0;
+        // Adaptive window: the stated probabilities of the verified drafts (t - 1 of them).
+        bool chances = false;
+        std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> chance{};
+        std::uint32_t lane = 0;
+        std::chrono::steady_clock::time_point started{};
+        double round_seconds = 0.0; // launch to completion, when the next round is not this lane's
+    } lookup_observation;
+
+    // The verified columns of the last launched MTP round (its commit reads them).
+    std::uint32_t mtp_round_width = 0;
+    // The columns the graph representative of an MTP capture lays out (0 = mtp_base_width).
+    std::uint32_t representative_mtp_width = 0;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;

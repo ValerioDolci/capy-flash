@@ -826,6 +826,18 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     if (!replay_fold) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
+    // An MTP-backend round wrote its records, target hidden and licensed tokens at the width it
+    // verified: prompt lookup picks that width per round.
+    const bool mtp_round = speculative_backend == SpeculativeBackend::Mtp;
+    const std::uint32_t round_width =
+        mtp_round && mtp_round_width != 0 ? mtp_round_width : draft_window + 1U;
+    const ops::GdnReplayFoldPlan& fold =
+        mtp_round && replay_fold_at[round_width] ? *replay_fold_at[round_width] : *replay_fold;
+    const auto round_hidden = [&](const Tensor& full, std::int32_t batch) {
+        return mtp_round ? Tensor(full.data, full.dtype,
+                                  {full.ne[0], static_cast<std::int32_t>(round_width), batch})
+                         : full.slice(2, 0, batch);
+    };
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
     std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
@@ -871,8 +883,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
-        replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        fold.execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                     device.stream);
         // Qwen4Exp: the PLE convolution history advances by the same committed prefixes.
         Qwen4PleRuntime::fold(
             *this, std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()));
@@ -884,7 +896,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 throw std::logic_error("tensor-parallel speculative batch has no rank 1 records");
             }
             const ScopedCurrentDevice rank1(peer->device.device);
-            peer->replay_fold->execute(
+            const ops::GdnReplayFoldPlan& peer_fold = mtp_round && peer->replay_fold_at[round_width]
+                                                          ? *peer->replay_fold_at[round_width]
+                                                          : *peer->replay_fold;
+            peer_fold.execute(
                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                 peer->device.stream);
         }
@@ -916,7 +931,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
                 qwen3_5::MtpDecodeState& frame = *io.mtp_decode;
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
-                hidden                         = frame.target_hidden.slice(2, 0, batch);
+                hidden                         = round_hidden(frame.target_hidden, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
             } else if (speculative_backend == SpeculativeBackend::DFlash2 && io.dflash_decode) {
@@ -948,9 +963,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 CUDA_CHECK(cudaMemcpyAsync(peer_selectors.data, hidden_selectors.data(),
                                            lanes.size() * sizeof(std::int32_t),
                                            cudaMemcpyHostToDevice, peer->device.stream));
-                ops::speculative_select_accepted_hidden(peer_frame.target_hidden.slice(2, 0, batch),
-                                                        peer_selectors, peer_selected,
-                                                        peer->device.stream);
+                ops::speculative_select_accepted_hidden(
+                    round_hidden(peer_frame.target_hidden, batch), peer_selectors, peer_selected,
+                    peer->device.stream);
                 ops::scatter(peer_selected, peer_frame.state_destination_slots.slice(0, 0, batch),
                              peer->state_images->continuation_hidden_store(), peer->device.stream);
             }
@@ -1012,7 +1027,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
+    const std::uint32_t width = round_width;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = active_sequence(lanes[row]);
@@ -1047,12 +1062,16 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next = mtp_host_egress->next_extents[row];
-                    if (validation && validation->mtp_calib()) {
+                    const bool calibration = validation && validation->mtp_calib();
+                    if (calibration) {
                         validation->write_mtp_calib(
                             mtp_host_ingress->current_extents[row], committed,
-                            std::span<const float>(sequence.mtp_draft_logprobs.data(),
-                                                   draft_window));
-                        for (std::uint32_t k = 0; k < draft_window; ++k) {
+                            std::span<const float>(sequence.mtp_draft_logprobs.data(), mtp_drafts));
+                    }
+                    // The next drafts' log-probabilities: calibration records them, the
+                    // adaptive window's policy reads them at the next round.
+                    if (calibration || adaptive_enabled) {
+                        for (std::uint32_t k = 0; k < mtp_drafts; ++k) {
                             sequence.mtp_draft_logprobs[k] =
                                 mtp_host_egress->next_draft_logprobs[k * max_concurrency + row];
                         }

@@ -286,14 +286,22 @@ detail::PhysicalResources positive_resource_difference(detail::PhysicalResources
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
                                                                       std::uint32_t k,
                                                                       std::uint32_t capacity) {
+    return mtp_causal_attention_envelopes(max_frontier, k + 1U, k, capacity);
+}
+
+execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
+                                                                      std::uint32_t width,
+                                                                      std::uint32_t drafts,
+                                                                      std::uint32_t capacity) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     execution::MtpCausalAttentionEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
+    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + width)};
     out.batch         = out.target_verify;
-    for (std::uint32_t step = 0; step + 1 < k; ++step) {
-        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
+    // The AR steps start at the updated frontier, at most `width` columns past the old one.
+    for (std::uint32_t step = 0; step + 1 < drafts; ++step) {
+        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + width + step + 1ULL)};
     }
     return out;
 }

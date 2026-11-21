@@ -112,8 +112,8 @@ std::unique_ptr<ValidationHooks> ValidationHooks::from_environment(bool mtp,
 
     const bool any =
         !hooks->mtp_oracle.empty() || !hooks->forced_tokens.empty() || hooks->mtp_no_drafts ||
-        hooks->mtp_extent_cap != qwen3_5::kMtpDecodeMaximumDrafts || hooks->calib_file != nullptr ||
-        hooks->replay != nullptr || hooks->round_log != nullptr ||
+        hooks->mtp_extent_cap != qwen3_5::kMtpMaximumProposalDrafts ||
+        hooks->calib_file != nullptr || hooks->replay != nullptr || hooks->round_log != nullptr ||
         hooks->replay_record != nullptr || hooks->top2_file != nullptr || hooks->tfdump != nullptr;
     if (!any) { hooks.reset(); }
     return hooks;

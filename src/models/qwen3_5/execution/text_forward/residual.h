@@ -422,8 +422,10 @@ void TextForward<Arena>::ple(std::size_t layer, const RankTensors& embedding, Ra
             if (col.replay_records != nullptr) {
                 // Verification: the history advances at commit by the accepted prefix.
                 const Tensor& record = state(r).runtime->ple_record;
-                if (record.data == nullptr || record.ne[0] != wide_rows() || record.ne[1] != W ||
-                    record.ne[2] < B) {
+                // Laid out for the widest window; a round of W columns writes a dense [rows, W, B]
+                // prefix, and its commit folds it at the same width (prompt lookup varies W).
+                if (record.data == nullptr || record.ne[0] != wide_rows() || record.ne[1] < W ||
+                    record.ne[2] < B || record.bytes() < normed[at(r)].bytes()) {
                     throw std::logic_error("Qwen4Exp PLE speculative record is unavailable");
                 }
                 CUDA_CHECK(::ninfer::memcpy_device_async(record.data, normed[at(r)].data,

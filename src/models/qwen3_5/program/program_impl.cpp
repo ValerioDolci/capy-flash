@@ -107,10 +107,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       shared_prefix_capacity(plan.inputs.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), qwen4_prompt_base_chunk(plan.qwen4_base_chunk),
       kv_lease_window_tokens(plan.inputs.kv_lease_window_tokens),
-      draft_window(plan.inputs.draft_window), speculative_backend(plan.inputs.speculative_backend),
-      kv_storage(plan.inputs.kv_storage), proposal_head(plan.inputs.proposal_head),
-      vision_enabled(plan.inputs.features.vision), vision_rank(plan.inputs.features.vision_rank),
-      use_cuda_graph(plan.inputs.use_cuda_graph), causal_scoring(plan.inputs.causal_scoring),
+      draft_window(plan.inputs.draft_window),
+      mtp_drafts(plan.inputs.mtp_drafts != 0 ? plan.inputs.mtp_drafts : plan.inputs.draft_window),
+      mtp_base_width((plan.inputs.mtp_base_drafts != 0 ? plan.inputs.mtp_base_drafts
+                      : plan.inputs.mtp_drafts != 0   ? plan.inputs.mtp_drafts
+                                                      : plan.inputs.draft_window) +
+                     1U),
+      speculative_backend(plan.inputs.speculative_backend), kv_storage(plan.inputs.kv_storage),
+      proposal_head(plan.inputs.proposal_head), vision_enabled(plan.inputs.features.vision),
+      vision_rank(plan.inputs.features.vision_rank), use_cuda_graph(plan.inputs.use_cuda_graph),
+      causal_scoring(plan.inputs.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       elastic_arena(make_elastic_arena(plan, plan.persistent, device_in.device)),
@@ -238,11 +244,49 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
+                const auto i = static_cast<std::size_t>(w);
+                replay_records_at[i].emplace(replay_records->narrowed(w));
+                replay_fold_at[i].emplace(*replay_records_at[i],
+                                          state_images->linear().all_layers_view());
+            }
+        }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
         replay_fold.has_value() != replay_records.has_value()) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
+    if (speculative_backend == SpeculativeBackend::Mtp &&
+        (plan.inputs.prompt_lookup || plan.inputs.adaptive_window)) {
+        // The draft policy's windows, each a one-row graph family beside the MTP's own
+        // (mtp_base_width, every batch size).
+        //  - Prompt lookup (--prompt-lookup), as Strata's default serve: windows of one and two
+        //    columns more than the MTP's and the widest window (Strata: --spec + 1, + 2 and
+        //    --lookup-max-t). A lookup shorter than the MTP's drafts runs in the MTP's own graph.
+        //  - Adaptive window (--adaptive-draft N): every window of 2..N + 1 columns, from the
+        //    drafts' stated probabilities, and a lookup window may be any of them too.
+        lookup_enabled            = plan.inputs.prompt_lookup;
+        adaptive_enabled          = plan.inputs.adaptive_window;
+        const std::uint32_t t_mtp = mtp_base_width;
+        const std::uint32_t t_max = draft_window + 1U;
+        if (adaptive_enabled) {
+            // The more drafts at every window, the base one included (mtp_wide_graphs).
+            for (std::uint32_t w = 2U; w <= std::min(mtp_drafts + 1U, t_max); ++w) {
+                lookup_widths |= 1U << w;
+            }
+        }
+        if (lookup_enabled) {
+            for (const std::uint32_t w : {t_mtp + 1U, t_mtp + 2U, t_max}) {
+                if (w > t_mtp && w <= t_max) { lookup_widths |= 1U << w; }
+            }
+        }
+        lookup_policy.emplace(static_cast<int>(t_max));
+        lookup_policy->set_sizes(lookup_widths | (1U << t_mtp));
+        // A size's first round captures its graph, and a slow round is not its cost.
+        lookup_policy->set_robust(true);
+    }
+    mtp_low_drafts = adaptive_enabled ? mtp_base_width - 1U : mtp_drafts;
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
         if (local == nullptr) {
