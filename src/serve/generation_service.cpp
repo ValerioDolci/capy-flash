@@ -387,8 +387,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.routed_experts.cpus             = options_.expert_cpus;
     engine_options.routed_experts.exclusive_layers = options_.expert_exclusive_layers;
     engine_options.routed_experts.gguf_hybrid_cost = options_.gguf_hybrid_cost;
-    engine_options.kv_ram_region_tokens            = options_.kv_ram_region_tokens;
-    engine_options.kv_ram_cache_blocks             = options_.kv_ram_cache_blocks;
+    if (options_.expert_half_life) {
+        engine_options.routed_experts.half_life_tokens = *options_.expert_half_life;
+    }
+    engine_options.kv_ram_region_tokens = options_.kv_ram_region_tokens;
+    engine_options.kv_ram_cache_blocks  = options_.kv_ram_cache_blocks;
 
     engine_options.rope_yarn_factor           = options_.rope_yarn_factor;
     engine_options.rope_original_max_position = options_.rope_original_max_position;
