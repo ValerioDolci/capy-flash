@@ -41,6 +41,20 @@ set(ninfer_op_tests
   ple
   moe_slots
   moe_grouped
+  short_conv
+  short_conv_record
+  dspark_draft
+  depth_attention
+  message_gate
+  message_gate_batch
+  message_gate_wide
+  rmsnorm_f32
+  residual_f32
+  residual_mix
+  softcap
+  concat_rows_split
+  moe_sigmoid_route
+  moe_bank
   moe_route)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
@@ -62,6 +76,11 @@ set_tests_properties(ninfer_allreduce_f32_copy_test PROPERTIES ENVIRONMENT "NINF
 # Q8 prefill on int8 tensor cores (ops/linear/q8/q8_a8.h) against an exact float oracle.
 ninfer_add_op_test(ninfer_q8_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q8_a8.cu"
+  LIBRARIES ninfer_ops)
+
+# moe_bank_capped_swiglu bit for bit against its reference execution (kept in the test).
+ninfer_add_op_test(ninfer_moe_bank_routes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_bank_routes.cu"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_linear_topk_test
@@ -140,6 +159,10 @@ ninfer_add_op_test(ninfer_softmax_attention_test
 
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_relative_sink_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_relative_sink_attention.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_kv_cache_append_test

@@ -48,6 +48,8 @@ ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_softmax_attention_bench.cu")
 ninfer_add_op_bench(ninfer_sliding_window_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/sliding_window_attention_bench.cu")
+ninfer_add_op_bench(ninfer_relative_sink_attention_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/relative_sink_attention_bench.cu")
 ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/kv_cache_append_bench.cu")
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
@@ -67,3 +69,13 @@ ninfer_add_op_bench(ninfer_miss_split_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/m
 add_executable(ninfer_host_gguf_bench "${CMAKE_CURRENT_LIST_DIR}/bench_host_gguf.cpp")
 ninfer_internal_includes(ninfer_host_gguf_bench)
 target_link_libraries(ninfer_host_gguf_bench PRIVATE ninfer_host_moe ninfer::json)
+ninfer_add_op_bench(ninfer_moe_bank_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_bank_bench.cu")
+ninfer_add_op_bench(ninfer_message_gate_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/message_gate_bench.cu")
+ninfer_add_op_bench(ninfer_message_gate_wide_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/message_gate_wide_bench.cu")
+ninfer_add_op_bench(ninfer_short_conv_record_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/short_conv_record_bench.cu")
+ninfer_add_op_bench(ninfer_dspark_draft_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/dspark_draft_bench.cu")
+ninfer_add_op_bench(ninfer_residual_stream_ops_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/residual_stream_ops_bench.cu")
+ninfer_add_op_bench(ninfer_inkling2_linear_bench
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/inkling2_linear_bench.cu")

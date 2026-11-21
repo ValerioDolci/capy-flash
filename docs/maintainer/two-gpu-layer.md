@@ -175,8 +175,10 @@ the single-device Op code (shared by every device) and would have to become tabl
 
 ## 6. Adding a new model to tp2
 
-Two-GPU execution exists for the dense Qwen3.5 family (Qwen3.6/3.8 artifacts). What is generic and
-what a new model family implements:
+Two-GPU execution exists for the Qwen3.5 family (Qwen3.6/3.8 artifacts, Qwen3.8-Flash-Next included) and
+for Inkling 2 (`src/models/inkling2/`, its own placement, config split and two-rank forward over the
+generic column below: [Inkling 2 model](inkling2-model.md#loading-and-two-rank-tensor-parallelism)).
+What is generic and what a new model family implements:
 
 | Generic (reuse as is) | Model-specific today (Qwen3.5), to implement for a new family |
 |---|---|

@@ -14,7 +14,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
-| `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
+| `--max-concurrency N` | maximum admitted requests; valid range `1..8` (Inkling 2 Mini: `1` only) | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` (10 minutes) |
 | `--decode-share F` | while a request's prompt runs, the requests already decoding get `F` times the time of each prompt unit (at least one decode round per unit). `0` keeps one round per unit: with Flash-Next a prompt unit of 16k tokens takes several seconds, during which the others produce almost nothing; `1` gives both equal time. Measured (Flash-Next, 2 GPUs, one request decoding while a 48k prompt arrives): the decoding request gets 1.7 / 41.8 / 71.0 tokens/s during that prompt with `0` / `0.5` / `1`, and the prompt's first token comes after 10.2 / 14.7 / 19.5 s. A prompt unit is not split: with 16k-token units the decoding requests still wait about 3.3 s per unit | `0` |
@@ -51,8 +51,8 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--log-speculation-detail-max-steps N` | decode steps recorded per request by `--log-speculation-detail` (`1..1048576`); a longer request is marked truncated | `4096` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash2` | speculative backend | off |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage (Inkling 2 Mini: `bf16` only, K BF16 and V FP16) | `bf16` |
+| `--spec mtp\|dflash2` | speculative backend (Inkling 2 Mini: `mtp`, the artifact's DSpark drafter) | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash2 `1..15` | unset |
 | `--rope-yarn-factor F` | YaRN RoPE context extension, `[1,4]`: raises the accepted `max-context` ceiling to native × F (native stays 262,144) and rotates as Hugging Face's `rope_type: "yarn"` does (the same inverse frequencies, cos and sin multiplied by 0.1 ln F + 1). It covers every text RoPE on every GPU: attention at one and two GPUs, text after an image (MRoPE), the Flash-Next QSA indexer and the MTP layer; the Vision tower and the DFlash2 drafter keep their RoPE. `1` installs nothing and leaves greedy output byte-identical; above 1 it costs perplexity and is experimental: its quality past the native window is not measured. Opt-in, ported from @splickz's work ([#28](https://github.com/ValerioDolci/capy-flash/issues/28), [PR #29](https://github.com/ValerioDolci/capy-flash/pull/29)) | `1.0` |
 | `--rope-original-max-position N` | the native window YaRN scales from (Hugging Face `original_max_position_embeddings`), used only when `--rope-yarn-factor` > 1 | `262144` |
@@ -65,7 +65,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized and the encode workspace is planned for `N` | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus) | mailbox on without P2P |
-| `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
+| `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus); refused on Inkling 2 Mini | off |
 | `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); slower where pageable, and on long prompts the tokens can differ from a fully pinned run (the CPU computes those layers' experts instead of streaming them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). With `--kv-ram-active` its Host KV planes count in the limit (the weights keep the rest page-locked). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
@@ -132,6 +132,8 @@ a bonus draw. Which draw a position uses depends on the drafts and on where each
 different text with and without speculation, or with another `--spec` or `--draft-tokens`, and the same text again
 only when drafts and logits repeat bit for bit; on Qwen3.8-Flash-Next they do not (see
 [What the engine does](capy-flash.md#what-the-engine-does)). At temperature `0` the seed is not used.
+Inkling 2 Mini does not use rejection sampling: its sampler runs on the host and draws each column of a round as an
+ordinary decode step would at that position, so the same seed gives the same text with and without `--spec mtp`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are

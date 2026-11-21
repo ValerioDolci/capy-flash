@@ -11,6 +11,13 @@ in [Op development](op-development.md#26-tensor-parallel-forms), the KV mirror i
 contracts that cut across them; [Two-GPU layer](two-gpu-layer.md) says how the two-GPU code
 attaches to the single-device files.
 
+Inkling 2 Mini (`src/models/inkling2/`) has its own two-rank implementation, which shares no model
+code with `src/models/qwen3_5/`: it reuses the generic layer of this document (`ExecutionContext`,
+sharded materialization, `allreduce_sum`/`allreduce_sum_f32`, `PeerEvents`, `PeerMailbox`, the
+two-device decode graph and `HostExchange`) and owns its placement, config split, forward and state.
+§14 summarizes it; [Inkling 2 model](inkling2-model.md#loading-and-two-rank-tensor-parallelism)
+is its authority. Everything else in this document describes the Qwen families.
+
 ## 1. Purpose and constraints
 
 The width is exactly 1 or 2 at every layer that accepts it: `product::parse_tp`
@@ -807,3 +814,22 @@ single-device Op), `ninfer_flash_next_tp2_mixers_test` (QSA 12/1 + replicated in
 (placement of every parameter, per-rank bytes, every device parent byte-compared with the
 host-applied slice), and host-only `ninfer_qwen4_shard_map_test` (rules, slicer acceptance of the
 real parents of both recipes, per-rank bytes of the 48-block model).
+
+## 14. Inkling 2 at tp 2
+
+Inkling 2 Mini's weights (about 18.9 GB) need two 16 GB boards. The family's `shard_rule`
+([`load/sharding.cpp`](../../src/models/inkling2/load/sharding.cpp)) splits the attention by query
+and KV heads (rows; the output projection by columns) and the output head by vocabulary rows; each
+rank holds one bank of half the experts of every layer (`SingleDevice`, IDs [r·E/2, (r+1)·E/2)) and
+the rest is replicated. Each rank keeps the whole residual and computes the replicated work itself,
+so the two ranks hold bit-identical residual streams and routing decisions. A visit exchanges twice:
+the attention output partials (one BF16 all-reduce) and the MoE partials (`allreduce_sum_f32`,
+rounded to BF16 once); the head gathers the vocabulary halves on rank 0 (`concat_rows_rank0`).
+Decode is one two-device CUDA Graph with a `PeerMailbox` and a `DecodeGraphPeerBridge` (§5); eager
+calls without peer access use a `HostExchange`. The DSpark drafter (`--spec mtp`) splits the same
+way: heads and MLP halves per rank, its folded head by vocabulary rows, two BF16 all-reduces per
+layer and one 16-byte exchange of the two ranks' top-1 per proposal; its verification round is one
+more two-device graph ([Inkling 2 model, Speculative decoding](inkling2-model.md#speculative-decoding)).
+One request at a time, no Vision. Tests: `ninfer_inkling2_forward_tp2_test` (synthetic, tp 2 against tp 1 within the
+registered KL bounds, replicated values bit-identical on the two ranks) and the family's shard-map
+and loading tests ([Inkling 2 model, Validating a change](inkling2-model.md#validating-a-change)).

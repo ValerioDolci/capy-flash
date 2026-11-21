@@ -36,6 +36,10 @@ set(NINFER_CPU_TESTS
   ninfer_host_timing_test
   ninfer_http_error_handler_test
   ninfer_http_transport_test
+  ninfer_inkling2_config_test
+  ninfer_inkling2_shard_map_test
+  ninfer_inkling2_frontend_contract_test
+  ninfer_inkling2_frontend_test
   ninfer_jinja_test
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test

@@ -100,6 +100,35 @@ Qwen3.8-27B projection set: at hidden 5120 it exercises the fused routes of the 
 head and embedding, and the projections outside `qwen4_nvfp4`'s set as `qwen4_nvfp4` stores them
 ([quantizing from BF16](maintainer/qwen4-exp-model.md#quantizing-from-bf16)).
 
+Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`, text only) converts with `inkling2_mini`. The checkpoint's
+own formats are kept, nothing is requantized: NVFP4 and MXFP8 experts are imported as stored, dense
+weights stay BF16 or FP32 ([Inkling 2 model](maintainer/inkling2-model.md)). `--components text,mtp` adds the
+checkpoint's DSpark drafter (`mtp.safetensors`, BF16 words kept; its head's output projection is stored folded into
+the output head), which `--spec mtp` (on in the launcher) uses; with the default `text` the artifact has no drafter. The text component
+alone converts on the CPU in a minute or less (1 GB of RAM) into 19.0 GB; with the drafter the artifact is 19.7 GB. The
+checkpoint takes 20.2 GB:
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini --local-dir /path/to/Inkling-2-Mini
+python3 -m tools.convert \
+  --model /path/to/Inkling-2-Mini \
+  --recipe inkling2_mini \
+  --components text,mtp \
+  --device cpu \
+  --name inkling-2-mini \
+  --out models/capy-flash-inkling2-mini-nvfp4.ninfer
+```
+
+With the Transformers of the Inkling 2 implementation installed, `tools/ref_ink/check_conversion.py`
+compares the artifact with the reference's own load-time transforms (MXFP8 layers, dense weights and
+the drafter's tensors bit for bit, the drafter's folded head against the fold recomputed in FP64, NVFP4
+layers within the reported distance); it exits non-zero on a failure:
+
+```bash
+python3 -B tools/ref_ink/check_conversion.py --checkpoint /path/to/Inkling-2-Mini \
+  --artifact models/capy-flash-inkling2-mini-nvfp4.ninfer --report check.json
+```
+
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.

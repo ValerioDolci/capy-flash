@@ -273,6 +273,11 @@ class Engine:
                 self.installer.verify_current()
             except DownloadError as e:
                 raise EngineError("no_release", e.message)
+        if not self.installer.launcher(model).is_file():  # an optional model's launcher is not in every release
+            raise EngineError(
+                "no_launcher",
+                f"the installed release {release['version']} has no {model['launcher']}: update the engine",
+            )
         return launch_plan(model, facts, self.installer, port, self._profile_for(key) if profile is None else profile)
 
     def start(self, key: str, profile: Optional[Dict[str, Any]] = None) -> None:

@@ -124,6 +124,32 @@ MODELS: List[Dict[str, Any]] = [
         "flags_2gpu": [],
         "optional": True,
     },
+    {
+        # Text only, one request at a time; verified on two 16 GB GPUs (one 32 GB GPU is not verified, so the app
+        # offers two). The artifact holds the text model and its DSpark drafter, which the launcher turns on (same
+        # text as without it): the released weights repackaged without requantizing. Its launcher ships only
+        # in the releases that serve Inkling, so a release without it still verifies (Installer._verify_release).
+        "key": "inkling2-mini",
+        "family": "inkling2",
+        "title": "Inkling 2 Mini",
+        "edition": "NVFP4",
+        "hf_repo": "Feyd89/Inkling-2-Mini-NVFP4-capy-flash",
+        "artifact": "capy-flash-inkling2-mini-nvfp4.ninfer",
+        "launcher": "capy-serve-inkling2-mini.sh",
+        "model_id": "inkling-2-mini",
+        "experts": "",
+        "need_gpus": 2,
+        "gpus": [2],
+        "need_ram_gib": 8,
+        "need_disk_gb": 23,
+        "need_simd": False,
+        "size_gb": 19.7,
+        "context": 253952,
+        "vision": False,
+        "flags": [],
+        "flags_2gpu": [],
+        "optional": True,
+    },
 ]
 
 # "Pick a model" in the README, as an order of preference for each number of usable GPUs.

@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 from collections.abc import Mapping
 
+from .inkling2 import build_model as build_inkling2_model, is_inkling2
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
@@ -136,7 +137,9 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
         companions = {"dflash2": sources["dflash2"]} if "dflash2" in components else {}
-        if is_qwen4_exp(base.config):
+        if is_inkling2(base.config):
+            model = build_inkling2_model(base, components=components, resource_overrides=overrides)
+        elif is_qwen4_exp(base.config):
             if companions:
                 raise ValueError("Qwen4Exp has no DFlash companions")
             model = build_qwen4_exp_model(base, components=components, resource_overrides=overrides)

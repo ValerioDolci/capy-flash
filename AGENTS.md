@@ -41,12 +41,15 @@ approval requirements beyond the user's instructions and the actual execution en
 capy-flash is a C++/CUDA inference engine built on NInfer (ninfer-tp2, renamed at v0.5.0) for two
 16 GB `sm_120a` boards without P2P, tensor-parallel (`--tp 2`). It serves Qwen3.8-Flash-Next
 (`Qwen4ExpForCausalLM`: NVFP4 routed experts in page-locked host RAM, missing experts computed on
-the CPU with AVX-512 VNNI or AVX2 (chosen at run time), n-gram (PLE) table read from disk) and the dense Qwen3.8-27B
-(`Qwen3_5ForCausalLM`) through the same Engine. It is tuned on 2x RTX 5070 Ti, Ryzen 9 9900X,
-96 GB DDR5; `--profile flash-next|27b` is the tested serving configuration of each model.
+the CPU with AVX-512 VNNI or AVX2 (chosen at run time), n-gram (PLE) table read from disk), the dense Qwen3.8-27B
+(`Qwen3_5ForCausalLM`) and the text part of Inkling 2 Mini (`Inkling2LoopForConditionalGeneration`, its own
+family under `src/models/inkling2/`, two GPUs, one request at a time: `docs/maintainer/inkling2-model.md`) through
+the same Engine. It is tuned on 2x RTX 5070 Ti, Ryzen 9 9900X,
+96 GB DDR5; `--profile flash-next|27b` is the tested serving configuration of each Qwen model (Inkling 2 has
+none: its launcher `capy-serve-inkling2-mini.sh` passes the flags).
 
 Generation uses one resident model, startup-fixed concurrency of one to eight requests (one for
-Flash-Next), bounded FIFO ingress, no active-request preemption, and one compact decode batch per
+Flash-Next and Inkling 2), bounded FIFO ingress, no active-request preemption, and one compact decode batch per
 round. One GPU (`--tp 1`) remains supported for the models that fit it.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
@@ -198,7 +201,8 @@ causes failures or interferes with the task, and briefly explain why.
 Use a Python 3.11+ interpreter explicitly; check the version of the default `python3` before relying
 on it. The local toolchain is CUDA 13.1 (`-DCMAKE_CUDA_ARCHITECTURES=120a`). The integration tests
 read their artifacts from `NINFER_TEST_QWEN4_ARTIFACT` (a synthetic Flash-Next artifact,
-`tools/capy_flash/make_test_artifact.sh`) and `NINFER_TEST_ARTIFACT` (a Qwen3.8-27B artifact).
+`tools/capy_flash/make_test_artifact.sh`) and `NINFER_TEST_ARTIFACT` (a Qwen3.8-27B artifact); Inkling 2's from
+the CMake paths `NINFER_TEST_INKLING2_SYNTH_ARTIFACT` and `NINFER_TEST_INKLING2_ARTIFACT`.
 The full Flash-Next model pins 64.6 GiB of host RAM: run one such process at a time, and do not
 build with many jobs while it is loaded.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified

@@ -1,8 +1,9 @@
 # capy-flash serving
 
-capy-flash serves two models with the same `ninfer-serve` binary: **Qwen3.8-Flash-Next** (MoE; the routed
-experts that do not fit in VRAM stay in host RAM and run on the CPU) and the dense **Qwen3.8-27B**, on one or
-two 16 GB `sm_120` boards. The rest of this page is NInfer's general server reference; this section is what is
+capy-flash serves three models with the same `ninfer-serve` binary: **Qwen3.8-Flash-Next** (MoE; the routed
+experts that do not fit in VRAM stay in host RAM and run on the CPU), the dense **Qwen3.8-27B**, on one or
+two 16 GB `sm_120` boards, and **Inkling 2 Mini** (MoE, entirely on two 16 GB boards; text only, one request at a
+time: [On Inkling 2 Mini](#on-inkling-2-mini)). The rest of this page is NInfer's general server reference; this section is what is
 specific to capy-flash: launchers, profiles, RAM, chat template, CPU threads and client setup.
 
 ## Launchers and profiles
@@ -18,13 +19,16 @@ the profile:
 | `flash-next-64gb` | `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` | `serve-flash-next.sh` (install.sh adds `--host-kv-mib 1024 --host-state-slots 2`); `NINFER_DEVICES=0` for one GPU | `flash-next`; one GPU: `flash-next-1gpu` | 1 or 2 |
 | `27b` | `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` | `serve-tp2.sh` | `27b` | 2 |
 | `27b-16gb` | `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` | `serve-27b-16gb.sh` | `27b-16gb` | 1 |
+| `inkling2-mini` | `Feyd89/Inkling-2-Mini-NVFP4-capy-flash` | `capy-serve-inkling2-mini.sh` (text only, one request at a time; drafter on, `NINFER_DRAFTER=0` turns it off; `NINFER_DEVICES=0` = one 32 GB GPU, not verified) | none (flags in the launcher) | 2 |
 
 RAM, disk and download size of each model: [Pick a model](../../README.md#pick-a-model).
 
 Launcher environment (defaults in brackets): `NINFER_HOST` (`127.0.0.1`), `NINFER_PORT` (`8080`),
-`NINFER_MAX_CONTEXT` (the profile's), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b` for the 27B),
+`NINFER_MAX_CONTEXT` (the profile's; `253952` for Inkling, with `NINFER_PREFILL_CHUNK` `2048`), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b`
+for the 27B, `inkling-2-mini` for Inkling),
 `NINFER_DEVICES` (`0,1`; `serve-flash-next.sh` switches to `flash-next-1gpu` when it holds one id),
-`NINFER_DEVICE` (`0`, `serve-27b-16gb.sh`) and `NINFER_VISION=0` (the two 27B launchers: `--no-vision`).
+`NINFER_DEVICE` (`0`, `serve-27b-16gb.sh`), `NINFER_VISION=0` (the two 27B launchers: `--no-vision`) and
+`NINFER_DRAFTER=0` (`capy-serve-inkling2-mini.sh`: no `--spec mtp --draft-tokens 3`).
 
 ### Profiles
 
@@ -68,6 +72,7 @@ uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM ca
   `serve-27b-16gb.sh`) turn Vision on. It costs VRAM that would otherwise go to the KV pool. To turn it off:
   `NINFER_VISION=0` with the launchers, or `--no-vision` after the profile (it also drops the profile's
   `--vision-device` and `--max-vision-tokens`).
+- Inkling 2 Mini is text only: `--vision` stops the start.
 - The Flash-Next artifacts that `install.sh` downloads are text only, and the Flash-Next profiles leave Vision off.
   Images on Flash-Next need the separate artifact `Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash` (download it by
   hand; `install.sh` never fetches it) or a conversion with `python tools/capy_flash/convert.py --model <checkpoint
@@ -211,7 +216,7 @@ On Qwen3.8-Flash-Next:
   the conversation (`--turn-anchors 1` restores the anchor). On one GPU the 27B keeps the anchor by default.
 - NVIDIA's FP4-Local checkpoint runs too (recipe `qwen3_8_flash_next_fp4_local`), about 19 % slower than the default
   artifact.
-- Empty-reply guards (v0.7, every model, on by default): a terminal token drawn right after `<think>` is redrawn
+- Empty-reply guards (v0.7, the Qwen models, on by default): a terminal token drawn right after `<think>` is redrawn
   (`--reasoning-eos-guard`), and a reply that ends inside its reasoning is closed and continued once
   (`--reasoning-close-retry`); `--no-reasoning-eos-guard` and `--no-reasoning-close-retry` turn them off.
 - Output is not bit-reproducible run to run: which experts sit in VRAM (GPU path) or not (CPU path) depends on
@@ -227,8 +232,38 @@ On Qwen3.8-27B:
   keeps the 16-bit, exact path; [diagnostics](../capy-flash/diagnostics.md)); `--profile 27b-16gb` fits one 16 GB card (int8 KV, 65,536 tokens, Vision, 13.9 GB of
   VRAM).
 
-On every model, the context cache keeps retained conversations in VRAM, in RAM (Host tiers) and, opt-in, on disk
+On the Qwen models, the context cache keeps retained conversations in VRAM, in RAM (Host tiers) and, opt-in, on disk
 ([Disk tier](options.md#disk-tier-of-the-context-cache)); a request's KV reservation is a lease that grows with its answer
 ([Start the server](start.md)).
+
+### On Inkling 2 Mini
+
+- Both GPUs hold half of the attention heads, half of the output head and half of each layer's 128 experts; nothing
+  runs on the CPU, so RAM and CPU threads do not matter. Weights take about 10 GB per GPU.
+- One request at a time (`--max-concurrency 1`, the default; another value stops the start); further requests
+  queue. Decode runs from one CUDA Graph (`--no-cuda-graph` keeps it eager).
+- `--max-context` is reserved whole at startup and does not grow: 16 KiB per token per GPU, 18 KiB with the drafter.
+  On two 16 GB boards the launcher's 253,952 tokens with 2048-token prefill blocks and the drafter leave about
+  300 MiB free per GPU; the largest with the same margin are 270,336 / 253,952 / 221,184 with the drafter and
+  335,872 / 319,488 / 286,720 without it, for prefill blocks of 1024 / 2048 / 4096 tokens (larger blocks prefill
+  faster and leave less context). A `--kv-capacity` that does not match it stops the start.
+- Speculative decoding with the checkpoint's DSpark drafter: `--spec mtp --draft-tokens K` (`K` from 1 to 5, 3 was
+  the best measured). The launcher passes `--spec mtp --draft-tokens 3` (`NINFER_DRAFTER=0`, or `--spec off` after
+  the artifact, turns it off); `ninfer-serve` started without those flags runs without a drafter. The artifact needs the drafter component (conversion
+  with `--components text,mtp`, [weight conversion](../weight-conversion.md)); an artifact without it starts with
+  `--spec mtp` and decodes without a drafter. Greedy and sampled requests both use it, and the text is the same as
+  without it (at temperature 0, and with sampling for the same seed). Steps that run forced tokens (thinking
+  budgets) or would pass `--max-context` are ordinary steps. It takes about 1.0 GiB more VRAM per GPU at the launcher's 253,952-token context (0.7 GiB at 131,072; measured
+  on this release); when few drafts are accepted it can decode slower than without it. The request log reports drafted and accepted tokens.
+- The context cache keeps the previous conversation on the GPUs (its end and the end of its prompt), so the next
+  turn of the same conversation resumes instead of re-reading it; there is no RAM or disk tier (`--disk-cache-dir`
+  stops the start) and no prefix shared between conversations. `--no-prefix-reuse` turns it off.
+- Stops the start: `--vision`, `--spec dflash2`, `--lm-head-draft`, `--max-concurrency` above 1, `--disk-cache-dir`,
+  `--embedding-host`, a `--kv-dtype` other than `bf16` (the cache keeps K in BF16 and V in FP16). Refused per request:
+  structured output and grammars, `tool_choice` other than automatic, continuing a final assistant message.
+- The chat template is the checkpoint's own (embedded in the artifact); `--chat-template` replaces it. Reasoning is
+  always on: `enable_thinking=false` selects the lowest reasoning effort. Thinking budgets work. The reasoning EOS
+  guard is off for this model (the server prints why at startup).
+- Architecture, validation and limits: [Inkling 2 model reference](../maintainer/inkling2-model.md).
 
 Environment variables (production settings, A/B switches, dumps): [docs/capy-flash/diagnostics.md](../capy-flash/diagnostics.md).

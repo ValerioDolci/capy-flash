@@ -1,0 +1,120 @@
+[
+ {
+  "name": "it1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Spiegami brevemente perché il cielo di giorno è azzurro e al tramonto diventa rosso."
+   }
+  ]
+ },
+ {
+  "name": "it2",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Sei un assistente conciso che risponde in italiano."
+   },
+   {
+    "role": "user",
+    "content": "Scrivi una breve ricetta per la pasta al pomodoro, con gli ingredienti per due persone e i passaggi numerati."
+   }
+  ]
+ },
+ {
+  "name": "en1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What are the main differences between a process and a thread in an operating system? Answer in a short paragraph."
+   }
+  ]
+ },
+ {
+  "name": "en2",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a limerick about a cat who learns to program in Rust."
+   }
+  ]
+ },
+ {
+  "name": "code1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function `merge_intervals(intervals)` that merges overlapping closed intervals given as a list of (start, end) tuples, with a docstring and two doctest examples."
+   }
+  ]
+ },
+ {
+  "name": "code2",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find the bug in this C function and give the corrected version:\n\n```c\nint sum(const int *a, int n) {\n    int s;\n    for (int i = 0; i <= n; i++)\n        s += a[i];\n    return s;\n}\n```"
+   }
+  ]
+ },
+ {
+  "name": "tool1",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the weather like in Rome right now? Use the tool."
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "long1",
+  "long_text": "long1.txt",
+  "max_new_tokens": 128,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Read the following engineering document carefully, then answer: which components does the document describe, and how do they interact? Answer in at most ten sentences.\n\n"
+   }
+  ]
+ },
+ {
+  "name": "val3k",
+  "long_text": "long1.txt",
+  "long_chars": 12000,
+  "max_new_tokens": 32,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Read the following engineering document carefully, then answer: which components does the document describe, and how do they interact? Answer in at most ten sentences.\n\n"
+   }
+  ]
+ }
+]

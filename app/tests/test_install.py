@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -351,6 +352,15 @@ class TestModel(InstallCase):
         job = self.run_job("27b-16gb")
         self.assertEqual((job.state, job.error["code"]), ("failed", "layout"))
         self.assertEqual(self.asked(M27["artifact"]), [])
+
+    def test_unpublished_model_is_converted_not_downloaded(self):
+        # A catalog entry without a repository: nothing is asked of Hugging Face, the user is told to convert it.
+        with mock.patch.dict(catalog.model("inkling2-mini"), {"hf_repo": ""}):
+            job = self.run_job("inkling2-mini")
+            self.assertEqual((job.state, job.error["code"]), ("failed", "unpublished"))
+            self.assertIn(str(self.installer.artifact("inkling2-mini")), job.error["message"])
+            self.assertEqual(self.sources.requests, [])
+            self.assertFalse(self.installer.model_status("inkling2-mini")["installed"])
 
     def test_new_revision_drops_old_parts(self):
         self.sources.break_after[M27["artifact"]] = 120_000

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Packages a release tarball from a Release build tree: package.sh <build-dir> <version> [out-dir]
-# Contents: bin/{ninfer,ninfer-serve,ninfer-perplexity} (stripped), lib/libcudart.so.13 (the CUDA
-# runtime the binaries link, redistributable), serve-flash-next.sh, serve-tp2.sh, serve-27b-16gb.sh, chat_templates/ (qwen3_8.jinja + LICENSE), README.md, COMMIT, SHA256SUMS.
+# Contents: bin/{ninfer,ninfer-serve,ninfer-perplexity} (stripped), bin/{capy,capy-serve,capy-perplexity}
+# (capy-flash names of the same programs: scripts that run them with lib/ on the library path),
+# lib/libcudart.so.13 (the CUDA runtime the binaries link, redistributable), serve-flash-next.sh,
+# serve-tp2.sh, serve-27b-16gb.sh, capy-serve-inkling2-mini.sh, chat_templates/ (qwen3_8.jinja + LICENSE), README.md, COMMIT, SHA256SUMS.
 # The tarball is named after the target: linux x86_64, sm_120a, the distribution it was built on.
 set -euo pipefail
 [ $# -ge 2 ] || { echo "usage: $0 <build-dir> <version> [out-dir]" >&2; exit 2; }
@@ -14,6 +16,10 @@ rm -rf "$stage"; mkdir -p "$stage/bin" "$stage/lib"
 for app in ninfer ninfer-serve ninfer-perplexity; do
   cp "$build/apps/$app" "$stage/bin/$app"
   strip --strip-unneeded "$stage/bin/$app"
+  alias="$stage/bin/capy${app#ninfer}"
+  printf '#!/bin/sh\n# capy-flash name of %s\nhere=$(cd "$(dirname "$0")" && pwd)\n' "$app" > "$alias"
+  printf 'LD_LIBRARY_PATH="$here/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$here/%s" "$@"\n' "$app" >> "$alias"
+  chmod 755 "$alias"
 done
 cudart=$(ldd "$build/apps/ninfer-serve" | awk '/libcudart\.so/ {print $3}')
 [ -n "$cudart" ] || { echo "libcudart not found in ldd output" >&2; exit 1; }
@@ -21,11 +27,12 @@ cp -L "$cudart" "$stage/lib/$(basename "$cudart")"
 cp "$here/serve-flash-next.sh" "$stage/serve-flash-next.sh"
 cp "$here/serve-tp2.sh" "$stage/serve-tp2.sh"
 cp "$here/serve-27b-16gb.sh" "$stage/serve-27b-16gb.sh"
+cp "$here/capy-serve-inkling2-mini.sh" "$stage/capy-serve-inkling2-mini.sh"
 cp "$here/README-release.md" "$stage/README.md"
 mkdir -p "$stage/chat_templates"
 cp "$here/../chat_templates/qwen3_8.jinja" "$here/../chat_templates/LICENSE" "$stage/chat_templates/"
 { echo "version $version"; echo "commit $(git -C "$here" rev-parse HEAD)"; echo "built $(date -u +%Y-%m-%dT%H:%M:%SZ) on $distro"; } > "$stage/COMMIT"
-( cd "$stage" && sha256sum bin/* lib/* serve-flash-next.sh serve-tp2.sh serve-27b-16gb.sh chat_templates/* README.md COMMIT > SHA256SUMS )
+( cd "$stage" && sha256sum bin/* lib/* serve-flash-next.sh serve-tp2.sh serve-27b-16gb.sh capy-serve-inkling2-mini.sh chat_templates/* README.md COMMIT > SHA256SUMS )
 tar -C "$out" -czf "$out/$name.tar.gz" "$name"
 ( cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
 echo "$out/$name.tar.gz"

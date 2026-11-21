@@ -1,0 +1,1043 @@
+# NInfer Engine Architecture
+
+This document defines NInfer's model instance, execution ownership and top-level control plane, and
+explains how weights enter the fixed model implementation and how requests, resources and outputs
+are committed together. It is the maintainer authority for the global architecture, the request
+lifecycle and cross-module commit relationships.
+
+This document specifies only long-term stable boundaries:
+
+- who owns requests, ordering, cache policy and physical state;
+- how architecture code, instance configuration, weight representation and actual execution connect;
+- which stable states a request transitions between;
+- when model state, output state and resource state may be published externally;
+- how cancellation and failure reach a unique terminal state.
+
+Resource selection and context cache policy are defined by
+[Resource Scheduling and Context Cache](resource-scheduling-and-context-cache.md); KV pages, replicas,
+block tables and the consumer contract are defined by [Paged KV Context Store](paged-kv-cache.md).
+
+---
+
+## 1. Product execution model
+
+The NInfer Engine with the Generation purpose always runs:
+
+- one GPU;
+- one resident model instance;
+- a `max_concurrency=1..8` fixed at startup;
+- one bounded FIFO waiting queue;
+- no preemption of already activated requests;
+- each decode round groups all decode-ready requests into one compact batch.
+
+Text, Vision, prefix reuse, MTP, DFlash2, CLI and HTTP serving all go through the public `ninfer::Engine` path.
+MTP and DFlash2 are execution backends internal to Program and do not create a second request
+scheduling or result publication mechanism.
+An artifact must provide Text; the private weights and resources of Vision, MTP and DFlash2 may be absent.
+Startup independently selects Vision and either none or one spec backend, and binds and prepares
+resources only for the selected features and their shared dependencies.
+
+The same public Engine also provides the CausalScoring purpose, fixed at startup. It serves only
+offline text scoring: `CausalScoreCore` calls Program serially, and windows use temporary empty State
+and Main KV; it creates no request, continuation, checkpoint or cache replica, and does not enter
+Scheduler/ResourceManager. Generation and CausalScoring are not switched at runtime, and
+scoring-specific staging is allocated only when CausalScoring starts.
+
+`max_concurrency` limits the number of simultaneously active requests; it does not split shared KV
+capacity evenly among lanes. A request enters Active only after Program proves that its complete
+execution resources are guaranteed; once Active, it cannot lose the ability to complete because of
+another request or the retention of inactive cache.
+
+This document does not cover multi-GPU placement, active request preemption, priority/QoS,
+cross-Engine context stores or large-scale continuous batching. These workloads require redefining
+the admission and fairness contracts and cannot be extrapolated directly from the current
+low-concurrency model.
+
+### 1.1 Architecture and weight instances
+
+Model code owns the mathematical formulas, call order, component handoffs and state transitions.
+Config provides instance parameters such as layer count, dimensions, Attention/GDN distribution and
+expert geometry. The current standard architecture entry points are `Qwen3_5ForCausalLM` and
+`Qwen4ExpForCausalLM`; trained instances and physical weight assignment enter the corresponding
+implementation as data.
+
+A V3 artifact stores the configuration, physical objects, the Binding of logical parameters, the Use
+at each use site, and Frontend resources. The Converter is responsible for source mapping, quantized
+or value-preserving import, fused storage, packing and layout conversion; the loader validates, reads
+and uploads the original bytes according to the actual binding. Swapping trained weights or combining
+existing representations under the same architecture and a handleable configuration keeps using the
+same model code.
+
+```mermaid
+flowchart LR
+    S["Source and recipe"] --> C["Converter / Writer"]
+    C --> A["v3 artifact"]
+    A --> L["Reader / semantic binding"]
+    L --> M["Materialization → Model"]
+    M --> P["Parameters / Frontend"]
+    P --> R["Resource preparation → Program"]
+    R --> E["Engine"]
+    O["Startup options"] --> L
+    O --> R
+    D["Actual device budget"] --> R
+```
+
+`metadata.name` provides the public instance name and defaults to the architecture name; serving can
+override the public alias with `--model-id`. These names and the conversion provenance identify the
+data and its source. Execution choices are based on the architecture, configuration and actual binding.
+
+For the file and reference contracts see [Container Specification](artifact-container.md); for the
+numeric interpretation of weights and for planes see [Numeric Formats](tensor-formats.md) and
+[Storage Layouts](storage-layouts.md), respectively.
+
+---
+
+## 2. Four execution boundaries
+
+The request path has only four layers:
+
+```text
+Gateway
+  │ product/protocol input
+  ▼
+Frontend
+  │ PreparedPrompt / OutputSession
+  ▼
+Engine
+  │ request order / lifecycle / publication
+  ▼
+Program
+    physical resources / model execution
+```
+
+### 2.1 Gateway
+
+Gateway is the CLI, the HTTP server or another product entry point, and owns:
+
+- protocol parsing, connections and streaming transport;
+- conversion of messages, tools and media into the public input;
+- URL, path and data acquisition;
+- response schema, usage and product-side errors;
+- Gateway's own concurrency and connection lifecycle.
+
+Gateway does not choose request order, cache source, active lane or KV page.
+
+### 2.2 Frontend
+
+Frontend owns the input and output semantics of the model family:
+
+- tokenizer, chat template, Vision preprocessing and MRoPE prompt construction;
+- the owning `PreparedPrompt` and its content identity;
+- stop, thinking/content channel, detokenization, final text and model-private structured output;
+- the prefix-execution boundary in model output that the history renderer can reconstruct exactly;
+- the `OutputSession` owned exclusively by each request.
+
+Frontend can preview the semantic effect that a model output will produce, but that effect can be
+published only after Engine completes the commit. Frontend does not own the waiting queue, the cache
+catalog or physical model state.
+
+### 2.3 Engine
+
+Engine is the request control plane and owns:
+
+- outstanding capacity, FIFO queue and request deadline;
+- request record, active slots, cancellation and response event;
+- Scheduler and ResourceManager;
+- orchestration of admission, prefill, decode, control, capture and terminal;
+- the ordering of model commit, output commit and response publication;
+- Engine-wide failure cleanup;
+- Engine availability readable by Gateway; the fact itself is still owned only by EngineCore's
+  failure/lifecycle state.
+
+Engine understands requests, budgets, finish reasons and publishable output; it does not interpret
+transformer layers, KV planes or allocators.
+
+### 2.4 Program
+
+Program is the physical execution entry point of the model instance and owns:
+
+- active sequences and complete continuation state;
+- State/KV stores, allocators, replicas, references and reservations;
+- prefill, ordinary decode, MTP/DFlash2 and forced control;
+- provisional model state and accepted-prefix commit/rollback;
+- resident prefix identity, shortlist digest and committed execution provenance;
+- resource feasibility, physical transitions and `ResourceResult`;
+- workspace, CUDA Graph and fixed model calls;
+- temporary State/KV and `lm_head`/logprob staging for CausalScoring windows.
+
+Program does not maintain the FIFO, SessionIndex, cache retention value or user-visible output.
+
+---
+
+## 3. Unique ownership
+
+| Fact or decision | Unique owner |
+|---|---|
+| config, binding, Use, weight backing and read-only resources | Model |
+| native execution parameters derived from the same source as the binding | ModelInstance's const Parameters; borrows Model |
+| protocol, connection, transport | Gateway |
+| prompt and output semantics | Frontend |
+| waiting queue, request record, response event | EngineCore |
+| Engine availability | EngineCore; Gateway only reads it and maps it to external readiness |
+| FIFO head, backfill, prefill/decode order, round membership | Scheduler |
+| logical lane, cache catalog, session binding, retention policy | ResourceManager |
+| model-output reconstruction-boundary semantics and preview state | Frontend |
+| committed resident prefix execution provenance | Program; Engine only validates and carries the metadata |
+| physical State/KV, reservation, placement, model state | Program |
+
+Other components may read the stable summary published by the owner, but must not keep an
+independently modifiable copy of the same kind of state.
+
+### 3.1 Scheduler: decides only "who runs when"
+
+Scheduler maintains:
+
+- the current FIFO head;
+- the staged-prefill owner;
+- the fairness gates for admission, prefill and decode;
+- the compact execution membership of each round;
+- backfill protection for a blocked head.
+
+Scheduler does not read checkpoint payloads, victim lists, resource vectors or allocator state.
+
+### 3.2 ResourceManager: decides only "which logical context to retain"
+
+ResourceManager maintains:
+
+- logical lane state;
+- the private/shared checkpoint catalog;
+- SessionIndex and the prefix candidate index;
+- retention class, hit observations and logical claims;
+- the cache policy for admission, capture and finish.
+
+It hands requests and cache candidates to Program for evaluation and adopts the complete physical
+result that Program returns. It does not maintain a mirror of Device/Host bytes, page refcounts or
+allocator free space.
+
+### 3.3 Program: decides only "whether and how it can physically execute"
+
+The real stores and allocators in Program are the sole authority on physical facts. Program:
+
+- computes occupancy, sharing, reclamation and per-stage peaks from the complete candidate terminal state;
+- seals an opaque `ResourcePlan` bound to the current `resource_revision`;
+- executes the single physical transition;
+- returns a complete result sufficient for ResourceManager to update the logical catalog.
+
+Program does not decide cache value based on session, FIFO position or user identity.
+
+### 3.4 Model instance and Engine lifetime
+
+Engine interprets the logical requirements of the selected features according to the standard
+architecture/config, and the binder maps them to the artifact's objects and Uses. The Materializer
+establishes stable backing and uploads the original bytes, yielding a read-only Model. ModelInstance
+holds the Model, forms const Parameters from it, and hands read-only resources such as the parsed
+tokenizer to Frontend.
+
+The Planner and actual execution borrow the same Parameters. The Planner queries the requirements of
+each layer and of the selected backends for the startup range and builds a capacity curve; it resolves
+KV capacity from the Device headroom left after the weights are resident, and then constructs
+Program's final layout. GenerationCore or CausalScoreCore uses it once instance preparation is complete.
+
+Model configuration, binding and weight addresses are fixed for the lifetime of the instance; each
+Program exclusively owns its own mutable State/KV, workspace and Graph. On destruction, the Engine
+core and pending device work are stopped first, then the instance's Program, Frontend and Parameters
+are destroyed, and finally the Model backing is released. The Reader and upload staging belong to the
+load lifecycle.
+
+Weights, State/KV backing, block-table matrices, workspace and CUDA Graph resources are established
+before Engine starts accepting requests. At runtime, ownership, mapping, frontier and replica placement
+change, but these large Device allocations are not rebuilt.
+
+### 3.5 Fixed execution and native parameters
+
+The numbers of logical parameters, physical objects and Op parameters are determined by the math, the
+storage and the actual entry point, respectively. For example, the two implemented forms of the
+current Dense Attention projection:
+
+| Actual binding | Fixed model call |
+|---|---|
+| One Q4 parent stores Q/K, another Q5 parent stores gate/V | Prepare two weight parameters and use the two-weight projection entry point |
+| One complete FP8 or NVFP4 parent stores Q/K/gate/V in order | Prepare one weight parameter and use the single-weight projection entry point |
+
+A View keeps the full parent's geometry, planes and element range; native preparation interprets
+these references as the entry point requires. A shared object is resident only once, and each use
+site keeps its own independent Use. The activation permissions are `A16Only={A16}`,
+`AllowA8={A16,A8}` and `AllowA4={A16,A8,A4}`; a fused call takes the intersection of the permissions
+of the relevant Uses and handles the required auxiliary values.
+
+With `LoadOptions.tp=2`, Dense Qwen3.5 is sharded by logical parameter name at load time
+(`qwen3_5/load/sharding.h`): Attention and GDN projections, MLP gate/up and `text/output_head` are
+split by rows along head/intermediate width/vocabulary; output projections, MLP down,
+`mtp/input_projection` and GDN convolution channels are split by columns; norms and
+`text/token_embedding` are replicated; Vision is resident only on `vision_rank`; for DFlash2
+placement see [Two-GPU tensor parallelism](tensor-parallel.md#2-weight-partitioning).
+Logical parameters on the same parent are combined into one parent placement. Model keeps one set of
+views per device, and each device constructs its own Parameters; a DFlash2 drafter that reads the
+whole head (full proposal head) is rejected under tp=2.
+
+Model code directly maintains the finite set of call forms, cross-Op fusion and stage relationships;
+closed computations and their shape/format dispatch belong to Ops. The Reader, binder, native
+parameter preparation, capacity queries, warmup and actual execution each check the contracts they
+consume. The executable range of a valid artifact depends on its actual consumers; conversion does not
+require complete weight combinations to be registered in advance.
+
+Mathematical formulas, weight representation values and implementation precision are interpreted
+separately. Different quantization, prefill, batch or speculative paths may produce different results;
+numerical and state correctness are verified against the [Op contract](op-development.md) and the
+corresponding independent oracle.
+
+---
+
+## 4. Request and resource lifecycle
+
+### 4.1 Request states
+
+A request advances through the following stable states:
+
+```text
+Waiting
+  -> Materializing
+  -> Prefill
+  -> DecodeReady | ControlReady
+  -> TerminalPending
+  -> Finished
+```
+
+- **Waiting**: has only the owning prompt and output state, and no Program sequence.
+- **Materializing**: the resource transition has acquired the logical claim; the source stays valid
+  until commit or abort.
+- **Prefill**: the request is already Active and is consuming the prompt suffix.
+- **DecodeReady**: can join the next compact decode round.
+- **ControlReady**: Frontend requires a canonical forced-control suffix to be committed.
+- **TerminalPending**: model execution has terminated, but the active resources have not yet
+  completed retain or release.
+- **Finished**: both resources and output have been committed, and the response can complete.
+
+### 4.2 Logical lane states
+
+ResourceManager's lane states are:
+
+```text
+Free -> Materializing -> Active -> TerminalPending -> Free
+```
+
+A request can enter Active only after both the physical and the logical result of materialization
+have been successfully adopted. A terminal request must keep active ownership until a complete
+checkpoint has been published or all active resources have been released.
+A streaming request publishes `GenerationStart` once, after the admission choice is committed and
+before any output delta; the prompt tokens and reused-prefix tokens in it are committed facts of the
+resource choice and do not wait for prefill to complete.
+
+Control lane, StateImage slot, KV execution row and decode batch row are distinct identities:
+
+- a lane is Engine's long-lived active request position;
+- State/KV execution resources are allocated by Program;
+- a compact row is only an index within the current GPU unit.
+
+Ownership must not be derived from one of them to another.
+
+### 4.3 Gateway and Engine capacity
+
+Gateway may acquire its own request lifetime before prepare or media acquisition. Engine outstanding capacity
+starts when a request with nonzero output is successfully submitted, and is released jointly by two
+independent facts:
+
+```text
+response_done       worker has formed the final result or error
+consumer_released   wait has ended, or GenerationHandle has been abandoned
+
+release_capacity =
+    response_done && consumer_released && !capacity_released
+```
+
+The two may occur in either order, but capacity is released only once. Abandoning the request handle
+only sets cancellation and `consumer_released`; it never calls Program from the consumer thread.
+
+### 4.4 Continuation and session
+
+An active continuation is writable model state; a published checkpoint is immutable reusable state.
+A reusable checkpoint must prove complete State, Main KV, selected backend KV and the metadata needed
+to continue execution, all at the same frontier.
+
+A session key is only a lookup hint and does not own the continuation. Each request acquires a
+monotonic `publication_order` when it enters Engine; only a completed result with a later order can
+replace a SessionIndex binding.
+
+---
+
+## 5. Worker and scheduling
+
+### 5.1 Single mutation owner
+
+Only the Engine worker modifies the request record, Scheduler, ResourceManager and Program. Ingress,
+consumer and transport threads interact through queues, the cancellation flag and response events,
+and do not change model state directly.
+
+A worker boundary processes, in semantic order:
+
+1. receive timeouts or cancellations of waiting requests;
+2. advance a resource transition that has already started;
+3. complete TerminalPending requests that can be settled;
+4. freeze the active cancellation snapshot;
+5. attempt one admission when the fairness gate allows it;
+6. choose staged prefill, forced control or compact decode;
+7. run at most one model execution unit;
+8. commit model, budget and Frontend output state;
+9. publish response events and observations.
+
+The concrete split of the loop may change, but the following ordering may not:
+
+- an in-flight GPU unit must first reach a stable boundary before its resource mapping is modified;
+- Program commit must precede publication of user output;
+- a resource result must be adopted before a lane can change its visible state;
+- while one global resource topology transition is unsettled, no other transition is started.
+
+### 5.2 Admission order
+
+Scheduler first determines the single waiting request that may be attempted, and ResourceManager
+then chooses the cache and resource terminal state for it. Resource conditions cannot change FIFO
+ownership in reverse.
+
+When the FIFO head is temporarily blocked by active incumbents, Scheduler records the protected head
+and the donor set that must finish. A later request can backfill only if Program proves the following
+condition:
+
+> with the borrower continuing to hold its complete active reservation, the established donor set
+> finishing is still enough for the head to enter under a root plan that releases all inactive cache.
+
+This proof does not use the timing assumption "the borrower is expected to finish first". A transition
+that changes the global resource topology advances `resource_revision`, and any later backfill must be
+proven again.
+
+### 5.3 Prefill and decode
+
+Scheduler guarantees:
+
+- at most one staged-prefill request at a time;
+- existing decode work is not starved by consecutive prefills;
+- a decode round contains all and only the current decode-ready requests;
+- a batch uses the exact `B` and is not padded with inactive lanes up to `max_concurrency`.
+
+Program receives the compact `SequenceHandle[B]` and per-row budgets. Prefix reuse only reduces
+materialization or suffix prefill; it does not create another scheduling path.
+
+### 5.4 Admission invalidation
+
+Only facts that can change the admission outcome trigger a new check:
+
+- the waiting queue or FIFO head changes;
+- a lane is released;
+- the staged-prefill gate changes;
+- a resource transition reaches its terminal state;
+- Program's global resource revision changes.
+
+Ordinary decode frontier advances, output publication and statistics updates do not scan the cache
+catalog and do not rerun the pressure planner.
+
+---
+
+## 6. Two kinds of commit transactions
+
+Engine orchestrates, across modules, two kinds of transactions that cannot replace each other.
+
+### 6.1 Resource transition
+
+A resource transition changes global resources or ownership at the following boundaries:
+
+- waiting request materialization;
+- active checkpoint capture;
+- terminal retain or release;
+- placement or deletion of an inactive checkpoint.
+
+Paths that require planning, allocation or transfer follow:
+
+```text
+logical choice
+  -> Program seals ResourcePlan
+  -> RunningTransaction
+  -> ResourceResult
+  -> ResourceManager adopts result
+```
+
+`ResourcePlan` is bound to Program's `resource_revision`. A plan that becomes stale before start can be
+replanned without side effects; after start, the source, victims or stage order cannot be changed.
+Abort must also return a complete terminal state, so that every claim, pin and committed safe
+degradation has a unique interpretation.
+
+Resource candidates, feasibility formulas, the cost model and bounded search are defined by
+[Resource Scheduling and Context Cache](resource-scheduling-and-context-cache.md).
+
+### 6.2 Model-unit transaction
+
+Prefill finalization, decode and control execution can produce a move-only `PendingBatch`:
+
+```text
+frozen sequence membership
+provisional tokens
+per-row produced extent
+per-row accepted-prefix execution metadata
+Program-owned provisional state
+```
+
+Engine runs a Frontend preview on each row's output, forms the accepted-prefix decision, and then
+consumes the whole batch with a single `Program::commit` or `Program::abort_pending`. Program commits
+or rolls back, together, the Main/backend KV, recurrent state, RNG and speculative state
+corresponding to that prefix.
+
+Non-cancelled rows obey:
+
+```text
+1 <= accepted_tokens <= produced_tokens
+nonterminal -> accepted_tokens == produced_tokens
+terminal    -> accepted_tokens may be a produced prefix
+```
+
+A cancelled row uses zero accepted tokens and enters terminal. Engine does not allow a still
+unconsumed `PendingBatch` to be abandoned row by row.
+
+### 6.3 Output publication order
+
+The visible order of one model output is:
+
+```text
+Frontend preview
+  -> Program commits accepted model state and resident prefix execution provenance
+  -> terminal resource result, when required
+  -> generation budget and scheduler accounting
+  -> OutputSession commits preview
+  -> publish stream/aggregate event
+```
+
+Therefore a consumer never sees a token that has not yet been committed, nor a continuation that is
+inconsistent with the Program frontier.
+Forced control uses the same commit order, but its tokens are provided by Frontend; it does not call
+the sampler or advance the sampling RNG.
+
+The boundary metadata produced by Frontend describes only relative positions within the current
+accepted span. Engine verifies that it falls within that span and carries it with the corresponding
+row; it does not interpret delimiters or modify the resident identity. Program converts it to absolute
+positions using the pending row's base frontier and commits it atomically with the accepted tokens,
+Main/backend state and prefix digest. When Program commit fails, the preview state of `OutputSession`
+is likewise not committed; ordinary, MTP, DFlash2 and forced control share this ownership chain.
+
+---
+
+## 7. Terminal, cancellation and failure
+
+### 7.1 Terminal
+
+An Active request that terminates successfully first enters TerminalPending:
+
+```text
+choose retain or release
+  -> Program publishes one complete checkpoint or releases the sequence
+  -> ResourceManager adopts the terminal result
+  -> optional SessionIndex update
+  -> lane becomes Free
+```
+
+The checkpoint's logical publication slot was already reserved at activation. If retention cannot
+form a complete continuation, the deterministic terminal state is release, rather than leaving the
+request in TerminalPending.
+
+### 7.2 Cancellation
+
+Cancellation takes effect at a stable boundary of the Engine worker:
+
+| State when cancellation is observed | Result |
+|---|---|
+| Waiting | Finish the request directly without creating Program state |
+| Materializing | Abort the resource transition and adopt its complete result |
+| Active | Once the current GPU unit is stable, enter TerminalPending and release |
+| PendingBatch | Commit through a cancelled-row decision, or abort as a whole |
+| Committed, not yet adopted | First adopt the committed result, then run the terminal path |
+
+Cancellation does not modify an in-flight mapping, and does not publish a checkpoint from incomplete
+active state.
+
+### 7.3 Request-local rejection
+
+Before Program mutation, it is possible to reject only the current request:
+
+- queue timeout, overload or waiting cancellation;
+- the input exceeds the public context contract;
+- the prompt or generation request cannot be represented;
+- the single request is still infeasible even with a root source and all inactive cache released.
+
+### 7.4 Engine-wide failure
+
+The following cases indicate that shared physical state can no longer be safely interpreted, and the
+whole Engine must fail:
+
+- after a GPU mutation, neither commit nor a stable abort is possible;
+- `PendingBatch` membership or disposition is inconsistent;
+- handle owner/generation mismatch;
+- a resource, checkpoint completeness or noexcept adoption invariant is broken.
+
+Cleanup must first terminate pending resource/model transactions in Program, then release active
+state, and finally clear ResourceManager and complete all request responses. Internal invariant
+errors must not be downgraded to a cache miss, a wait or a retry.
+
+---
+
+## 8. Top-level constraints on physical execution
+
+The following constraints belong to the Engine architecture, but their concrete implementation is
+defined by Program and lower-level documents:
+
+- Program establishes a fixed number of control/state/table resources at startup;
+- growing KV is backed by shared paged pools, and an active request holds a complete growth reservation;
+- State/KV mapping stays stable within one GPU execution unit;
+- CUDA Graphs are built per valid exact-`B` topology; request identity and page IDs are stable input
+  data, not graph keys;
+- ordinary decode does not run a catalog scan, pressure search or background replica scan;
+- workspace is backing planned as a whole by Program at startup; Vision, Text and the speculative
+  schedule use its internal regions according to mutually exclusive lifetimes.
+
+An Op owns Graph update compatibility within its declared execution range; Program captures the
+complete execution unit and validates updates of same-kind definitions at startup. Length tiers are
+used to bound reserved resources and are not the same as topology classes. Program does not replicate
+the private kernel dispatch boundaries of target attention; the actual topology requirements of other
+Ops, such as draft, are still handled separately by the complete execution unit.
+
+Capacity queries consume the same per-layer parameters and Uses as execution. Allocation scopes are
+used both for layout computation and for actual execution; sequentially exclusive scratch is counted
+at its peak, and data still live across stages is counted for its full lifetime. The Vision handoff is
+kept until the last consumer among Text and the selected MTP, and speculative pending features and
+verify records are kept until the corresponding commit boundary.
+
+Prefill cost selects measured values by hardware class and by the `prefill_signature` derived from the
+actual Text/Vision configuration, binding and Uses; when there is no matching value, a generic cost is
+used. Costs are used for planning choices; physical feasibility is still decided by Program's actual
+layout and occupancy.
+
+### 8.1 Two-GPU tensor parallelism
+
+For the complete design (weight partitioning, transfers, two-device CUDA Graph, mirrored state, tests
+and known limitations) see [Two-GPU tensor parallelism](tensor-parallel.md).
+
+With `EngineOptions.tp = 2`, Engine creates one `DeviceContext` for each rank in `devices`, forms
+an `ExecutionContext` from them, and enables peer access when the driver allows it (otherwise
+collectives copy via host staging; in CUDA Graphs, the all-reduce with a single active request is
+exchanged through a pinned host mailbox).
+Loading yields one two-device Model; `ModelInstance` holds the `execution::Parameters` of rank 0 and
+rank 1.
+Scheduler, ResourceManager, admission, sampling and request output still exist only on rank 0, and
+Engine semantics are the same as on a single GPU.
+
+Program has only one set of logical stores (KV address space, pages, StateImage, catalog), held by
+rank 0. rank 1 allocates in `ProgramImpl::PeerRuntime` the same per-rank persistent/workspace layout
+as rank 0 (with KV heads, GDN channels and value heads halved), and its KV page pool, execution tables
+and StateImage pool are attached at construction as mirrors of the rank 0 pools: every page
+zero/copy, row acquire/release/publish and slot zero/copy on rank 0 is replayed on rank 1's stream
+with the same physical index. The Host tier has no rank 1 copy, so tp 2 requires Host State and Host
+KV capacity of 0. Every bind, prefill step and forced-token prefill publishes the same prefill KV row
+on both ranks; decode uploads the same host ingress to the frames of both ranks. CUDA Graph forks/joins
+rank 1's stream into the same capture on rank 0, and before launch gates on rank 1's committed mirror
+work. Both ranks keep the same runtime reservation, and KV capacity is solved for the rank with less
+free device memory. Currently supported: ordinary, MTP and DFlash2 (requires `--lm-head-draft`)
+generation and CausalScoring, optionally with Vision, with KV in
+`bf16`/`int8`/`nvfp4`. The Vision tower and encode workspace exist only on
+`vision_rank` (`--vision-device`): that rank encodes every item, the merged embeddings are copied by
+the other rank's stream, ordered by events, into its own handoff, and each rank scatters its own copy;
+the other rank allocates no encode region, and the difference is added back to its budget when solving
+KV. Prefix reuse is the same as on a single GPU, including zero-suffix and the MTP
+bridge: under MTP, rank 1 keeps its own copy of the target hidden in the same StateImage slot, and the
+first token of a zero-suffix is sampled through the vocabulary-sharded output head. For the
+reclamation rule of private prefill capture when there is no Host tier, see
+[Resource Scheduling and Context Cache](resource-scheduling-and-context-cache.md#101-retention-policy).
+
+Serve warmup uses the same public Engine execution path, but its request-level context cache is always
+disabled. Warmup may establish runtime state for CUDA Graph, libraries and allocators; when it finishes
+it must not leave behind any continuation that external requests could hit, nor occupy the
+checkpoint catalog.
+
+---
+
+## 9. Core invariants
+
+1. Request order is decided only by Scheduler.
+2. Logical cache policy is decided only by ResourceManager.
+3. Physical occupancy, reservation, feasibility and model state are decided only by Program.
+4. Before Active publication, a complete continuation and the completion reservation must be in place.
+5. There is at most one global resource topology transition at any time.
+6. A `PendingBatch` must be fully consumed by a single Program commit or abort.
+7. Model output becomes visible to the consumer only after Program, Frontend and budget have all committed.
+8. A request's active ownership must not be released or reused before TerminalPending ends.
+9. Cancellation can change request state only at a linearized worker boundary.
+10. Every accepted request, resource transaction and model transaction has a finite and unique terminal state.
+
+---
+
+## 10. Implementation locations and adjacent authorities
+
+| Responsibility | Main location |
+|---|---|
+| Public Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
+| Engine worker and request lifecycle | `src/runtime/engine/engine_core.h`, `src/runtime/engine/request_record.h` |
+| Scheduler | `src/runtime/engine/scheduler.h`, `admission_policy.*` |
+| Instance construction and lifetime | `src/runtime/engine/model_instance.*` |
+| ResourceManager and materialization planner | `src/runtime/engine/context_cache/` |
+| Request, execution, resource and timing contracts | `src/runtime/contract/` |
+| Model config, binding and read-only data | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
+| Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |
+| Program planning, storage and transactions | `src/models/qwen3_5/program/` |
+| Frontend and model state layout | `src/models/qwen3_5/frontend/`, `state/` |
+| device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
+| generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |
+| semantic Ops | `src/ops/`, `include/ninfer/ops/` |
+| shared JSON/message-to-owning-input adapter | `src/product/prompt_input/` |
+| media URL/path/data acquisition | `src/product/media_acquire/`, CLI and serving |
+| media decode from already-owned bytes | `src/media/decode/` |
+| HTTP Gateway | `src/serve/` |
+| Source adaptation, recipes and conversion methods | `tools/convert/` |
+| Python container reading, encoded output and writer | `tools/artifact/` |
+
+These paths locate the current authority; they do not freeze the file split into an external interface.
+
+`include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface and owning host
+values used by in-tree applications; NInfer currently does not install or export a C++ SDK.
+`include/ninfer/ops/` holds the repository-internal semantic Op contracts. `.ninfer` is the only C++
+product artifact; other formats are not loaded through extension detection, compatibility shims or a
+second product entry point. The CLI, server and inference benchmark run inference only through the
+public Engine; the converter provides no Python model-inference route.
+
+The artifact layer owns the generic file and residency contracts, the model implementation owns the
+math and state operations, runtime owns the public runtime contracts and Engine publication policy,
+and product/serving owns input acquisition and protocol translation. Every semantically closed Op
+(including fused, fixed-shape and device-specialized implementations) belongs to `src/ops`.
+
+Adjacent documents:
+
+- [Resource Scheduling and Context Cache](resource-scheduling-and-context-cache.md): resource vector,
+  checkpoint capability, pressure planning and physical transition;
+- [Paged KV Context Store](paged-kv-cache.md): typed pools, logical pages, replicas, block tables
+  and consumer address contract;
+- [Op development](op-development.md): admission criteria for Op correctness and performance;
+- [CLI](../cli.md) and [HTTP serving](../serving.md): external behavior.
+
+
+# NInfer Persistent Tensor Numeric Formats
+
+This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+artifacts: their logical words, quantization semantics, canonical reference encoders where
+applicable, and conformance boundaries. [Container framing](artifact-container.md),
+[physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
+separately.
+
+## 1. Registered formats
+
+NInfer has exactly nine persistent numeric tensor formats in four categories.
+
+Direct scalar formats preserve one logical scalar word per tensor element:
+
+| Canonical name | Category | Logical width | Logical meaning |
+|---|---|---:|---|
+| `bf16` | direct floating point | 16 | bfloat16 bit encoding |
+| `fp32` | direct floating point | 32 | IEEE-754 binary32 |
+| `int32` | direct signed integer | 32 | 32-bit two's-complement integer |
+
+Grouped quantized-weight formats preserve signed codes plus one scale per logical group:
+
+| Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
+|---|---:|---:|---:|---|---:|
+| `q3_g128_fp16` | 3 | 128 | `[-4, 3]` | one binary16 scale/group (may be negative, §6.1) | 3.125 |
+| `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
+| `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
+| `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
+| `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
+
+The block-scaled floating-point weight format is:
+
+| Canonical name | Code | K group | Block scale | Global field |
+|---|---|---:|---|---|
+| `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor per stacked source matrix |
+
+The row-scaled floating-point weight format is:
+
+| Canonical name | Code | Scale granularity | Scale |
+|---|---|---|---|
+| `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
+
+Each name fixes a code and scale contract. The format registry is implemented in
+[`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
+[`src/artifact/formats.cpp`](../../src/artifact/formats.cpp). Additional formats need an explicit
+numeric definition and codec implementation. Layout and Op support are separate: a known format
+can be stored without every model consumer supporting it.
+
+## 2. Terms and ownership
+
+The registry keeps the following concerns separate.
+
+### 2.1 Persistent numeric format
+
+A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
+an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
+the block-scaled `nvfp4` format, and the row-scaled `fp8_e4m3fn_row_bf16` format. It does not
+identify a tensor's model role, physical byte layout, or supported consumer.
+
+### 2.2 Direct scalar format
+
+A **direct scalar format** assigns one fixed-width logical word to every logical tensor coordinate.
+It defines the value of that word without a group, scale, zero point, or reconstruction step. `bf16`,
+`fp32`, and `int32` are direct scalar formats.
+
+The adjective “direct” does not require a particular physical layout or prohibit a registered
+lossless storage transformation. It means only that layout decoding recovers the original logical
+word rather than a quantized approximation of another word.
+
+### 2.3 Quantization scheme
+
+A **quantization scheme** defines only the persistent logical representation of a quantized weight:
+
+- the code domain;
+- the group axis and group size;
+- the scale type and scale granularity;
+- the validity rules for codes and scales;
+- the mathematical reconstruction of each represented weight.
+
+The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
+from context.
+
+### 2.4 Conversion method
+
+A **conversion method** produces the words of a selected format from a logical source. Scale
+selection, rounding order, calibration, clipping, and error optimization belong here. Methods
+may preserve an already encoded source or quantize floating-point values.
+
+The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
+grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
+E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
+scales, and, for NVFP4, the weight divisor of each source matrix (sources with different divisors
+grouped explicitly into one parent become a stacked plane). `nvfp4_absmax` and `nvfp4_mse` quantize
+floating-point weights to `nvfp4`: one divisor per parent puts its largest group scale inside the
+E4M3FN range, each 16-value group maps its largest magnitude to an E2M1 target (6, or for
+`nvfp4_mse` the least-squared-error choice among 6, 5.5, 5, 4.5 and 4), and codes round to
+nearest with ties to even. `nvfp4_mse_stacked` quantizes each source matrix of an explicit group as
+`nvfp4_mse` would quantize it alone and keeps one divisor per source.
+
+A recipe can supply a Python callable as its method. Different methods can produce different
+valid codes and scales for the same format; they share the format's decoding contract. Method
+identity and numerical parameters belong to conversion provenance.
+
+Direct formats also separate representation from conversion. For example, `bf16` defines stored
+bits; the conversion method decides how an FP32 source becomes those bits.
+
+### 2.5 Weight recipe
+
+A **weight recipe** selects the format and conversion method for each logical parameter or
+region. Parameter meaning and shape come from the architecture. Source selection, grouping and
+per-input activation permissions are described in the [conversion guide](../weight-conversion.md).
+
+### 2.6 Storage layout
+
+A **storage layout** maps direct logical words or quantized codes and scales to bytes. It owns,
+among other things:
+
+- bit and byte packing;
+- plane ordering and interleaving;
+- row, tile, expert, or kernel-native ordering;
+- physical padding and alignment;
+- endianness and any layout-specific validation metadata.
+
+One format may have more than one deliberately supported layout, but every layout must decode to
+exactly the same direct words or logical codes and scales. The currently registered layouts are
+`contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
+`block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
+`fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
+alignment rules belong to the layout registry, not to these nine numeric formats.
+
+### 2.7 Compute profile and kernel support
+
+A **compute profile** owns observable input and output types, explicitly semantic casts or
+quantization boundaries, determinism requirements, and operator-level numerical tolerances. Kernel
+operand and accumulator precision, tiling, Tensor Core use, internal reduction trees, private
+staging or materialization, split strategy, fusion schedule, launch geometry, and hardware dispatch
+remain implementation choices. Exact or bitwise operations may require an exact observable result;
+that requirement does not turn a floating-point oracle into a prescribed internal evaluation order.
+
+In `q8_g32_fp16`, the `fp16` suffix describes stored scales. Activation and output precision are
+chosen by the consumer. A kernel supports specific combinations of numeric format, storage layout,
+operator semantics, shape, compute profile, and execution platform.
+Native Op implementations define these combinations and check them when preparing or consuming
+operands. A recipe's ability to encode a combination is independent of native execution support.
+
+### 2.8 Runtime-state codec
+
+KV-cache quantization, activation quantization, temporary kernel compression, recurrent state, and
+communication formats are runtime-state codecs. They are outside this persistent-tensor registry
+even if they also use signed integers and grouped scales. In particular, an INT8 KV-cache format
+must not be labeled `q8_g32_fp16` merely because some of its fields look similar.
+
+## 3. Canonical identities and format semantics
+
+### 3.1 Direct scalar formats
+
+#### `bf16`
+
+`bf16` is the bfloat16 bit encoding. Its abstract 16-bit word has one sign bit at bit 15, an 8-bit
+exponent at bits 14 through 7 with bias 127, and a 7-bit trailing fraction at bits 6 through 0.
+
+Its value classes are:
+
+- exponent zero and fraction zero: positive or negative zero according to the sign bit;
+- exponent zero and nonzero fraction: a subnormal value
+  `(-1)^sign * fraction * 2^-133`;
+- exponent 1 through 254: a normal value
+  `(-1)^sign * 2^(exponent-127) * (1 + fraction/2^7)`;
+- exponent 255 and fraction zero: positive or negative infinity;
+- exponent 255 and nonzero fraction: NaN, including its sign, quiet/signaling bit, and payload.
+
+Equivalently, its exact expansion to binary32 places the 16-bit logical word in the high 16 bits of
+a binary32 word and appends 16 zero low bits. `bf16` is not IEEE binary16/FP16.
+
+All 65,536 logical BF16 words are valid at the format layer. Positive and negative zero remain
+distinct words. Infinity and NaN are also representable, and a direct layout must recover their
+original logical words without canonicalizing a NaN payload or changing its quiet/signaling bit.
+Whether a particular model tensor permits non-finite values is a parameter or conversion constraint, not
+a different BF16 format. A compute operation is not required to preserve a NaN payload unless its
+compute profile says so.
+
+#### `fp32`
+
+`fp32` is IEEE-754 binary32: one sign bit at bit 31, an 8-bit exponent at bits 30 through 23 with
+bias 127, and a 23-bit trailing fraction at bits 22 through 0. Its zeros, subnormals, normal values,
+infinities, and NaNs have the standard binary32 interpretation; the minimum positive subnormal is
+`2^-149`.
+
+All 2^32 logical words are valid at the format layer. As with BF16, signed zeros, infinities, and
+NaN payloads remain distinct persistent words. Tensor-specific restrictions on non-finite values
+belong to the recipe, while compute-time propagation belongs to the compute profile.
+
+#### `int32`
+
+`int32` is a 32-bit two's-complement signed integer. For an abstract unsigned logical word `u`:
+
+```text
+value = u                         if u < 2^31
+value = u - 2^32                  otherwise
+```
+
+Every 32-bit word is valid, and the value interval is `[-2147483648, 2147483647]`. `int32` has no
+scale, zero point, saturation behavior, sentinel convention, or dependency on the host C++ `int`
+type. Requirements such as nonnegativity, vocabulary bounds, or the meaning of `-1` belong to the
+specific tensor role.
+
+#### Common direct-format rules
+
+For a direct tensor, every logical coordinate owns one independent word of the selected format.
+Direct formats are shape-agnostic: rank, dimension validity, coordinate traversal, strides,
+padding, and alignment are defined by the container and selected layout, not by the scalar format.
+Byte order is likewise a layout property and must never be inferred from host-native representation.
+
+Persistence from the same source type is bitwise identity at the logical-word boundary. A conversion
+between different source and target types is not implicit. The recipe must define it,
+including rounding for FP32-to-BF16 and the value conversion and range policy for INT32.
+
+Control parameters, ordinary weights, norms, indexes, and maps use a direct format plus a separate
+logical parameter role.
+
+### 3.2 Grouped signed-integer weight identities
+
+The identifiers record code width, group size and scale type. For example, `q4_g64_fp16` uses
+4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q5_g64_fp16`,
+`q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
+
+The parser resolves names through the format registry. `Q4`, `Q5`, `Q6`, and `Q8` are prose
+abbreviations; artifacts store the complete canonical names.
+
+### 3.3 `nvfp4`
+
+`nvfp4` is a block-scaled floating-point weight representation, not a signed-integer
+`QuantFormat`. For a logical matrix `[N,K]`, every K-axis group contains 16 E2M1 code words and one
+E4M3FN scale word. The representation also contains one FP32 serialized weight divisor `d_w` per
+source matrix stacked into the plane: a plane quantized as one matrix holds one, and a plane
+assembled from several matrices that were quantized apart (a layer's routed experts) holds one for
+each, covering `N / divisors` consecutive rows in the order the sources are stacked. `divisors` is
+the tensor object's member of that name; with more than one, every source covers a whole number of
+128-row scale tiles, so a source is a contiguous range of the code plane, of the swizzled scale
+plane and of the divisor words.
+
+An E2M1 word has sign bit 3, exponent bits 2:1, and mantissa bit 0. Positive code words `0..7`
+decode to:
+
+```text
+0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+```
+
+Bit 3 negates that value. Words `0x0` and `0x8` are distinct positive and negative zero words; all
+16 code words are valid and must remain bit-exact.
+
+An E4M3FN word has sign bit 7, exponent `e` in bits 6:3, fraction `m` in bits 2:0, and bias 7:
+
+```text
+e == 0, m == 0 : signed zero
+e == 0, m != 0 : (-1)^sign * m * 2^-9
+1 <= e <= 14   : (-1)^sign * (1 + m/8) * 2^(e-7)
+e == 15, m < 7 : (-1)^sign * (1 + m/8) * 2^8
+e == 15, m == 7: NaN
+```
+
+Stored NVFP4 weight scales admit only sign-zero finite words, including positive zero. Negative
+values, negative zero, and both NaN words are invalid. Every serialized binary32 word of `d_w` must be
+finite and strictly positive.
+
+For code `c[n,k]`, scale word `s[n,g]`, and `g=floor(k/16)`, the exact represented weight is:
+
+```text
+W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) / d_w[floor(n / (N / divisors))]
+```
+
+`import_encoded` copies all three fields without requantizing or canonicalizing them. Activation
+calibration is not part of this weight format. In particular, a
+site-level input divisor used by an NVFP4 execution path is a separate model-role tensor and cannot
+be inferred from `nvfp4`, its block scales, or `d_w`.
+
+### 3.4 `fp8_e4m3fn_row_bf16`
+
+`fp8_e4m3fn_row_bf16` is a rank-two weight matrix `[N,K]` with positive dimensions. Every logical
+weight owns one E4M3FN code word, and every logical row owns one BF16 dequantization multiplier. The
+row is the first matrix coordinate `n`; “row” is structural and does not infer a model-specific
+channel role.
+
+The E4M3FN code meaning is the one defined in Section 3.3. Both signed-zero words and every finite
+subnormal or normal word are valid. The positive and negative NaN words `0x7f` and `0xff` are
+invalid; E4M3FN has no infinity words.
+
+The BF16 scale meaning is the one defined in Section 3.1. A valid row scale has sign bit zero and is
+finite, including positive zero and positive subnormals. Negative values, negative zero, infinity,
+and NaN are invalid. If a row scale is positive zero, every code in that row must be either positive
+zero `0x00` or negative zero `0x80`. The converse is not required.
+
+For code word `c[n,k]` and row-scale word `s[n]`, the exact represented weight is:
+
+```text
+c32          = exact_e4m3fn_to_binary32(c[n,k])
+s32          = exact_bfloat16_to_binary32(s[n])
+w_hat[n,k]   = binary32(c32 * s32)
+```
+
+The scale is a multiplier. Division by `s[n]`, a zero point, a matrix-level divisor, or another
+implicit coefficient implements a different format. The code plane and row-scale plane together
+form one persistent weight; neither a bare E4M3FN tensor nor an independently named scale tensor is
+an alias for this format.
+
+The format does not define how a floating-point source is assigned a scale or rounded to E4M3FN.
+A recipe either preserves already selected code and scale words exactly or names its
+conversion method. Activation quantization and activation scales are separate compute or runtime-state
+concerns and are not persistent fields of this format.
+
+## 4. Grouped signed-integer tensor model
+
+### 4.1 Shape and group axis
+
+For the four grouped signed-integer schemes, let a logical quantized weight tensor have rank
+`r >= 1`, a positive `K`, and shape:
+
+```text
+[D0, D1, ..., D(r-2), K]
+```
+
+For `r = 1`, this notation reduces to `[K]` with no leading coordinate.
+

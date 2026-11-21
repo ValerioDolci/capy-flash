@@ -105,6 +105,22 @@ python3 -m tools.convert \
   --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --name qwen3.8-27b \
   --out out/qwen3_8_27b.ninfer
+
+python3 -m tools.convert \
+  --model /path/to/Inkling-2-Mini \
+  --recipe inkling2_mini --components text,mtp --device cpu \
+  --name inkling-2-mini \
+  --out out/capy-flash-inkling2-mini-nvfp4.ninfer
+```
+
+An Inkling 2 artifact (`--components text`, or `text,mtp` with the DSpark drafter) is checked
+against the reference's own load-time transforms with
+[`ref_ink/check_conversion.py`](ref_ink/check_conversion.py) (Transformers of the Inkling 2
+implementation required; the drafter's tensors are compared when the artifact has them):
+
+```bash
+python3 -B tools/ref_ink/check_conversion.py --checkpoint /path/to/Inkling-2-Mini \
+  --artifact out/capy-flash-inkling2-mini-nvfp4.ninfer --report check.json
 ```
 
 Inspect a result:

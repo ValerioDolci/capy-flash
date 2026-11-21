@@ -6,7 +6,8 @@
 #
 #   --dir DIR          where the release and the model go (default ~/capy-flash)
 #   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-#                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
+#                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
+#                      or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
 #   --version vX.Y.Z   release tag (default: the latest release)
 #   --check            only check the machine, download nothing
 #   --no-model         download the release only
@@ -15,10 +16,11 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
+usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb|inkling2-mini] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
   --dir DIR          where the release and the model go (default ~/capy-flash)
   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-                     108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
+                     108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
+                     or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
   --version vX.Y.Z   release tag (default: the latest release)
   --check            only check the machine, download nothing
   --no-model         download the release only
@@ -75,8 +77,17 @@ case $model in
     launcher=serve-tp2.sh
     model_id=qwen3.8-27b
     need_ram_gib=8 need_disk_gb=20 need_simd=0 need_gpus=2 ;;
-  *) echo "install.sh: --model must be flash-next, flash-next-64gb, 27b or 27b-16gb" >&2; exit 2 ;;
+  inkling2-mini)
+    # The artifact holds the text model and the DSpark drafter: the released weights, not requantized.
+    hf_repo=Feyd89/Inkling-2-Mini-NVFP4-capy-flash
+    artifact=capy-flash-inkling2-mini-nvfp4.ninfer
+    launcher=capy-serve-inkling2-mini.sh
+    model_id=inkling-2-mini
+    need_ram_gib=8 need_disk_gb=23 need_simd=0 need_gpus=2 ;;
+  *) echo "install.sh: --model must be flash-next, flash-next-64gb, 27b, 27b-16gb or inkling2-mini" >&2; exit 2 ;;
 esac
+convert_model=0
+if [ -z "$hf_repo" ] && [ "$fetch_model" = 1 ]; then fetch_model=0; convert_model=1; fi
 
 failed=0
 ok()   { printf '  ok    %s\n' "$*"; }
@@ -189,6 +200,18 @@ if [ "$fetch_model" = 1 ]; then
 fi
 
 port=8080
+if [ "$convert_model" = 1 ]; then
+  cat <<EOF
+
+The $model artifact is not published yet: convert it from the checkpoint (Python 3.11 with PyTorch and
+NumPy; about half a minute on the CPU; 20.2 GB of checkpoint plus 19.7 GB), in a checkout of
+https://github.com/$repo at $version (docs/weight-conversion.md):
+
+  hf download thinkingmachines/Inkling-2-Mini --local-dir $dir/checkpoints/Inkling-2-Mini
+  python3 -m tools.convert --model $dir/checkpoints/Inkling-2-Mini --recipe inkling2_mini \\
+    --components text,mtp --device cpu --name inkling-2-mini --out $dir/models/$model/$artifact
+EOF
+fi
 cat <<EOF
 
 capy-flash $version is ready. Serve $model with:
@@ -197,7 +220,10 @@ capy-flash $version is ready. Serve $model with:
 $( [ "$model" = flash-next-64gb ] && echo "
 (one GPU: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" )
 $( case "$model" in 27b|27b-16gb) echo "
-(text only, more room for the KV: NINFER_VISION=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;; esac )
+(text only, more room for the KV: NINFER_VISION=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;;
+  inkling2-mini) echo "
+(the drafter is on, same text; to turn it off: NINFER_DRAFTER=0 $dir/current/$launcher $dir/models/$model/$artifact)
+(one 32 GB GPU, not verified: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;; esac )
 
 then, from another shell (the first start takes a minute or two):
 

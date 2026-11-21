@@ -1,7 +1,8 @@
 # capy-flash — prebuilt binaries
 
 capy-flash (formerly ninfer-tp2) serves **Qwen3.8-Flash-Next** (MoE, NVFP4 experts, CPU offload) and **Qwen3.8-27B**
-on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RAM and the 27B (3-bit) on one board. Source and documentation: https://github.com/ValerioDolci/capy-flash.
+on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RAM and the 27B (3-bit) on one board;
+since v0.16 also **Inkling 2 Mini** (text only) on two 16 GB boards. Source and documentation: https://github.com/ValerioDolci/capy-flash.
 `COMMIT` records the exact commit.
 
 ## Contents
@@ -11,10 +12,12 @@ on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RA
 | `bin/ninfer-serve` | OpenAI- and Anthropic-compatible server |
 | `bin/ninfer` | command-line generation |
 | `bin/ninfer-perplexity` | perplexity evaluator |
+| `bin/capy-serve`, `bin/capy`, `bin/capy-perplexity` | the same three programs under their capy-flash names (scripts that also put `lib/` on the library path) |
 | `lib/libcudart.so.13` | the CUDA runtime the binaries link (NVIDIA redistributable) |
 | `serve-flash-next.sh` | launcher with the Qwen3.8-Flash-Next profile |
 | `serve-tp2.sh` | launcher with the Qwen3.8-27B two-GPU production profile (as in ninfer-tp2) |
 | `serve-27b-16gb.sh` | launcher for the 3-bit Qwen3.8-27B on one 16 GB board (`--profile 27b-16gb`) |
+| `capy-serve-inkling2-mini.sh` | launcher for Inkling 2 Mini on two 16 GB boards (text only, one request at a time, 253,952-token context with 2048-token prefill blocks, its drafter on) |
 | `chat_templates/` | `qwen3_8.jinja` (NInfer's Qwen3.8 chat template, which the launchers pass with `--chat-template`; it accepts the `developer` role and Responses `instructions`, needed by Codex CLI) and its `LICENSE` |
 | `SHA256SUMS` | digests of every file above; check with `sha256sum -c SHA256SUMS` |
 
@@ -45,10 +48,15 @@ sha256sum -c SHA256SUMS
 NINFER_DEVICES=0 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.ninfer                           # 64 GB edition, one GPU
 ./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4.ninfer                           # Qwen3.8-27B
 ./serve-27b-16gb.sh /path/to/qwen3_8_27b_gsq3.ninfer                              # Qwen3.8-27B 3-bit, one GPU
+./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer       # Inkling 2 Mini, two GPUs
+NINFER_DRAFTER=0 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                 # without its drafter
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```
 The launchers add `--chat-template chat_templates/qwen3_8.jinja`, the model id and the profile; extra flags win
-over the profile. Requests name the model `capy-flash` (Flash-Next) or `qwen3.8-27b` (27B); `NINFER_MODEL_ID` or
+over the profile (the Inkling launcher passes no template or profile: its artifact carries its own template, and it
+passes `--spec mtp --draft-tokens 3`: the drafter of an artifact converted with `--components text,mtp`, with the
+same text as without it; an artifact without the drafter decodes without it). Requests
+name the model `capy-flash` (Flash-Next), `qwen3.8-27b` (27B) or `inkling-2-mini`; `NINFER_MODEL_ID` or
 `--model-id` changes it:
 ```bash
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \

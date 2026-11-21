@@ -8,6 +8,7 @@ include(cmake/ConstraintTests.cmake)
 include(cmake/ProductTests.cmake)
 include(cmake/BenchSupportTests.cmake)
 include(models/qwen3_5/tests.cmake)
+include(models/inkling2/tests.cmake)
 include(ops/tests.cmake)
 include(cmake/TestLabels.cmake)
 

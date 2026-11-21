@@ -124,6 +124,12 @@ class TestPlan(EngineCase):
         self.assertEqual((os.path.basename(p["argv"][0]), p["env"].get("NINFER_DEVICE")), ("serve-27b-16gb.sh", "0"))
         self.assertNotIn("NINFER_DEVICES", p["env"])
         self.assertEqual(self.plan("flash-next-vision")["argv"][2:], ["--vision"])
+        p = self.plan("inkling2-mini")
+        self.assertEqual(
+            p["argv"],
+            [current + "/capy-serve-inkling2-mini.sh", models + "/inkling2-mini/capy-flash-inkling2-mini-nvfp4.ninfer"],
+        )
+        self.assertEqual((p["env"]["NINFER_DEVICES"], p["gpus"]), ("0,1", 2))
 
     def test_usable_gpus_only(self):
         mixed = "0, NVIDIA GeForce GTX 1080, 8192, 6.1\n1, NVIDIA GeForce RTX 5080, 16303, 12.0\n2, NVIDIA GeForce RTX 5080, 16303, 12.0\n"
@@ -354,6 +360,14 @@ class TestGuards(EngineCase):
         e = self.refused("27b")
         self.assertEqual((e.code, e.detail["found"]), ("unverified", "foreign"))
         self.assertIn(str(self.root / "models" / "27b"), e.message)
+
+    def test_not_a_release_without_the_models_launcher(self):
+        # A release from before Inkling 2 Mini verifies (its launcher is optional) but cannot start it.
+        make_install(self.root, ("inkling2-mini",))
+        self.installer.verify_current()
+        e = self.refused("inkling2-mini")
+        self.assertEqual(e.code, "no_launcher")
+        self.assertIn("capy-serve-inkling2-mini.sh", e.message)
 
     def test_not_a_release_that_fails_verification(self):
         (self.root / "current" / "bin" / "ninfer-serve").write_text("#!/bin/sh\necho tampered\n")

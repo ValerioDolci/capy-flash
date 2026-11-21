@@ -519,7 +519,7 @@ class Installer:
         if not sums_file.is_file():
             raise DownloadError("checksum", "the release has no SHA256SUMS")
         sums = parse_sums(sums_file.read_text(errors="replace"))
-        needed = {catalog.ENGINE_BINARY} | {m["launcher"] for m in catalog.MODELS}
+        needed = {catalog.ENGINE_BINARY} | {m["launcher"] for m in catalog.MODELS if not m.get("optional")}
         if not needed <= set(sums):
             raise DownloadError("checksum", "the release's SHA256SUMS does not cover the engine and its launchers")
         if job:
@@ -593,6 +593,12 @@ class Installer:
     def listing(self, key: str) -> Dict[str, Any]:
         """The model repository at its current commit: revision and files (path, size, expected digest)."""
         repo = catalog.model(key)["hf_repo"]
+        if not repo:
+            raise DownloadError(
+                "unpublished",
+                f"{key} is not published yet: convert it (docs/weight-conversion.md) into {self.artifact(key)} "
+                "and use it as it is",
+            )
         info = self.fetcher.json(f"{self.hf}/api/models/{repo}")
         revision = info.get("sha") if isinstance(info, dict) else None
         if not isinstance(revision, str) or not re.match(r"^[0-9a-f]{40}$", revision):

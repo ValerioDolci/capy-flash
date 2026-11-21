@@ -57,8 +57,9 @@ low-concurrency model.
 
 Model code owns the mathematical formulas, call order, component handoffs and state transitions.
 Config provides instance parameters such as layer count, dimensions, Attention/GDN distribution and
-expert geometry. The current standard architecture entry points are `Qwen3_5ForCausalLM` and
-`Qwen4ExpForCausalLM`; trained instances and physical weight assignment enter the corresponding
+expert geometry. The current standard architecture entry points are `Qwen3_5ForCausalLM`,
+`Qwen4ExpForCausalLM` and `Inkling2LoopForConditionalGeneration` (its Text backbone; a family of its
+own under `src/models/inkling2/`, [Inkling 2 model](inkling2-model.md)); trained instances and physical weight assignment enter the corresponding
 implementation as data.
 
 A V3 artifact stores the configuration, physical objects, the Binding of logical parameters, the Use
@@ -270,7 +271,8 @@ With `LoadOptions.tp=2`, Dense Qwen3.5 is sharded by logical parameter name at l
 split by rows along head/intermediate width/vocabulary; output projections, MLP down,
 `mtp/input_projection` and GDN convolution channels are split by columns; norms and
 `text/token_embedding` are replicated; Vision is resident only on `vision_rank`; for DFlash2
-placement see [Two-GPU tensor parallelism](tensor-parallel.md#2-weight-partitioning).
+placement see [Two-GPU tensor parallelism](tensor-parallel.md#2-weight-partitioning); Inkling 2 has its
+own rules ([Inkling 2 model](inkling2-model.md#loading-and-two-rank-tensor-parallelism)).
 Logical parameters on the same parent are combined into one parent placement. Model keeps one set of
 views per device, and each device constructs its own Parameters; a DFlash2 drafter that reads the
 whole head (full proposal head) is rejected under tp=2.
@@ -683,6 +685,7 @@ checkpoint catalog.
 | Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |
 | Program planning, storage and transactions | `src/models/qwen3_5/program/` |
 | Frontend and model state layout | `src/models/qwen3_5/frontend/`, `state/` |
+| Inkling 2 family (config, loading, forward, state, Program, frontend, Engine family) | `src/models/inkling2/` ([Inkling 2 model](inkling2-model.md#where-things-are)) |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |
 | semantic Ops | `src/ops/`, `include/ninfer/ops/` |

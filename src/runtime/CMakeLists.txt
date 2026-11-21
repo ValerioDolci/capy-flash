@@ -25,3 +25,4 @@ target_link_libraries(ninfer_engine PRIVATE
   ninfer_text
   ninfer_media_decode)
 add_library(ninfer::engine ALIAS ninfer_engine)
+include(${PROJECT_SOURCE_DIR}/src/models/inkling2/engine_sources.cmake)

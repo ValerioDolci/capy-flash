@@ -55,6 +55,8 @@ Everything can be changed later from the status card at the bottom left.
   Hugging Face repositories only, over HTTPS, resume where they stopped, and every file is checked against its
   published SHA-256 before anything is used. The layout is `install.sh`'s (`~/capy-flash/current`,
   `~/capy-flash/models/<name>/`): what the command line installed is recognised, and the other way round.
+  Inkling 2 Mini (two 16 GB GPUs, text only) downloads like the others (19.7 GB, with its drafter). It needs a
+  release that ships `capy-serve-inkling2-mini.sh`, which turns the drafter on.
 - **Files that are already there are yours.** The app deletes or replaces only files it created itself (it keeps a
   record of each, with size, time and digest, in `~/capy-flash/.capy-app/`, where its temporary files live too). A
   model folder it finds is hashed first, as one unit: if every file matches the repository it is used as it is (and

@@ -10,6 +10,7 @@
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
 #include "models/qwen3_5/execution/reasoning_eos_guard.h"
+#include "models/inkling2/engine_family.h"
 
 #include <algorithm>
 #include <limits>
@@ -64,10 +65,15 @@ public:
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
+    explicit Impl(models::inkling2::EnginePrompt prompt)
+        : summary(prompt.summary), prepare(prompt.preparation), sampling_mode(prompt.sampling_mode),
+          inkling2(std::move(prompt.value)) {}
+
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     models::qwen3_5::PreparedPrompt value;
+    models::inkling2::PreparedPrompt inkling2;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -88,6 +94,7 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    if (impl_ != nullptr && impl_->inkling2) { return impl_->inkling2.token_ids(); }
     return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
 }
 
@@ -169,6 +176,11 @@ public:
         // The mailbox is qualified between GPUs without peer access, where the staged copies go
         // through host memory. With direct P2P the copies stay the captured transport.
         if (peer_access) { options.tp_mailbox = false; }
+        if (models::inkling2::is_inkling2_artifact(options.artifact_path)) {
+            inkling2 = models::inkling2::EngineFamily::start(options, execution, peer_access, load,
+                                                             sampling_defaults);
+            return;
+        }
         auto constructed    = runtime::construct_model(options, execution);
         active              = std::move(constructed.instance);
         load                = std::move(constructed.load);
@@ -187,6 +199,7 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        inkling2.reset();
         core.emplace<std::monostate>();
         try {
             if (execution.tp == 2) { execution.dev[1]->synchronize(); }
@@ -202,6 +215,7 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    std::unique_ptr<models::inkling2::EngineFamily> inkling2; // set for an Inkling 2 artifact
 };
 
 Engine::Engine(EngineOptions options) {
@@ -218,6 +232,10 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) {
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            impl_->inkling2->prepare(std::move(input), control)));
+    }
     auto prepared      = impl_->active->frontend.prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
@@ -235,6 +253,10 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) {
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            impl_->inkling2->prepare_tokens(std::move(token_ids), allow_prefix_identity)));
+    }
     if (token_ids.size() > impl_->active->capacity) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
                            context_capacity_error(token_ids.size(), impl_->active->capacity));
@@ -254,6 +276,10 @@ PreparedPrompt Engine::prepare_continuation(PromptInput input, std::span<const T
                                             const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) {
+        return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+            impl_->inkling2->prepare_continuation(std::move(input), appended, control)));
+    }
     auto prepared =
         impl_->active->frontend.prepare_continuation(std::move(input), appended, control);
     PromptSummary info = prepared.summary();
@@ -269,11 +295,13 @@ PreparedPrompt Engine::prepare_continuation(PromptInput input, std::span<const T
 
 ReasoningGuardTokens Engine::reasoning_guard_tokens() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->reasoning_guard_tokens(); }
     return impl_->active->frontend.reasoning_guard_tokens();
 }
 
 void Engine::configure_reasoning_eos_guard(bool enabled) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->configure_reasoning_eos_guard(enabled); }
     models::qwen3_5::execution::ReasoningEosGuardConfig config;
     config.enabled = enabled;
     if (enabled) {
@@ -294,11 +322,13 @@ std::uint64_t Engine::reasoning_eos_guard_replacements() const noexcept {
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->tokenize_text(text); }
     return impl_->active->frontend.tokenize_text(text);
 }
 
 std::string Engine::detokenize_text(std::span<const TokenId> token_ids) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->detokenize_text(token_ids); }
     return impl_->active->frontend.detokenize_text(token_ids);
 }
 
@@ -317,7 +347,10 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
-    std::vector<float> result  = std::visit(
+    if (impl_->inkling2) {
+        return impl_->inkling2->score(std::move(prompt.impl_->inkling2), first_target, expected);
+    }
+    std::vector<float> result = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
@@ -335,6 +368,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->count_tokens(std::move(input), control); }
     return impl_->active->frontend.count_tokens(std::move(input), control);
 }
 
@@ -396,6 +430,14 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             impl_, std::move(immediate), resolved_sampling));
     }
 
+    if (impl_->inkling2) {
+        return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+            impl_,
+            impl_->inkling2->submit(std::move(prompt.impl_->inkling2), prompt_summary,
+                                    prepare_seconds, std::move(resolved_options), consumer_mode,
+                                    observation, pending_deadline),
+            resolved_sampling));
+    }
     return std::visit(
         [&](auto& core) -> GenerationHandle {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -434,6 +476,7 @@ LoadSummary Engine::load_summary() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->memory_summary(); }
     return std::visit(
         [](const auto& core) -> MemorySummary {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -448,11 +491,13 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->media_cache_summary(); }
     return impl_->active->frontend.media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->inkling2) { return impl_->inkling2->runtime_stats(); }
     return std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -467,6 +512,7 @@ RuntimeStats Engine::runtime_stats() const {
 
 bool Engine::is_available() const {
     if (impl_ == nullptr) { return false; }
+    if (impl_->inkling2) { return impl_->inkling2->is_available(); }
     return std::visit(
         [](const auto& core) {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -495,6 +541,7 @@ void Engine::persist_context_cache() noexcept {
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
+    if (impl_->inkling2) { return impl_->inkling2->reset_memory_peaks(); }
     std::visit(
         [](auto& core) {
             using CoreState = std::remove_cvref_t<decltype(core)>;

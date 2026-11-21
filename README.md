@@ -4,23 +4,26 @@
   <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
 </picture></h1>
 
-**Qwen3.8-Flash-Next (125B MoE) and Qwen3.8-27B on one or two 16 GB RTX 50-series GPUs, built for agents.**
+**Qwen3.8-Flash-Next (125B MoE), Qwen3.8-27B and Inkling 2 Mini on one or two 16 GB RTX 50-series GPUs, built for agents.**
 
-capy-flash is an inference server. It runs two models on consumer GPUs with 16 GB of VRAM and exposes an OpenAI- and
+capy-flash is an inference server. It runs three models on consumer GPUs with 16 GB of VRAM and exposes an OpenAI- and
 Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and OpenCode can use it like a hosted model.
 
 - **Qwen3.8-Flash-Next** is a mixture-of-experts model too large for the GPUs. capy-flash keeps the experts that do
   not fit in VRAM in host RAM and computes them on the CPU; everything else runs on the GPU (split over two GPUs when
   there are two). That is why Flash-Next needs a lot of RAM and a CPU with AVX2 or AVX-512.
 - **Qwen3.8-27B** is a dense model that runs entirely on the GPUs.
+- **Inkling 2 Mini** is a mixture-of-experts model whose weights fit two GPUs: it runs entirely on them, split over
+  two 16 GB cards, with the checkpoint's own weights and nothing requantized, and its own drafter for speculative
+  decoding (on in its launcher). Text only, one request at a time ([what it does and does not do](#inkling-2-mini)).
 - For agents: a prefix cache across turns, idle conversations moved to RAM (and optionally to disk) instead of being
   recomputed, and the expert cache follows the conversation. For long contexts Flash-Next can also keep the KV cache
   of the conversations being generated in RAM (`--kv-ram-active`), with one request or several at once.
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.15.1**. Built, tested and measured on one machine ([below](#benchmarks));
-users report other setups. Not affiliated with Qwen or NVIDIA.
+of prior work it builds on. Status: **v0.16.0**. Built, tested and measured on one machine ([below](#benchmarks));
+users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
 
@@ -32,6 +35,7 @@ users report other setups. Not affiliated with Qwen or NVIDIA.
 | Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | 17.4 GB / 20 GB | `--model 27b` |
 | Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | 108.9 GB / 118 GB | `--model flash-next-64gb` |
 | Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | 126.6 GB / 135 GB | (default) |
+| Inkling 2 Mini, NVFP4 + MXFP8 (the checkpoint's own) | **two** with 16 GB | nothing special | 19.7 GB / 23 GB | `--model inkling2-mini` |
 
 - **One GPU, little RAM:** the 3-bit 27B. It costs quality: GSM8K on par with the NVFP4 27B, MMLU-Pro about 0.72
   against 0.78 ([benchmarks](#benchmarks)).
@@ -39,11 +43,14 @@ users report other setups. Not affiliated with Qwen or NVIDIA.
   of 65; quality on par with NVFP4 on GSM8K and MMLU-Pro).
 - **Two GPUs:** the 64 GB edition is the fastest Flash-Next here; the NVFP4 edition uses NVIDIA's experts as published.
   For the 27B on two cards, the NVFP4 27B is the better choice than the 3-bit one.
+- **Inkling 2 Mini** needs two 16 GB cards: its weights take about 10 GB per card. It does not run on one 16 GB
+  card. One 32 GB card (RTX 5090) is expected to hold it at `--tp 1` but has **not been verified**.
 
 ## What you need
 
 - Linux x86_64 (tested on Ubuntu). Users run the 27B on WSL2 and on Windows with Docker; a native Windows build exists
-  as a community port ([OmarxGx/capy-flash](https://github.com/OmarxGx/capy-flash)), not in the releases yet.
+  as a community port ([OmarxGx/capy-flash](https://github.com/OmarxGx/capy-flash)), not in the releases yet. The
+  Inkling 2 Mini code has not been built with MSVC or on Windows.
 - An NVIDIA driver with CUDA 13.1 support (R580 or newer). The release needs no CUDA toolkit; building does (CUDA 13.1).
 - `sm_120` GPUs with 16 GB: RTX 5060 Ti 16 GB, 5070 Ti, 5080 and 5090 are reported to work; a mixed pair runs at the
   pace of the slower card. Peer-to-peer is not needed.
@@ -73,13 +80,15 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 - The first start takes a minute or two (a cold start of Flash-Next reads its experts from disk).
 - **Launchers.** `serve-flash-next.sh` (Flash-Next; `NINFER_DEVICES=0` for one GPU), `serve-tp2.sh` (27B, two GPUs) and
   `serve-27b-16gb.sh` (27B 3-bit, one GPU) start `ninfer-serve` with the tested profile, the model id (`capy-flash` or
-  `qwen3.8-27b`, the `model` name requests must use) and the chat template. `NINFER_PORT=9000` changes the port;
+  `qwen3.8-27b`, the `model` name requests must use) and the chat template. `capy-serve-inkling2-mini.sh` (Inkling 2
+  Mini, two GPUs, model id `inkling-2-mini`) passes its flags without a profile or template and turns the drafter on
+  (`--spec mtp --draft-tokens 3`; `NINFER_DRAFTER=0` turns it off). `NINFER_PORT=9000` changes the port;
   extra `ninfer-serve` flags go after the model path and win over the profile.
 - **Vision.** The two 27B artifacts include the vision tower and their launchers load it (it takes VRAM from the
   context); `NINFER_VISION=0` before the launcher, or `--no-vision` after the model path, turns it off. The Flash-Next
   downloads are text only: images on Flash-Next need the separate
   [Vision artifact](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash), which `install.sh` does
-  not fetch, and `--vision`.
+  not fetch, and `--vision`. Inkling 2 Mini is text only: `--vision` is refused at startup.
 - **Keep it running.** `ninfer-serve` exits with status 2 when the Engine fails, so run it under a supervisor that
   restarts it: a systemd unit and a llama-swap entry are in [examples/serving](examples/serving).
 - By hand: download a [release](https://github.com/ValerioDolci/capy-flash/releases) tarball
@@ -102,7 +111,8 @@ Details, including authentication and what each client sends: [docs/serving/capy
 **Structured output.** `response_format` (`json_object`, `json_schema`) on Chat Completions, `text.format` on
 Responses, `output_config.format` on Messages, and the `structured_outputs` extension (`grammar`, `regex`, `choice`)
 constrain the answer: the reply is valid JSON for the schema (or matches the grammar, regex or choice) whenever the
-model ends it. With thinking on, only the answer after `</think>` is constrained.
+model ends it. With thinking on, only the answer after `</think>` is constrained. Not on Inkling 2 Mini, which refuses
+constrained requests.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -115,6 +125,77 @@ Schemas and grammars come from the client, so they are bounded: size, nesting an
 compilation timeout, and a time and memory budget while generating (`--constraint-*` flags). A request over a limit
 fails alone with a 400 that names the flag; the other requests keep their speed. Fields, errors, limits and cost:
 [docs/serving/structured-output.md](docs/serving/structured-output.md).
+
+## Inkling 2 Mini
+
+Inkling 2 Mini (`Inkling2LoopForConditionalGeneration`) is a 128-expert mixture-of-experts model with a looped core.
+capy-flash runs its text part on two 16 GB GPUs from the original checkpoint: the NVFP4
+experts of layers 0-19 and the MXFP8 experts of layers 20-23 are copied into the artifact as they are, the dense
+weights keep their BF16 values, and nothing is requantized. The checkpoint's DSpark drafter is imported in BF16 the
+same way. The drafter leaves the generated text unchanged.
+
+- **What you need:** two `sm_120` GPUs with 16 GB, as for the other models; no special RAM or CPU (no expert runs
+  on the CPU). Linux; the Windows and MSVC builds of this code are not verified.
+- **Weights:** `install.sh --model inkling2-mini` downloads the release and the artifact
+  [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash) (19.7 GB, with the drafter). To build
+  the same file yourself, convert the checkpoint
+  [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on the CPU (about half a
+  minute), 20.2 GB for the checkpoint plus 19.7 GB for the artifact with the drafter; Python 3.11 with PyTorch
+  and NumPy, from the repository root ([weight conversion](docs/weight-conversion.md#start-with-an-official-recipe)):
+  ```bash
+  hf download thinkingmachines/Inkling-2-Mini --local-dir /path/to/Inkling-2-Mini
+  python3 -m tools.convert --model /path/to/Inkling-2-Mini --recipe inkling2_mini --components text,mtp \
+    --device cpu --name inkling-2-mini --out models/capy-flash-inkling2-mini-nvfp4.ninfer
+  ```
+  `--components text,mtp` adds the drafter; without it (the default `text`, 19.0 GB) the artifact runs without one,
+  also from the launcher.
+- **Launch:**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash -s -- --model inkling2-mini
+  ~/capy-flash/current/capy-serve-inkling2-mini.sh ~/capy-flash/models/inkling2-mini/capy-flash-inkling2-mini-nvfp4.ninfer
+  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":512}'
+  ```
+  The launcher runs `--tp 2 --devices 0,1 --max-context 253952 --prefill-chunk 2048 --spec mtp --draft-tokens 3`
+  (`NINFER_MAX_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_DEVICES`, `NINFER_PORT`, `NINFER_MODEL_ID`, `NINFER_DRAFTER`
+  change them; extra flags after the artifact win). The context is reserved at startup: 253,952 tokens with
+  2048-token prefill blocks and the drafter leave about 300 MiB free per 16 GB card (without the drafter 319,488
+  fit). Larger prefill blocks (4096) make the prefill faster and leave less context (221,184 with the drafter),
+  smaller ones (1024) the opposite (270,336). The block size does not change results on prompts whose last block has
+  at least 128 tokens, and can change the rounding of the few tokens of a shorter tail (a mean KL of 1.8e-3 measured
+  on a 10-token tail, within the noise between two valid routes); it is not a reduction of precision. `NINFER_DEVICES=0` starts it on one GPU only if that GPU has 32 GB (not
+  verified); with 16 GB the launcher refuses. From a build: `build/apps/ninfer-serve <artifact> --tp 2 --max-context
+  253952 --prefill-chunk 2048`.
+- **Drafter:** the launcher turns it on (`--spec mtp --draft-tokens 3`); `ninfer-serve` (or `capy-serve`) started
+  by hand leaves it off unless given those flags. To turn it off in the launcher:
+  ```bash
+  NINFER_DRAFTER=0 ~/capy-flash/current/capy-serve-inkling2-mini.sh ~/capy-flash/models/inkling2-mini/capy-flash-inkling2-mini-nvfp4.ninfer
+  ```
+  `--spec off`, or another `--draft-tokens`, after the artifact also wins over the launcher's. The drafter proposes
+  tokens that the model verifies in one pass; it works with greedy and sampled requests, and the text is the same
+  as without it (at temperature 0, and with sampling for the same seed). Steps that run forced tokens (thinking
+  budgets) or reach the end of the context are ordinary steps. `--draft-tokens` accepts 1 to 5; 3 was the best
+  measured. It takes about 1.0 GiB more VRAM per card at the launcher's 253,952-token context (0.7 GiB at 131,072). When few drafts are accepted it
+  can decode slower than without it. An artifact without the drafter starts with `--spec mtp` and decodes without
+  it. Speed with and without the drafter: [benchmarks](#benchmarks).
+- **What it does:** chat over the same OpenAI and Anthropic endpoints, streaming, reasoning in its own field, tool
+  calls, thinking budgets, stop strings, temperature / top-k (up to 20) / top-p / min-p and penalties, reuse of
+  the previous conversation's prefix (on the GPUs only), and speculative decoding with the checkpoint's drafter.
+  Reasoning cannot be switched off: `enable_thinking=false` selects the lowest effort. The chat template is the
+  checkpoint's own.
+- **What it does not do (yet):** images (`--vision` is refused); `--spec dflash2` and `--lm-head-draft` (refused);
+  more than one request at a time (`--max-concurrency` must be 1; further requests queue); one 16 GB card; structured
+  output and grammars; `tool_choice` other than automatic; the RAM and disk tiers of the context cache
+  (`--disk-cache-dir` is refused) and shared prefixes between conversations; `--embedding-host` (refused); a
+  `--kv-dtype` other than `bf16` (refused); continuing a final assistant message. The empty-reply EOS guard is off
+  for this model (the server says so at startup).
+- **Quality:** not measured with GSM8K or MMLU-Pro. The engine's output is checked against the reference
+  implementation with the checkpoint's exact weights, token by token and on greedy generations
+  ([validation](docs/maintainer/inkling2-model.md#numerics-and-validation)). With the drafter, the server's text was
+  compared with the text without it: identical at temperature 0 and, with sampling, for the same seed. Test suite
+  of this release: 263 of 263 tests pass, 26 of them on two GPUs.
+
+How the engine implements it: [Inkling 2 model reference](docs/maintainer/inkling2-model.md).
 
 ## The capy-flash app (alpha)
 
@@ -207,6 +288,11 @@ Ready to serve on Hugging Face (`install.sh --model` downloads one of these; eac
   ISTA-DASLab's 3-bit GSQ 27B plus the official MTP layer; recipe `qwen3_8_27b_gsq3`).
 - [`Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer`](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer)
   (17.4 GB, the 27B for two GPUs; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
+- [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash)
+  (19.7 GB, Inkling 2 Mini with its drafter, for two GPUs): the released weights of
+  [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache-2.0)
+  repackaged without requantizing; the recipe `inkling2_mini` with `--components text,mtp` builds the same file
+  ([above](#inkling-2-mini)).
 
 How the engine runs these models, every server flag, the RAM tiers, the chat template and the CPU threads:
 [docs/serving/capy-flash.md](docs/serving/capy-flash.md). Environment variables and diagnostics:
@@ -262,6 +348,11 @@ prompt, 512 tokens).
 | Qwen3.8-27B 3-bit | 2 | v0.7.0 | prefill 4k / 16k / 64k | 5,787 / 5,567 / 4,304 tok/s |
 | Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7emi03oirf01vyxuhulr) | 288 tok/s |
 | Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.6.0 | prefill 4k / 16k / 64k, `--profile 27b` | 9,343 / 9,234 / 6,287 tok/s |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode without the drafter, 68-token / 12.8k-token prompt | 127.5 / 112.8 tok/s |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode with `--spec mtp --draft-tokens 3` (the launcher's default), temperature 0: 68-token / 12.8k-token prompt / a coding task | 149.0 / 166.6 / 193.9 tok/s |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | the same with the model's default sampling (one seed): 68-token prompt / an essay / a coding task | 146.1 / 129.6 / 173.9 tok/s (124.7 / 124.4 / 124.9 without the drafter) |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | prefill 512 / 4k / 12.8k / 99k tokens | 4,002 / 5,032 / 4,524 / 2,522 tok/s |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | VRAM per GPU at the launcher's 253,952-token context, without / with the drafter | 14.2 / 15.2 GiB |
 
 More on the 27B NVFP4 (`--profile 27b`, MTP; 280 prompts in three languages, v0.6): the same tokens as v0.5.4 on 280 of
 280 answers (and with DFlash2), decode +5 % (Italian 168 → 176 tok/s), prefill at 4k / 16k / 64k 5,777 / 5,585 / 4,352
@@ -298,6 +389,18 @@ capy-flash v0.6.0:
 Strata's IQ3_S experts are 26 % smaller than NVIDIA's NVFP4 ones (lower quality: KL 0.144 vs 0.070 for NVFP4, as
 Strata reports), which is why it leads on the short benchmark. v0.6 against the build before the v0.6 work
 (2026-10-17): replay total 212 → 177 s, decode 118 → 155 tok/s.
+
+**Inkling 2 Mini.** Every Inkling number here is measured with the checkpoint's own weights: the NVFP4 and MXFP8
+experts as released and the dense weights in BF16, with no further quantization of weights, activations or KV.
+Against llama.cpp on our machine, same day, two GPUs: capy-flash v0.16.0 from the server with those weights,
+llama.cpp `29b52d3` with `llama-bench -ngl 99 -fa on -ts 1/3` and the requantized `IQ4_NL` GGUF from ggml-org
+(measured in the morning session):
+
+| | **capy-flash** | llama.cpp |
+|---|---:|---:|
+| decode, short prompt | 127.5 (149.0 with the drafter) | 44.0 |
+| prefill, 512-token prompt | 4,002 | 1,268 |
+| prefill, 12,800-token prompt | 4,524 | 1,033 |
 
 **Comparing decode with other engines.** capy-flash computes every routed expert the model selects; an expert that
 misses the VRAM cache is computed on the CPU, never skipped. Strata's "route tail skip" skips low-ranked experts that
@@ -343,18 +446,36 @@ run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 2
   and long streamed prefills differ in the last bits; quality is measured with that in place.
 - Decode of Flash-Next is bound by host-RAM bandwidth for the experts computed on the CPU (about 270-300 per MTP
   window), so a slower CPU or RAM decodes slower.
+- Inkling 2 Mini: text only, one request at a time, no structured output, two 16 GB GPUs (one 32 GB card not
+  verified), quality not measured with benchmarks; the drafter (on in the launcher) can decode slower than without it when few
+  of its drafts are accepted; the full list is in [its section](#inkling-2-mini).
 
 ## Tests
 `ctest --test-dir build` runs the unit tests. The Engine integration tests run when their artifacts are set:
 `NINFER_TEST_QWEN4_ARTIFACT` (a small synthetic Flash-Next artifact with the real layer geometry, made by
 `tools/capy_flash/make_test_artifact.sh <checkpoint dir> <out dir>`, CPU only) and `NINFER_TEST_ARTIFACT` (a
-Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). `ctest -j4` is supported; tests that need a model too
+Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2); Inkling 2 Mini's tests take the CMake cache paths
+`NINFER_TEST_INKLING2_SYNTH_ARTIFACT` (a small synthetic checkpoint from `tools/ref_ink/synthetic.py`, converted) and
+`NINFER_TEST_INKLING2_ARTIFACT` ([validating a change](docs/maintainer/inkling2-model.md#validating-a-change)). `ctest -j4` is supported; tests that need a model too
 large for one 16 GB board skip with the sizes. For the 27B, `tools/tp2/gate.sh` is the reference run: it sets the
 artifacts, runs the integration tests (`GATE_CTEST_EXCLUDE` excludes more), then checks golden ids, perplexity and
 greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.0)), a third model; nothing
+changes for the Qwen models
+- **Inkling 2 Mini** on two 16 GB GPUs: chat, streaming, tool calls and thinking budgets over the OpenAI and
+  Anthropic endpoints, from the original checkpoint without requantizing: its NVFP4 and MXFP8 experts as published,
+  dense weights in BF16 ([details](#inkling-2-mini)). Text only, one request at a time.
+- Speculative decoding for Inkling 2 Mini with the checkpoint's DSpark drafter (`--spec mtp --draft-tokens 3`,
+  on in `capy-serve-inkling2-mini.sh`, `NINFER_DRAFTER=0` turns it off; the artifact needs `--components text,mtp`): greedy and sampled requests, the same text as without
+  the drafter. Speed at temperature 0: 149.0 tok/s against 127.5 on a short prompt, 166.6 against 112.8 at 12,800
+  tokens of context; beyond 98,304 tokens of context the engine takes ordinary steps by itself.
+- Qwen3.8-Flash-Next and Qwen3.8-27B run the same kernels as v0.15.1 (kernel fingerprint: none changed, none
+  removed); same tokens as v0.15.1: the 27B gate texts 60/60 and DFlash2 10/10 identical, golden ids and
+  perplexity identical, the coding-agent replay 24/24 and a wave of 8 concurrent requests identical.
 
 **v0.15.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.15.1)), two pull requests; same tokens
 - GGUF expert dots in AVX-VNNI on AVX2 CPUs that have it (Intel since Alder Lake), same bits: decode +0.6 to +1.0 % on an

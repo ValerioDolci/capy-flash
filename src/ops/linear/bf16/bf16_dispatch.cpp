@@ -30,6 +30,12 @@ constexpr std::array kShapes{
     ShapeEntry{2560, 640, select_bf16_qwen4_dense<2560, 640>},
     ShapeEntry{2560, 2560, select_bf16_qwen4_dense<2560, 2560>},
     ShapeEntry{12800, 2560, select_bf16_qwen4_dense<12800, 2560>},
+    // Inkling 2 Mini at tp 2: attention queries, all, keys/values, key/value and output shards.
+    ShapeEntry{3276, 2304, select_bf16_inkling2<3276, 2304>},
+    ShapeEntry{4300, 2304, select_bf16_inkling2<4300, 2304>},
+    ShapeEntry{528, 2304, select_bf16_inkling2<528, 2304>},
+    ShapeEntry{512, 2304, select_bf16_inkling2<512, 2304>},
+    ShapeEntry{2304, 1536, select_bf16_inkling2<2304, 1536>},
 };
 } // namespace
 

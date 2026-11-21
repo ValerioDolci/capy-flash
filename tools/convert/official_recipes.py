@@ -648,6 +648,13 @@ def qwen3_8_27b_gsq3(model, recipe, sources):
     recipe.assign("proposal/head", format=Q4, method=import_encoded)
 
 
+def inkling2_mini(model, recipe, sources):
+    """Inkling 2 Mini as published (``thinkingmachines/Inkling-2-Mini``): see ``inkling2_recipes.py``."""
+    from .inkling2_recipes import inkling2_mini as configure
+
+    configure(model, recipe, sources)
+
+
 RECIPES = {
     "qwen3_8_27b_gsq3": qwen3_8_27b_gsq3,
     "qwen3_6_27b": qwen3_6_27b,
@@ -666,4 +673,5 @@ RECIPES = {
     "qwen4_bf16_hcq8": qwen4_bf16_hcq8,
     "qwen4_nvfp4": qwen4_nvfp4,
     "qwen4_nvfp4_rtn_all": qwen4_nvfp4_rtn_all,
+    "inkling2_mini": inkling2_mini,
 }
