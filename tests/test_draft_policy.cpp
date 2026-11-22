@@ -32,6 +32,7 @@ void check(bool ok, const char* what) {
 }
 
 double cost(int t) { return 19.0 + 10.5 * (t - 1); } // ms per round, measured shape
+
 double ds_cost(int t) { return 13.0 + 3.6 * (t - 1); } // a round: verify + commit + draft
 
 // Rounds of a drafter whose drafts are each accepted with chance `q` (a fixed-seed draw), stating
@@ -100,7 +101,7 @@ void drafter_cases() {
         DraftPolicy p(8);
         p.set_sizes((1U << 2) | (1U << 4) | (1U << 8));
         const float ch[7] = {1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F};
-        bool inside = true;
+        bool inside       = true;
         for (int n = 0; n <= 7; ++n) { inside = inside && p.allowed(p.window(ch, n)); }
         check(inside, "drafter: never a size outside the mask");
     }
@@ -133,8 +134,9 @@ void drafter_cases() {
             const bool lk = i % 3 == 0;
             fast.observe(lk, t, a2, m, 10.0 + 7.0 * t);
             slow.observe(lk, t, a2, m, 55.0 - 3.0 * t + (i % 11));
-            const DraftPolicy::Pick x = fast.choose(t, 5 + i % 9, m), y = slow.choose(t, 5 + i % 9, m);
-            same = same && x.lookup == y.lookup && x.t == y.t;
+            const DraftPolicy::Pick x = fast.choose(t, 5 + i % 9, m),
+                                    y = slow.choose(t, 5 + i % 9, m);
+            same                      = same && x.lookup == y.lookup && x.t == y.t;
         }
         check(same, "untimed: the picks do not depend on the round times");
     }

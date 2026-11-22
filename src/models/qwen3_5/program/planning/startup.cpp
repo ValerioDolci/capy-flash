@@ -1567,8 +1567,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             }
             for (std::uint32_t w = 2U; w <= t_max; ++w) {
                 if (((widths >> w) & 1U) == 0) { continue; }
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, family_allowance(w, drafts), "lookup graph allowance");
+                impl->graph_allowance_bytes =
+                    checked_add(impl->graph_allowance_bytes, family_allowance(w, drafts),
+                                "lookup graph allowance");
             }
         } else {
             const auto profiles =
@@ -1665,17 +1666,17 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .prompt_lookup          = options.speculative.prompt_lookup &&
                          options.speculative.backend == SpeculativeBackend::Mtp &&
                          options.purpose != EnginePurpose::CausalScoring,
-        .adaptive_window        = adaptive_mtp_window(options),
-        .speculative_backend    = options.speculative.backend,
-        .kv_storage             = options.kv_cache,
-        .proposal_head          = options.speculative.proposal_head,
-        .features               = models::load_options(options),
-        .use_cuda_graph         = options.use_cuda_graph,
-        .causal_scoring         = options.purpose == EnginePurpose::CausalScoring,
-        .device                 = options.device,
-        .tp                     = options.tp,
-        .tp_mailbox             = options.tp_mailbox,
-        .context_cache          = options.context_cache,
+        .adaptive_window     = adaptive_mtp_window(options),
+        .speculative_backend = options.speculative.backend,
+        .kv_storage          = options.kv_cache,
+        .proposal_head       = options.speculative.proposal_head,
+        .features            = models::load_options(options),
+        .use_cuda_graph      = options.use_cuda_graph,
+        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
+        .device              = options.device,
+        .tp                  = options.tp,
+        .tp_mailbox          = options.tp_mailbox,
+        .context_cache       = options.context_cache,
     };
     // The draft shortlist (Qwen4Exp MTP): read and split here, the rows gathered by the
     // Program. At tp 2 the prefix view is bounded by rank 0's vocabulary half.

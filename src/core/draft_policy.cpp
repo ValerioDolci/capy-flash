@@ -13,8 +13,8 @@ namespace {
 // measured size or while a single size is measured (two measured sizes give the cost of a row;
 // measured round times replace both). It sits between the measured curves: steeper with every
 // missed expert on the CPU, flatter when the experts are resident.
-constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
-                                                   3.95, 4.3, 4.65, 5.0, 5.35, 5.7,  6.05, 6.4};
+constexpr double kShape[DraftPolicy::kMaxT + 1] = {
+    0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6, 3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4};
 // A round's cost is scale x base(size): the scale follows every round fast, each size's base
 // follows its own rounds slowly.
 constexpr double kScaleAlpha = 0.2;
@@ -24,9 +24,9 @@ constexpr double kCostAlpha  = 0.1; // EMA weight of a size's new base
 constexpr double kBasePrior = 3.0;
 // Rounds after which a size's base is from another time: the sizes measured since stand in for it
 // until it is measured again, so a size measured dear once is not ruled out for good.
-constexpr long kStale       = 64;
-constexpr double kTokAlpha  = 0.05; // EMA weight of a new MTP window outcome
-constexpr double kDecay     = 0.97; // lookup counts: older windows fade
+constexpr long kStale      = 64;
+constexpr double kTokAlpha = 0.05; // EMA weight of a new MTP window outcome
+constexpr double kDecay    = 0.97; // lookup counts: older windows fade
 // Before a bucket has data: the longer the match, the likelier its continuation; worth 4
 // observations, so a few real windows override it.
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
@@ -37,8 +37,10 @@ constexpr int kProbes = 3; // a size is tried this often before its guessed cost
 constexpr float kChanceEdge[]  = {0.3F, 0.5F, 0.7F, 0.8F, 0.9F, 0.95F, 0.98F, 0.995F};
 constexpr double kChanceDecay  = 0.98;
 constexpr double kChancePriorN = 10.0;
-constexpr double kProbeChance  = 0.85; // the joint chance at which a window one row past the best is probed
-constexpr double kSlowRound    = 1.3;  // robust mode: a round counts at most this times the known cost
+// The joint chance at which a window one row past the best is probed.
+constexpr double kProbeChance = 0.85;
+// Robust mode: a round counts at most this times the known cost.
+constexpr double kSlowRound = 1.3;
 
 } // namespace
 
@@ -79,7 +81,9 @@ double DraftPolicy::lookup_rate(int match) const {
 
 bool DraftPolicy::recent(int t) const { return base_n_[t] > 0 && round_ - seen_[t] <= kStale; }
 
-bool DraftPolicy::unmeasured(int t) const { return base_n_[t] < kBasePrior + kProbes || !recent(t); }
+bool DraftPolicy::unmeasured(int t) const {
+    return base_n_[t] < kBasePrior + kProbes || !recent(t);
+}
 
 double DraftPolicy::base(int t) const {
     if (recent(t)) { return base_[t]; }
@@ -173,9 +177,9 @@ DraftPolicy::Pick DraftPolicy::lookup_over(int t, double rate, int lookup_k, int
         p.t      = best_t;
         return p;
     }
-    // A guessed cost can keep the policy from ever measuring a size: the first few times a confident
-    // lookup would need a size not measured yet (or not for long), it is tried (verification keeps
-    // the output; only the one round's speed is at stake).
+    // A guessed cost can keep the policy from ever measuring a size: the first few times a
+    // confident lookup would need a size not measured yet (or not for long), it is tried
+    // (verification keeps the output; only the one round's speed is at stake).
     const int t_full = fit(std::min(lookup_k, max_t_ - 1) + 1);
     if (t_full > p.t && unmeasured(t_full) && q >= 0.85) {
         p.lookup = true;
@@ -198,8 +202,9 @@ int DraftPolicy::window(const float* chance, int n) const {
             best_t = t;
         }
     }
-    // As for lookup windows: a size whose cost is only guessed (or old) is tried a few times when its
-    // drafts are likely accepted, so a guessed or stale cost cannot keep the window from growing.
+    // As for lookup windows: a size whose cost is only guessed (or old) is tried a few times when
+    // its drafts are likely accepted, so a guessed or stale cost cannot keep the window from
+    // growing.
     int next = best_t + 1;
     while (next <= most && !allowed(next)) { ++next; }
     if (next <= most && unmeasured(next)) {

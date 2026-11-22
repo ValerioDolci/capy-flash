@@ -110,8 +110,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       draft_window(plan.inputs.draft_window),
       mtp_drafts(plan.inputs.mtp_drafts != 0 ? plan.inputs.mtp_drafts : plan.inputs.draft_window),
       mtp_base_width((plan.inputs.mtp_base_drafts != 0 ? plan.inputs.mtp_base_drafts
-                      : plan.inputs.mtp_drafts != 0   ? plan.inputs.mtp_drafts
-                                                      : plan.inputs.draft_window) +
+                      : plan.inputs.mtp_drafts != 0    ? plan.inputs.mtp_drafts
+                                                       : plan.inputs.draft_window) +
                      1U),
       speculative_backend(plan.inputs.speculative_backend), kv_storage(plan.inputs.kv_storage),
       proposal_head(plan.inputs.proposal_head), vision_enabled(plan.inputs.features.vision),

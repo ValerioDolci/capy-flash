@@ -53,7 +53,7 @@ int run_case(const std::string& label, int rows, int columns, float scale1, std:
     std::vector<float> full(static_cast<std::size_t>(2 * rows * columns));
     for (int t = 0; t < columns; ++t) {
         for (int r = 0; r < 2 * rows; ++r) {
-            const float v = n(rng) * (r < rows ? 1.0F : scale1);
+            const float v                                    = n(rng) * (r < rows ? 1.0F : scale1);
             full[static_cast<std::size_t>(t) * 2 * rows + r] = bf16_round(v);
         }
     }
@@ -95,10 +95,10 @@ int run_case(const std::string& label, int rows, int columns, float scale1, std:
     Tensor ot(out.p, DType::FP32, {columns});
     ops::argmax_split_logprob(cst, pst, ot, nullptr);
     const std::vector<float> got = from_device<float>(out, static_cast<std::size_t>(columns));
-    int failures = 0;
+    int failures                 = 0;
     for (int t = 0; t < columns; ++t) {
         const float* col = &full[static_cast<std::size_t>(t) * 2 * rows];
-        double m = col[0];
+        double m         = col[0];
         for (int r = 1; r < 2 * rows; ++r) { m = std::max(m, static_cast<double>(col[r])); }
         double s = 0;
         for (int r = 0; r < 2 * rows; ++r) { s += std::exp(static_cast<double>(col[r]) - m); }

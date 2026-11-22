@@ -604,10 +604,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     std::array<float, kMtpDecodeMaximumDrafts> chance{};
     bool chances = false;
     // The rounds the policy learns from: one unconstrained row, no validation hooks.
-    const bool policy_on = lookup_enabled || adaptive_enabled;
-    const bool policy_round =
-        policy_on && lanes.size() == 1 && !validation && !row_constrained(0);
-    const auto round_start = std::chrono::steady_clock::now();
+    const bool policy_on    = lookup_enabled || adaptive_enabled;
+    const bool policy_round = policy_on && lanes.size() == 1 && !validation && !row_constrained(0);
+    const auto round_start  = std::chrono::steady_clock::now();
     if (policy_on && lookup_observation.pending) {
         // The previous one-row round's outcome. When this round is the same lane's next one, the
         // time between their starts covers that round's commit too (its replay fold runs at this
@@ -673,7 +672,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             k = room > 0 ? drafter->propose(static_cast<int>(room), looked_up.data()) : 0;
             // As Strata: a lookup proposal counts only when the MTP has no drafts or its first
             // draft agrees with the lookup's first token.
-            if (k > 0 && !(sequence.mtp_draft_count == 0 || looked_up[0] == sequence.mtp_drafts[0])) {
+            if (k > 0 &&
+                !(sequence.mtp_draft_count == 0 || looked_up[0] == sequence.mtp_drafts[0])) {
                 k = 0;
             }
             if (k > 0) { lookup_match = drafter->last_match(); }
@@ -690,8 +690,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             lookup_round = true;
             // Without the adaptive window every allowed lookup width is the MTP's or wider
             // (Program: lookup_widths); with it, any window of 2..draft_window + 1.
-            width = adaptive_enabled ? std::max(static_cast<std::uint32_t>(pick.t), 2U)
-                                     : std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
+            width           = adaptive_enabled ? std::max(static_cast<std::uint32_t>(pick.t), 2U)
+                                               : std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
             looked_up_count = std::min(static_cast<std::uint32_t>(k), width - 1U);
             chances         = false;
         } else if (chances) {

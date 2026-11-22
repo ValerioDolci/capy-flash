@@ -96,12 +96,12 @@ __global__ void argmax_split_logprob_kernel(const __nv_bfloat16* candidates,
     float best = -INFINITY;
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
-        const auto vbits = static_cast<unsigned short>((digit_value(c[4 * r + 0]) << 8U) |
-                                                       digit_value(c[4 * r + 1]));
-        const float v    = __bfloat162float(__ushort_as_bfloat16(vbits));
-        const std::uint32_t pbits =
-            (digit_value(p[4 * r + 0]) << 24U) | (digit_value(p[4 * r + 1]) << 16U) |
-            (digit_value(p[4 * r + 2]) << 8U) | digit_value(p[4 * r + 3]);
+        const auto vbits          = static_cast<unsigned short>((digit_value(c[4 * r + 0]) << 8U) |
+                                                                digit_value(c[4 * r + 1]));
+        const float v             = __bfloat162float(__ushort_as_bfloat16(vbits));
+        const std::uint32_t pbits = (digit_value(p[4 * r + 0]) << 24U) |
+                                    (digit_value(p[4 * r + 1]) << 16U) |
+                                    (digit_value(p[4 * r + 2]) << 8U) | digit_value(p[4 * r + 3]);
         lse[r] = v - __uint_as_float(pbits); // the block's log-normalizer
         best   = fmaxf(best, v);
     }

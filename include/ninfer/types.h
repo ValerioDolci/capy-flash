@@ -96,7 +96,7 @@ struct SpeculativeOptions {
     // MTP only: prompt lookup (Strata's suffix drafter and draft policy). A one-row round may
     // verify a window of up to 8 tokens copied from an earlier repeat of its own text instead
     // of the MTP's drafts, when the measured acceptance and round costs say it pays.
-    bool prompt_lookup         = false;
+    bool prompt_lookup = false;
     // MTP only: adaptive draft window, 0 = off. The MTP layer drafts this
     // many tokens (1..7) every round, and a one-row round verifies the window of 2..N+1 tokens
     // with the most expected committed tokens per measured millisecond, from each draft's stated

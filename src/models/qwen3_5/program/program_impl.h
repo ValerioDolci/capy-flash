@@ -814,11 +814,11 @@ public:
     // covers verify, draft and its own commit (the replay fold runs at the next round's start),
     // as Strata times a round.
     struct LookupObservation {
-        bool pending       = false;
-        bool lookup        = false;
-        int t              = 0;
-        int accepted       = 0;
-        int match          = 0;
+        bool pending = false;
+        bool lookup  = false;
+        int t        = 0;
+        int accepted = 0;
+        int match    = 0;
         // Adaptive window: the stated probabilities of the verified drafts (t - 1 of them).
         bool chances = false;
         std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> chance{};

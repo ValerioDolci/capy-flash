@@ -418,13 +418,8 @@ void ProgramImpl::prepare_graphs() {
                 const auto planned_profiles = mtp_graph_profiles(capacity, width, drafts);
                 validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
                 execution::MtpBatchContext mtp_state{
-                    execution_core(),
-                    decoder->text_kv,
-                    *decoder->mtp_cache(),
-                    *io.mtp_decode,
-                    *mtp_host_ingress,
-                    *mtp_host_egress,
-                    state_images->continuation_hidden_store(),
+                    execution_core(), decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
+                    *mtp_host_ingress, *mtp_host_egress, state_images->continuation_hidden_store(),
                     peer ? &*peer->io.mtp_decode : nullptr,
                     peer ? &peer->state_images->continuation_hidden_store() : nullptr,
                     // Each draft's log-probability: calibration, and the adaptive window's

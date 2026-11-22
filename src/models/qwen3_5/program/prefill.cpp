@@ -1062,7 +1062,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next = mtp_host_egress->next_extents[row];
-                    const bool calibration = validation && validation->mtp_calib();
+                    const bool calibration  = validation && validation->mtp_calib();
                     if (calibration) {
                         validation->write_mtp_calib(
                             mtp_host_ingress->current_extents[row], committed,
