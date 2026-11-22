@@ -302,8 +302,8 @@ private:
     std::atomic<EngineState> state_{EngineState::Loaded};
     mutable std::shared_mutex engine_mutex_;
     std::atomic<std::uint64_t> generation_{0};
-    // The device memory the first Engine took on each device (free before minus free after):
-    // --load-min-free-mib auto requires it free again.
+    // --load-min-free-mib auto, per device: the memory the first Engine took (free before minus
+    // free after) less half its expert slot pool and a margin (see the constructor).
     std::vector<std::size_t> footprint_bytes_;
     std::thread idle_thread_;
     std::mutex idle_mutex_;

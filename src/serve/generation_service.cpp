@@ -475,16 +475,27 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     // --load-min-free-mib auto: what the first Engine takes on each device, measured around its
-    // construction (the CUDA contexts exist before: the first query creates them).
+    // construction (the CUDA contexts exist before: the first query creates them), less what a
+    // load can do without:
+    // - half the routed-expert slot pool. The slots are sized from the free memory at every
+    //   load, so they fill whatever the first Engine found free; a load with less memory builds
+    //   fewer slots and stays correct. Below half the pool more experts run on the CPU, and the
+    //   load waits or answers 503 instead.
+    // - kLoadMargin for what other programs keep after giving their memory back (an image
+    //   generator's CUDA context) and for a desktop on the device.
     const std::vector<std::size_t> free_before =
         options_.load_min_free_auto ? free_device_memory() : std::vector<std::size_t>{};
     build_engine(std::move(startup_observer));
     engine_options_ = engine_->options();
     if (options_.load_min_free_auto) {
+        constexpr std::size_t kLoadMargin         = std::size_t(512) << 20;
+        const std::size_t elastic                 = memory_summary_.routed_expert_pool_bytes / 2;
         const std::vector<std::size_t> free_after = free_device_memory();
         for (std::size_t i = 0; i < free_before.size(); ++i) {
-            footprint_bytes_.push_back(
-                free_before[i] > free_after[i] ? free_before[i] - free_after[i] : 0);
+            const std::size_t taken =
+                free_before[i] > free_after[i] ? free_before[i] - free_after[i] : 0;
+            footprint_bytes_.push_back(taken > elastic + kLoadMargin ? taken - elastic - kLoadMargin
+                                                                     : 0);
         }
     }
     if (!options_.prefill_miss_dump_dir.empty()) {

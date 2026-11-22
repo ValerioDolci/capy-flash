@@ -78,7 +78,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--disk-cache-flush-seconds N` | at SIGTERM/SIGINT, and at an unload, the time allowed to write the conversations not yet on disk | `60` |
 | `--unload-endpoints` | `POST /unload` tears the Engine down inside the server to free the GPUs for another program, `POST /load` (or the next request) builds it again; see [Unload and load](endpoints.md#unload-and-load) | off |
 | `--idle-unload-seconds N` | unload the Engine after N seconds without a request; the next request loads it (`0`: never) | `0` |
-| `--load-min-free-mib N\|auto` | a load first checks that every device has `N` MiB free, or with `auto` the device memory the first Engine took there, and answers 503 otherwise | off |
+| `--load-min-free-mib N\|auto` | a load first checks that every device has `N` MiB free, or with `auto` the device memory the first Engine took there less half its routed-expert slot pool (a load sizes the slots from the free memory, so fewer slots still load) and 512 MiB (what another program keeps after freeing its memory, a desktop), and answers 503 otherwise | off |
 | `--load-wait-seconds N` | with `--load-min-free-mib`: a load short of device memory waits up to `N` seconds for it (checked every half second) before answering 503; a request that loads the Engine waits with it | `0` |
 | `--unload-release-host` | an unload also frees the page-locked host weights (Flash-Next's expert banks, the `--embedding-host` table); by default they stay page-locked and the next load reuses them without reading the artifact again | off |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |

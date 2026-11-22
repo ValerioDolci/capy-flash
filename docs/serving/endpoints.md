@@ -38,10 +38,12 @@ key and queue (opt-in: `--unload-endpoints`, `--idle-unload-seconds`; [options](
   (`engine_busy`) while a request holds the Engine, from its submission until its response ends.
 - `POST /load` builds the Engine the way start-up does, with the same options, and warms it up;
   answers `{"engine":"loaded","seconds":S}`. With `--load-min-free-mib` it first checks the free
-  memory of every device and answers HTTP 503 (`insufficient_device_memory`) instead of building a
-  smaller Engine (the KV capacity and the expert slots follow the free memory) or failing during
-  the load, after waiting up to `--load-wait-seconds` for the memory; a load that fails anyway answers HTTP 500 (`engine_load_failed`) and leaves the Engine
-  unloaded, the server serving.
+  memory of every device and answers HTTP 503 (`insufficient_device_memory`) instead of failing
+  during the load, after waiting up to `--load-wait-seconds` for the memory. A load sizes the KV
+  capacity (when automatic) and the expert slots from the free memory: with `auto` a load may build
+  down to half the first Engine's expert slots, so the other program's leftover CUDA context does
+  not block it. A load that fails anyway answers HTTP 500 (`engine_load_failed`) and leaves the
+  Engine unloaded, the server serving.
 - A generation or token-count request to an unloaded Engine loads it first; the load does not count
   against its `--pending-timeout-ms`. When that load is refused or fails, the request answers HTTP
   503 (`service_unavailable`).
