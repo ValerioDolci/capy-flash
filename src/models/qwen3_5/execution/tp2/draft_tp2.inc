@@ -326,8 +326,7 @@ void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size,
     if (tp == nullptr || tp->dflash == nullptr || state.peer_frame == nullptr) {
         throw std::logic_error("DFlash2 tp2 round requires the split drafter on both ranks");
     }
-    const std::int32_t width = static_cast<std::int32_t>(k) + 1;
-    const auto ranks         = draft_ranks(state);
+    const auto ranks = draft_ranks(state);
     each_rank(*tp->execution, [&](std::size_t r) {
         const DraftRank& d        = ranks[r];
         ExecutionCore& core       = *d.execution;
@@ -339,9 +338,10 @@ void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size,
         Tensor positions      = d.frame->append_positions.slice(1, 0, batch_size);
         Tensor counts         = d.frame->append_counts.slice(0, 0, batch_size);
         Tensor destinations   = d.frame->state_destination_slots.slice(0, 0, batch_size);
-        Tensor compact        = core.work.alloc(
-            DType::BF16,
-            {dimension(core.parameters.draft->feature_projection.weight.k), width, batch_size});
+        // At the frame's full window: a row's pending features may come from a wider round.
+        Tensor compact = core.work.alloc(
+            DType::BF16, {dimension(core.parameters.draft->feature_projection.weight.k),
+                          d.frame->append_positions.ne[0], batch_size});
         ops::prepare_ragged_prefix(d.dflash->pending_features, active_lanes, context_starts,
                                    frontiers, compact, positions, counts, stream);
         DFlashAppendContext append{core, *d.dflash};

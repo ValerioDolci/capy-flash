@@ -51,6 +51,16 @@ constexpr long kMoreProbeMax = 512; // while the balance stays below zero, up to
 // Hysteresis: drafting more opens at a balance of kMoreOpen tokens and closes below zero, so a
 // balance about zero does not flip it every few rounds.
 constexpr double kMoreOpen = 0.1;
+// Draft positions (a drafter without stated chances): a position's drafts are tested only when the
+// ones before it were accepted, so its own counts can be old. Its rate is its counts shrunk toward
+// the rate of all drafts tested lately (kPosShrink tested drafts' worth), which follows every round
+// fast; its own counts fade every round, so after a change of text (code to prose) the positions
+// not reached since fall back to it. Before any round the pooled rate is kPosPrior.
+constexpr double kPosPrior      = 0.7;
+constexpr double kPosPriorN     = 2.0;
+constexpr double kPosShrink     = 3.0;
+constexpr double kPosRoundDecay = 0.9; // a position's own counts, per round
+constexpr double kPoolDecay     = 0.7; // all drafts tested, per round
 
 } // namespace
 
@@ -92,6 +102,7 @@ double DraftPolicy::lookup_rate(int match) const {
 bool DraftPolicy::recent(int t) const { return base_n_[t] > 0 && round_ - seen_[t] <= kStale; }
 
 bool DraftPolicy::unmeasured(int t) const {
+    if (plain_) { return ms_n_[t] < kProbes || round_ - seen_[t] > kStale; }
     return base_n_[t] < kBasePrior + kProbes || !recent(t);
 }
 
@@ -131,7 +142,34 @@ double DraftPolicy::base_from(int t, bool lately) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
+    if (plain_) { return plain_cost(t); }
     return (scale_ > 0 ? scale_ : 1.0) * base(t); // before any round: the prior shape
+}
+
+double DraftPolicy::plain_cost(int t) const {
+    if (ms_n_[t] > 0) { return ms_[t]; }
+    // Between two measured sizes, the line through them; above the largest, the line on from the
+    // two largest (never falling); below the smallest, the prior shape scales it, which prices a
+    // smaller window low until it is measured (the round cost is not a line: on the 27B it steps
+    // between 4 and 7 columns, so a line from the wider sizes would price the narrow ones too high
+    // ever to be tried).
+    int lo = 0, hi = 0, below = 0;
+    for (int u = 1; u <= kMaxT; ++u) {
+        if (ms_n_[u] <= 0) { continue; }
+        if (u < t) {
+            below = lo;
+            lo    = u;
+        } else if (hi == 0) {
+            hi = u;
+        }
+    }
+    if (lo > 0 && hi > 0) { return ms_[lo] + (ms_[hi] - ms_[lo]) * (t - lo) / double(hi - lo); }
+    if (lo > 0 && below > 0) {
+        return ms_[lo] + std::max(0.0, (ms_[lo] - ms_[below]) / (lo - below)) * (t - lo);
+    }
+    if (lo > 0) { return ms_[lo] * kShape[t] / kShape[lo]; }
+    if (hi > 0) { return ms_[hi] * kShape[t] / kShape[hi]; }
+    return kShape[t];
 }
 
 double DraftPolicy::mtp_tokens(int t) const {
@@ -228,6 +266,49 @@ int DraftPolicy::window(const float* chance, int n, bool more) const {
     return best_t;
 }
 
+double DraftPolicy::pooled_rate() const {
+    return (pool_ok_ + kPosPriorN * kPosPrior) / (pool_n_ + kPosPriorN);
+}
+
+double DraftPolicy::position_rate(int i) const {
+    i = std::clamp(i, 0, kMaxT - 1);
+    return (p_ok_[i] + kPosShrink * pooled_rate()) / (p_n_[i] + kPosShrink);
+}
+
+int DraftPolicy::position_window(int n, int widen_from) const {
+    n = std::clamp(n, 0, max_t_ - 1);
+    std::array<float, kMaxT> chance{};
+    for (int i = 0; i < n; ++i) { chance[i] = static_cast<float>(position_rate(i)); }
+    // No stated chances: the chance bins stay empty, so window() takes these rates as they are.
+    int t = window(chance.data(), n);
+    if (widen_from > 0) {
+        int next = widen_from + 1;
+        while (next <= n + 1 && !allowed(next)) { ++next; }
+        if (next <= n + 1) { t = std::max(t, next); }
+    }
+    return t;
+}
+
+void DraftPolicy::observe_positions(int t, int accepted, double round_ms) {
+    // Drafts 0..accepted-1 were accepted given their prefix and draft `accepted` (if the window had
+    // it) was not; the drafts after it were never tested.
+    const int tested = std::min(std::min(t - 1, accepted + 1), kMaxT);
+    for (int i = 0; i < kMaxT; ++i) {
+        p_ok_[i] *= kPosRoundDecay;
+        p_n_[i] *= kPosRoundDecay;
+    }
+    pool_ok_ *= kPoolDecay;
+    pool_n_ *= kPoolDecay;
+    for (int i = 0; i < tested; ++i) {
+        const double ok = i < accepted ? 1.0 : 0.0;
+        p_ok_[i] += ok;
+        p_n_[i] += 1.0;
+        pool_ok_ += ok;
+        pool_n_ += 1.0;
+    }
+    observe(false, t, accepted, 0, round_ms);
+}
+
 bool DraftPolicy::draft_more() {
     if (base_t_ <= 0) { return true; }
     if (more_open_ ? gain_ < 0 : gain_ >= kMoreOpen) { more_open_ = !more_open_; }
@@ -301,6 +382,21 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     t = std::clamp(t, 1, kMaxT);
     ++round_;
     if (!timed_) { round_ms = kShape[t]; }
+    if (round_ms > 0 && plain_) {
+        // The first round of a size captures its graph: skipped. A slow round counts at most
+        // kSlowRound times the size's cost.
+        if (ms_n_[t] <= 0 && robust_ && seen_[t] == 0) {
+            seen_[t] = round_;
+        } else {
+            const double ms =
+                ms_n_[t] > 0 && robust_ ? std::min(round_ms, kSlowRound * ms_[t]) : round_ms;
+            const double w = std::max(kCostAlpha, 1.0 / (ms_n_[t] + 1.0));
+            ms_[t]         = ms_n_[t] > 0 ? (1.0 - w) * ms_[t] + w * ms : ms;
+            ms_n_[t] += 1.0;
+            seen_[t] = round_;
+        }
+        round_ms = 0; // the scaled costs below are not used
+    }
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
         if (scale_ <= 0) { scale_ = round_ms / kShape[t]; } // the first round sets the scale
@@ -336,7 +432,10 @@ std::string DraftPolicy::cost_table_text() const {
         out += b;
     }
     for (int t = 1; t <= kMaxT; ++t) {
-        if (base_n_[t] > 0) {
+        if (plain_ && ms_n_[t] > 0) {
+            std::snprintf(b, sizeof b, " T%d:%.2f(n=%.0f)", t, ms_[t], ms_n_[t]);
+            out += b;
+        } else if (!plain_ && base_n_[t] > 0) {
             std::snprintf(b, sizeof b, " T%d:%.2f(n=%.0f%s)", t, cost_ms(t), base_n_[t],
                           recent(t) ? "" : ",old");
             out += b;

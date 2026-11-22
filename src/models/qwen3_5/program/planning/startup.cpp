@@ -1596,6 +1596,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes =
                 checked_mul(per_batch_allowance, impl->inputs.max_concurrency,
                             "DFlash exact-b graph allowance");
+            if (impl->inputs.adaptive_window) {
+                // The adaptive window's one-row families (ProgramImpl::dflash_wide_graphs).
+                const unsigned sizes =
+                    dflash_adaptive_drafts(impl->inputs.draft_window, impl->inputs.mtp_base_drafts);
+                for (std::uint32_t k = 1; k <= impl->inputs.draft_window; ++k) {
+                    if (((sizes >> k) & 1U) == 0) { continue; }
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes, per_batch_allowance,
+                                    "DFlash adaptive window graph allowance");
+                }
+            }
         }
     }
 
@@ -1632,7 +1643,20 @@ std::uint32_t verified_draft_window(const EngineOptions& options) {
         options.purpose != EnginePurpose::CausalScoring) {
         return std::max(options.speculative.draft_tokens, kMaximumMtpDraftTokens);
     }
+    // DFlash2 with --adaptive-draft N: one-row rounds draft up to N.
+    if (options.speculative.adaptive_drafts != 0 &&
+        options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        options.purpose != EnginePurpose::CausalScoring) {
+        return std::max(options.speculative.draft_tokens, options.speculative.adaptive_drafts);
+    }
     return options.speculative.draft_tokens;
+}
+
+// DFlash2 with --adaptive-draft: one-row rounds choose their drafts.
+bool adaptive_dflash_window(const EngineOptions& options) {
+    return options.speculative.adaptive_drafts != 0 &&
+           options.speculative.backend == SpeculativeBackend::DFlash2 &&
+           options.purpose != EnginePurpose::CausalScoring;
 }
 
 // With the adaptive window the MTP drafts --adaptive-draft tokens every round; otherwise
@@ -1670,7 +1694,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .prompt_lookup          = options.speculative.prompt_lookup &&
                          options.speculative.backend == SpeculativeBackend::Mtp &&
                          options.purpose != EnginePurpose::CausalScoring,
-        .adaptive_window     = adaptive_mtp_window(options),
+        .adaptive_window     = adaptive_mtp_window(options) || adaptive_dflash_window(options),
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

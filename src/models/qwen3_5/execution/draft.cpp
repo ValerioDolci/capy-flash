@@ -362,11 +362,25 @@ TargetVerifyFrameView dflash_verify_view(qwen3_5::DFlashDecodeState& frame, std:
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
                               ops::CausalAttentionExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+    return [&outer = state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
+        // A round of fewer drafts than the frame's window (adaptive draft window, or the base
+        // window below it) works on the frames' dense prefixes at its own width, on both ranks.
+        qwen3_5::DFlashDecodeState narrow_frame = outer.frame.narrowed(k);
+        std::optional<qwen3_5::DFlashDecodeState> narrow_peer;
+        if (outer.peer_frame != nullptr) { narrow_peer.emplace(outer.peer_frame->narrowed(k)); }
+        DFlashBatchContext state{outer.execution,
+                                 outer.text_cache,
+                                 outer.dflash,
+                                 narrow_frame,
+                                 outer.host_ingress,
+                                 outer.host_egress,
+                                 outer.continuation_hidden_store,
+                                 narrow_peer ? &*narrow_peer : nullptr,
+                                 outer.peer_continuation_hidden_store};
         qwen3_5::DFlashDecodeState& frame = state.frame;
         const std::int32_t width          = static_cast<std::int32_t>(k) + 1;
         const cudaStream_t stream         = state.execution.device.stream;
@@ -416,10 +430,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             dflash2_draft_round_tp2(state, batch_size, k, envelopes);
         } else {
             state.execution.work.reset();
+            // At the frame's full window: a row's pending features may come from a wider round.
             Tensor compact_features = state.execution.work.alloc(
                 DType::BF16,
-                {dimension(state.execution.parameters.draft->feature_projection.weight.k), width,
-                 batch_size});
+                {dimension(state.execution.parameters.draft->feature_projection.weight.k),
+                 frame.append_positions.ne[0], batch_size});
             ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                        context_starts, frontiers, compact_features,
                                        append_positions, append_counts, stream);

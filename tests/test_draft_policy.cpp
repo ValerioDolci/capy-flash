@@ -18,11 +18,19 @@
 //  12. a base-window round that drafted more prices drafting more, not the base window;
 //  13. more drafts that bring nothing close drafting more, and it is then probed ever more rarely;
 //  14. more drafts that are kept and cheap keep it open.
+// Draft-position cases, for a drafter without stated chances whose drafts are made in the round
+// (DFlash2) and a dense target whose verify cost is nearly flat in width:
+//  15. drafts that are always accepted grow the window to its cap;
+//  16. drafts that are mostly rejected keep the window small;
+//  17. after a change of text (accepted to rejected) the window shrinks within a few rounds, and
+//      grows back after it;
+//  18. only allowed sizes are picked.
 #include "core/draft_policy.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <random>
+#include <vector>
 
 using ninfer::spec::DraftPolicy;
 
@@ -210,6 +218,72 @@ void more_cases() {
     }
 }
 
+// A DFlash2 round on the dense 27B at tp 2 (measured, ms): nearly flat from 7 to 11 columns.
+double dense_cost(int t) {
+    constexpr double ms[17] = {12.0,  12.0,  12.46, 12.65, 12.76, 13.13, 13.94, 14.69, 13.56,
+                               14.10, 14.38, 14.54, 14.8,  15.08, 15.3,  15.5,  15.66};
+    return ms[std::clamp(t, 0, 16)];
+}
+
+// Rounds of drafts each accepted with chance q; returns the median window of the last half.
+int run_positions(DraftPolicy& p, double q, int rounds, int& widen, std::mt19937& rng,
+                  bool& allowed) {
+    std::bernoulli_distribution keep(q);
+    std::vector<int> picks;
+    for (int r = 0; r < rounds; ++r) {
+        const int t  = std::max(p.position_window(15, widen), 2);
+        allowed      = allowed && p.allowed(t);
+        int accepted = 0;
+        while (accepted < t - 1 && keep(rng)) { ++accepted; }
+        p.observe_positions(t, accepted, dense_cost(t));
+        widen = accepted == t - 1 ? t : 0;
+        if (r >= rounds / 2) { picks.push_back(t); }
+    }
+    std::sort(picks.begin(), picks.end());
+    return picks[picks.size() / 2];
+}
+
+void position_cases() {
+    // The sizes of the 27B service: drafts 1, 2, 3, 4, 7, 10, 12, 15.
+    unsigned sizes = 0;
+    for (const int k : {1, 2, 3, 4, 7, 10, 12, 15}) { sizes |= 1U << (k + 1); }
+    std::mt19937 rng(7);
+    bool allowed = true;
+    {
+        DraftPolicy p(16);
+        p.set_sizes(sizes);
+        p.set_robust(true);
+        p.set_plain_costs(true);
+        int widen = 0;
+        check(run_positions(p, 0.99, 200, widen, rng, allowed) == 16,
+              "positions: drafts always accepted grow the window to 16");
+    }
+    {
+        DraftPolicy p(16);
+        p.set_sizes(sizes);
+        p.set_robust(true);
+        p.set_plain_costs(true);
+        int widen = 0;
+        check(run_positions(p, 0.12, 200, widen, rng, allowed) <= 4,
+              "positions: drafts mostly rejected keep the window at 4 or less");
+    }
+    {
+        DraftPolicy p(16);
+        p.set_sizes(sizes);
+        p.set_robust(true);
+        p.set_plain_costs(true);
+        int widen = 0;
+        run_positions(p, 0.99, 200, widen, rng, allowed);
+        const int after = run_positions(p, 0.2, 20, widen, rng, allowed);
+        // At this rate windows of 2 to 8 columns commit about as many tokens per ms (the round
+        // with 7 drafts costs less than with 5): the wide one is left.
+        check(after <= 8, "positions: a change of text shrinks the window within 20 rounds");
+        check(run_positions(p, 0.99, 40, widen, rng, allowed) == 16,
+              "positions: and it grows back within 40 rounds");
+    }
+    check(allowed, "positions: only allowed sizes are picked");
+}
+
 } // namespace
 
 int main() {
@@ -313,6 +387,7 @@ int main() {
     }
     drafter_cases();
     more_cases();
+    position_cases();
     std::printf("draft_policy: %s\n", g_fail != 0 ? "FAILED" : "PASS");
     return g_fail != 0 ? 1 : 0;
 }

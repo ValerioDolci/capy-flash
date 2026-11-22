@@ -88,6 +88,17 @@ public:
 
     [[nodiscard]] double more_cost_ms() const { return extra_n_ > 0 ? extra_ms_ : 0.0; }
 
+    // A drafter whose drafts state no chance and are made in the round that verifies them
+    // (DFlash2): the window (1 + up to `n` drafts) with the most expected tokens per ms, from each
+    // draft position's acceptance rate given its prefix (decayed counts over the observed rounds).
+    // `widen_from` > 0: the last round kept every draft of its window of that size, so the window
+    // is at least the next allowed size above it (its drafts past that window were never tested).
+    [[nodiscard]] int position_window(int n, int widen_from) const;
+    // After such a round: its window, the drafts accepted, and the round's time.
+    void observe_positions(int t, int accepted, double round_ms);
+    [[nodiscard]] double position_rate(int i) const; // current q for draft position i (0-based)
+    [[nodiscard]] double pooled_rate() const;        // current q of all drafts tested lately
+
     [[nodiscard]] double lookup_rate(int match) const; // current q for a match length
     [[nodiscard]] double
     chance_rate(float chance) const;           // current q for a draft stated at `chance`
@@ -101,6 +112,12 @@ public:
     // what is known for that size (a stalled round) are clamped, so one capture cannot price a size
     // out of use.
     void set_robust(bool on) { robust_ = on; }
+
+    // Plain costs: each size's round time is its own EMA in ms (sizes not measured: the line
+    // through the measured ones), with no shared scale. For a target whose round cost by size is
+    // stable (all weights on the GPU: DFlash2 on the dense 27B), where a scale moved by every round
+    // leaves the sizes measured rarely priced against an old scale.
+    void set_plain_costs(bool on) { plain_ = on; }
 
     // The measured round cost of every window size seen, for the log.
     [[nodiscard]] std::string cost_table_text() const;
@@ -133,11 +150,14 @@ private:
     [[nodiscard]] Pick lookup_over(int t, double rate, int lookup_k, int match) const;
     [[nodiscard]] double drafter_tokens(const float* chance, int t) const;
     [[nodiscard]] double clamp_sample(int t, double ms) const;
+    [[nodiscard]] double plain_cost(int t) const;
 
     int max_t_;
     double margin_;
     bool timed_;
-    bool robust_    = false;
+    bool robust_ = false;
+    bool plain_  = false;
+    std::array<double, kMaxT + 1> ms_{}, ms_n_{};     // plain costs: round ms by window size
     unsigned sizes_ = ~0U;                            // allowed window sizes (bit t)
     double scale_   = 0.0;                            // round ms = scale x base(size)
     std::array<double, kMaxT + 1> base_{}, base_n_{}; // by window size; rounds behind it
@@ -155,6 +175,8 @@ private:
     long more_tries_  = 0;    // chances to draft more since the last probe
     long probe_every_ = 16;   // the current probe interval
     bool more_open_   = true; // drafting more pays (hysteresis on the balance)
+    std::array<double, kMaxT> p_ok_{}, p_n_{};       // drafts accepted / tested, by position
+    double pool_ok_ = 0.0, pool_n_ = 0.0;            // all positions
 };
 
 } // namespace ninfer::spec

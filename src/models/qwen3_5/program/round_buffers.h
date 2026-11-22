@@ -20,6 +20,11 @@ inline constexpr std::uint32_t kMtpDecodeMaximumWidth  = kMtpDecodeMaximumDrafts
 inline constexpr std::uint32_t kMtpMaximumProposalDrafts  = 5;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
+// GDN replay records and their folds by verified width (index = columns): MTP and DFlash2 rounds.
+inline constexpr std::size_t kReplayWidths =
+    std::size_t{kMtpDecodeMaximumWidth > kDFlashDecodeMaximumWidth ? kMtpDecodeMaximumWidth
+                                                                   : kDFlashDecodeMaximumWidth} +
+    1U;
 
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
@@ -312,6 +317,13 @@ struct DFlashDecodeState {
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
+
+    // The same frame for a round of `drafts` <= the frame's window (adaptive draft window): every
+    // tensor with a column axis is the dense [.., drafts (+1), batch capacity] prefix of its
+    // buffer, so a round's rows stay contiguous at its own width and the host's ingress and egress
+    // records use that width as their row stride. The append positions keep the frame's width: a
+    // row's pending features may come from a wider round before.
+    [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t drafts) const;
 };
 
 struct RoundState {

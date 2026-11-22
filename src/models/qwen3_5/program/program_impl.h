@@ -733,12 +733,10 @@ public:
     std::vector<DiskSaved> disk_saved;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
-    // MTP backend: the records and their fold at every width a round may verify (index = verified
-    // columns): an MTP round mtp_drafts + 1, a prompt-lookup round wider.
-    std::array<std::optional<GdnReplayRecords>, qwen3_5::kMtpDecodeMaximumWidth + 1>
-        replay_records_at;
-    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_5::kMtpDecodeMaximumWidth + 1>
-        replay_fold_at;
+    // The records and their fold at every width a round may verify (index = verified columns): an
+    // MTP round mtp_drafts + 1, a prompt-lookup round wider; a DFlash2 round its drafts + 1.
+    std::array<std::optional<GdnReplayRecords>, qwen3_5::kReplayWidths> replay_records_at;
+    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_5::kReplayWidths> replay_fold_at;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -794,6 +792,27 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    // DFlash2 adaptive draft window (--adaptive-draft N): draft_window is N, every batch size runs
+    // dflash_base_drafts (--draft-tokens) in dflash_graphs, and a one-row round drafts and verifies
+    // the drafts of `dflash_sizes` (bit k) in dflash_wide_graphs[k], k chosen by the draft policy
+    // from the acceptance of the row's recent rounds. dflash_round_drafts: the drafts of the last
+    // launched round (its commit folds and selects at that width); representative_dflash_drafts:
+    // the drafts a capture's representative lays out (0 = dflash_base_drafts).
+    std::uint32_t dflash_base_drafts = 0;
+    unsigned dflash_sizes            = 0;
+    std::array<DecodeGraphFamily, qwen3_5::kDFlashDecodeMaximumDrafts + 1> dflash_wide_graphs;
+    std::uint32_t dflash_round_drafts          = 0;
+    std::uint32_t representative_dflash_drafts = 0;
+
+    // The last one-row DFlash2 round's outcome, given to the policy when the next round starts.
+    struct DFlashObservation {
+        bool pending       = false;
+        int t              = 0;
+        int accepted       = 0;
+        std::uint32_t lane = 0;
+        std::chrono::steady_clock::time_point started{};
+        double round_seconds = 0.0;
+    } dflash_observation;
 
     // The draft policy: MTP rounds verify mtp_base_width columns
     // (mtp_graphs); a one-row round may verify another window of `lookup_widths` columns (bit w),

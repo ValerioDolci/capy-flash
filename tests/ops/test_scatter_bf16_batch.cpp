@@ -22,7 +22,10 @@ std::vector<std::uint16_t> bits(std::size_t count, unsigned salt) {
     return values;
 }
 
-int run_case(int d, int width, int batch, bool padded, int mode, bool replay, int features = 5) {
+// wide: the destination view holds max(width, 16) columns per lane (a DFlash2 round narrower than
+// the pending-feature buffer's window); only the source's columns are written.
+int run_case(int d, int width, int batch, bool padded, int mode, bool replay, int features = 5,
+             bool wide = false) {
     const std::int64_t column_stride = features * d + (padded ? 8 : 0);
     const std::int64_t lane_stride =
         column_stride * (padded ? std::max(width, 16) : width) + (padded ? 16 : 0);
@@ -37,7 +40,7 @@ int run_case(int d, int width, int batch, bool padded, int mode, bool replay, in
         x[slice] = Tensor(static_cast<std::uint16_t*>(input.data()) + slice * source_count,
                           DType::BF16, {d, width, batch});
         y[slice] = Tensor(static_cast<std::uint16_t*>(destination.data()) + slice * d, DType::BF16,
-                          {d, width, 8});
+                          {d, wide && padded ? std::max(width, 16) : width, 8});
         y[slice].nb[1] = column_stride * 2;
         y[slice].nb[2] = lane_stride * 2;
         y[slice].nb[3] = lane_stride * 8 * 2;
@@ -131,6 +134,8 @@ int main() {
     for (int d : {8, 24, 16384}) failures += run_case(d, 3, 8, true, 1, true);
     failures += run_case(5120, 17, 1, true, 1, true);
     failures += run_case(2048, 16, 8, true, 1, true, 8);
+    for (int w : {1, 7, 8, 15})
+        for (int b : {1, 4}) failures += run_case(5120, w, b, true, 1, true, 5, true);
     std::cout << (failures ? "FAIL" : "PASS") << " scatter_bf16_batch\n";
     return failures ? 1 : 0;
 }

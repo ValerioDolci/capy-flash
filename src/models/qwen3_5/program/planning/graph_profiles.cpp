@@ -83,4 +83,23 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
     return profiles;
 }
 
+unsigned dflash_adaptive_drafts(std::uint32_t maximum, std::uint32_t base) {
+    // Each family is a graph executable per resource tier, so only the counts worth a round of
+    // their own. Measured on the dense 27B at tp 2 (fixed --draft-tokens, ms per round): 1..4
+    // drafts 12.5-13.1, 5 and 6 drafts 13.9 and 14.7, 7 drafts 13.6 (the verify GEMMs take A4
+    // activations from 8 columns), 10 drafts 14.5, 15 drafts 15.7; and the drafter's blocks of 8
+    // (7 drafts) and more draft better than the smaller ones (conversation: 3.2 tokens a round at
+    // 6 drafts, 4.0 at 7). So 5 and 6 drafts are dearer than 7 and worse. Fewer drafts than the
+    // base count are not offered: a smaller block drafts worse, its rounds then keep fewer drafts
+    // and the measured rates pull the window smaller still (a conversation run fell from 278 to
+    // 221 tok/s), for at most ~1 ms of a 13.6 ms round.
+    constexpr std::array<std::uint32_t, 8> kDrafts{1, 2, 3, 4, 7, 10, 12, 15};
+    unsigned mask = 0;
+    for (const std::uint32_t k : kDrafts) {
+        if (k <= maximum && k > base) { mask |= 1U << k; }
+    }
+    if (maximum > base && ((mask >> maximum) & 1U) == 0) { mask |= 1U << maximum; }
+    return mask;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

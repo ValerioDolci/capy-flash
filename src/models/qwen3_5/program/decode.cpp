@@ -989,7 +989,37 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     }
     require_round_membership(lanes, budgets, max_concurrency, "DFlash batch");
 
-    const std::uint32_t width           = draft_window + 1U;
+    // The round's drafts: --draft-tokens (dflash_base_drafts), or with --adaptive-draft, for one
+    // unconstrained row and no validation hooks, the count the draft policy expects to commit the
+    // most tokens per ms from the row's recent rounds.
+    const bool policy_round = lookup_policy.has_value() && dflash_sizes != 0 && lanes.size() == 1 &&
+                              !validation && !row_constrained(0);
+    const auto round_start = std::chrono::steady_clock::now();
+    int widen_from         = 0;
+    if (lookup_policy && dflash_observation.pending) {
+        // The previous one-row round's outcome. When this round is the same lane's next one, the
+        // time between their starts covers that round's commit too; otherwise, or after a gap
+        // (another request's prompt), its launch to completion.
+        DFlashObservation& o = dflash_observation;
+        const double between =
+            std::chrono::duration<double, std::milli>(round_start - o.started).count();
+        const double alone = o.round_seconds * 1000.0;
+        const bool next    = lanes.size() == 1 && lanes[0] == o.lane && between <= 3.0 * alone;
+        lookup_policy->observe_positions(o.t, o.accepted, next ? between : alone);
+        // A window whose drafts were all kept widens the row's next one: its drafts past that
+        // window were never tested.
+        if (next && o.accepted == o.t - 1) { widen_from = o.t; }
+        o.pending = false;
+    }
+    std::uint32_t drafts = dflash_base_drafts != 0 ? dflash_base_drafts : draft_window;
+    if (policy_round) {
+        const int t  = lookup_policy->position_window(static_cast<int>(draft_window), widen_from);
+        const auto k = static_cast<std::uint32_t>(std::max(t, 2) - 1);
+        if (k == drafts || ((dflash_sizes >> k) & 1U) != 0) { drafts = k; }
+    }
+    const std::uint32_t width = drafts + 1U;
+    // Pending drafter context: a row's last round may have been wider than this one.
+    const std::uint32_t context_width   = draft_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1003,18 +1033,18 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            sequence.execution_frontier - sequence.dflash_context_frontier > context_width ||
             !ledger_at_decode_frontier(sequence)) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
         const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
         // D3: a constrained row drafts nothing (its drafts are born on the device, after the
         // host masks): an ordinary round for that row, counted as a fallback step.
-        const std::uint32_t extent = row_constrained(row)
-                                         ? 0U
-                                         : std::min({draft_window, max_by_budget,
-                                                     capacity - sequence.execution_frontier - 1U});
-        maximum_frontier           = std::max(maximum_frontier, sequence.execution_frontier);
+        const std::uint32_t extent =
+            row_constrained(row)
+                ? 0U
+                : std::min({drafts, max_by_budget, capacity - sequence.execution_frontier - 1U});
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
@@ -1028,8 +1058,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
+            DecodeGraphFamily& family =
+                drafts == dflash_base_drafts ? dflash_graphs : dflash_wide_graphs[drafts];
             const RoundGraph graph =
-                select_round_graph(dflash_graphs, lanes.size(), maximum_frontier, "DFlash batch");
+                select_round_graph(family, lanes.size(), maximum_frontier, "DFlash batch");
             const DecodeGraphProfile& profile = graph.profile;
             executable                        = graph.executable;
             envelopes                         = dflash_envelopes(profile.min_execution_frontier,
@@ -1037,7 +1069,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             target_envelope                   = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     drafts + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1046,9 +1078,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
             const std::uint32_t extent =
-                row_constrained(row)
-                    ? 0U
-                    : std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                row_constrained(row) ? 0U
+                                     : std::min({drafts, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -1073,10 +1104,16 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U, 0U);
         }
 
+        // The replay records at the round's width, on both ranks.
+        std::optional<execution::TpExecution> tp_round;
+        if (const execution::TpExecution* tp = tp_binding(); tp != nullptr) {
+            tp_round.emplace(*tp);
+            tp_round->replay_records = &*peer->replay_records_at[width];
+        }
         execution::DFlashBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge()},
+            {device, parameters, work, state_images->linear(), &*replay_records_at[width], io,
+             prefill_hidden, prefill_chunk, proposal_head, tp_round ? &*tp_round : nullptr,
+             graph_peer_bridge()},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
@@ -1087,8 +1124,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             peer ? &peer->state_images->continuation_hidden_store() : nullptr};
 
         mark_workspace_usage(workspace_plan.dflash_round);
+        dflash_round_drafts = drafts;
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                       draft_window, envelopes, target_envelope, executable);
+                                       drafts, envelopes, target_envelope, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -1119,6 +1157,21 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (policy_round &&
+                static_cast<std::uint32_t>(count_i) < budgets[row].generated_tokens_remaining &&
+                extent == drafts) {
+                // The policy learns from every full one-row round but a request's last: its
+                // window, the drafts accepted and, once the next round starts, its time.
+                dflash_observation = DFlashObservation{
+                    .pending  = true,
+                    .t        = static_cast<int>(width),
+                    .accepted = accepted_i,
+                    .lane     = lanes[row],
+                    .started  = round_start,
+                    .round_seconds =
+                        std::chrono::duration<double>(Clock::now() - round_start).count(),
+                };
+            }
             record_speculative_row(request, extent, accepted_i);
             sequence.dflash_context_frontier = base_E;
             set_round_pending(request, PendingKind::Speculative, base_E, base_S,

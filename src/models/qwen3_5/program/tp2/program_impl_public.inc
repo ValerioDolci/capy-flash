@@ -27,11 +27,9 @@ struct PeerRuntime {
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
-    // MTP backend: as ProgramImpl::replay_records_at / replay_fold_at, rank 1's.
-    std::array<std::optional<GdnReplayRecords>, qwen3_5::kMtpDecodeMaximumWidth + 1>
-        replay_records_at;
-    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_5::kMtpDecodeMaximumWidth + 1>
-        replay_fold_at;
+    // As ProgramImpl::replay_records_at / replay_fold_at, rank 1's.
+    std::array<std::optional<GdnReplayRecords>, qwen3_5::kReplayWidths> replay_records_at;
+    std::array<std::optional<ops::GdnReplayFoldPlan>, qwen3_5::kReplayWidths> replay_fold_at;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     // Causal scoring only: rank 1's copy of the staged hidden columns, the input of its half

@@ -255,10 +255,14 @@ void ProgramImpl::prepare_graphs() {
                            checked_i32(frontier, "graph representative MTP position"));
         }
         if (io.dflash_decode) {
-            *dflash_host_ingress       = {};
-            *dflash_host_egress        = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
-            const std::uint32_t width  = draft_window + 1U;
+            *dflash_host_ingress = {};
+            *dflash_host_egress  = {};
+            // The drafts of the family being captured: the base ones or an adaptive window's.
+            const std::uint32_t drafts = representative_dflash_drafts != 0
+                                             ? representative_dflash_drafts
+                                             : dflash_base_drafts;
+            const std::uint32_t extent = std::min(drafts, capacity - frontier - 1U);
+            const std::uint32_t width  = drafts + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
@@ -479,54 +483,76 @@ void ProgramImpl::prepare_graphs() {
             }
         }
         if (speculative_backend == SpeculativeBackend::DFlash2) {
+            // One family per draft count: the base drafts for every batch size (dflash_graphs) and,
+            // with the adaptive window, each count of dflash_sizes for one row. Every family runs
+            // on the frames' dense prefixes at its own width (DFlashDecodeState::narrowed) with
+            // the replay records of that width; the drafter's context append and envelopes stay
+            // at the full window (a row's pending features may come from a wider round).
             const auto planned_profiles = dflash_graph_profiles(capacity, draft_window);
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-            execution::DFlashBatchContext dflash_state{
-                execution_core(),
-                decoder->text_kv,
-                *dflash,
-                *io.dflash_decode,
-                *dflash_host_ingress,
-                *dflash_host_egress,
-                state_images->continuation_hidden_store(),
-                peer ? &*peer->io.dflash_decode : nullptr,
-                peer ? &peer->state_images->continuation_hidden_store() : nullptr};
-            const GraphExecutionProfile code_warm = planned_profiles.front();
-            const ops::CausalAttentionExecutionEnvelope code_warm_target{
-                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                       capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
-            // As for ordinary and MTP rounds: every batch size is warmed eagerly on both devices at
-            // tp 2 before any capture, since batch shape selects kernels.
-            const std::uint32_t warm_batches = tensor_parallel() ? max_concurrency : 1U;
-            for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
-                prepare_representative(code_warm.min, batch_size);
-                synchronize_all();
-                execution::dflash_decode_batch(
-                    dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_envelopes(code_warm.min, code_warm.max, draft_window), code_warm_target,
-                    nullptr);
-                synchronize_all();
-            }
+            const auto capture_dflash_family = [&](DecodeGraphFamily& family, std::uint32_t drafts,
+                                                   std::uint32_t batch_limit) {
+                representative_dflash_drafts = drafts;
+                execution::DFlashBatchContext dflash_state{
+                    execution_core(),
+                    decoder->text_kv,
+                    *dflash,
+                    *io.dflash_decode,
+                    *dflash_host_ingress,
+                    *dflash_host_egress,
+                    state_images->continuation_hidden_store(),
+                    peer ? &*peer->io.dflash_decode : nullptr,
+                    peer ? &peer->state_images->continuation_hidden_store() : nullptr};
+                const std::size_t width               = drafts + 1U;
+                dflash_state.execution.replay_records = &*replay_records_at[width];
+                std::optional<execution::TpExecution> tp_width;
+                if (const execution::TpExecution* tp = tp_binding(); tp != nullptr) {
+                    tp_width.emplace(*tp);
+                    tp_width->replay_records  = &*peer->replay_records_at[width];
+                    dflash_state.execution.tp = &*tp_width;
+                }
+                const auto target_envelope = [&](std::uint32_t max_frontier) {
+                    return ops::CausalAttentionExecutionEnvelope{
+                        1,
+                        static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                            capacity, static_cast<std::uint64_t>(max_frontier) + drafts + 1ULL))};
+                };
+                const GraphExecutionProfile code_warm = planned_profiles.front();
+                // As for ordinary and MTP rounds: every batch size is warmed eagerly on both
+                // devices at tp 2 before any capture, since batch shape selects kernels.
+                const std::uint32_t warm_batches = tensor_parallel() ? batch_limit : 1U;
+                for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
+                    prepare_representative(code_warm.min, batch_size);
+                    synchronize_all();
+                    execution::dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), drafts,
+                        dflash_envelopes(code_warm.min, code_warm.max, draft_window),
+                        target_envelope(code_warm.max), nullptr);
+                    synchronize_all();
+                }
 
-            dflash_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    dflash_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
-                    const ops::CausalAttentionExecutionEnvelope target_envelope{
-                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               capacity,
-                               static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
-
-                    execution::capture_dflash_decode_batch(
-                        dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                        dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                        profile.definition);
+                family.profiles.reserve(planned_profiles.size() * batch_limit);
+                for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
+                    for (const GraphExecutionProfile planned : planned_profiles) {
+                        family.profiles.emplace_back();
+                        DecodeGraphProfile& profile    = family.profiles.back();
+                        profile.batch_size             = batch_size;
+                        profile.min_execution_frontier = planned.min;
+                        profile.max_execution_frontier = planned.max;
+                        profile.topology_class =
+                            planned.topology_class * max_concurrency + (batch_size - 1U);
+                        execution::capture_dflash_decode_batch(
+                            dflash_state, static_cast<std::int32_t>(batch_size), drafts,
+                            dflash_envelopes(planned.min, planned.max, draft_window),
+                            target_envelope(planned.max), profile.definition);
+                    }
+                }
+                representative_dflash_drafts = 0;
+            };
+            capture_dflash_family(dflash_graphs, dflash_base_drafts, max_concurrency);
+            for (std::uint32_t k = 1; k <= draft_window; ++k) {
+                if (((dflash_sizes >> k) & 1U) != 0) {
+                    capture_dflash_family(dflash_wide_graphs[k], k, 1U);
                 }
             }
         }
@@ -550,6 +576,14 @@ void ProgramImpl::prepare_graphs() {
         if (speculative_backend == SpeculativeBackend::DFlash2) {
             instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,
                                      synchronize_graphs);
+            for (std::uint32_t k = 1; k <= draft_window; ++k) {
+                if (((dflash_sizes >> k) & 1U) == 0) { continue; }
+                // The representative lays out this family's columns.
+                representative_dflash_drafts = k;
+                instantiate_graph_family(dflash_wide_graphs[k], "DFlash window", device,
+                                         prepare_representative, synchronize_graphs);
+                representative_dflash_drafts = 0;
+            }
         }
     };
     for (;;) {

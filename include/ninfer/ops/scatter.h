@@ -36,8 +36,9 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
  * Scatter compact request-major BF16 blocks into lane-owned fixed storage.
  *
  * source is contiguous [D,W,B], lanes and valid_columns are contiguous I32 [B], and destination
- * is a possibly row-sliced [D,W,C] view with dense rows and explicit column/lane strides.
- * C is lane capacity, independent of B; a feature slice retains its parent storage strides.
+ * is a possibly row-sliced [D,W',C] view with dense rows and explicit column/lane strides, W' >= W
+ * (a lane may hold more columns than one round writes). C is lane capacity, independent of B; a
+ * feature slice retains its parent storage strides.
  * For each b and j<valid_columns[b]:
  *
  *   destination[:,j,lanes[b]] = source[:,j,b]
