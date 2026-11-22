@@ -308,6 +308,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
+           "[--unload-endpoints] [--idle-unload-seconds N] [--load-min-free-mib N|auto] "
+           "[--unload-release-host] [--load-wait-seconds N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash2|off --draft-tokens N] "
            "[--rope-yarn-factor F] [--rope-original-max-position N] "
@@ -622,6 +624,31 @@ std::string serve_usage_text(const char* argv0) {
            "  --prefill-miss-min-match <F>\n"
            "    Minimum fraction of the prompt shared with a recent context to trigger a dump.\n"
            "    default: 0.5\n"
+           "  --unload-endpoints\n"
+           "    POST /unload frees the GPUs for another program: the retained conversations go to "
+           "the disk cache (--disk-cache-dir) and the Engine is torn down inside the server, which "
+           "keeps its port; POST /load, or the next request, builds it again as start-up does. "
+           "/unload answers 409 while a request runs; /health reports the Engine's state.\n"
+           "    default: off\n"
+           "  --idle-unload-seconds <N>\n"
+           "    Unload the Engine after N seconds without a request; the next request loads it "
+           "(0 = never).\n"
+           "    default: 0\n"
+           "  --load-min-free-mib <N|auto>\n"
+           "    A load (POST /load or a request to an unloaded Engine) first checks that every "
+           "device has N MiB free, or with auto the device memory the first Engine took there, "
+           "and answers 503 instead of loading a smaller Engine or failing mid-load.\n"
+           "    default: off\n"
+           "  --load-wait-seconds <N>\n"
+           "    With --load-min-free-mib: a load short of device memory (another program still "
+           "holds the GPUs) waits up to N seconds for it, checking every half second, before "
+           "answering 503; a request that loads the Engine waits with it.\n"
+           "    default: 0\n"
+           "  --unload-release-host\n"
+           "    An unload also frees the page-locked host weights (Flash-Next's expert banks, the "
+           "--embedding-host table); by default they stay page-locked and the next load reuses "
+           "them instead of reading them from the artifact again.\n"
+           "    default: off\n"
            "  --response-store-max-records <N>\n"
            "    Maximum records in the process-local Responses state store.\n"
            "    default: " +
@@ -1064,6 +1091,26 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--unload-endpoints") {
+            options.unload_endpoints = true;
+        } else if (arg == "--load-wait-seconds") {
+            options.load_wait_seconds = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--load-wait-seconds"), "load-wait-seconds"));
+        } else if (arg == "--unload-release-host") {
+            options.unload_release_host = true;
+        } else if (arg == "--idle-unload-seconds") {
+            options.idle_unload_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--idle-unload-seconds"), "idle-unload-seconds"));
+        } else if (arg == "--load-min-free-mib") {
+            const std::string value = require_value("--load-min-free-mib");
+            if (value == "auto") {
+                options.load_min_free_auto = true;
+                options.load_min_free_mib.reset();
+            } else {
+                options.load_min_free_mib = static_cast<std::uint64_t>(
+                    parse_nonnegative_int(value.c_str(), "load-min-free-mib"));
+                options.load_min_free_auto = false;
+            }
         } else if (arg == "--prefill-miss-dump") {
             options.prefill_miss_dump_dir = require_value("--prefill-miss-dump");
             if (options.prefill_miss_dump_dir.empty()) {
@@ -1320,6 +1367,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.load_wait_seconds != 0 && !options.load_min_free_mib &&
+        !options.load_min_free_auto) {
+        throw std::invalid_argument("--load-wait-seconds requires --load-min-free-mib");
+    }
     // The key without putting it on the command line (ps, /proc/PID/cmdline, systemctl status):
     // --api-key-file, else NINFER_API_KEY. --api-key KEY keeps working.
     if (api_key_file) {

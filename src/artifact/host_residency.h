@@ -11,9 +11,12 @@
 //
 // Pure planning, no CUDA: the materializer allocates what this returns.
 
+#include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "core/arena.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +35,30 @@ struct HostResidency {
     std::size_t pageable_objects        = 0;
 
     [[nodiscard]] bool split() const noexcept { return pageable_objects != 0; }
+};
+
+// Unload and load inside one process (serve --unload-endpoints): the HostMapped parents' bytes
+// (Flash-Next's expert banks, --embedding-host), page-locked, kept across an Engine rebuild.
+// MaterializedArtifact::release_host_weights() hands them out before the Engine is freed; a later
+// materialization of the same plan (MaterializationPlan::retained_host) adopts them instead of
+// allocating, page-locking and reading them again. Nothing writes these bytes after the load but
+// the exclusive tier, which is refused.
+struct RetainedHostWeights {
+    std::unique_ptr<PinnedHostBuffer> pinned;
+    std::unique_ptr<PageableHostBuffer> pageable;
+    // What they were placed for: the plan's host_mapped_objects and its total, the residency the
+    // load chose, and the artifact.
+    std::vector<HostMappedPlacement> placements;
+    std::uint64_t bytes = 0;
+    HostResidency residency;
+    ArtifactId artifact_id{};
+    int device_count                      = 0;
+    std::uint64_t host_pinned_limit_bytes = 0;
+    bool host_pinned_alloc_failed         = false;
+
+    // Whether `plan` places exactly these parents (same objects, offsets and sizes, same artifact
+    // and device count) and the bytes are still held.
+    [[nodiscard]] bool matches(const MaterializationPlan& plan, const ArtifactId& artifact) const;
 };
 
 // Splits `placements` (a plan's host_mapped_objects, `total_bytes` = its host_mapped_bytes) so

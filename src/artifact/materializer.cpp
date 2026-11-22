@@ -380,7 +380,37 @@ private:
     const std::byte* data_ = nullptr;
 };
 
-MaterializedArtifact::MaterializedArtifact()                                           = default;
+MaterializedArtifact::MaterializedArtifact() = default;
+
+bool RetainedHostWeights::matches(const MaterializationPlan& plan,
+                                  const ArtifactId& artifact) const {
+    if ((pinned == nullptr && pageable == nullptr) || artifact != artifact_id ||
+        plan.device_count != device_count || plan.host_mapped_bytes != bytes ||
+        plan.host_mapped_objects.size() != placements.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < placements.size(); ++i) {
+        const HostMappedPlacement& a = placements[i];
+        const HostMappedPlacement& b = plan.host_mapped_objects[i];
+        if (a.object.index != b.object.index || a.offset != b.offset || a.bytes != b.bytes ||
+            a.alignment != b.alignment || a.pageable_rank != b.pageable_rank ||
+            a.tail_bytes != b.tail_bytes || a.spare_bytes != b.spare_bytes || b.tail_bytes != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::shared_ptr<RetainedHostWeights> MaterializedArtifact::release_host_weights() {
+    if (host_record_ == nullptr || host_tails_ != nullptr ||
+        (host_mapped_ == nullptr && host_pageable_ == nullptr)) {
+        return nullptr;
+    }
+    host_record_->pinned   = std::move(host_mapped_);
+    host_record_->pageable = std::move(host_pageable_);
+    return std::move(host_record_);
+}
+
 MaterializedArtifact::~MaterializedArtifact()                                          = default;
 MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
 MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&&) noexcept = default;
@@ -553,11 +583,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             out.host_tails_->buffer =
                 std::make_unique<PageableHostBuffer>(static_cast<std::size_t>(tail_total));
         }
-        require_host_memory(host_mapped_total);
+        // An earlier Engine of this process left these exact parents page-locked (unload and
+        // load): adopt them, with the residency it chose, instead of allocating and reading.
+        std::shared_ptr<RetainedHostWeights> retained = std::move(plan.retained_host);
+        const bool adopt =
+            retained != nullptr && tail_total == 0 && retained->matches(plan, reader.artifact_id());
+        if (!adopt) { require_host_memory(host_mapped_total); }
         const std::span<const HostMappedPlacement> placements(compact);
-        std::uint64_t pinned_limit   = host_pinned_limit(plan);
+        std::uint64_t pinned_limit =
+            adopt ? retained->host_pinned_limit_bytes : host_pinned_limit(plan);
         const std::uint64_t reserved = plan.host_pinned_reserved_bytes;
-        if (pinned_limit == 0 && ram_guard_enabled()) {
+        if (!adopt && pinned_limit == 0 && ram_guard_enabled()) {
             // Without an explicit limit, keep the page-locked part outside free CMA memory.
             const HostMemInfo memory = read_host_meminfo();
             pinned_limit = cma_pinned_limit(memory.total, memory.available, memory.cma_free,
@@ -571,7 +607,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                              gib_text(memory.cma_free).c_str(), gib_text(pinned_limit).c_str());
             }
         }
-        if (pinned_limit != 0 && reserved >= pinned_limit) {
+        if (!adopt && pinned_limit != 0 && reserved >= pinned_limit) {
             const auto mib = [](std::uint64_t bytes) {
                 return std::to_string((bytes + (1ULL << 20) - 1) >> 20) + " MiB";
             };
@@ -589,9 +625,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.host_pinned_limit_bytes = pinned_limit;
         HostResidency residency;
         bool placed_whole = false;
+        if (adopt) {
+            out.host_mapped_                    = std::move(retained->pinned);
+            out.host_pageable_                  = std::move(retained->pageable);
+            residency                           = retained->residency;
+            out.stats_.host_pinned_alloc_failed = retained->host_pinned_alloc_failed;
+            out.stats_.host_mapped_retained     = true;
+            placed_whole                        = true;
+        }
         // Even without pageable candidates, an explicit cap must hold. The residency planner
         // below reports mandatory pinned bytes above the budget and refuses before allocation.
-        if (limit == 0 || limit >= host_mapped_total) {
+        if (!adopt && (limit == 0 || limit >= host_mapped_total)) {
             try {
                 out.host_mapped_ =
                     std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(host_mapped_total),
@@ -611,7 +655,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                              gib_text(host_mapped_total).c_str(), error.what());
             }
         }
-        if (!placed_whole) {
+        if (!placed_whole && !adopt) {
             // The first try leaves room for the engine's other page-locked buffers (Host KV,
             // StateImages, mailboxes, the staging ring, the Host KV planes of --kv-ram-active)
             // unless the limit is explicit; every failed try steps down.
@@ -725,6 +769,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 tail_of[i] = tail.data();
                 tail_used += placement.tail_bytes;
             }
+            if (adopt) { continue; } // the bytes are in place already
             reads.push_back({descriptor.offset, bytes.first(payload)});
             // Padding after the stored payload reads as zero, as in a device arena.
             std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(payload), bytes.end(),
@@ -732,7 +777,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             out.stats_.read_bytes =
                 checked_add(out.stats_.read_bytes, descriptor.bytes, "host-mapped read bytes");
         }
-        parallel_read(reader, reads, [&](std::uint64_t read) { phase.progress(read, all_total); });
+        if (!reads.empty()) {
+            parallel_read(reader, reads,
+                          [&](std::uint64_t read) { phase.progress(read, all_total); });
+        }
         for (std::size_t i = 0; i < plan.host_mapped_objects.size(); ++i) {
             const auto& placement = plan.host_mapped_objects[i];
             const auto& geometry  = reader.geometry(placement.object);
@@ -760,6 +808,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.host_pageable_bytes   = residency.pageable_bytes;
         out.stats_.host_pageable_objects = residency.pageable_objects;
         out.stats_.host_mapped_objects   = plan.host_mapped_objects.size();
+        if (tail_total == 0) {
+            // What release_host_weights() hands out with the bytes at an unload.
+            out.host_record_                           = std::make_shared<RetainedHostWeights>();
+            out.host_record_->placements               = plan.host_mapped_objects;
+            out.host_record_->bytes                    = plan.host_mapped_bytes;
+            out.host_record_->residency                = residency;
+            out.host_record_->artifact_id              = reader.artifact_id();
+            out.host_record_->device_count             = plan.device_count;
+            out.host_record_->host_pinned_limit_bytes  = out.stats_.host_pinned_limit_bytes;
+            out.host_record_->host_pinned_alloc_failed = out.stats_.host_pinned_alloc_failed;
+        }
     }
     for (const auto handle : plan.file_objects) {
         reader.validate_object(handle);

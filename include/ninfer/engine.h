@@ -136,6 +136,12 @@ public:
     // ContextCacheOptions::disk_flush_seconds.
     void persist_context_cache() noexcept;
 
+    // Unload and load: hands the host-mapped weights' bytes (expert banks, embedding_host) out so
+    // they outlive this Engine, to give to the next one (EngineOptions::retained_host_weights);
+    // null when there are none or they cannot be kept (the exclusive tier writes them). Call it
+    // with nothing running, then free this Engine.
+    [[nodiscard]] std::shared_ptr<artifact::RetainedHostWeights> release_host_weights();
+
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;

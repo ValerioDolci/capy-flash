@@ -66,6 +66,8 @@ public:
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
     void engine_failure() const;
+    // --unload-endpoints / --idle-unload-seconds: an Engine unload or load, as one line.
+    void engine_transition(std::string_view line) const;
     void engine_failure_cause(std::uint64_t request_id, std::string_view detail) const;
 
 private:

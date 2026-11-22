@@ -5,6 +5,8 @@
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -24,6 +26,36 @@ struct RequestCapacity {
     std::mutex mutex;
     std::size_t active = 0;
     const std::size_t maximum;
+    // Engine calls outside a request (token counting): they hold the Engine like a request, so
+    // an unload waits for neither and refuses both.
+    std::size_t users = 0;
+    // When a request or a use last started or ended (steady clock ns): --idle-unload-seconds.
+    std::atomic<std::int64_t> last_activity_ns{0};
+
+    void touch() noexcept {
+        last_activity_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                               std::memory_order_relaxed);
+    }
+};
+
+// An Engine call outside a request reservation (token counting): counted in
+// RequestCapacity::users while it runs.
+struct EngineUse {
+    explicit EngineUse(std::shared_ptr<RequestCapacity> owner) : capacity(std::move(owner)) {
+        std::lock_guard lock(capacity->mutex);
+        ++capacity->users;
+    }
+
+    ~EngineUse() {
+        std::lock_guard lock(capacity->mutex);
+        --capacity->users;
+        capacity->touch();
+    }
+
+    EngineUse(const EngineUse&)            = delete;
+    EngineUse& operator=(const EngineUse&) = delete;
+
+    std::shared_ptr<RequestCapacity> capacity;
 };
 
 struct RequestLifetime {
@@ -35,6 +67,7 @@ struct RequestLifetime {
     ~RequestLifetime() {
         std::lock_guard lock(capacity->mutex);
         --capacity->active;
+        capacity->touch();
     }
 
     std::shared_ptr<RequestCapacity> capacity;
@@ -353,87 +386,396 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
-    : options_(std::move(options)) {
-    ninfer::EngineOptions engine_options;
-    engine_options.artifact_path          = options_.artifact_path;
-    engine_options.chat_template_path     = options_.chat_template_path;
-    engine_options.device                 = options_.device;
-    engine_options.tp                     = options_.tp;
-    engine_options.devices                = options_.devices;
-    engine_options.max_context            = options_.max_context;
-    engine_options.kv_capacity            = options_.kv_capacity;
-    engine_options.max_concurrency        = options_.max_concurrency;
-    engine_options.max_pending_requests   = options_.max_pending_requests;
-    engine_options.pending_timeout_ms     = options_.pending_timeout_ms;
-    engine_options.decode_share           = options_.decode_share;
-    engine_options.prefill_chunk          = options_.prefill_chunk;
-    engine_options.kv_lease_window_tokens = options_.kv_lease_window_tokens;
-    engine_options.kv_cache               = options_.kv_cache;
-    engine_options.elastic_kv             = options_.elastic_kv;
-    engine_options.kv_ram_active          = options_.kv_ram_active;
-    if (options_.miss_split) {
-        engine_options.routed_experts.miss_split.mode      = *options_.miss_split;
-        engine_options.routed_experts.miss_split.calibrate = options_.miss_split_calibrate;
-    }
-    if (options_.expert_cpu_threads) {
-        engine_options.routed_experts.cpu_threads      = *options_.expert_cpu_threads;
-        engine_options.routed_experts.gguf_cpu_threads = *options_.expert_cpu_threads;
-    }
-    if (options_.stream_min_tokens) {
-        engine_options.routed_experts.stream_min_tokens     = *options_.stream_min_tokens;
-        engine_options.routed_experts.stream_min_tokens_set = true;
-    }
-    engine_options.routed_experts.cpus             = options_.expert_cpus;
-    engine_options.routed_experts.exclusive_layers = options_.expert_exclusive_layers;
-    engine_options.routed_experts.gguf_hybrid_cost = options_.gguf_hybrid_cost;
-    engine_options.kv_ram_region_tokens            = options_.kv_ram_region_tokens;
-    engine_options.kv_ram_cache_blocks             = options_.kv_ram_cache_blocks;
+namespace {
 
-    engine_options.rope_yarn_factor           = options_.rope_yarn_factor;
-    engine_options.rope_original_max_position = options_.rope_original_max_position;
-    engine_options.enable_vision              = options_.enable_vision;
-    engine_options.vision_device              = options_.vision_device;
-    engine_options.max_vision_tokens          = options_.max_vision_tokens;
-    engine_options.use_cuda_graph             = options_.use_cuda_graph;
-    engine_options.tp_mailbox                 = options_.tp_mailbox;
-    engine_options.embedding_host             = options_.embedding_host;
-    engine_options.host_pinned_max_bytes      = options_.host_pinned_max_bytes;
-    engine_options.lossy_prefill              = options_.lossy_prefill;
-    engine_options.speculative                = options_.speculative;
-    engine_options.context_cache              = options_.context_cache;
-    engine_options.context_cost.preset_path   = options_.context_cost_presets;
-    engine_options.media_cache_bytes          = options_.media_cache_bytes;
-    engine_options.media_live_bytes           = options_.media_live_bytes;
-    engine_options.media_preprocess_threads   = options_.media_preprocess_threads;
-    engine_options.constraint_limits          = options_.constraint_limits;
-    engine_options.startup_observer           = std::move(startup_observer);
-    engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
-    turn_anchors_ =
-        resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().turn_anchors,
-                             static_cast<std::uint32_t>(options_.tp));
-    if (options_.reasoning_close_retry) {
-        reasoning_guard_tokens_ = engine_->reasoning_guard_tokens();
+ninfer::EngineOptions to_engine_options(const ServeOptions& options) {
+    ninfer::EngineOptions out;
+    out.artifact_path          = options.artifact_path;
+    out.chat_template_path     = options.chat_template_path;
+    out.device                 = options.device;
+    out.tp                     = options.tp;
+    out.devices                = options.devices;
+    out.max_context            = options.max_context;
+    out.kv_capacity            = options.kv_capacity;
+    out.max_concurrency        = options.max_concurrency;
+    out.max_pending_requests   = options.max_pending_requests;
+    out.pending_timeout_ms     = options.pending_timeout_ms;
+    out.decode_share           = options.decode_share;
+    out.prefill_chunk          = options.prefill_chunk;
+    out.kv_lease_window_tokens = options.kv_lease_window_tokens;
+    out.kv_cache               = options.kv_cache;
+    out.elastic_kv             = options.elastic_kv;
+    out.kv_ram_active          = options.kv_ram_active;
+    if (options.miss_split) {
+        out.routed_experts.miss_split.mode      = *options.miss_split;
+        out.routed_experts.miss_split.calibrate = options.miss_split_calibrate;
     }
-    // On by default: a model whose stop configuration the guard cannot handle (no or more than two
-    // terminal ids, no thinking opener) serves without it instead of not starting.
-    try {
-        engine_->configure_reasoning_eos_guard(options_.reasoning_eos_guard);
-    } catch (const std::invalid_argument& error) {
-        std::fprintf(stderr, "reasoning EOS guard off for this model: %s\n", error.what());
-        engine_->configure_reasoning_eos_guard(false);
+    if (options.expert_cpu_threads) {
+        out.routed_experts.cpu_threads      = *options.expert_cpu_threads;
+        out.routed_experts.gguf_cpu_threads = *options.expert_cpu_threads;
     }
+    if (options.stream_min_tokens) {
+        out.routed_experts.stream_min_tokens     = *options.stream_min_tokens;
+        out.routed_experts.stream_min_tokens_set = true;
+    }
+    out.routed_experts.cpus             = options.expert_cpus;
+    out.routed_experts.exclusive_layers = options.expert_exclusive_layers;
+    out.routed_experts.gguf_hybrid_cost = options.gguf_hybrid_cost;
+    out.kv_ram_region_tokens            = options.kv_ram_region_tokens;
+    out.kv_ram_cache_blocks             = options.kv_ram_cache_blocks;
+
+    out.rope_yarn_factor           = options.rope_yarn_factor;
+    out.rope_original_max_position = options.rope_original_max_position;
+    out.enable_vision              = options.enable_vision;
+    out.vision_device              = options.vision_device;
+    out.max_vision_tokens          = options.max_vision_tokens;
+    out.use_cuda_graph             = options.use_cuda_graph;
+    out.tp_mailbox                 = options.tp_mailbox;
+    out.embedding_host             = options.embedding_host;
+    out.host_pinned_max_bytes      = options.host_pinned_max_bytes;
+    out.lossy_prefill              = options.lossy_prefill;
+    out.speculative                = options.speculative;
+    out.context_cache              = options.context_cache;
+    out.context_cost.preset_path   = options.context_cost_presets;
+    out.media_cache_bytes          = options.media_cache_bytes;
+    out.media_live_bytes           = options.media_live_bytes;
+    out.media_preprocess_threads   = options.media_preprocess_threads;
+    out.constraint_limits          = options.constraint_limits;
+    return out;
+}
+
+} // namespace
+
+namespace {
+
+std::string format_seconds(double seconds) {
+    char text[32];
+    std::snprintf(text, sizeof text, "%.2f s", seconds);
+    return text;
+}
+
+} // namespace
+
+const char* engine_state_name(EngineState state) noexcept {
+    switch (state) {
+    case EngineState::Loaded:
+        return "loaded";
+    case EngineState::Unloading:
+        return "unloading";
+    case EngineState::Unloaded:
+        return "unloaded";
+    case EngineState::Loading:
+        return "loading";
+    }
+    return "unknown";
+}
+
+GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
+    : options_(std::move(options)), engine_input_(to_engine_options(options_)) {
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    // --load-min-free-mib auto: what the first Engine takes on each device, measured around its
+    // construction (the CUDA contexts exist before: the first query creates them).
+    const std::vector<std::size_t> free_before =
+        options_.load_min_free_auto ? free_device_memory() : std::vector<std::size_t>{};
+    build_engine(std::move(startup_observer));
+    engine_options_ = engine_->options();
+    if (options_.load_min_free_auto) {
+        const std::vector<std::size_t> free_after = free_device_memory();
+        for (std::size_t i = 0; i < free_before.size(); ++i) {
+            footprint_bytes_.push_back(
+                free_before[i] > free_after[i] ? free_before[i] - free_after[i] : 0);
+        }
+    }
     if (!options_.prefill_miss_dump_dir.empty()) {
-        const ninfer::Engine* engine = engine_.get();
-        prefill_miss_dump_           = std::make_shared<PrefillMissDump>(
+        prefill_miss_dump_ = std::make_shared<PrefillMissDump>(
             PrefillMissDumpOptions{.directory  = options_.prefill_miss_dump_dir,
-                                             .min_tokens = options_.prefill_miss_min_tokens,
-                                             .min_match  = options_.prefill_miss_min_match},
-            [engine](std::span<const ninfer::TokenId> tokens) {
-                return engine->detokenize_text(tokens);
+                                   .min_tokens = options_.prefill_miss_min_tokens,
+                                   .min_match  = options_.prefill_miss_min_match},
+            // The dump runs at the end of a request, which holds the Engine.
+            [this](std::span<const ninfer::TokenId> tokens) {
+                std::shared_lock lock(engine_mutex_);
+                return engine_ != nullptr ? engine_->detokenize_text(tokens) : std::string{};
             });
+    }
+    note_activity();
+    if (options_.idle_unload_seconds != 0) {
+        idle_thread_ = std::thread([this] { run_idle_unload(); });
+    }
+}
+
+GenerationService::~GenerationService() {
+    if (idle_thread_.joinable()) {
+        {
+            std::lock_guard lock(idle_mutex_);
+            idle_stopping_ = true;
+        }
+        idle_cv_.notify_one();
+        idle_thread_.join();
+    }
+}
+
+void GenerationService::build_engine(StartupObserver observer) {
+    ninfer::EngineOptions input = engine_input_;
+    input.startup_observer      = std::move(observer);
+    auto engine                 = std::make_unique<ninfer::Engine>(std::move(input));
+    const std::uint32_t anchors =
+        resolve_turn_anchors(options_.turn_anchors, engine->load_summary().turn_anchors,
+                             static_cast<std::uint32_t>(options_.tp));
+    ninfer::ReasoningGuardTokens guard_tokens;
+    if (options_.reasoning_close_retry) { guard_tokens = engine->reasoning_guard_tokens(); }
+    // On by default: a model whose stop configuration the guard cannot handle (no or more than two
+    // terminal ids, no thinking opener) serves without it instead of not starting. The guard's
+    // configuration is process-wide: every load sets it again.
+    try {
+        engine->configure_reasoning_eos_guard(options_.reasoning_eos_guard);
+    } catch (const std::invalid_argument& error) {
+        std::fprintf(stderr, "reasoning EOS guard off for this model: %s\n", error.what());
+        engine->configure_reasoning_eos_guard(false);
+    }
+    ninfer::LoadSummary load               = engine->load_summary();
+    ninfer::MemorySummary memory           = engine->memory_summary();
+    ninfer::MediaCacheSummary media        = engine->media_cache_summary();
+    ninfer::ModelSamplingDefaults sampling = engine->sampling_defaults();
+    std::unique_lock lock(engine_mutex_);
+    engine_                 = std::move(engine);
+    turn_anchors_           = anchors;
+    reasoning_guard_tokens_ = std::move(guard_tokens);
+    load_summary_           = std::move(load);
+    memory_summary_         = std::move(memory);
+    media_cache_summary_    = std::move(media);
+    sampling_defaults_      = std::move(sampling);
+    generation_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::vector<std::size_t> GenerationService::free_device_memory() const {
+    const std::vector<int> devices = engine_input_.devices.empty()
+                                         ? std::vector<int>{engine_input_.device}
+                                         : engine_input_.devices;
+    int previous                   = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = 0; }
+    std::vector<std::size_t> free_bytes;
+    for (const int device : devices) {
+        std::size_t free  = 0;
+        std::size_t total = 0;
+        if (cudaSetDevice(device) != cudaSuccess || cudaMemGetInfo(&free, &total) != cudaSuccess) {
+            (void)cudaSetDevice(previous);
+            throw std::runtime_error("cannot query the free memory of device " +
+                                     std::to_string(device));
+        }
+        free_bytes.push_back(free);
+    }
+    (void)cudaSetDevice(previous);
+    return free_bytes;
+}
+
+void GenerationService::note_activity() const noexcept { request_capacity_->touch(); }
+
+void GenerationService::log_transition(const std::string& line) const {
+    std::function<void(const std::string&)> log;
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        log = transition_log_;
+    }
+    if (log) { log(line); }
+}
+
+ninfer::LoadSummary GenerationService::load_summary() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ != nullptr ? engine_->load_summary() : load_summary_;
+}
+
+ninfer::MemorySummary GenerationService::memory_summary() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ != nullptr ? engine_->memory_summary() : memory_summary_;
+}
+
+ninfer::RuntimeStats GenerationService::runtime_stats() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ != nullptr ? engine_->runtime_stats() : ninfer::RuntimeStats{};
+}
+
+bool GenerationService::is_available() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ == nullptr || engine_->is_available();
+}
+
+void GenerationService::persist_context_cache() noexcept {
+    std::shared_lock lock(engine_mutex_);
+    if (engine_ != nullptr) { engine_->persist_context_cache(); }
+}
+
+ninfer::MediaCacheSummary GenerationService::media_cache_summary() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ != nullptr ? engine_->media_cache_summary() : media_cache_summary_;
+}
+
+ninfer::ModelSamplingDefaults GenerationService::sampling_defaults() const {
+    std::shared_lock lock(engine_mutex_);
+    return engine_ != nullptr ? engine_->sampling_defaults() : sampling_defaults_;
+}
+
+EngineTransition GenerationService::unload(std::string_view reason) {
+    const auto started = Clock::now();
+    {
+        std::unique_lock lock(lifecycle_mutex_);
+        lifecycle_cv_.wait(lock, [this] {
+            const EngineState state = state_.load(std::memory_order_acquire);
+            return state == EngineState::Loaded || state == EngineState::Unloaded;
+        });
+        if (state_.load(std::memory_order_acquire) == EngineState::Unloaded) {
+            return EngineTransition{.result = EngineTransition::Result::Already};
+        }
+        std::lock_guard capacity(request_capacity_->mutex);
+        const std::size_t holding = request_capacity_->active + request_capacity_->users;
+        if (holding != 0) {
+            return EngineTransition{.result = EngineTransition::Result::Busy,
+                                    .message =
+                                        std::to_string(holding) + " request(s) hold the Engine"};
+        }
+        // A request that arrives from here on reserves its lifetime and then waits in
+        // ensure_loaded() until the Engine is unloaded, and loads it again.
+        state_.store(EngineState::Unloading, std::memory_order_release);
+    }
+    log_transition("engine unloading | " + std::string(reason));
+    // The retained conversations go to the disk tier (bounded by --disk-cache-flush-seconds)
+    // while the Engine still serves the readers; then it is taken out and freed outside the lock.
+    engine_->persist_context_cache();
+    // The page-locked host weights stay for the next load unless --unload-release-host.
+    if (!options_.unload_release_host) { retained_host_ = engine_->release_host_weights(); }
+    std::unique_ptr<ninfer::Engine> released;
+    {
+        std::unique_lock lock(engine_mutex_);
+        released = std::move(engine_);
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    released.reset();
+    const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    log_transition("engine unloaded | " + format_seconds(seconds) + " | " + std::string(reason) +
+                   (retained_host_ != nullptr ? " | host weights kept page-locked" : ""));
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        state_.store(EngineState::Unloaded, std::memory_order_release);
+    }
+    lifecycle_cv_.notify_all();
+    return EngineTransition{.result = EngineTransition::Result::Done, .seconds = seconds};
+}
+
+EngineTransition GenerationService::load(std::string_view reason) {
+    const auto started = Clock::now();
+    // --load-wait-seconds: while another program still holds the GPUs, the load waits for their
+    // memory instead of answering InsufficientMemory at once.
+    const auto wait_until = started + std::chrono::seconds(options_.load_wait_seconds);
+    for (bool logged_wait = false;;) {
+        std::unique_lock lock(lifecycle_mutex_);
+        lifecycle_cv_.wait(lock, [this] {
+            const EngineState state = state_.load(std::memory_order_acquire);
+            return state == EngineState::Loaded || state == EngineState::Unloaded;
+        });
+        if (state_.load(std::memory_order_acquire) == EngineState::Loaded) {
+            return EngineTransition{.result = EngineTransition::Result::Already};
+        }
+        // Another program may still hold the GPUs: refuse instead of building a smaller Engine
+        // (KV capacity and expert slots are planned from the free memory) or failing in the
+        // middle of the load.
+        const std::string shortage = memory_shortage();
+        if (shortage.empty()) {
+            state_.store(EngineState::Loading, std::memory_order_release);
+            break;
+        }
+        if (Clock::now() >= wait_until) {
+            return EngineTransition{.result  = EngineTransition::Result::InsufficientMemory,
+                                    .message = shortage};
+        }
+        lock.unlock();
+        if (!logged_wait) {
+            log_transition("engine load waiting for device memory | " + shortage);
+            logged_wait = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    log_transition("engine loading | " + std::string(reason));
+    engine_input_.retained_host_weights = std::move(retained_host_);
+    try {
+        build_engine({});
+        engine_input_.retained_host_weights.reset();
+        warmup();
+    } catch (const std::exception& error) {
+        engine_input_.retained_host_weights.reset();
+        {
+            std::unique_lock lock(engine_mutex_);
+            engine_.reset();
+        }
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            state_.store(EngineState::Unloaded, std::memory_order_release);
+        }
+        lifecycle_cv_.notify_all();
+        log_transition("engine load failed | " + std::string(reason) + " | " + error.what());
+        return EngineTransition{.result  = EngineTransition::Result::Failed,
+                                .message = error.what()};
+    }
+    const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    log_transition("engine loaded | " + format_seconds(seconds) + " | " + std::string(reason));
+    note_activity();
+    {
+        std::lock_guard lock(lifecycle_mutex_);
+        state_.store(EngineState::Loaded, std::memory_order_release);
+    }
+    lifecycle_cv_.notify_all();
+    return EngineTransition{.result = EngineTransition::Result::Done, .seconds = seconds};
+}
+
+std::string GenerationService::memory_shortage() const {
+    if (!options_.load_min_free_mib && !options_.load_min_free_auto) { return {}; }
+    const std::vector<std::size_t> free = free_device_memory();
+    const std::vector<int> devices      = engine_input_.devices.empty()
+                                              ? std::vector<int>{engine_input_.device}
+                                              : engine_input_.devices;
+    for (std::size_t i = 0; i < free.size(); ++i) {
+        const std::size_t need = options_.load_min_free_mib    ? *options_.load_min_free_mib << 20
+                                 : i < footprint_bytes_.size() ? footprint_bytes_[i]
+                                                               : 0;
+        if (free[i] < need) {
+            return "device " + std::to_string(devices[i]) + " has " +
+                   std::to_string(free[i] >> 20) + " MiB free, the Engine needs " +
+                   std::to_string(need >> 20) + " MiB";
+        }
+    }
+    return {};
+}
+
+void GenerationService::ensure_loaded(std::string_view reason) const {
+    if (state_.load(std::memory_order_acquire) == EngineState::Loaded) { return; }
+    // A request (it holds a reservation, so no unload starts meanwhile) loads the Engine the way
+    // POST /load does. Loading is not const, the request path is: the service owns the Engine.
+    const EngineTransition loaded = const_cast<GenerationService*>(this)->load(reason);
+    if (loaded.result == EngineTransition::Result::Done ||
+        loaded.result == EngineTransition::Result::Already) {
+        return;
+    }
+    throw_request_error(
+        ninfer::RequestError(RequestErrorKind::Unavailable,
+                             "the model is unloaded and could not be loaded: " + loaded.message));
+}
+
+void GenerationService::run_idle_unload() {
+    const auto idle = std::chrono::seconds(options_.idle_unload_seconds);
+    for (;;) {
+        {
+            std::unique_lock lock(idle_mutex_);
+            if (idle_cv_.wait_for(lock, std::chrono::seconds(1),
+                                  [this] { return idle_stopping_; })) {
+                return;
+            }
+        }
+        if (state_.load(std::memory_order_acquire) != EngineState::Loaded) { continue; }
+        const auto last = Clock::time_point(
+            Clock::duration(request_capacity_->last_activity_ns.load(std::memory_order_relaxed)));
+        if (Clock::now() - last < idle) { continue; }
+        // Busy (a request just arrived) is fine: its end counts as activity.
+        (void)unload("idle " + std::to_string(options_.idle_unload_seconds) + " s");
+        note_activity();
     }
 }
 
@@ -447,6 +789,7 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
                                                      "inference request queue is full"));
         }
         ++request_capacity_->active;
+        request_capacity_->touch();
     }
     try {
         const Clock::time_point deadline =
@@ -494,6 +837,15 @@ PreparedRequest GenerationService::prepare_impl(
     prepared.reasoning_effort  = semantics.reasoning_effort;
     prepared.preserve_thinking = semantics.preserve_thinking;
     prepared.lifetime          = acquire_request_lifetime(deadline_policy);
+    if (deadline_policy == DeadlinePolicy::ClientPendingTimeout &&
+        engine_state() != EngineState::Loaded) {
+        // An unloaded Engine is loaded for this request; the load does not count against the
+        // request's pending timeout.
+        ensure_loaded("request");
+        prepared.lifetime->deadline =
+            std::max(prepared.lifetime->deadline,
+                     Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms));
+    }
 
     try {
         const auto acquisition_started = Clock::now();
@@ -573,6 +925,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& original,
     const GenerationRequest without_media =
         omit_media ? media_as_text(original) : GenerationRequest{};
     const GenerationRequest& request = omit_media ? without_media : original;
+    const EngineUse use(request_capacity_);
+    ensure_loaded("token count");
     const Clock::time_point deadline =
         Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);

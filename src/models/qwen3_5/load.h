@@ -30,6 +30,9 @@ public:
     // Page-locked bytes the Engine allocates after the weights within the same page-locked limit
     // (artifact::MaterializationPlan::host_pinned_reserved_bytes).
     void reserve_host_pinned_bytes(std::uint64_t bytes);
+    // Unload and load: the host-mapped bytes an earlier Engine of this process kept, adopted by
+    // the materialization when they match this plan (artifact/host_residency.h).
+    void retain_host_weights(std::shared_ptr<artifact::RetainedHostWeights> retained);
     [[nodiscard]] std::size_t parameter_count() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;

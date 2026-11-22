@@ -597,6 +597,7 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
+    std::uint64_t generation        = service_->engine_generation();
     ninfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     // The first sample only sets the energy baseline; NVML reads stay on this thread.
@@ -612,9 +613,17 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        ThroughputReport report            = make_throughput_report(
+        const std::uint64_t before   = service_->engine_generation();
+        ninfer::RuntimeStats current = service_->runtime_stats();
+        const std::uint64_t after    = service_->engine_generation();
+        if (before != generation || after != before) {
+            // The Engine was unloaded or loaded (--unload-endpoints): its counters restarted, so
+            // this interval starts a new baseline instead of a difference across two Engines.
+            generation = after;
+            previous   = current;
+        }
+        const Clock::time_point now = Clock::now();
+        ThroughputReport report     = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         // Sampled every interval, written or not, so energy always covers exactly one interval.
         if (gpu_telemetry_ != nullptr) { report.gpus = gpu_telemetry_->sample(); }
@@ -626,6 +635,7 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
+    if (service_->engine_generation() != generation) { return; } // no tail across two Engines
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     ThroughputReport tail              = make_throughput_report(
@@ -750,9 +760,53 @@ void HttpServer::register_routes() {
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
-        res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
-                        "application/json");
+        nlohmann::json body{{"status", available ? "ok" : "unavailable"}};
+        // --unload-endpoints / --idle-unload-seconds: an unloaded Engine is a healthy server; the
+        // state says whether the next request loads it first.
+        if (service_ != nullptr &&
+            (options_.unload_endpoints || options_.idle_unload_seconds != 0)) {
+            body["engine"] = engine_state_name(service_->engine_state());
+        }
+        res.set_content(body.dump(), "application/json");
     });
+    if (options_.unload_endpoints) {
+        const auto transition = [this](httplib::Response& res, const EngineTransition& done) {
+            nlohmann::json body{{"engine", engine_state_name(service_->engine_state())}};
+            switch (done.result) {
+            case EngineTransition::Result::Done:
+                res.status      = 200;
+                body["seconds"] = done.seconds;
+                break;
+            case EngineTransition::Result::Already:
+                res.status = 200;
+                break;
+            case EngineTransition::Result::Busy:
+            case EngineTransition::Result::InsufficientMemory:
+            case EngineTransition::Result::Failed: {
+                ApiError error;
+                error.status = done.result == EngineTransition::Result::Busy                 ? 409
+                               : done.result == EngineTransition::Result::InsufficientMemory ? 503
+                                                                                             : 500;
+                error.type = done.result == EngineTransition::Result::Busy ? "invalid_request_error"
+                                                                           : "server_error";
+                error.code = done.result == EngineTransition::Result::Busy ? "engine_busy"
+                             : done.result == EngineTransition::Result::InsufficientMemory
+                                 ? "insufficient_device_memory"
+                                 : "engine_load_failed";
+                error.message = done.message;
+                throw ApiException(std::move(error));
+            }
+            }
+            res.set_content(body.dump(), "application/json");
+        };
+        server_.Post("/unload",
+                     [this, transition](const httplib::Request&, httplib::Response& res) {
+                         transition(res, service_->unload("POST /unload"));
+                     });
+        server_.Post("/load", [this, transition](const httplib::Request&, httplib::Response& res) {
+            transition(res, service_->load("POST /load"));
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -851,6 +905,8 @@ void HttpServer::attach(GenerationService& service) {
         resolve_default_max_tokens(options_, service.engine_options().max_context);
     options_.default_max_tokens = request_limits_.default_max_tokens;
     service_                    = &service;
+    service.set_transition_log(
+        [this](const std::string& line) { operational_log_.engine_transition(line); });
     if (request_jsonl_.enabled() && options_.log_stats_interval_ms != 0) {
         const ninfer::EngineOptions& engine = service.engine_options();
         const std::vector<int> devices =

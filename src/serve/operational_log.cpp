@@ -668,4 +668,6 @@ void OperationalLog::engine_failure() const {
                       "supervisor can reload the model (exit status 2)");
 }
 
+void OperationalLog::engine_transition(std::string_view line) const { logger_->info("{}", line); }
+
 } // namespace ninfer::serve

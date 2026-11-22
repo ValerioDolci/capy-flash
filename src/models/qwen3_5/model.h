@@ -89,6 +89,11 @@ public:
     // Exclusive expert tier: the expert banks' start-up tails (artifact::HostTails), or null.
     [[nodiscard]] artifact::HostTails* host_tails() const noexcept { return backing_.host_tails(); }
 
+    // Unload: the host-mapped weights' bytes, to outlive this Model (MaterializedArtifact).
+    [[nodiscard]] std::shared_ptr<artifact::RetainedHostWeights> release_host_weights() {
+        return backing_.release_host_weights();
+    }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);

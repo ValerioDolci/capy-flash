@@ -9,13 +9,18 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <thread>
 #include <string_view>
 #include <vector>
 
@@ -139,35 +144,91 @@ struct PreparedRequest {
     std::shared_ptr<ReasoningRetryContext> reasoning_retry;
 };
 
+// --unload-endpoints / --idle-unload-seconds: the Engine can be torn down inside the running
+// server to free the GPUs for another program, and built again the way start-up builds it.
+//   Loaded    serving; the start-up state
+//   Unloading the retained conversations are written to the disk cache, then the Engine is freed
+//   Unloaded  no Engine: every device allocation and the Engine's page-locked host memory are
+//             released; the CUDA contexts stay (each process keeps its primary contexts)
+//   Loading   the Engine is being built; requests that arrived meanwhile wait for it
+enum class EngineState : std::uint8_t {
+    Loaded,
+    Unloading,
+    Unloaded,
+    Loading,
+};
+
+[[nodiscard]] const char* engine_state_name(EngineState state) noexcept;
+
+// The answer to an unload or load call.
+struct EngineTransition {
+    enum class Result : std::uint8_t {
+        Done,               // the Engine is now unloaded / loaded
+        Already,            // it already was
+        Busy,               // unload: a request holds the Engine (HTTP 409)
+        InsufficientMemory, // load: a device has less free memory than the Engine needs (503)
+        Failed,             // load: building the Engine threw; it stays unloaded (500)
+    };
+    Result result  = Result::Done;
+    double seconds = 0.0; // the transition's own time (0 when nothing was done)
+    std::string message;  // why, for Busy, InsufficientMemory and Failed
+};
+
 class GenerationService {
 public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    ~GenerationService();
+
+    GenerationService(const GenerationService&)            = delete;
+    GenerationService& operator=(const GenerationService&) = delete;
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
     [[nodiscard]] std::uint32_t turn_anchors() const noexcept { return turn_anchors_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
-    // value instead of reinterpreting optional defaults from ServeOptions.
-    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
+    // value instead of reinterpreting optional defaults from ServeOptions. The summaries below are
+    // the loaded Engine's, or while it is unloaded those of the last one loaded (every load uses
+    // the same options).
+    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_options_; }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] ninfer::LoadSummary load_summary() const;
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] ninfer::MemorySummary memory_summary() const;
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    // Counters restart with every Engine: engine_generation() changes at each unload and load, so
+    // a reader taking differences starts a new baseline. Zero while unloaded.
+    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const;
 
-    [[nodiscard]] bool is_available() const { return engine_->is_available(); }
-
-    // Disk tier of the context cache: writes the retained conversations at a clean shutdown.
-    void persist_context_cache() noexcept { engine_->persist_context_cache(); }
-
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
-        return engine_->media_cache_summary();
+    [[nodiscard]] std::uint64_t engine_generation() const noexcept {
+        return generation_.load(std::memory_order_acquire);
     }
 
-    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
-        return engine_->sampling_defaults();
+    // False only after an Engine-wide failure; an unloaded Engine is not a failure.
+    [[nodiscard]] bool is_available() const;
+
+    // Disk tier of the context cache: writes the retained conversations at a clean shutdown.
+    void persist_context_cache() noexcept;
+
+    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const;
+
+    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const;
+
+    [[nodiscard]] EngineState engine_state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
+
+    // Tear the Engine down (POST /unload, the idle timeout): refused with Busy while a request
+    // holds it, from submission until its response is released. `reason` goes to the log.
+    EngineTransition unload(std::string_view reason);
+    // Build it again (POST /load; a request to an unloaded Engine loads it first). With
+    // --load-min-free-mib, refused with InsufficientMemory when a device has less free memory.
+    EngineTransition load(std::string_view reason);
+
+    // Where the unload and load lines go (the server's operational log); stderr until set.
+    void set_transition_log(std::function<void(const std::string&)> log) {
+        std::lock_guard lock(lifecycle_mutex_);
+        transition_log_ = std::move(log);
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
@@ -208,8 +269,49 @@ private:
                                GenerationOutcome& outcome, const StreamSink* sink,
                                const ninfer::CancellationView& cancellation);
 
+    // The Engine for a request that holds a lifetime reservation (or an EngineUse): loads it when
+    // unloaded, waits while it is being unloaded or loaded. Throws an Unavailable request error
+    // when the load is refused or fails.
+    void ensure_loaded(std::string_view reason) const;
+    // Builds the Engine from engine_input_ and adopts it (turn anchors, guards, caches).
+    void build_engine(StartupObserver observer);
+    // Free memory of every device the Engine uses, in device order.
+    [[nodiscard]] std::vector<std::size_t> free_device_memory() const;
+    // --load-min-free-mib: why a device has too little free memory for a load; empty when every
+    // device has enough (or without the check).
+    [[nodiscard]] std::string memory_shortage() const;
+    void run_idle_unload();
+    void log_transition(const std::string& line) const;
+    void note_activity() const noexcept;
+
     ServeOptions options_;
+    // The options every load builds the Engine from (the observer only at start-up), and the
+    // normalized options of the first Engine.
+    ninfer::EngineOptions engine_input_;
+    ninfer::EngineOptions engine_options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    // The summaries of the last Engine loaded, for the readers while it is unloaded.
+    ninfer::LoadSummary load_summary_;
+    ninfer::MemorySummary memory_summary_;
+    ninfer::MediaCacheSummary media_cache_summary_;
+    ninfer::ModelSamplingDefaults sampling_defaults_;
+    // Lifecycle: state_ changes under lifecycle_mutex_; engine_ is replaced under an exclusive
+    // engine_mutex_ and read under a shared one by the readers that hold no request.
+    mutable std::mutex lifecycle_mutex_;
+    mutable std::condition_variable lifecycle_cv_;
+    std::atomic<EngineState> state_{EngineState::Loaded};
+    mutable std::shared_mutex engine_mutex_;
+    std::atomic<std::uint64_t> generation_{0};
+    // The device memory the first Engine took on each device (free before minus free after):
+    // --load-min-free-mib auto requires it free again.
+    std::vector<std::size_t> footprint_bytes_;
+    std::thread idle_thread_;
+    std::mutex idle_mutex_;
+    std::condition_variable idle_cv_;
+    bool idle_stopping_ = false;
+    std::function<void(const std::string&)> transition_log_;
+    // The host-mapped weights the last unload kept page-locked, for the next load.
+    std::shared_ptr<ninfer::artifact::RetainedHostWeights> retained_host_;
     ninfer::ReasoningGuardTokens reasoning_guard_tokens_; // filled when --reasoning-close-retry
     std::uint32_t turn_anchors_ = 0; // --turn-anchors or the model's default (resolve_turn_anchors)
     std::shared_ptr<RequestCapacity> request_capacity_;
