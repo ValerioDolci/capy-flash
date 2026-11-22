@@ -76,6 +76,10 @@ struct HostTails {
     }
 };
 
+// Unload and load inside one process: the host-mapped bytes an earlier Engine kept
+// (artifact/host_residency.h).
+struct RetainedHostWeights;
+
 struct MaterializationPlan {
     const Reader* source                = nullptr;
     std::size_t object_count            = 0;
@@ -102,6 +106,8 @@ struct MaterializationPlan {
     std::uint64_t host_pinned_reserved_bytes = 0;
     // Residency::HostFile objects, mapped read-only from their files (object order).
     std::vector<ObjectHandle> file_objects;
+    // The host-mapped bytes of an earlier Engine of this process, adopted when they match.
+    std::shared_ptr<RetainedHostWeights> retained_host;
 };
 
 struct MaterializationStats {
@@ -136,6 +142,8 @@ struct MaterializationStats {
     // failed first.
     std::uint64_t host_pinned_limit_bytes = 0;
     bool host_pinned_alloc_failed         = false;
+    // The host-mapped parents came from an earlier Engine (RetainedHostWeights): not read.
+    bool host_mapped_retained = false;
     // Bytes of the Residency::HostFile objects, mapped and never read at load.
     std::uint64_t mapped_file_bytes = 0;
 };
@@ -186,6 +194,11 @@ public:
     // experts releases them.
     [[nodiscard]] HostTails* host_tails() const noexcept { return host_tails_.get(); }
 
+    // Unload: hands the host-mapped parents' bytes out (RetainedHostWeights) so they outlive this
+    // artifact; null without any, or with the exclusive tier (it writes them). The parents keep
+    // pointing into them, so the caller frees the Engine using them right after.
+    [[nodiscard]] std::shared_ptr<RetainedHostWeights> release_host_weights();
+
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&,
                                             std::span<DeviceContext* const>,
@@ -210,6 +223,8 @@ private:
     // Pinned fallback: the HostMapped parents that did not fit the page-locked allocation.
     std::unique_ptr<PageableHostBuffer> host_pageable_;
     std::unique_ptr<HostTails> host_tails_;
+    // What release_host_weights() records with the bytes (no buffers in it until then).
+    std::shared_ptr<RetainedHostWeights> host_record_;
     std::vector<std::unique_ptr<FileMapping>> mappings_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;

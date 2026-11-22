@@ -136,12 +136,23 @@ PeerMailbox::PeerMailbox(const ExecutionContext& ec, std::size_t slot_bytes, int
             // capture that first launches it.
             cudaFuncAttributes attributes{};
             constexpr int kVecsPerLane = detail::kPeerPipelinedVecsPerLane;
+            constexpr int kWide        = detail::kPeerPrefetchRanges;
             throw_on_error(cudaFuncGetAttributes(
                                &attributes, detail::peer_exchange_pipelined_kernel<kVecsPerLane>),
                            "cudaFuncGetAttributes");
             throw_on_error(
+                cudaFuncGetAttributes(
+                    &attributes,
+                    detail::peer_exchange_pipelined_kernel<kVecsPerLane, detail::kPeerPollAcquire,
+                                                           false, kWide>),
+                "cudaFuncGetAttributes");
+            throw_on_error(
                 cudaFuncGetAttributes(&attributes,
                                       detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane>),
+                "cudaFuncGetAttributes");
+            throw_on_error(
+                cudaFuncGetAttributes(
+                    &attributes, detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane, kWide>),
                 "cudaFuncGetAttributes");
         }
     } catch (...) {
@@ -192,8 +203,14 @@ int PeerMailbox::take_capture_slot(std::size_t bytes) noexcept {
 }
 
 namespace {
-detail::PeerPipelinedTuning pipelined_tuning(bool release_dependents) {
-    detail::PeerPipelinedTuning tuning{};
+// A hint holds at most PeerMailbox::kL2PrefetchRanges ranges, which the wide launch argument must
+// carry; the narrow one is taken only for hints that fit it.
+static_assert(PeerMailbox::kL2PrefetchRanges <= detail::kPeerPrefetchRanges);
+static_assert(detail::kPeerPrefetchRangesNarrow < detail::kPeerPrefetchRanges);
+
+template <int R>
+detail::PeerPipelinedTuningT<R> pipelined_tuning(bool release_dependents) {
+    detail::PeerPipelinedTuningT<R> tuning{};
     tuning.release_dependents = release_dependents;
     return tuning;
 }
@@ -218,9 +235,9 @@ void PeerMailbox::set_l2_prefetch(int rank, std::span<const PeerL2Range> ranges)
 namespace {
 // Takes rank `rank`'s pending hint into `tuning` behind `blocks` exchange blocks; returns the
 // prefetching blocks to add to the grid.
-template <class Hint>
-int take_l2_hint(Hint& hint, int blocks, int threads, detail::PeerPipelinedTuning& tuning) {
-    detail::PeerL2Prefetch& prefetch = tuning.prefetch;
+template <class Hint, class Tuning>
+int take_l2_hint(Hint& hint, int blocks, int threads, Tuning& tuning) {
+    auto& prefetch = tuning.prefetch;
     for (int r = 0; r < hint.count; ++r) {
         prefetch.data[r]  = hint.ranges[r].data;
         prefetch.bytes[r] = static_cast<std::uint32_t>(hint.ranges[r].bytes);
@@ -258,13 +275,22 @@ void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size
     constexpr int kVecsPerLane = detail::kPeerPipelinedVecsPerLane;
     constexpr int kThreads     = detail::kPeerPipelinedThreads;
     const int blocks           = detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads);
-    auto tuning                = pipelined_tuning(release_dependents_);
-    const int prefetch_blocks  = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
-    detail::peer_exchange_pipelined_kernel<kVecsPerLane>
-        <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
-            partial, mine_payload, set.flags[rank] + flag_slot, peer_payload,
-            set.flags[1 - rank] + flag_slot, words + lane_base, hang_, static_cast<int>(vecs),
-            tuning);
+    const auto launch          = [&](auto tuning) {
+        constexpr int kRanges     = decltype(tuning.prefetch)::kRanges;
+        const int prefetch_blocks = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
+        detail::peer_exchange_pipelined_kernel<kVecsPerLane, detail::kPeerPollAcquire, false,
+                                                        kRanges>
+            <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
+                partial, mine_payload, set.flags[rank] + flag_slot, peer_payload,
+                set.flags[1 - rank] + flag_slot, words + lane_base, hang_, static_cast<int>(vecs),
+                tuning);
+    };
+    if (l2_hint_[rank].count > detail::kPeerPrefetchRangesNarrow) {
+        ++wide_prefetch_launches_;
+        launch(pipelined_tuning<detail::kPeerPrefetchRanges>(release_dependents_));
+    } else {
+        launch(pipelined_tuning<detail::kPeerPrefetchRangesNarrow>(release_dependents_));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -288,16 +314,24 @@ void PeerMailbox::enqueue_exchange_sum_f32(int rank, int slot, void* data, std::
     constexpr int kVecsPerLane  = detail::kPeerPipelinedVecsPerLane;
     constexpr int kThreads      = detail::kPeerPipelinedThreads;
     const int blocks            = detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads);
-    auto tuning                 = pipelined_tuning(release_dependents_);
-    const int prefetch_blocks   = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
-    detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane>
-        <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
-            static_cast<detail::PeerVec*>(data),
-            reinterpret_cast<detail::PeerVec*>(set.payload[rank] + offset),
-            set.flags[rank] + flag_slot,
-            reinterpret_cast<const detail::PeerVec*>(set.payload[1 - rank] + offset),
-            set.flags[1 - rank] + flag_slot, set.device_words[rank] + lane_base, hang_,
-            static_cast<int>(vecs), static_cast<__nv_bfloat16*>(bf16_out), tuning);
+    const auto launch           = [&](auto tuning) {
+        constexpr int kRanges     = decltype(tuning.prefetch)::kRanges;
+        const int prefetch_blocks = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
+        detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane, kRanges>
+            <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
+                static_cast<detail::PeerVec*>(data),
+                reinterpret_cast<detail::PeerVec*>(set.payload[rank] + offset),
+                set.flags[rank] + flag_slot,
+                reinterpret_cast<const detail::PeerVec*>(set.payload[1 - rank] + offset),
+                set.flags[1 - rank] + flag_slot, set.device_words[rank] + lane_base, hang_,
+                static_cast<int>(vecs), static_cast<__nv_bfloat16*>(bf16_out), tuning);
+    };
+    if (l2_hint_[rank].count > detail::kPeerPrefetchRangesNarrow) {
+        ++wide_prefetch_launches_;
+        launch(pipelined_tuning<detail::kPeerPrefetchRanges>(release_dependents_));
+    } else {
+        launch(pipelined_tuning<detail::kPeerPrefetchRangesNarrow>(release_dependents_));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

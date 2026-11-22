@@ -941,10 +941,10 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     // one or two. On a hybrid CPU a small core's slice item takes about three times a big core's,
     // and the phase waits for the slowest: the chunk-sized gate/up items keep the big cores busy
     // until it ends (HostMoeExecutor::Options::gguf_fine). With equal cores the slice items
-    // already spread evenly, and the finer items only add claims.
-    config.executor.gguf_fine =
-        partitions_ == 2 && ops::host::hybrid_members(config.cpus, ops::host::big_core_cpus());
-    config.gpu_stamps = tracing;
+    // already spread evenly, and the finer items only add claims. The mailbox decides on its final
+    // cpu list (after NINFER_HOST_MOE_CPUS).
+    config.gguf_fine_on_hybrid = partitions_ == 2;
+    config.gpu_stamps          = tracing;
     // One record per publish: the Text layers once per window, every later (MTP) layer once per
     // call (a prompt chunk and its drafts, or an alignment and the AR drafts of a round).
     config.trace_capacity =

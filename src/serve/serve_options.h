@@ -143,6 +143,24 @@ struct ServeOptions {
     std::uint32_t prefill_miss_min_tokens = 10000;
     double prefill_miss_min_match         = 0.5;
 
+    // Unload and load (opt-in; the Engine is torn down inside the server and built again the way
+    // start-up builds it, the HTTP server keeps its port):
+    //   --unload-endpoints        POST /unload and POST /load
+    //   --idle-unload-seconds N   unload after N seconds without a request (0 = never)
+    //   --load-min-free-mib N|auto  a load needs N MiB free on every device, or with auto the
+    //                             device memory the first Engine took there; else 503
+    bool unload_endpoints             = false;
+    std::uint32_t idle_unload_seconds = 0;
+    std::optional<std::uint64_t> load_min_free_mib; // set: explicit N
+    bool load_min_free_auto = false;
+    // --load-wait-seconds N (with --load-min-free-mib): a load short of device memory waits up to
+    // N seconds for it before answering 503.
+    std::uint32_t load_wait_seconds = 0;
+    // --unload-release-host: an unload also frees the page-locked expert banks (Flash-Next) and
+    // the --embedding-host table, for a machine where the other program needs that RAM; by
+    // default they stay page-locked and the next load reuses them without reading them again.
+    bool unload_release_host = false;
+
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;

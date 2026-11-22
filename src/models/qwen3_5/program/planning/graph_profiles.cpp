@@ -10,8 +10,8 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 // Resource tiers bound inactive attention work. They are not kernel/topology boundaries but for
 // the last one: on Qwen4Exp the tiers past kQsaSplitTopkMinKeys also launch the QSA split top-k,
-// so a round crossing it re-instantiates that graph executable once, and no shorter frontier
-// launches the split.
+// so they are marked (GraphExecutionProfile::split_topk) and a round crossing the boundary
+// re-instantiates that graph executable once; no shorter frontier launches the split.
 constexpr std::array<std::uint32_t, 8> kCausalVisibleTiers{
     128, 512, 2048, 4096, 8192, 16384, 32768, ops::kQsaSplitTopkMinKeys};
 
@@ -32,27 +32,36 @@ graph_profiles_through(std::uint32_t max_frontier,
 }
 
 std::vector<GraphExecutionProfile> causal_resource_profiles(std::uint32_t capacity,
-                                                            std::uint32_t visible_offset) {
+                                                            std::uint32_t visible_offset,
+                                                            bool qsa_split_topk) {
     std::vector<std::uint32_t> ends;
     for (const auto visible : kCausalVisibleTiers)
         if (visible >= visible_offset) ends.push_back(visible - visible_offset);
-    return graph_profiles_through(capacity - 1, ends);
+    auto profiles = graph_profiles_through(capacity - 1, ends);
+    for (GraphExecutionProfile& profile : profiles) {
+        profile.split_topk =
+            qsa_split_topk &&
+            static_cast<std::uint64_t>(profile.min) + visible_offset > ops::kQsaSplitTopkMinKeys;
+    }
+    return profiles;
 }
 
 } // namespace
 
-std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
+std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity,
+                                                           bool qsa_split_topk) {
     // E+1 is the one-token visible window; the tiers share one topology per exact B (but for the
     // QSA split top-k boundary above).
-    return causal_resource_profiles(capacity, 1);
+    return causal_resource_profiles(capacity, 1, qsa_split_topk);
 }
 
-std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
-                                                      std::uint32_t draft_window) {
+std::vector<GraphExecutionProfile>
+mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, bool qsa_split_topk) {
     if (draft_window == 0 || capacity == 0) { return {}; }
     // The final AR call can see E+2K. Target verify and MTP attention are update-compatible
-    // across all resource tiers, independently of the selected KV representation.
-    return causal_resource_profiles(capacity, 2 * draft_window);
+    // across the resource tiers, independently of the selected KV representation, but for the
+    // QSA split top-k boundary (causal_resource_profiles).
+    return causal_resource_profiles(capacity, 2 * draft_window, qsa_split_topk);
 }
 
 std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,

@@ -22,7 +22,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.16.0**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.16.1**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
@@ -463,6 +463,25 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.1)), six pull requests; same
+tokens except the prompts of the 64 GB Flash-Next edition
+- `POST /unload` and `POST /load` free the GPUs for another program and bring the model back without restarting the
+  server (`--unload-endpoints`, `--idle-unload-seconds`, `--load-min-free-mib`, all off by default;
+  [PR #116](https://github.com/ValerioDolci/capy-flash/pull/116) by @Mici81, [#95](https://github.com/ValerioDolci/capy-flash/issues/95)).
+  Flash-Next on 2 × RTX 5070 Ti: unload 0.7 s, load 5-6 s with the host weights kept, about 0.4 GB left per card;
+  the text after a reload is the same.
+- 64 GB Flash-Next edition: the grouped gate/up GEMM of the prompt accumulates in FP16: prompts +1.8 % at 54k and
+  +1.6 % at 114k tokens, perplexity +0.02 % (within noise); the greedy text of this edition changes
+  ([PR #100](https://github.com/ValerioDolci/capy-flash/pull/100) by @Mici81).
+- The 27B's exchanges launch with v0.14.1's four-range prefetch argument again: decode −0.11 % / −0.33 % ms per round
+  (NVFP4 / 3-bit), same tokens ([PR #112](https://github.com/ValerioDolci/capy-flash/pull/112) by @Mici81).
+- No more "CUDA Graph update rejected" line at every Flash-Next start, same tokens
+  ([PR #111](https://github.com/ValerioDolci/capy-flash/pull/111) by @Mici81); an explicit `NINFER_HOST_MOE_CPUS` list
+  now decides the GGUF gate/up work items ([PR #110](https://github.com/ValerioDolci/capy-flash/pull/110) by @Mici81).
+- Second step of the native Windows build ([#43](https://github.com/ValerioDolci/capy-flash/issues/43)): TMA descriptors
+  as kernel parameters under MSVC; Linux builds the same machine code
+  ([PR #114](https://github.com/ValerioDolci/capy-flash/pull/114) by @mirifiuto135-debug).
 
 **v0.16.0** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.0)), a third model; nothing
 changes for the Qwen models

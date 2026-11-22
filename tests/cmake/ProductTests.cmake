@@ -92,6 +92,14 @@ target_link_options(ninfer_serve_engine_failure_real_test PRIVATE
   "LINKER:--wrap=cudaStreamSynchronize")
 set_tests_properties(ninfer_serve_engine_failure_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Real artifact, two devices: --unload-endpoints tears the Engine down inside the server and builds
+# it again; /health states, device memory after every unload, greedy text after every load, load on
+# request, 409 while a request runs, the idle timeout.
+ninfer_add_test(ninfer_serve_unload_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_unload_real.cpp"
+  LIBRARIES ninfer_serve ninfer_product_logging CUDA::cudart CUDA::nvml)
+set_tests_properties(ninfer_serve_unload_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Real artifact, two devices: a captured exchange that times out while serving fails only its
 # request; the transport steps down and the server keeps serving with the same tokens, and a
 # step-down that fails fails the Engine without telling the request it keeps serving. Link-time

@@ -1,5 +1,5 @@
 #pragma once
-
+#include "ops/common/kernel_tensor_map.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -21,11 +21,11 @@
 
 namespace ninfer::ops::detail {
 
-struct alignas(128) Nvfp4A4TmaDescriptors {
-    CUtensorMap a_codes;
-    CUtensorMap b_codes;
-    CUtensorMap a_scales;
-    CUtensorMap b_scales;
+struct NINFER_KERNEL_PARAM_ALIGNAS(128) Nvfp4A4TmaDescriptors {
+    ::ninfer::ops::KernelTensorMap a_codes;
+    ::ninfer::ops::KernelTensorMap b_codes;
+    ::ninfer::ops::KernelTensorMap a_scales;
+    ::ninfer::ops::KernelTensorMap b_scales;
 };
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
@@ -393,9 +393,9 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     };
     if (!aligned(p.x) || !aligned(p.codes) || !aligned(p.scales) || !aligned(p.x_scales))
         throw std::invalid_argument("NVFP4 TMA operands require 16-byte alignment");
-    const auto descriptors = make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p);
-    constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
-    constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
+    const auto descriptors       = make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p);
+    constexpr int bytes          = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
+    static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));

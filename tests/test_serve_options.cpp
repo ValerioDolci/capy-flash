@@ -65,6 +65,40 @@ int main() {
         }
     }
 
+    // Unload and load: off unless given.
+    {
+        const ServeOptions off = parse({"ninfer-serve", "model.ninfer"});
+        failures +=
+            check(!off.unload_endpoints && off.idle_unload_seconds == 0 && !off.load_min_free_mib &&
+                      !off.load_min_free_auto && !off.unload_release_host,
+                  "unload and load are not off by default");
+        const ServeOptions on =
+            parse({"ninfer-serve", "model.ninfer", "--unload-endpoints", "--idle-unload-seconds",
+                   "600", "--load-min-free-mib", "12000", "--unload-release-host"});
+        failures += check(on.unload_endpoints && on.idle_unload_seconds == 600 &&
+                              on.load_min_free_mib == 12000 && !on.load_min_free_auto &&
+                              on.unload_release_host,
+                          "unload and load options were not parsed");
+        const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--load-min-free-mib",
+                                              "auto", "--load-wait-seconds", "120"});
+        failures += check(automatic.load_min_free_auto && !automatic.load_min_free_mib &&
+                              automatic.load_wait_seconds == 120,
+                          "--load-min-free-mib auto / --load-wait-seconds were not parsed");
+        bool wait_alone_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--load-wait-seconds", "30"});
+        } catch (const std::invalid_argument&) { wait_alone_rejected = true; }
+        failures += check(wait_alone_rejected,
+                          "--load-wait-seconds without --load-min-free-mib was accepted");
+        for (const char* value : {"-1", "lots", ""}) {
+            bool rejected = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--load-min-free-mib", value});
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "an invalid --load-min-free-mib was accepted");
+        }
+    }
+
     failures += check(parse({"ninfer-serve", "model.ninfer", "--host-pinned-max-gib", "0.5"})
                               .host_pinned_max_bytes == (1ULL << 29),
                       "fractional pinned limit was not converted to bytes");

@@ -295,6 +295,7 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
     // page-locked limit.
     plan.reserve_host_pinned_bytes(
         models::qwen3_5::active_kv_host_pinned_bytes(plan.config(), options));
+    plan.retain_host_weights(options.retained_host_weights);
     binding.complete();
     auto model = execution != nullptr
                      ? models::qwen3_5::materialize_model(std::move(plan), *execution,

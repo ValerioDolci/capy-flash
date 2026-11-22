@@ -1,5 +1,5 @@
 #pragma once
-
+#include "ops/common/kernel_tensor_map.h"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -12,9 +12,9 @@
 
 namespace ninfer::ops::detail {
 
-struct alignas(128) Bf16TmaDescriptors {
-    CUtensorMap weight;
-    CUtensorMap activation;
+struct NINFER_KERNEL_PARAM_ALIGNAS(128) Bf16TmaDescriptors {
+    ::ninfer::ops::KernelTensorMap weight;
+    ::ninfer::ops::KernelTensorMap activation;
 };
 
 inline CUtensorMap bf16_tma_map(const __nv_bfloat16* pointer, int rows, int k, int block_rows,

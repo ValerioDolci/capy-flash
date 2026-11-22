@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "core/device_scope.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "ninfer/ops/allreduce.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -525,8 +527,24 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+std::shared_ptr<artifact::RetainedHostWeights> Engine::release_host_weights() {
+    if (impl_ == nullptr || impl_->inkling2 || impl_->active == nullptr ||
+        impl_->active->model == nullptr) {
+        return nullptr;
+    }
+    return impl_->active->model->release_host_weights();
+}
+
 void Engine::persist_context_cache() noexcept {
     if (impl_ == nullptr) { return; }
+    // The save copies active KV from host records, which must be device-addressable pinned memory
+    // (cudaPointerGetAttributes): only true on a thread with a CUDA context current. A thread
+    // that never selected a device (the HTTP handler of POST /unload, the idle-unload thread)
+    // has none, and every save failed there.
+    std::optional<ScopedCurrentDevice> current;
+    try {
+        current.emplace(impl_->device.device);
+    } catch (...) { return; }
     std::visit(
         [](auto& core) {
             using CoreState = std::remove_cvref_t<decltype(core)>;

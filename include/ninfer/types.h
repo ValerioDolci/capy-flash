@@ -19,6 +19,12 @@
 
 namespace ninfer {
 
+namespace artifact {
+// Unload and load inside one process: the host-mapped weights an earlier Engine kept page-locked
+// (Engine::release_host_weights, EngineOptions::retained_host_weights). Opaque here.
+struct RetainedHostWeights;
+} // namespace artifact
+
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
@@ -443,6 +449,10 @@ struct EngineOptions {
     // results; slower where they are used. With kv_ram_active the Host KV planes count in the
     // limit: the weights keep the limit minus them page-locked.
     std::uint64_t host_pinned_max_bytes = 0;
+    // The host-mapped weights (expert banks, embedding_host) of an earlier Engine of this process
+    // (Engine::release_host_weights): adopted instead of allocated and read again when this load
+    // places exactly the same parents; otherwise freed and loaded as usual. Null = none.
+    std::shared_ptr<artifact::RetainedHostWeights> retained_host_weights;
     LossyPrefillOptions lossy_prefill;
     RoutedExpertOptions routed_experts;
     ElasticKvOptions elastic_kv;

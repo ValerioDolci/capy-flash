@@ -44,6 +44,10 @@ void LoadPlan::reserve_host_pinned_bytes(std::uint64_t bytes) {
     impl_->materialization.host_pinned_reserved_bytes = bytes;
 }
 
+void LoadPlan::retain_host_weights(std::shared_ptr<artifact::RetainedHostWeights> retained) {
+    impl_->materialization.retained_host = std::move(retained);
+}
+
 std::size_t LoadPlan::parameter_count() const { return impl_->pending.size(); }
 
 const artifact::ParameterReference& LoadPlan::parameter(WeightId id) const {

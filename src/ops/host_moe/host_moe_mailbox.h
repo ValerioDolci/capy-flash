@@ -130,6 +130,9 @@ struct HostMoeMailboxConfig {
     // `cpus` is the caller's explicit list (RoutedExpertOptions::cpus); otherwise
     // NINFER_HOST_MOE_CPUS, when set, replaces it.
     bool cpus_explicit = false;
+    // Sets executor.gguf_fine when the pool, once NINFER_HOST_MOE_CPUS is applied, holds both
+    // big and small cores of a hybrid CPU (tp 2: HostMoeExecutor::Options::gguf_fine).
+    bool gguf_fine_on_hybrid = false;
     HostMoeExecutor::Options executor;
     double idle_ms              = 200.0;
     std::int64_t trace_capacity = 0; // timing records kept (0 = no trace)
