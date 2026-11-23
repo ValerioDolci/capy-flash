@@ -1,4 +1,5 @@
-// Implements: include/ninfer/ops/tp2/argmax.h (argmax_split_pack, argmax_split_select)
+// Implements: include/ninfer/ops/tp2/argmax.h (argmax_split_pack, argmax_split_select,
+// logprob_split_pack, argmax_split_logprob)
 // Match: validated contiguous BF16 [R,T] logits with R <= kArgmaxSplitMaxRowsPerRank, I32 [T]
 // rows, BF16 [8,T] candidates.
 // Algorithm assumptions: one thread per column; a candidate is four base-256 digits, each an
@@ -13,6 +14,7 @@
 
 #include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -68,7 +70,66 @@ __global__ void argmax_split_select_kernel(const __nv_bfloat16* candidates,
     out[t] = value[1] > value[0] ? rows_per_rank + row[1] : row[0];
 }
 
+__global__ void logprob_split_pack_kernel(const float* local_logprob, std::int32_t columns,
+                                          int rank, __nv_bfloat16* packed) {
+    const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= columns) { return; }
+    const std::uint32_t bits = __float_as_uint(local_logprob[t]);
+    __nv_bfloat16* out       = packed + static_cast<std::int64_t>(t) * kArgmaxSplitCandidateRows;
+    const __nv_bfloat16 zero = __float2bfloat16_rn(0.0F);
+#pragma unroll
+    for (int i = 0; i < kArgmaxSplitCandidateRows; ++i) { out[i] = zero; }
+    out[4 * rank + 0] = digit(bits >> 24U);
+    out[4 * rank + 1] = digit(bits >> 16U);
+    out[4 * rank + 2] = digit(bits >> 8U);
+    out[4 * rank + 3] = digit(bits);
+}
+
+__global__ void argmax_split_logprob_kernel(const __nv_bfloat16* candidates,
+                                            const __nv_bfloat16* packed, std::int32_t columns,
+                                            float* out) {
+    const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= columns) { return; }
+    const __nv_bfloat16* c = candidates + static_cast<std::int64_t>(t) * kArgmaxSplitCandidateRows;
+    const __nv_bfloat16* p = packed + static_cast<std::int64_t>(t) * kArgmaxSplitCandidateRows;
+    float lse[2];
+    float best = -INFINITY;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const auto vbits          = static_cast<unsigned short>((digit_value(c[4 * r + 0]) << 8U) |
+                                                                digit_value(c[4 * r + 1]));
+        const float v             = __bfloat162float(__ushort_as_bfloat16(vbits));
+        const std::uint32_t pbits = (digit_value(p[4 * r + 0]) << 24U) |
+                                    (digit_value(p[4 * r + 1]) << 16U) |
+                                    (digit_value(p[4 * r + 2]) << 8U) | digit_value(p[4 * r + 3]);
+        lse[r] = v - __uint_as_float(pbits); // the block's log-normalizer
+        best   = fmaxf(best, v);
+    }
+    const float hi = fmaxf(lse[0], lse[1]);
+    out[t]         = best - (hi + logf(expf(lse[0] - hi) + expf(lse[1] - hi)));
+}
+
 } // namespace
+
+void logprob_split_pack_launch(const Tensor& local_logprob, int rank, Tensor& packed,
+                               cudaStream_t stream) {
+    const std::int32_t columns = local_logprob.ne[0];
+    logprob_split_pack_kernel<<<static_cast<unsigned int>(div_up(columns, kSplitBlock)),
+                                kSplitBlock, 0, stream>>>(
+        static_cast<const float*>(local_logprob.data), columns, rank,
+        static_cast<__nv_bfloat16*>(packed.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void argmax_split_logprob_launch(const Tensor& candidates, const Tensor& packed, Tensor& out,
+                                 cudaStream_t stream) {
+    const std::int32_t columns = candidates.ne[1];
+    argmax_split_logprob_kernel<<<static_cast<unsigned int>(div_up(columns, kSplitBlock)),
+                                  kSplitBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(candidates.data),
+        static_cast<const __nv_bfloat16*>(packed.data), columns, static_cast<float*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void argmax_split_pack_launch(const Tensor& logits, const Tensor& local, int rank,
                               Tensor& candidates, cudaStream_t stream) {

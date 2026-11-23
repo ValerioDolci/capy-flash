@@ -282,10 +282,12 @@ void ProgramImpl::prepare_graphs() {
             }
         }
         if (io.mtp_decode) {
-            *mtp_host_ingress          = {};
-            *mtp_host_egress           = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
-            const std::uint32_t width  = draft_window + 1U;
+            *mtp_host_ingress = {};
+            *mtp_host_egress  = {};
+            // The columns of the family being captured: the MTP window or a lookup window.
+            const std::uint32_t width =
+                representative_mtp_width != 0 ? representative_mtp_width : mtp_base_width;
+            const std::uint32_t extent = std::min(width - 1U, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
                 mtp_host_ingress->base_frontiers[row] =
@@ -295,8 +297,8 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->current_extents[row] = static_cast<std::int32_t>(extent);
                 mtp_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
-                for (std::uint32_t step = 0; step < draft_window; ++step) {
-                    mtp_host_ingress->current_drafts[row * draft_window + step] = 0;
+                for (std::uint32_t step = 0; step + 1U < width; ++step) {
+                    mtp_host_ingress->current_drafts[row * (width - 1U) + step] = 0;
                 }
                 for (std::uint32_t column = 0; column < width; ++column) {
                     mtp_host_ingress->target_rope_positions[row * width + column] =
@@ -411,48 +413,71 @@ void ProgramImpl::prepare_graphs() {
         }
 
         if (speculative_backend == SpeculativeBackend::Mtp) {
-            const auto planned_profiles =
-                mtp_graph_profiles(capacity, draft_window, qsa_split_topk);
-            validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
-            execution::MtpBatchContext mtp_state{
-                execution_core(),
-                decoder->text_kv,
-                *decoder->mtp_cache(),
-                *io.mtp_decode,
-                *mtp_host_ingress,
-                *mtp_host_egress,
-                state_images->continuation_hidden_store(),
-                peer ? &*peer->io.mtp_decode : nullptr,
-                peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-                validation && validation->mtp_calib()};
-            const GraphExecutionProfile code_warm = planned_profiles.front();
-            // As for ordinary rounds: every batch size is warmed eagerly on both devices at tp 2
-            // before any capture, since batch shape selects kernels.
-            const std::uint32_t warm_batches = tensor_parallel() ? max_concurrency : 1U;
-            for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
-                prepare_representative(code_warm.min, batch_size);
-                synchronize_all();
-                execution::mtp_decode_batch(
-                    mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_causal_attention_envelopes(code_warm.max, draft_window, capacity), nullptr);
-                synchronize_all();
-            }
+            // One family per verified width: the MTP's base window for every batch size and each
+            // window the draft policy may choose for one row (its rounds are solo).
+            const auto capture_mtp_family = [&](DecodeGraphFamily& family, std::uint32_t width,
+                                                std::uint32_t batch_limit, std::uint32_t drafts) {
+                representative_mtp_width    = width;
+                const auto planned_profiles =
+                    mtp_graph_profiles(capacity, width, drafts, qsa_split_topk);
+                validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+                execution::MtpBatchContext mtp_state{
+                    execution_core(), decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
+                    *mtp_host_ingress, *mtp_host_egress, state_images->continuation_hidden_store(),
+                    peer ? &*peer->io.mtp_decode : nullptr,
+                    peer ? &peer->state_images->continuation_hidden_store() : nullptr,
+                    // Each draft's log-probability: calibration, and the adaptive window's
+                    // policy.
+                    (validation && validation->mtp_calib()) || adaptive_enabled};
+                // The records at this width, on both ranks.
+                mtp_state.execution.replay_records = &*replay_records_at[width];
+                std::optional<execution::TpExecution> tp_width;
+                if (const execution::TpExecution* tp = tp_binding(); tp != nullptr) {
+                    tp_width.emplace(*tp);
+                    tp_width->replay_records = &*peer->replay_records_at[width];
+                    mtp_state.execution.tp   = &*tp_width;
+                }
+                const GraphExecutionProfile code_warm = planned_profiles.front();
+                // As for ordinary rounds: every batch size is warmed eagerly on both devices at
+                // tp 2 before any capture, since batch shape selects kernels.
+                const std::uint32_t warm_batches = tensor_parallel() ? batch_limit : 1U;
+                for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
+                    prepare_representative(code_warm.min, batch_size);
+                    synchronize_all();
+                    execution::mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), width, drafts,
+                        mtp_causal_attention_envelopes(code_warm.max, width, drafts, capacity),
+                        nullptr);
+                    synchronize_all();
+                }
 
-            mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    mtp_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
-                    profile.split_topk = planned.split_topk;
-                    execution::capture_mtp_decode_batch(
-                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                        mtp_causal_attention_envelopes(planned.max, draft_window, capacity),
-                        profile.definition);
+                family.profiles.reserve(planned_profiles.size() * batch_limit);
+                for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
+                    for (const GraphExecutionProfile planned : planned_profiles) {
+                        family.profiles.emplace_back();
+                        DecodeGraphProfile& profile    = family.profiles.back();
+                        profile.batch_size             = batch_size;
+                        profile.min_execution_frontier = planned.min;
+                        profile.max_execution_frontier = planned.max;
+                        profile.topology_class =
+                            planned.topology_class * max_concurrency + (batch_size - 1U);
+                        profile.split_topk = planned.split_topk;
+                        execution::capture_mtp_decode_batch(
+                            mtp_state, static_cast<std::int32_t>(batch_size), width, drafts,
+                            mtp_causal_attention_envelopes(planned.max, width, drafts, capacity),
+                            profile.definition);
+                    }
+                }
+                representative_mtp_width = 0;
+            };
+            capture_mtp_family(mtp_graphs, mtp_base_width, max_concurrency, mtp_low_drafts);
+            for (std::uint32_t w = 2; w <= qwen3_5::kMtpDecodeMaximumWidth; ++w) {
+                if (((lookup_widths >> w) & 1U) != 0) {
+                    capture_mtp_family(mtp_wide_graphs[w], w, 1U, mtp_drafts);
+                }
+                // Adaptive window: the base drafts at the windows below the base one.
+                if (adaptive_enabled && w < mtp_base_width && mtp_low_drafts < mtp_drafts) {
+                    capture_mtp_family(mtp_low_graphs[w], w, 1U, mtp_low_drafts);
                 }
             }
         }
@@ -516,6 +541,21 @@ void ProgramImpl::prepare_graphs() {
         if (speculative_backend == SpeculativeBackend::Mtp) {
             instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative,
                                      synchronize_graphs);
+            for (std::uint32_t w = 2; w <= qwen3_5::kMtpDecodeMaximumWidth; ++w) {
+                if (((lookup_widths >> w) & 1U) == 0) { continue; }
+                // The representative lays out this family's columns.
+                representative_mtp_width = w;
+                instantiate_graph_family(mtp_wide_graphs[w], "MTP window", device,
+                                         prepare_representative, synchronize_graphs);
+                representative_mtp_width = 0;
+            }
+            for (std::uint32_t w = 2; w < mtp_base_width; ++w) {
+                if (!adaptive_enabled || mtp_low_drafts >= mtp_drafts) { break; }
+                representative_mtp_width = w;
+                instantiate_graph_family(mtp_low_graphs[w], "MTP narrow window", device,
+                                         prepare_representative, synchronize_graphs);
+                representative_mtp_width = 0;
+            }
         }
         if (speculative_backend == SpeculativeBackend::DFlash2) {
             instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative,

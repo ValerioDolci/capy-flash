@@ -66,6 +66,24 @@ TensorParallelProposalRoots tp_proposal_argmax(Allocator& allocator, std::int32_
     return out;
 }
 
+// The log-probability of that split argmax (the adaptive draft window reads it): this rank's
+// log-probability of its own candidate, and the packed values with their all-reduce staging
+// (ops::logprob_split_pack).
+struct TensorParallelProposalLogprobRoots {
+    Tensor local;
+    Tensor packed;
+    Tensor staging;
+};
+
+template <class Allocator>
+TensorParallelProposalLogprobRoots tp_proposal_logprob(Allocator& allocator, std::int32_t columns) {
+    TensorParallelProposalLogprobRoots out;
+    out.local   = vector(allocator, DType::FP32, columns);
+    out.packed  = matrix(allocator, DType::BF16, ops::kArgmaxSplitCandidateRows, columns);
+    out.staging = matrix(allocator, DType::BF16, ops::kArgmaxSplitCandidateRows, columns);
+    return out;
+}
+
 // The vocabulary-split DFlash2 candidate ranking over `columns` final drafter hidden columns on one
 // rank (execution::dflash2_candidates_split): with `broadcast`, the hidden rank 1 receives from
 // rank 0 and the all-reduce staging it arrives through (rank 1's `hidden` is its copy, rank 0's is

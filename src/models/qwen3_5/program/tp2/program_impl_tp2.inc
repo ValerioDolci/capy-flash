@@ -24,8 +24,7 @@ namespace {
 // batch of `max_concurrency` requests, so the batched rounds stay on the mailbox instead of the
 // staged copies inside the same graph: without P2P the mailbox beats the staged copies at these
 // widths (tools/tp2/mailbox_probe.cu). Returns the wide slot's bytes, 0 for none.
-std::size_t tp2_mailbox_wide_slot_bytes(std::size_t request_bytes,
-                                        std::uint32_t max_concurrency) {
+std::size_t tp2_mailbox_wide_slot_bytes(std::size_t request_bytes, std::uint32_t max_concurrency) {
     return max_concurrency > 1 ? request_bytes * max_concurrency : 0;
 }
 
@@ -60,7 +59,8 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     : device(peer_device),
       elastic_arena(make_elastic_arena(plan, layout(plan), peer_device.device)),
       persistent(layout(plan).bytes, ZeroFill::Yes),
-      workspace_storage(plan.workspace.rank_capacity(1, plan.inputs.features.vision_rank), ZeroFill::Yes),
+      workspace_storage(plan.workspace.rank_capacity(1, plan.inputs.features.vision_rank),
+                        ZeroFill::Yes),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}) {
     const PersistentLayout& own = layout(plan);
     const DeviceSpan backing    = persistent.alloc_bytes(own.bytes, 256);
@@ -71,6 +71,14 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     if (own.replay_records) {
         replay_records.emplace(backing, *own.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+        if (plan.inputs.speculative_backend == SpeculativeBackend::Mtp) {
+            for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
+                const auto i = static_cast<std::size_t>(w);
+                replay_records_at[i].emplace(replay_records->narrowed(w));
+                replay_fold_at[i].emplace(*replay_records_at[i],
+                                          state_images->linear().all_layers_view());
+            }
+        }
     }
     io             = qwen3_5::RoundState(backing, own.round);
     prefill_hidden = own.prefill_hidden.bind(backing);
@@ -198,9 +206,10 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             const char* host_exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
             const char* peer_overlap_env  = std::getenv("NINFER_TP_PEER_OVERLAP");
             const bool peer_access        = ops::enable_peer_access(*execution_context);
-            const Tp2EagerTransport eager = tp2_eager_transport(
-                peer_access, plan.inputs.elastic_kv.enabled, host_exchange_env ? host_exchange_env : "",
-                peer_overlap_env ? peer_overlap_env : "");
+            const Tp2EagerTransport eager =
+                tp2_eager_transport(peer_access, plan.inputs.elastic_kv.enabled,
+                                    host_exchange_env ? host_exchange_env : "",
+                                    peer_overlap_env ? peer_overlap_env : "");
             if (eager.host_exchange) {
                 host_exchange.emplace(*execution_context);
                 peer_events->attach_host_exchange(&*host_exchange);
@@ -518,8 +527,10 @@ void ProgramImpl::synchronize_devices() const {
 bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
     if (!peer_mailbox || !tp_execution) { return false; }
     // The executables bake in the hung mailbox's slab and words: they go first.
-    ordinary_graphs                   = {};
-    mtp_graphs                        = {};
+    ordinary_graphs = {};
+    mtp_graphs      = {};
+    for (DecodeGraphFamily& family : mtp_wide_graphs) { family = {}; }
+    for (DecodeGraphFamily& family : mtp_low_graphs) { family = {}; }
     dflash_graphs                     = {};
     const std::size_t slot_bytes      = peer_mailbox->slot_bytes();
     const std::size_t wide_slot_bytes = peer_mailbox->wide_slot_bytes();

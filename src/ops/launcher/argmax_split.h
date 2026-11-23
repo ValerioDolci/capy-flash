@@ -17,4 +17,10 @@ void argmax_split_pack_launch(const Tensor& logits, const Tensor& local, int ran
 void argmax_split_select_launch(const Tensor& candidates, std::int32_t rows_per_rank, Tensor& out,
                                 cudaStream_t stream);
 
+void logprob_split_pack_launch(const Tensor& local_logprob, int rank, Tensor& packed,
+                               cudaStream_t stream);
+
+void argmax_split_logprob_launch(const Tensor& candidates, const Tensor& packed, Tensor& out,
+                                 cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

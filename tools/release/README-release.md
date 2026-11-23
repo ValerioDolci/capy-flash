@@ -46,7 +46,7 @@ sha256sum -c SHA256SUMS
 ./serve-flash-next.sh /path/to/vision-artifact.ninfer --vision                    # Flash-Next with images (opt-in)
 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.ninfer --host-kv-mib 1024 --host-state-slots 2   # 64 GB edition
 NINFER_DEVICES=0 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.ninfer                           # 64 GB edition, one GPU
-./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4.ninfer                           # Qwen3.8-27B
+./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4_dflash2.ninfer                   # Qwen3.8-27B
 ./serve-27b-16gb.sh /path/to/qwen3_8_27b_gsq3.ninfer                              # Qwen3.8-27B 3-bit, one GPU
 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer       # Inkling 2 Mini, two GPUs
 NINFER_DRAFTER=0 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                 # without its drafter

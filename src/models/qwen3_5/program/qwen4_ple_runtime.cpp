@@ -88,18 +88,22 @@ void Qwen4PleRuntime::prefetch_next_round(const ProgramImpl& program,
         }
         return;
     }
-    const std::uint32_t draft_window    = program.draft_window;
+    // The next round as an MTP round (a prompt-lookup round reads its own rows): its drafts and
+    // columns; the licensed tokens are laid out at the width of the round that just ran.
+    const std::uint32_t draft_window    = program.mtp_drafts;
     const std::uint32_t max_concurrency = program.max_concurrency;
     const auto* mtp_host_egress         = program.mtp_host_egress;
     const std::uint32_t width           = draft_window + 1U;
+    const std::uint32_t round_width =
+        program.mtp_round_width != 0 ? program.mtp_round_width : width;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const SequenceState& sequence = program.active_sequence(lanes[row]);
         const std::int32_t count      = mtp_host_egress->licensed_counts[row];
-        if (count <= 0 || static_cast<std::uint32_t>(count) > width) { continue; }
+        if (count <= 0 || static_cast<std::uint32_t>(count) > round_width) { continue; }
         // After the commit the ledger is the current one + the licensed tokens; the next round
         // reads the `context` tokens before its anchor (the last licensed token), the anchor,
         // then the drafts (padding columns repeat the anchor), as stage_rows does.
-        const TokenId* licensed  = mtp_host_egress->licensed_tokens.data() + row * width;
+        const TokenId* licensed  = mtp_host_egress->licensed_tokens.data() + row * round_width;
         const std::size_t ledger = sequence.ledger.size();
         const std::size_t total =
             ledger + static_cast<std::size_t>(count) - 1U; // before the anchor
@@ -227,8 +231,13 @@ void Qwen4PleRuntime::fold_rank(ProgramImpl& program, std::span<const ops::GdnRe
     // The transfer reads the pageable array before returning, so it may go out of scope.
     CUDA_CHECK(cudaMemcpyAsync(control.data, host.data(), control.bytes(), cudaMemcpyHostToDevice,
                                stream));
-    const Tensor& record   = runtime->ple_record;
-    const Tensor inputs    = record.slice(2, 0, count);
+    const Tensor& record = runtime->ple_record;
+    // The round wrote a dense [rows, width, count] prefix at the width it verified.
+    const std::int32_t width =
+        program.speculative_backend == SpeculativeBackend::Mtp && program.mtp_round_width != 0
+            ? static_cast<std::int32_t>(program.mtp_round_width)
+            : record.ne[1];
+    const Tensor inputs    = Tensor(record.data, record.dtype, {record.ne[0], width, count});
     Tensor states          = runtime->ple_states;
     const Tensor sources   = control.slice(1, 0, 1).view({count});
     const Tensor targets   = control.slice(1, 1, 1).view({count});

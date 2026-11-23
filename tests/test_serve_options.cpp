@@ -318,6 +318,26 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    // --prompt-lookup: off unless given, MTP only.
+    const ServeOptions lookup_off =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});
+    const ServeOptions lookup_on = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                          "--draft-tokens", "3", "--prompt-lookup"});
+    failures +=
+        check(!lookup_off.speculative.prompt_lookup && lookup_on.speculative.prompt_lookup &&
+                  lookup_on.speculative.draft_tokens == 3,
+              "--prompt-lookup was not parsed");
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--prompt-lookup"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                   "--draft-tokens", "4", "--lm-head-draft", "--prompt-lookup"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--prompt-lookup without --spec mtp was accepted");
+    }
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",
@@ -793,6 +813,39 @@ int main() {
     failures += check(profile_27b.context_cache.host_state_slots == 8 &&
                           profile_27b.context_cache.host_kv_capacity_bytes == (8192ULL << 20),
                       "--profile 27b did not turn the Host tier on");
+    // --profile 27b: MTP unless the artifact carries a DFlash2 drafter ("model.ninfer" does not
+    // exist, so it has none); with one, DFlash2 with 7 drafts and the optimized proposal head.
+    failures += check(profile_27b.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          profile_27b.speculative.draft_tokens == 3,
+                      "--profile 27b without a DFlash2 drafter does not decode with MTP");
+    {
+        std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+        for (const std::string_view flag : ninfer::serve::serve_profile_flags("27b", true)) {
+            args.emplace_back(flag);
+        }
+        const ServeOptions dflash2 = parse(args);
+        failures +=
+            check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                      dflash2.speculative.draft_tokens == 7 &&
+                      dflash2.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                      dflash2.context_cache.host_state_slots == 8 && dflash2.prefill_chunk == 2048,
+                  "--profile 27b with a DFlash2 drafter is not DFlash2 K=7 with the "
+                  "optimized head and the rest of the profile");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb"})
+                              .speculative.prompt_lookup,
+                          "--profile 27b-16gb does not turn prompt lookup on");
+        failures += check(
+            !parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb", "--spec", "dflash2",
+                    "--draft-tokens", "7"})
+                    .speculative.prompt_lookup &&
+                parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb", "--spec", "mtp"})
+                    .speculative.prompt_lookup,
+            "--profile 27b-16gb: another --spec does not drop prompt lookup, or "
+            "--spec mtp drops it");
+        failures += check(ninfer::serve::serve_profile_flags("flash-next", true) ==
+                              ninfer::serve::serve_profile_flags("flash-next", false),
+                          "a profile without a DFlash2 configuration changed with a drafter");
+    }
     failures += check(defaults.kv_lease_window_tokens == 4096 &&
                           parse({"ninfer-serve", "model.ninfer", "--kv-lease-window", "0"})
                                   .kv_lease_window_tokens == 0,

@@ -13,7 +13,7 @@ models:
     name: "Qwen3.8-27B (capy-flash)"
     cmd: |
       /home/me/capy-flash/current/serve-tp2.sh
-      /home/me/capy-flash/models/27b/qwen3_8_27b_quasar_nvfp4.ninfer
+      /home/me/capy-flash/models/27b/qwen3_8_27b_quasar_nvfp4_dflash2.ninfer
       --port ${PORT} --model-id capy-27b
     checkEndpoint: /health
     ttl: 1800

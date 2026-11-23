@@ -22,7 +22,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.16.1**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.16.2**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
@@ -32,7 +32,7 @@ users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines
 | what you want to run | GPUs (RTX 50 series, sm_120) | RAM | download / free disk | `install.sh` |
 |---|---|---|---|---|
 | Qwen3.8-27B, 3-bit | **one** with 16 GB of VRAM (the minimum) | nothing special | 12.5 GB / 15 GB | `--model 27b-16gb` |
-| Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | 17.4 GB / 20 GB | `--model 27b` |
+| Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | 19.2 GB / 22 GB | `--model 27b` |
 | Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | 108.9 GB / 118 GB | `--model flash-next-64gb` |
 | Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | 126.6 GB / 135 GB | (default) |
 | Inkling 2 Mini, NVFP4 + MXFP8 (the checkpoint's own) | **two** with 16 GB | nothing special | 19.7 GB / 23 GB | `--model inkling2-mini` |
@@ -239,8 +239,8 @@ order. `ninfer-serve --help` and [docs/serving/capy-flash.md](docs/serving/capy-
 | `flash-next` | Flash-Next on two GPUs (the launcher's default) | `--tp 2`, INT8 KV, elastic KV / expert slots, 262,144 tokens, MTP 3, 4 GiB of idle KV and 8 conversation states in RAM, embedding in RAM |
 | `flash-next-multi` | Flash-Next on two GPUs for 2-3 clients at once (agents) | `flash-next` with 3 requests at a time, the KV in RAM (`--kv-ram-active`) for 786,432 tokens in all, MTP 1 |
 | `flash-next-1gpu` | the 64 GB edition on one GPU (`NINFER_DEVICES=0`) | the same on one device, 1 GiB of idle KV and 8 states in RAM |
-| `27b` | Qwen3.8-27B NVFP4 on two GPUs | `--tp 2`, INT8 KV, 196,608 tokens, MTP 3, Vision, 8 GiB of context cache in RAM |
-| `27b-16gb` | Qwen3.8-27B 3-bit on one GPU | INT8 KV, 65,536 tokens, MTP 3, Vision, embedding in RAM (13.9 GB of VRAM) |
+| `27b` | Qwen3.8-27B NVFP4 on two GPUs | `--tp 2`, INT8 KV, 196,608 tokens, DFlash2 7 (MTP 3 with an artifact without the DFlash2 drafter), Vision, 8 GiB of context cache in RAM |
+| `27b-16gb` | Qwen3.8-27B 3-bit on one GPU | INT8 KV, 65,536 tokens, MTP 3 with prompt lookup, Vision, embedding in RAM (13.9 GB of VRAM) |
 
 For the 64 GB edition on two GPUs add `--host-kv-mib 1024 --host-state-slots 2` to `--profile flash-next` (smaller RAM
 caches); `install.sh --model flash-next-64gb` prints that command.
@@ -287,7 +287,8 @@ Ready to serve on Hugging Face (`install.sh --model` downloads one of these; eac
 - [`Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash) (12.5 GB,
   ISTA-DASLab's 3-bit GSQ 27B plus the official MTP layer; recipe `qwen3_8_27b_gsq3`).
 - [`Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer`](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer)
-  (17.4 GB, the 27B for two GPUs; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
+  (19.2 GB, the 27B for two GPUs with the DFlash2 drafter, `qwen3_8_27b_quasar_nvfp4_dflash2.ninfer`; the earlier 17.4 GB file
+  without it stays there and decodes with MTP; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
 - [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash)
   (19.7 GB, Inkling 2 Mini with its drafter, for two GPUs): the released weights of
   [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache-2.0)
@@ -348,6 +349,9 @@ prompt, 512 tokens).
 | Qwen3.8-27B 3-bit | 2 | v0.7.0 | prefill 4k / 16k / 64k | 5,787 / 5,567 / 4,304 tok/s |
 | Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7emi03oirf01vyxuhulr) | 288 tok/s |
 | Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.6.0 | prefill 4k / 16k / 64k, `--profile 27b` | 9,343 / 9,234 / 6,287 tok/s |
+| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | decode, `--profile 27b` (DFlash2 7): conversation / JSON / code edit / Italian essay / quoting from 30K | 277 / 415 / 520 / 140 / 385 tok/s |
+| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | agentic replay decode (53 turns, up to 81K tokens), `--profile 27b` | 234 tok/s (MTP 3: 205) |
+| Qwen3.8-27B 3-bit | 1 | v0.16.2, 2026-11-23 | decode, `--profile 27b-16gb` (prompt lookup): conversation / JSON / code edit / Italian essay / quoting | 145 / 212 / 318 / 106 / 304 tok/s |
 | Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode without the drafter, 68-token / 12.8k-token prompt | 127.5 / 112.8 tok/s |
 | Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode with `--spec mtp --draft-tokens 3` (the launcher's default), temperature 0: 68-token / 12.8k-token prompt / a coding task | 149.0 / 166.6 / 193.9 tok/s |
 | Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | the same with the model's default sampling (one seed): 68-token prompt / an essay / a coding task | 146.1 / 129.6 / 173.9 tok/s (124.7 / 124.4 / 124.9 without the drafter) |
@@ -463,6 +467,18 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.2)): the 27B decodes with
+DFlash2 by default, prompt lookup on the one-GPU 27B
+- `--profile 27b` (`serve-tp2.sh`) decodes with DFlash2 (7 drafts) when the artifact carries the DFlash2 drafter: the new
+  file `qwen3_8_27b_quasar_nvfp4_dflash2.ninfer` (19.2 GB, the one `install.sh --model 27b` downloads; same weights plus
+  the drafter). On 2 × RTX 5070 Ti against v0.16.1 (MTP 3), same weights: conversation +53 %, JSON +67 %, a code edit
+  returned whole +98 %, quoting from 30K tokens +54 %, a 53-turn agent replay +14 %; an Italian essay −7 %. The 17.4 GB
+  file without the drafter keeps MTP.
+- Prompt lookup and an adaptive MTP draft window in one draft policy, `--prompt-lookup` and `--adaptive-draft N`, off by
+  default ([PR #113](https://github.com/ValerioDolci/capy-flash/pull/113) by @Mici81). `--profile 27b-16gb` turns prompt
+  lookup on: code edit +59 %, quoting +60 %, JSON +10 %, conversation, prose and the agent replay unchanged (one RTX 5070 Ti).
+  On Flash-Next both are slower on the agent replay (adaptive window −4 %), so its profiles keep them off.
 
 **v0.16.1** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.1)), six pull requests; same
 tokens except the prompts of the 64 GB Flash-Next edition

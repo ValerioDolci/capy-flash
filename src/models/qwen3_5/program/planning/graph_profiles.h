@@ -9,6 +9,11 @@ namespace ninfer::models::qwen3_5::detail {
                                                                          bool qsa_split_topk);
 [[nodiscard]] std::vector<GraphExecutionProfile>
 mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, bool qsa_split_topk);
+// An MTP-backend round that verifies `width` columns and drafts `drafts` (prompt lookup).
+[[nodiscard]] std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
+                                                                    std::uint32_t width,
+                                                                    std::uint32_t drafts,
+                                                                    bool qsa_split_topk);
 // The DFlash2 round's profiles.
 [[nodiscard]] std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                                        std::uint32_t draft_window);

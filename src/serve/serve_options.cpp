@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "artifact/reader.h"
 #include "core/byte_size.h"
 #include "product/engine_options.h"
 #include "product/speculative_options.h"
@@ -87,6 +88,9 @@ namespace {
 struct ServeProfile {
     std::string_view name;
     std::vector<std::string_view> flags;
+    // With a DFlash2 drafter in the artifact (a `dflash2` component) and no `--spec` on the
+    // command line: these replace the profile's `--spec` and `--draft-tokens` values.
+    std::vector<std::string_view> dflash2 = {};
 };
 
 // One flag or value per line; clang-format would pack the shorter lists into columns.
@@ -168,7 +172,14 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--host-kv-mib",
           "8192",
           "--prefill-chunk",
-          "2048"}},
+          "2048"},
+         // DFlash2 decodes the 27B faster than MTP on code, structured output and conversation;
+         // at tp 2 it needs the optimized proposal head.
+         {"--spec",
+          "dflash2",
+          "--draft-tokens",
+          "7",
+          "--lm-head-draft"}},
         // Qwen3.8-Flash-Next on ONE 16 GB GPU (GSQ-RCO 64 GB edition, 57 GiB of RAM): the
         // flash-next configuration at one device with small RAM caches. 8 Host StateImages
         // (+0.66 GiB pinned): at one device only 1 Device StateImage fits, and with 2 Host ones
@@ -195,7 +206,8 @@ const std::vector<ServeProfile>& serve_profiles() {
           "8"}},
         // Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
         // (docs/serving/capy-flash.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9
-        // GiB).
+        // GiB). Prompt lookup: text copied from the prompt (code edits, quotes) decodes faster, the rest
+        // as fast.
         {"27b-16gb",
          {"--device",
           "0",
@@ -216,6 +228,7 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--draft-tokens",
           "3",
           "--lm-head-draft",
+          "--prompt-lookup",
           "--embedding-host",
           "--vision",
           "--vision-device",
@@ -244,12 +257,39 @@ const ServeProfile& find_profile(std::string_view name) {
 }
 
 std::string profile_text(std::string_view name) {
+    const ServeProfile& profile = find_profile(name);
     std::string text;
-    for (const std::string_view flag : find_profile(name).flags) {
+    for (const std::string_view flag : profile.flags) {
         if (!text.empty()) { text += ' '; }
         text += flag;
     }
+    if (!profile.dflash2.empty()) {
+        text += "; with a DFlash2 drafter in the artifact:";
+        for (const std::string_view flag : profile.dflash2) {
+            text += ' ';
+            text += flag;
+        }
+    }
     return text;
+}
+
+bool artifact_has_dflash2(const char* path) {
+    if (path == nullptr) { return false; }
+    try {
+        return artifact::Reader(path).directory().components.count("dflash2") != 0;
+    } catch (const std::exception&) {
+        return false; // loading the artifact reports its own error
+    }
+}
+
+// The command line's own `--spec` value (the last one), if it names one.
+std::optional<std::string_view> explicit_spec(int argc, char** argv) {
+    std::optional<std::string_view> spec;
+    for (int i = 2; i < argc; ++i) {
+        if (argv[i] == nullptr || std::string_view(argv[i]) != "--spec") { continue; }
+        spec = i + 1 < argc && argv[i + 1] != nullptr ? std::string_view(argv[i + 1]) : "";
+    }
+    return spec;
 }
 
 // argv with every `--profile NAME` replaced by the profile's flags, placed right after the
@@ -260,7 +300,14 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
         const std::string arg = argv[i] == nullptr ? "" : argv[i];
         if (i >= 2 && arg == "--profile") {
             if (++i >= argc) { throw std::invalid_argument("--profile needs a value"); }
-            for (const std::string_view flag : find_profile(argv[i]).flags) {
+            const ServeProfile& profile                = find_profile(argv[i]);
+            const std::optional<std::string_view> spec = explicit_spec(argc, argv);
+            for (const std::string_view flag :
+                 serve_profile_flags(profile.name, !profile.dflash2.empty() && !spec &&
+                                                       artifact_has_dflash2(argv[1]))) {
+                // Prompt lookup is an MTP option: a command line that picks another backend drops
+                // it.
+                if (flag == "--prompt-lookup" && spec && *spec != "mtp") { continue; }
                 head.emplace_back(flag);
             }
         } else {
@@ -274,6 +321,21 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 }
 
 } // namespace
+
+std::vector<std::string_view> serve_profile_flags(std::string_view name, bool dflash2_drafter) {
+    const ServeProfile& profile = find_profile(name);
+    if (!dflash2_drafter || profile.dflash2.empty()) { return profile.flags; }
+    std::vector<std::string_view> flags;
+    for (std::size_t i = 0; i < profile.flags.size(); ++i) {
+        if (profile.flags[i] == "--spec" || profile.flags[i] == "--draft-tokens") {
+            ++i;
+            continue;
+        }
+        flags.push_back(profile.flags[i]);
+    }
+    flags.insert(flags.end(), profile.dflash2.begin(), profile.dflash2.end());
+    return flags;
+}
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
@@ -319,7 +381,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--q8-a8 32|128] [--attn-pv-f16acc] [--tp-ar-payload fp16|int8] "
            "[--reasoning-close-retry|--no-reasoning-close-retry] "
            "[--reasoning-eos-guard|--no-reasoning-eos-guard] "
-           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--chat-template FILE] [--lm-head-draft] [--prompt-lookup] [--adaptive-draft N] "
+           "[--no-thinking] "
+           "[--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] "
@@ -586,6 +650,13 @@ std::string serve_usage_text(const char* argv0) {
            "    Draft tokens per speculative step: 1..5 with mtp, 1..15 with dflash2.\n"
            "  --lm-head-draft\n"
            "    Propose with the artifact's optimized proposal head.\n"
+           "  --prompt-lookup\n"
+           "    With --spec mtp: verify windows copied from an earlier repeat of the text\n"
+           "    (prompt lookup) when they pay; changes rounding, not the method.\n"
+           "  --adaptive-draft <N>\n"
+           "    With --spec mtp: the MTP drafts N (1..7) tokens and a one-request round\n"
+           "    verifies the window its drafts' probabilities and the measured round\n"
+           "    costs favour; changes rounding, not the method.\n"
            "\n"
            "Prefill and response store:\n"
            "  --prefill-chunk <N>\n"
@@ -1247,6 +1318,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.reasoning_eos_guard = true;
         } else if (arg == "--no-reasoning-eos-guard") {
             options.reasoning_eos_guard = false;
+        } else if (arg == "--prompt-lookup") {
+            options.speculative.prompt_lookup = true;
+        } else if (arg == "--adaptive-draft") {
+            options.speculative.adaptive_drafts = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--adaptive-draft"), "adaptive-draft"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--chat-template") {

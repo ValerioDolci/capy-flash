@@ -119,4 +119,29 @@ void argmax_split_select(const Tensor& candidates, std::int32_t rows_per_rank, T
     detail::argmax_split_select_launch(candidates, rows_per_rank, out, stream);
 }
 
+void logprob_split_pack(const Tensor& local_logprob, int rank, Tensor& packed,
+                        cudaStream_t stream) {
+    constexpr const char* op = "logprob_split_pack";
+    const std::int32_t cols  = local_logprob.ne[0];
+    if (cols <= 0) { throw std::invalid_argument("logprob_split_pack: T must be positive"); }
+    if (rank != 0 && rank != 1) {
+        throw std::invalid_argument("logprob_split_pack: rank must be 0 or 1");
+    }
+    require_split_vector(local_logprob, DType::FP32, cols, 1, op, "local_logprob");
+    require_split_vector(packed, DType::BF16, kArgmaxSplitCandidateRows, cols, op, "packed");
+    detail::logprob_split_pack_launch(local_logprob, rank, packed, stream);
+}
+
+void argmax_split_logprob(const Tensor& candidates, const Tensor& packed, Tensor& out,
+                          cudaStream_t stream) {
+    constexpr const char* op = "argmax_split_logprob";
+    const std::int32_t cols  = candidates.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("argmax_split_logprob: T must be positive"); }
+    require_split_vector(candidates, DType::BF16, kArgmaxSplitCandidateRows, cols, op,
+                         "candidates");
+    require_split_vector(packed, DType::BF16, kArgmaxSplitCandidateRows, cols, op, "packed");
+    require_split_vector(out, DType::FP32, cols, 1, op, "out");
+    detail::argmax_split_logprob_launch(candidates, packed, out, stream);
+}
+
 } // namespace ninfer::ops

@@ -8,10 +8,13 @@ checkpoint is not handled: `import_encoded` would fail on it.
 `configure` is the recipe of the published artifact. `configure_mtp_nvfp4` (select it with
 `--recipe quasar_recipe.py:configure_mtp_nvfp4`) is the same plus the MTP layer's MLP gate/up, MLP down
 and attention output as NVFP4 quantized from QUASAR's BF16 MTP weights (`_mtp_nvfp4_layer`); every other
-object is byte-identical to `configure`'s."""
+object is byte-identical to `configure`'s. `configure_dflash2` (`--recipe quasar_recipe.py:configure_dflash2`,
+with `--components text,vision,mtp,dflash2` and `--source dflash2=<Qwen3.8-27B-DFlash2>`) is `configure` plus the
+DFlash2 drafter, its MLP gate/up as NVFP4 (`_dflash2_nvfp4_gate_up`) and the rest of it Q8: the recipe of
+`qwen3_8_27b_quasar_nvfp4_dflash2.ninfer`."""
 
 from tools.convert.methods import fp8_row_maxabs, import_encoded
-from tools.convert.official_recipes import FP8, _mtp_nvfp4_layer, _optional
+from tools.convert.official_recipes import FP8, _dflash2_nvfp4_gate_up, _mtp_nvfp4_layer, _optional
 
 REPORT = {"nvfp4": [], "fp8_from_bf16": [], "as_is": []}
 
@@ -59,3 +62,8 @@ def configure(model, recipe, sources):
 def configure_mtp_nvfp4(model, recipe, sources):
     configure(model, recipe, sources)
     _mtp_nvfp4_layer(model, recipe)
+
+
+def configure_dflash2(model, recipe, sources):
+    configure(model, recipe, sources)
+    _dflash2_nvfp4_gate_up(model, recipe)

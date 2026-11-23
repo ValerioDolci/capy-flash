@@ -57,11 +57,18 @@ std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacit
 
 std::vector<GraphExecutionProfile>
 mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, bool qsa_split_topk) {
-    if (draft_window == 0 || capacity == 0) { return {}; }
-    // The final AR call can see E+2K. Target verify and MTP attention are update-compatible
-    // across the resource tiers, independently of the selected KV representation, but for the
-    // QSA split top-k boundary (causal_resource_profiles).
-    return causal_resource_profiles(capacity, 2 * draft_window, qsa_split_topk);
+    if (draft_window == 0) { return {}; }
+    return mtp_graph_profiles(capacity, draft_window + 1U, draft_window, qsa_split_topk);
+}
+
+std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity, std::uint32_t width,
+                                                      std::uint32_t drafts, bool qsa_split_topk) {
+    if (width < 2 || drafts == 0 || capacity == 0) { return {}; }
+    // The final AR call can see E + (width - 1) + drafts (2K for an MTP round of K drafts). Target
+    // verify and MTP attention are update-compatible across the resource tiers, independently of
+    // the selected KV representation, but for the QSA split top-k boundary
+    // (causal_resource_profiles).
+    return causal_resource_profiles(capacity, (width - 1U) + drafts, qsa_split_topk);
 }
 
 std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,

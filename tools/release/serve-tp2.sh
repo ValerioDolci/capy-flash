@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B two-GPU launcher for the release tarball: serve-tp2.sh <artifact.ninfer> [ninfer-serve flags...]
 # (Qwen3.8-Flash-Next: serve-flash-next.sh.) The ninfer-tp2 production profile, `ninfer-serve --profile 27b` (two 16 GB sm_120 boards, no P2P): INT8 KV, 196,608-token
-# context, MTP with 3 draft tokens, Vision on device 0. Environment overrides:
+# context, DFlash2 with 7 draft tokens when the artifact carries the DFlash2 drafter (MTP with 3 otherwise), Vision on device 0.
+# Environment overrides:
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1)  NINFER_MAX_CONTEXT (196608)
 #   NINFER_MODEL_ID (qwen3.8-27b: the `model` name requests must use)
 #   NINFER_VISION=0 turns Vision off (--no-vision; artifacts without a vision component).

@@ -188,7 +188,7 @@ inline constexpr int kPeerPipelinedThreads = 64;
 // prefetch cannot change a result bit -- only which weight lines the next GEMM finds in L2.
 // The widest hint (the hyper-connection block's: a Q8 weight takes two ranges) and the plain
 // block's widest. A hint of up to kPeerPrefetchRangesNarrow ranges launches the exchange with the
-// narrow argument, so the plain block (all of the 27B) keeps v0.14.1's launch.
+// narrow argument, so the plain block (all of the 27B) launches with the four-range argument.
 inline constexpr int kPeerPrefetchRanges          = 8;
 inline constexpr int kPeerPrefetchRangesNarrow    = 4;
 inline constexpr std::uint32_t kPeerPrefetchChunk = 4096u;

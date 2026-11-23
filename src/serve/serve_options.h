@@ -167,6 +167,9 @@ struct ServeOptions {
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);
+// The flags `--profile NAME` inserts. `dflash2_drafter`: the artifact carries a DFlash2 drafter
+// and the command line names no `--spec`, so a profile with a DFlash2 configuration (27b) uses it.
+std::vector<std::string_view> serve_profile_flags(std::string_view name, bool dflash2_drafter);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 // The output limit of a request that sets none: --default-max-tokens when given, otherwise the

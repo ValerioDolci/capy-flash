@@ -14,11 +14,25 @@ tags:
   - rtx-5070-ti
 ---
 
-# Qwen3.8-27B QUASAR-QAT NVFP4 on two 16 GB GPUs — NInfer artifact (`qwen3_8_27b_quasar_nvfp4.ninfer`)
+# Qwen3.8-27B QUASAR-QAT NVFP4 on two 16 GB GPUs — NInfer artifacts (`qwen3_8_27b_quasar_nvfp4_dflash2.ninfer`, `qwen3_8_27b_quasar_nvfp4.ninfer`)
 
 > **Runs Qwen3.8-27B on two 16 GB GPUs.** Verified on 2× RTX 5070 Ti (PCIe, no P2P) with tensor
 > parallelism (`--tp 2`) in [capy-flash](https://github.com/ValerioDolci/capy-flash) (formerly ninfer-tp2): 196,608-token context
 > with Vision and MTP at 13,083 / 12,743 MiB per board; 262,144 tokens also fit.
+
+Two files, the same weights:
+- **`qwen3_8_27b_quasar_nvfp4_dflash2.ninfer`** (19.2 GB): text, vision, MTP and the
+  [DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2). With it, `--profile 27b` (`serve-tp2.sh`) decodes with
+  DFlash2 (7 drafts, optimized proposal head); 196,608 tokens with Vision at 13,957 / 13,915 MiB per board. This is the file
+  `install.sh --model 27b` downloads.
+- **`qwen3_8_27b_quasar_nvfp4.ninfer`** (17.4 GB): text, vision and MTP; `--profile 27b` decodes with MTP (3 drafts).
+
+Decode with `--profile 27b` on 2× RTX 5070 Ti (one request, greedy, thinking off, the same weights, three runs each; tok/s):
+
+| | conversation | JSON (200 objects) | code edit (206-line file returned) | Italian essay | quoting 3 functions from 30K tokens | 53-turn agent replay (up to 81K tokens) |
+|---|---|---|---|---|---|---|
+| MTP 3 (file without the drafter) | 181 | 249 | 263 | 150 | 250 | 205.0 |
+| DFlash2 7 (file with the drafter) | 277 | 415 | 520 | 140 | 385 | 234.3 |
 
 An all-NVFP4 `.ninfer` v3 artifact of Qwen3.8-27B built from the
 [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
@@ -32,7 +46,8 @@ context with Vision and 8 device state slots.
   no requantization), `lm_head` and embedding FP8 rows (the official method), GDN `a`/`b` projections
   decoded from QUASAR's NVFP4 to BF16 (the runtime wants them unquantized), norms as stored. Vision tower
   and MTP head are read from the BF16 copies inside the QUASAR checkpoint and quantized with the official
-  `_optional` choices (Q4-Q8). Components: text, vision, MTP (the DFlash2 drafter is not included).
+  `_optional` choices (Q4-Q8). Components: text, vision, MTP; the `_dflash2` file adds the DFlash2 drafter (its MLP
+  gate/up NVFP4 from the BF16 drafter, the rest Q8 with the official `_optional` choices).
 - **Source revision:** `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` at `15d2e47b`.
 - **Size:** 17.4 GB on disk. At `--tp 2` with 196,608 tokens, Vision and MTP: 13,083 / 12,743 MiB per board
   (official NVFP4 artifact: 15,035 / 14,695).
@@ -43,18 +58,19 @@ context with Vision and 8 device state slots.
 |---|---|---|
 | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | base model (architecture; the checkpoint below carries its vision and MTP weights) | Apache-2.0 |
 | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | all weights: NVFP4 projections (QAT) plus BF16 vision, MTP, head | Apache-2.0 |
+| [incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) ([z-lab/dflash](https://github.com/z-lab/dflash)) | DFlash2 drafter (the `_dflash2` file only) | Apache-2.0 |
 | [Neroued/ninfer](https://github.com/Neroued/ninfer) | converter, single-GPU runtime | Apache-2.0 |
 | [ValerioDolci/capy-flash](https://github.com/ValerioDolci/capy-flash) (formerly ninfer-tp2) | two-GPU runtime this artifact was verified with | Apache-2.0 |
 
-This artifact is redistributed under Apache-2.0. All credit for the quantization goes to the QUASAR-QAT
-authors; this card only documents the conversion and the measurements below.
+These artifacts are redistributed under Apache-2.0. All credit for the quantization goes to the QUASAR-QAT
+authors and for the drafter to the DFlash2 authors; this card only documents the conversion and the measurements.
 
 **Prior art.** A QUASAR-QAT NInfer artifact was published first by
 [MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)
 (2026-08-26, with the DFlash2 drafter, MTP and Vision, built with upstream's converter from the BF16 base
 plus the QUASAR checkpoint). This one was built independently from the QUASAR checkpoint alone
-(`import_encoded`, no BF16 copy), leaves the DFlash2 drafter out so that 196,608 tokens with Vision fit two
-16 GB boards with MTP3, and is the artifact the two-GPU measurements above were taken with.
+(`import_encoded`, no BF16 copy); its first file leaves the DFlash2 drafter out, the `_dflash2` file carries it and
+still fits 196,608 tokens with Vision on two 16 GB boards.
 
 ## Conversion
 
@@ -75,6 +91,11 @@ python3 -m tools.convert \
 ```
 
 With `--device cpu` the conversion takes about two minutes (0.75 GB RAM); the default is `cuda`.
+
+The `_dflash2` file: the same command with `--recipe model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/quasar_recipe.py:configure_dflash2`,
+`--source dflash2=/path/to/Qwen3.8-27B-DFlash2`, `--components text,vision,mtp,dflash2` and
+`--out qwen3_8_27b_quasar_nvfp4_dflash2.ninfer` (about eight minutes on the CPU, 18 GB of RAM). Every object of the first file
+has the same recipe in it.
 
 ### Variant: MTP layer in NVFP4 (not on the Hub)
 

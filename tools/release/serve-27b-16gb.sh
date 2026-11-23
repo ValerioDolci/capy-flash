@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B one-GPU launcher for the release tarball: serve-27b-16gb.sh <artifact.ninfer> [ninfer-serve flags...]
 # For the 3-bit GSQ artifact (Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash) on ONE 16 GB sm_120 board:
-# `ninfer-serve --profile 27b-16gb` = INT8 KV, 65,536-token context, MTP with 3 draft tokens, Vision,
+# `ninfer-serve --profile 27b-16gb` = INT8 KV, 65,536-token context, MTP with 3 draft tokens and prompt lookup, Vision,
 # embedding in host RAM (13.9 GB of VRAM in use). Environment overrides:
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICE (0)  NINFER_MAX_CONTEXT (65536)
 #   NINFER_MODEL_ID (qwen3.8-27b: the `model` name requests must use)

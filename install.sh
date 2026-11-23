@@ -6,7 +6,7 @@
 #
 #   --dir DIR          where the release and the model go (default ~/capy-flash)
 #   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-#                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
+#                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 19.2 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
 #                      or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
 #   --version vX.Y.Z   release tag (default: the latest release)
 #   --check            only check the machine, download nothing
@@ -19,7 +19,7 @@ usage() {
 usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb|inkling2-mini] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
   --dir DIR          where the release and the model go (default ~/capy-flash)
   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
-                     108.9 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
+                     108.9 GB), 27b (Qwen3.8-27B, two GPUs, 19.2 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
                      or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
   --version vX.Y.Z   release tag (default: the latest release)
   --check            only check the machine, download nothing
@@ -73,10 +73,11 @@ case $model in
     need_ram_gib=8 need_disk_gb=15 need_simd=0 need_gpus=1 ;;
   27b)
     hf_repo=Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer
-    artifact=qwen3_8_27b_quasar_nvfp4.ninfer
+    # The artifact holds the DFlash2 drafter: --profile 27b decodes with DFlash2.
+    artifact=qwen3_8_27b_quasar_nvfp4_dflash2.ninfer
     launcher=serve-tp2.sh
     model_id=qwen3.8-27b
-    need_ram_gib=8 need_disk_gb=20 need_simd=0 need_gpus=2 ;;
+    need_ram_gib=8 need_disk_gb=22 need_simd=0 need_gpus=2 ;;
   inkling2-mini)
     # The artifact holds the text model and the DSpark drafter: the released weights, not requantized.
     hf_repo=Feyd89/Inkling-2-Mini-NVFP4-capy-flash

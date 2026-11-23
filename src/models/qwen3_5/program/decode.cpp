@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -582,7 +584,6 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
     require_round_membership(lanes, budgets, max_concurrency, "MTP batch");
 
-    const std::uint32_t width      = draft_window + 1;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         require_round_lane(lanes, row, max_concurrency, "MTP batch");
@@ -601,6 +602,134 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // The round's verified columns: the MTP's base window (mtp_base_width), or a window the draft
+    // policy prefers for a one-row round: with --adaptive-draft, the MTP's own drafts cut where
+    // their stated probabilities stop paying; with --prompt-lookup, a window copied from
+    // an earlier repeat of the row's own text (Strata's suffix drafter). The MTP still drafts
+    // mtp_drafts for the next round.
+    const std::uint32_t mtp_width = mtp_base_width;
+    std::uint32_t width           = mtp_width;
+    std::array<TokenId, kMtpDecodeMaximumDrafts> looked_up{};
+    std::uint32_t looked_up_count = 0;
+    int lookup_match              = 0;
+    bool lookup_round             = false;
+    // The stated probabilities of the row's drafts (adaptive window), when all are known.
+    std::array<float, kMtpDecodeMaximumDrafts> chance{};
+    bool chances = false;
+    // The rounds the policy learns from: one unconstrained row, no validation hooks.
+    const bool policy_on    = lookup_enabled || adaptive_enabled;
+    const bool policy_round = policy_on && lanes.size() == 1 && !validation && !row_constrained(0);
+    const auto round_start  = std::chrono::steady_clock::now();
+    if (policy_on && lookup_observation.pending) {
+        // The previous one-row round's outcome. When this round is the same lane's next one, the
+        // time between their starts covers that round's commit too (its replay fold runs at this
+        // round's start); otherwise, or after a gap (another request's prompt), its launch to
+        // completion.
+        LookupObservation& o = lookup_observation;
+        const double between =
+            std::chrono::duration<double, std::milli>(round_start - o.started).count();
+        const double alone = o.round_seconds * 1000.0;
+        const bool next    = lanes.size() == 1 && lanes[0] == o.lane && between <= 3.0 * alone;
+        const double ms    = next ? between : alone;
+        // Adaptive window: a round that kept every draft it verified (base ones at least), each
+        // stated at 0.9 or more, lets the next round draft more. A round whose drafts were kept
+        // at lower chances (conversation) rarely widens past the base window, and drafting more
+        // for it costs MTP steps the window does not verify.
+        bool sure = true;
+        for (int i = 0; o.chances && i + 1 < o.t; ++i) { sure = sure && o.chance[i] >= 0.9F; }
+        adaptive_draft_more = adaptive_enabled && o.accepted == o.t - 1 &&
+                              o.t - 1 >= static_cast<int>(mtp_low_drafts) && sure;
+        if (o.chances) {
+            lookup_policy->observe_window(o.chance.data(), o.t, o.accepted, ms);
+        } else {
+            lookup_policy->observe(o.lookup, o.t, o.accepted, o.match, ms);
+        }
+        o.pending = false;
+    }
+    if (policy_round) {
+        const std::uint32_t lane      = lanes[0];
+        const SequenceState& sequence = active_sequence(lane);
+        // The drafts' stated probabilities: none after a prompt (its proposals carry none).
+        const std::uint32_t drafted = std::min(sequence.mtp_draft_count, mtp_drafts);
+        if (adaptive_enabled && drafted > 0) {
+            chances = true;
+            for (std::uint32_t i = 0; i < drafted && chances; ++i) {
+                const float lp = sequence.mtp_draft_logprobs[i];
+                chances        = std::isfinite(lp);
+                chance[i]      = chances ? std::exp(std::min(lp, 0.0F)) : 0.0F;
+            }
+        }
+        int k = 0;
+        if (lookup_enabled) {
+            std::unique_ptr<::ninfer::spec::SuffixDrafter>& drafter = lookup_drafters[lane];
+            if (!drafter) {
+                // Strata's settings: matches of 3 to 64 tokens, a table for the whole context.
+                drafter = std::make_unique<::ninfer::spec::SuffixDrafter>(3, 64, capacity + 4096U);
+            }
+            // The drafter indexes the row's ledger (prompt + accepted tokens) incrementally; a new
+            // request in the lane (another lane epoch), or a ledger that is not the history's
+            // continuation, starts it again.
+            const std::vector<TokenId>& ledger    = sequence.ledger;
+            const std::vector<std::int32_t>& hist = drafter->history();
+            if (lookup_epochs[lane] != lane_epochs[lane] || hist.size() > ledger.size() ||
+                (!hist.empty() &&
+                 (hist.front() != ledger.front() || hist.back() != ledger[hist.size() - 1]))) {
+                drafter->reset();
+                lookup_epochs[lane] = lane_epochs[lane];
+            }
+            if (hist.size() < ledger.size()) {
+                drafter->append(ledger.data() + hist.size(), ledger.size() - hist.size());
+            }
+            const std::uint32_t room = std::min({draft_window, drafts_within_budget(budgets[0]),
+                                                 capacity - sequence.execution_frontier - 1U});
+            k = room > 0 ? drafter->propose(static_cast<int>(room), looked_up.data()) : 0;
+            // As Strata: a lookup proposal counts only when the MTP has no drafts or its first
+            // draft agrees with the lookup's first token.
+            if (k > 0 &&
+                !(sequence.mtp_draft_count == 0 || looked_up[0] == sequence.mtp_drafts[0])) {
+                k = 0;
+            }
+            if (k > 0) { lookup_match = drafter->last_match(); }
+        }
+        ::ninfer::spec::DraftPolicy::Pick pick;
+        pick.t = static_cast<int>(mtp_width);
+        if (chances) {
+            pick = lookup_policy->choose_window(chance.data(), static_cast<int>(drafted), k,
+                                                lookup_match);
+        } else if (k > 0) {
+            pick = lookup_policy->choose(static_cast<int>(mtp_width), k, lookup_match);
+        }
+        if (pick.lookup) {
+            lookup_round = true;
+            // Without the adaptive window every allowed lookup width is the MTP's or wider
+            // (Program: lookup_widths); with it, any window of 2..draft_window + 1.
+            width           = adaptive_enabled ? std::max(static_cast<std::uint32_t>(pick.t), 2U)
+                                               : std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
+            looked_up_count = std::min(static_cast<std::uint32_t>(k), width - 1U);
+            chances         = false;
+        } else if (chances) {
+            // The MTP's own drafts, cut to the policy's window (one draft at least: a round
+            // verifies two columns or more).
+            width = std::max(static_cast<std::uint32_t>(pick.t), 2U);
+        }
+    }
+    // The drafts this round makes for the next one: the base drafts, or with the adaptive window
+    // the more drafts after a round that kept all its drafts, or when this window is wider than
+    // the base one (a lookup window too).
+    std::uint32_t round_drafts = mtp_low_drafts;
+    if (policy_round && (lookup_round || adaptive_draft_more || width > mtp_width)) {
+        round_drafts = mtp_drafts;
+    }
+    if (!policy_round) { adaptive_draft_more = false; }
+    DecodeGraphFamily* family = &mtp_low_graphs[width];
+    if (width == mtp_width && round_drafts == mtp_low_drafts) {
+        family = &mtp_graphs;
+    } else if (round_drafts == mtp_drafts && ((lookup_widths >> width) & 1U) != 0) {
+        family = &mtp_wide_graphs[width];
+    }
+    DecodeGraphFamily& graph_family = *family;
+    mtp_round_width                 = width;
+
     const auto started = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -611,13 +740,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                               static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, width, round_drafts, capacity);
         if (use_cuda_graph) {
             const RoundGraph graph =
-                select_round_graph(mtp_graphs, lanes.size(), maximum_frontier, "MTP batch");
+                select_round_graph(graph_family, lanes.size(), maximum_frontier, "MTP batch");
             executable = graph.executable;
-            envelopes  = mtp_causal_attention_envelopes(graph.profile.max_execution_frontier,
-                                                        draft_window, capacity);
+            envelopes  = mtp_causal_attention_envelopes(graph.profile.max_execution_frontier, width,
+                                                        round_drafts, capacity);
         }
         if (qwen4_ple.gather) { qwen4_ple.begin_round(); }
 
@@ -627,12 +756,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = drafts_within_budget(budgets[row]);
             ValidationHooks::MtpRowReplay replay;
+            const std::uint32_t drafts_in_window = width - 1U;
             const std::uint32_t proposed_extent =
-                validation ? validation->plan_mtp_row(sequence.ledger, frontier, draft_window,
-                                                      sequence.mtp_draft_count, replay)
-                           : sequence.mtp_draft_count;
+                validation     ? validation->plan_mtp_row(sequence.ledger, frontier, round_drafts,
+                                                          sequence.mtp_draft_count, replay)
+                : lookup_round ? looked_up_count
+                               : sequence.mtp_draft_count;
             const std::uint32_t extent_limit =
-                std::min({draft_window, max_by_budget, qwen3_5::kMtpDecodeMaximumDrafts,
+                std::min({drafts_in_window, max_by_budget, qwen3_5::kMtpDecodeMaximumDrafts,
                           capacity - sequence.execution_frontier - 1});
             const std::uint32_t extent =
                 validation ? validation->cap_mtp_extent(proposed_extent, extent_limit)
@@ -643,9 +774,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
             mtp_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1);
-            for (std::uint32_t j = 0; j < draft_window; ++j) {
-                mtp_host_ingress->current_drafts[row * draft_window + j] =
-                    j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
+            for (std::uint32_t j = 0; j < drafts_in_window; ++j) {
+                mtp_host_ingress->current_drafts[row * drafts_in_window + j] =
+                    j < extent ? (lookup_round ? looked_up[j] : sequence.mtp_drafts[j])
+                               : sequence.ledger.back();
             }
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
@@ -666,7 +798,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             if (validation) {
                 validation->override_mtp_drafts(
                     sequence.ledger, frontier, extent, width, replay,
-                    &mtp_host_ingress->current_drafts[row * draft_window],
+                    &mtp_host_ingress->current_drafts[row * drafts_in_window],
                     &mtp_host_ingress->forced_targets[row * width]);
             }
             // Structured output: masks of the K+1 verified columns from the host drafts of this
@@ -674,25 +806,31 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             // nonempty mask. Uploaded before the launch (D2).
             mtp_host_ingress->sampling[row].mask = fill_grammar_mask(
                 row, lanes[row],
-                std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * draft_window],
+                std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * drafts_in_window],
                                          extent));
             if (qwen4_ple.gather) {
                 // Qwen4Exp n-gram rows of the verified window: the anchor, then the drafts (the
                 // padding columns past the extent repeat the anchor and are never committed).
                 std::array<TokenId, kMtpDecodeMaximumWidth> window{};
                 window[0] = sequence.ledger.back();
-                for (std::uint32_t j = 0; j < draft_window; ++j) {
-                    window[j + 1] = mtp_host_ingress->current_drafts[row * draft_window + j];
+                for (std::uint32_t j = 0; j < drafts_in_window; ++j) {
+                    window[j + 1] = mtp_host_ingress->current_drafts[row * drafts_in_window + j];
                 }
                 qwen4_ple.queue_rows(lanes[row], frontier,
                                      std::span<const TokenId>(window.data(), width), row * width);
             }
         }
 
+        // The records at the round's width, on both ranks (rank 1's through a copy of the binding).
+        std::optional<execution::TpExecution> tp_round;
+        if (const execution::TpExecution* tp = tp_binding(); tp != nullptr) {
+            tp_round.emplace(*tp);
+            tp_round->replay_records = &*peer->replay_records_at[width];
+        }
         execution::MtpBatchContext schedule_state{
-            {device, parameters, work, state_images->linear(),
-             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge(), forward_runtime()},
+            {device, parameters, work, state_images->linear(), &*replay_records_at[width], io,
+             prefill_hidden, prefill_chunk, proposal_head, tp_round ? &*tp_round : nullptr,
+             graph_peer_bridge(), forward_runtime()},
             decoder->text_kv,
             *decoder->mtp_cache(),
             *io.mtp_decode,
@@ -701,7 +839,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             state_images->continuation_hidden_store(),
             peer ? &*peer->io.mtp_decode : nullptr,
             peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-            validation && validation->mtp_calib()};
+            (validation && validation->mtp_calib()) || adaptive_enabled};
 
         // An eager round gathers its n-gram rows before the body; a graph round after the launch
         // (on the stager thread).
@@ -713,8 +851,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         // One expert window per MTP round: the verification over the Text layers, then the MTP
         // layer's alignment and draft calls (the offload backend's layer num_hidden_layers).
         qwen4_routed.begin_window(*this, execution::Qwen4Window::Decode);
-        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                    draft_window, envelopes, executable);
+        execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), width,
+                                    round_drafts, envelopes, executable);
         submit_range.reset();
         timing.begin_wait();
         {
@@ -736,9 +874,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         if (executable == nullptr) { qwen4_ple.prefetch_next_round(*this, lanes, true); }
         qwen4_routed.end_window(*this);
         if (validation) {
+            // The round wrote its logits as a dense [rows, width, B] prefix of the frame tensor.
+            const Tensor& frame_logits = io.mtp_decode->target_logits;
             validation->after_mtp_round(
                 *this, lanes, width, mtp_host_egress->licensed_counts.data(),
-                mtp_host_egress->licensed_tokens.data(), io.mtp_decode->target_logits);
+                mtp_host_egress->licensed_tokens.data(),
+                Tensor(frame_logits.data, frame_logits.dtype,
+                       {frame_logits.ne[0], static_cast<std::int32_t>(width),
+                        static_cast<std::int32_t>(lanes.size())}));
         }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -752,7 +895,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
-                next_i > static_cast<std::int32_t>(draft_window) ||
+                next_i > static_cast<std::int32_t>(mtp_drafts) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {
@@ -771,9 +914,28 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             if (validation) {
                 validation->on_mtp_commit(
                     *this, base_E, pcur, accepted_i, seconds,
-                    std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * draft_window],
-                                             draft_window),
+                    std::span<const TokenId>(&mtp_host_ingress->current_drafts[row * (width - 1U)],
+                                             width - 1U),
                     sequence.ledger, row_tokens);
+            }
+            if (policy_round &&
+                static_cast<std::uint32_t>(count_i) < budgets[row].generated_tokens_remaining) {
+                // The policy learns from every one-row round but a request's last: the window it
+                // ran (with the stated probabilities of its drafts, adaptive window), the drafts
+                // accepted and, once the next round starts, its time.
+                lookup_observation = LookupObservation{
+                    .pending  = true,
+                    .lookup   = lookup_round,
+                    .t        = static_cast<int>(width),
+                    .accepted = accepted_i,
+                    .match    = lookup_match,
+                    .chances  = chances,
+                    .chance   = chance,
+                    .lane     = lanes[row],
+                    .started  = round_start,
+                    .round_seconds =
+                        std::chrono::duration<double>(Clock::now() - round_start).count(),
+                };
             }
             record_speculative_row(request, pcur, accepted_i);
             set_round_pending(request, PendingKind::Speculative, base_E, base_S,

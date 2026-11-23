@@ -43,15 +43,33 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument(
                 "--draft-tokens and --lm-head-draft require --spec mtp|dflash2");
         }
+        if (options.prompt_lookup) {
+            throw std::invalid_argument("--prompt-lookup requires --spec mtp");
+        }
+        if (options.adaptive_drafts != 0) {
+            throw std::invalid_argument("--adaptive-draft requires --spec mtp");
+        }
         return;
     case SpeculativeBackend::Mtp:
         if (options.draft_tokens == 0 || options.draft_tokens > 5) {
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
         }
+        if (options.adaptive_drafts > 7) {
+            throw std::invalid_argument("--adaptive-draft takes 1..7 drafts");
+        }
+        if (options.adaptive_drafts != 0 && options.adaptive_drafts < options.draft_tokens) {
+            throw std::invalid_argument("--adaptive-draft must be at least --draft-tokens");
+        }
         return;
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        }
+        if (options.prompt_lookup) {
+            throw std::invalid_argument("--prompt-lookup requires --spec mtp");
+        }
+        if (options.adaptive_drafts != 0) {
+            throw std::invalid_argument("--adaptive-draft requires --spec mtp");
         }
         return;
     }

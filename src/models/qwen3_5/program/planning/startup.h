@@ -164,12 +164,22 @@ struct SequencePlanningInputs {
     // may be rank 1's alone.
     const execution::Parameters* peer_parameters = nullptr;
     // Merged-token ceiling of one Vision item; the encode workspace is planned for it.
-    std::uint32_t max_vision_item_tokens   = static_cast<std::uint32_t>(kMaximumVisionItemTokens);
-    std::uint32_t capacity                 = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
-    std::uint32_t kv_lease_window_tokens   = 0; // 0: whole max_tokens reserved at admission
-    std::uint32_t draft_window             = 0;
+    std::uint32_t max_vision_item_tokens = static_cast<std::uint32_t>(kMaximumVisionItemTokens);
+    std::uint32_t capacity               = 0;
+    std::uint32_t max_concurrency        = 1;
+    std::uint32_t prefill_chunk          = 0;
+    std::uint32_t kv_lease_window_tokens = 0; // 0: whole max_tokens reserved at admission
+    // The widest verified window past its anchor (every round buffer is sized for it).
+    std::uint32_t draft_window = 0;
+    // MTP: the drafts the MTP layer proposes each round (0 = draft_window). Below draft_window
+    // only with prompt lookup or the adaptive window, whose windows may be wider.
+    std::uint32_t mtp_drafts = 0;
+    // MTP: the drafts a round verifies when the draft policy does not choose its window (several
+    // rows, validation, the first round after a prompt); 0 = mtp_drafts.
+    std::uint32_t mtp_base_drafts = 0;
+    // MTP: prompt lookup windows, and the adaptive window from the drafts' stated probabilities.
+    bool prompt_lookup                     = false;
+    bool adaptive_window                   = false;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
     ProposalHead proposal_head             = ProposalHead::Full;
