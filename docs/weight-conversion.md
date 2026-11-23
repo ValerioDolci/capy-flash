@@ -439,6 +439,13 @@ Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` a
 --resource chat_template.jinja=/path/to/chat_template.jinja
 ```
 
+Conversion stops if the selected resources combine the Qwen3.5 vocabulary with a Qwen2 `Split`
+pattern while `tokenizer_config.json` still declares the Qwen3.5 `pretokenize_regex`. The patterns
+are not equivalent for some languages. The error asks for the base model's official tokenizer
+files and shows how to replace both `tokenizer.json` and `tokenizer_config.json` using `--resource`.
+This check runs after resource selection; the checkpoint's chat template and generation config
+remain selected unless explicitly overridden. No tokenizer resources are automatically repaired.
+
 The official conversion examples select these maintained templates:
 
 | Model | Template | Defaults |

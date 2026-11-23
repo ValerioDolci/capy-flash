@@ -14,6 +14,15 @@ TEXT_RESOURCES = (
 )
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
+_QWEN35_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_QWEN2_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
 
 def token_domain(tokenizer: dict, config: dict, vocab_size: int) -> tuple[int, tuple[int, ...]]:
     ids: dict[int, str] = {}
@@ -50,6 +59,35 @@ def token_domain(tokenizer: dict, config: dict, vocab_size: int) -> tuple[int, t
     if not ids or set(ids) != set(range(max(ids) + 1)):
         raise ValueError("this tokenizer requires a contiguous public token ID domain")
     return len(ids), tuple(sorted(index for index, flag in special.items() if flag))
+
+
+def _validate_qwen_split(tokenizer: dict, config: dict) -> None:
+    if config.get("pretokenize_regex") != _QWEN35_SPLIT_PATTERN:
+        return
+    model = tokenizer["model"]
+    if model.get("type") != "BPE" or len(model["vocab"]) != 248044:
+        return
+    # Identify the Qwen3.5 vocabulary by its size and control-token IDs, not the checkpoint name.
+    added = {token["content"]: token["id"] for token in tokenizer.get("added_tokens", [])}
+    if any(
+        added.get(token) != index for index, token in enumerate(("<|endoftext|>", "<|im_start|>", "<|im_end|>"), 248044)
+    ):
+        return
+    match tokenizer.get("pre_tokenizer"):
+        case {
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": pattern}, "behavior": "Isolated", "invert": False},
+                {"type": "ByteLevel"},
+            ],
+        } if pattern == _QWEN2_SPLIT_PATTERN:
+            raise ValueError(
+                "tokenizer.json uses a Qwen2 Split pattern with a Qwen3.5 vocabulary, but "
+                "tokenizer_config.json pretokenize_regex specifies Qwen3.5. "
+                "Download the official tokenizer files for the base model and replace both using "
+                "--resource tokenizer.json=/path/to/tokenizer.json and "
+                "--resource tokenizer_config.json=/path/to/tokenizer_config.json."
+            )
 
 
 def load_resources(
@@ -94,4 +132,5 @@ def load_resources(
             references[component][role] = object_id
             payloads[object_id] = data
     count, special = token_domain(parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size)
+    _validate_qwen_split(parsed["tokenizer.json"], parsed["tokenizer_config.json"])
     return references, payloads, count, special
