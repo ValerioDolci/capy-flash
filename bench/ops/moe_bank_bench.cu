@@ -36,7 +36,8 @@ struct Options {
     std::vector<std::string> formats{"nvfp4", "mxfp8", "bf16"};
     std::vector<int> tokens{1, 4, 8, 512};
     int hidden = 2304, intermediate = 1152, bank_experts = 64, experts = 128, top_k = 8;
-    int nvfp4_banks = 3, mxfp8_banks = 2, bf16_banks = 2, calls = 24, wide_calls = 4, warmup = 3, repeat = 20;
+    int nvfp4_banks = 3, mxfp8_banks = 2, bf16_banks = 2, calls = 24, wide_calls = 4, warmup = 3,
+        repeat      = 20;
     int pool        = 0; // experts a call's tokens choose from (0: all of them)
     double peak_gbs = 896.0;
     bool route      = true;
@@ -59,11 +60,12 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help") {
-            std::puts("usage: ninfer_moe_bank_bench [--format nvfp4,mxfp8,bf16] [--tokens 1,4,8,512] "
-                      "[--hidden 2304] [--intermediate 1152] [--bank-experts 64] [--experts 128] "
-                      "[--top-k 8] [--nvfp4-banks 3] [--mxfp8-banks 2] [--bf16-banks 2] [--calls 24] "
-                      "[--wide-calls 4] [--warmup 3] [--repeat 20] [--peak-gbs 896] [--pool N] "
-                      "[--no-route]");
+            std::puts(
+                "usage: ninfer_moe_bank_bench [--format nvfp4,mxfp8,bf16] [--tokens 1,4,8,512] "
+                "[--hidden 2304] [--intermediate 1152] [--bank-experts 64] [--experts 128] "
+                "[--top-k 8] [--nvfp4-banks 3] [--mxfp8-banks 2] [--bf16-banks 2] [--calls 24] "
+                "[--wide-calls 4] [--warmup 3] [--repeat 20] [--peak-gbs 896] [--pool N] "
+                "[--no-route]");
             std::exit(0);
         }
         if (arg == "--no-route") {
@@ -121,7 +123,8 @@ struct Parent {
 // format: "nvfp4" (scale words 1.0, divisors 1024), "mxfp8" (random codes, exponents 2^-7) or
 // "bf16".
 std::unique_ptr<Parent> make_parent(const std::string& format, std::uint64_t rows,
-                                    std::uint64_t cols, std::uint64_t divisors, std::uint64_t seed) {
+                                    std::uint64_t cols, std::uint64_t divisors,
+                                    std::uint64_t seed) {
     auto p           = std::make_unique<Parent>();
     const bool nvfp4 = format == "nvfp4", mxfp8 = format == "mxfp8";
     const std::array<std::uint64_t, 2> shape{rows, cols};
@@ -133,8 +136,8 @@ std::unique_ptr<Parent> make_parent(const std::string& format, std::uint64_t row
     const auto& g = p->parent.geometry;
     if (mxfp8) {
         p->data = bench::make_bf16((g.bytes + 1) / 2, seed, -0.5F, 0.5F);
-        CUDA_CHECK(cudaMemset(static_cast<std::uint8_t*>(p->data.p) + g.scale_offset, 120,
-                              g.scale_bytes));
+        CUDA_CHECK(
+            cudaMemset(static_cast<std::uint8_t*>(p->data.p) + g.scale_offset, 120, g.scale_bytes));
     } else if (nvfp4) {
         p->data = bench::make_bf16((g.bytes + 1) / 2, seed, -3.0F, 3.0F);
         CUDA_CHECK(cudaMemset(static_cast<std::uint8_t*>(p->data.p) + g.scale_offset, 0x38,
@@ -208,8 +211,9 @@ int main(int argc, char** argv) {
             const bool nvfp4 = format == "nvfp4", mxfp8 = format == "mxfp8";
             if (!nvfp4 && !mxfp8 && format != "bf16") throw std::invalid_argument("bad --format");
             const int banks = nvfp4 ? o.nvfp4_banks : mxfp8 ? o.mxfp8_banks : o.bf16_banks;
-            const double expert_bytes =
-                (2.0 * F * H + 1.0 * H * F) * (nvfp4 ? 0.5 + 1.0 / 16 : mxfp8 ? 1.0 + 1.0 / 32 : 2.0);
+            const double expert_bytes = (2.0 * F * H + 1.0 * H * F) * (nvfp4   ? 0.5 + 1.0 / 16
+                                                                       : mxfp8 ? 1.0 + 1.0 / 32
+                                                                               : 2.0);
             std::vector<Bank> bank(static_cast<std::size_t>(banks));
             for (int b = 0; b < banks; ++b) {
                 const auto E         = static_cast<std::uint64_t>(o.bank_experts);

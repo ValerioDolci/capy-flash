@@ -30,6 +30,8 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
     detail::scatter_launch(src, indices, dst, stream);
 }
 
+// The destination may hold more columns per lane than the source (a DFlash2 round narrower than
+// the pending-feature buffer's window): column c of row b lands in column c of its lane.
 void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor& valid_columns,
                         Tensor& destination, cudaStream_t stream) {
     const std::int32_t width = source.ne[1];
@@ -37,7 +39,7 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 ||
         lanes.dtype != DType::I32 || valid_columns.dtype != DType::I32 || source.ne[0] <= 0 ||
         (source.ne[0] % 8) != 0 || width <= 0 || batch <= 0 || source.ne[3] != 1 ||
-        destination.ne[0] != source.ne[0] || destination.ne[1] != width || destination.ne[2] <= 0 ||
+        destination.ne[0] != source.ne[0] || destination.ne[1] < width || destination.ne[2] <= 0 ||
         destination.ne[3] != 1 || lanes.ne[0] != batch || valid_columns.ne[0] != batch ||
         lanes.ne[1] != 1 || valid_columns.ne[1] != 1 || lanes.ne[2] != 1 ||
         valid_columns.ne[2] != 1 || lanes.ne[3] != 1 || valid_columns.ne[3] != 1) {

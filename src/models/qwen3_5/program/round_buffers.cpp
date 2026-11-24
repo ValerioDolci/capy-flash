@@ -386,6 +386,37 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
 }
 
+DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t drafts) const {
+    const std::int32_t full = draft_tokens.ne[0];
+    if (drafts == 0 || drafts > static_cast<std::uint32_t>(full)) {
+        throw std::invalid_argument("DFlash narrowed round exceeds its frame's draft window");
+    }
+    if (drafts == static_cast<std::uint32_t>(full)) { return *this; }
+    const auto k     = static_cast<std::int32_t>(drafts);
+    const auto width = k + 1;
+    // Column axis `axis` of `t` (its own extent full or full + 1) becomes `columns`.
+    const auto narrow = [](const Tensor& t, int axis, std::int32_t columns) {
+        if (t.data == nullptr) { return t; }
+        std::int32_t ne[4] = {t.ne[0], t.ne[1], t.ne[2], t.ne[3]};
+        ne[axis]           = columns;
+        return Tensor(t.data, t.dtype, {ne[0], ne[1], ne[2], ne[3]});
+    };
+    DFlashDecodeState out     = *this;
+    out.target_rope_positions = narrow(target_rope_positions, 0, width);
+    out.licensed_tokens       = narrow(licensed_tokens, 0, width);
+    out.proposal_ids          = narrow(proposal_ids, 0, width);
+    out.proposal_positions    = narrow(proposal_positions, 0, width);
+    out.verify_positions      = narrow(verify_positions, 0, width);
+    out.candidate_ids         = narrow(candidate_ids, 1, k);
+    out.proposal_q            = narrow(proposal_q, 1, k);
+    out.draft_tokens          = narrow(draft_tokens, 0, k);
+    out.verify_ids            = narrow(verify_ids, 0, width);
+    out.target_argmax         = narrow(target_argmax, 0, width);
+    out.target_logits         = narrow(target_logits, 1, width);
+    out.target_hidden         = narrow(target_hidden, 1, width);
+    return out;
+}
+
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {

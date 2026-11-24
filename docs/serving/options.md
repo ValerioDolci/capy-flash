@@ -58,7 +58,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--rope-original-max-position N` | the native window YaRN scales from (Hugging Face `original_max_position_embeddings`), used only when `--rope-yarn-factor` > 1 | `262144` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--prompt-lookup` | with `--spec mtp`: prompt lookup ([below](#prompt-lookup)). A one-request round may verify up to 8 tokens copied from an earlier repeat of the request's own text instead of the MTP's drafts | off |
-| `--adaptive-draft N` | with `--spec mtp`: adaptive draft window ([below](#adaptive-draft-window)). The MTP drafts up to N (1..7) tokens and a one-request round verifies the window its drafts' probabilities and the measured round costs favour; `--draft-tokens` stays the window of the other rounds | off |
+| `--adaptive-draft N` | with `--spec mtp` or `--spec dflash2`: adaptive draft window ([below](#adaptive-draft-window)). MTP: the MTP drafts up to N (1..7) tokens and a one-request round verifies the window its drafts' probabilities and the measured round costs favour. DFlash2: a one-request round drafts and verifies up to N (1..15) tokens, as many as the row's recent acceptance and the measured round costs favour. `--draft-tokens` stays the window of the other rounds | off |
 | `--default-max-tokens N` | output limit when omitted by a request | the context left after the prompt |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -427,14 +427,36 @@ The lookup widths have their own one-request CUDA Graphs (more startup time and 
 ## Adaptive draft window
 
 `--adaptive-draft N` (with `--spec mtp`, N in 1..7 and at least `--draft-tokens`): the MTP layer states each draft's probability; for a one-request round
-the policy verifies the window of 2..N+1 tokens with the most expected committed tokens per
-millisecond, where a draft's chance is calibrated online (how often drafts stated at about that
-probability were accepted) and each window's cost is the measured round time on this machine. On a
-Flash-Next machine a wider window costs its extra experts on the CPU, so the window grows only where
-its drafts pay. A round drafts N tokens only after a round that kept every draft it verified, each
-stated at 0.9 or more, or when its own window is wider than the base one; otherwise it drafts
-`--draft-tokens`. Rounds of several requests and validation rounds verify `--draft-tokens` + 1. With
+the policy verifies the window of `--draft-tokens`+1..N+1 tokens with the most expected committed
+tokens per millisecond, where a draft's chance is calibrated online (how often drafts stated at about
+that probability were accepted) and each window's cost is the measured round time on this machine. On
+a Flash-Next machine a wider window costs its extra experts on the CPU, so the window grows only where
+its drafts pay; it never narrows below the base window (a column less saves little of a round, and
+the narrow windows' CUDA Graphs would cost expert slots). Drafting N tokens costs MTP steps in the
+round that drafts them, whatever the next round verifies, so the policy prices it on its own: a round
+drafts N tokens after a round that kept every draft it verified (each stated at 0.9 or more, when
+stated) while drafting more has paid lately (the tokens the wider windows kept past the base window's,
+less the time they cost, at the current tokens per millisecond), or when its own window is wider than
+the base one; otherwise it drafts `--draft-tokens`, without the drafts' probabilities. While drafting
+more does not pay it is still tried now and then (ever more rarely, down to one chance in 512, and
+again every 16th chance after a try that paid), so a change of text opens it again. Rounds of several requests and validation rounds verify `--draft-tokens` + 1. With
 `--prompt-lookup` too, a lookup window is taken only when it beats the best MTP window. Verification
 keeps the method; a different window is a different verifier batch, so greedy text can change from
 the first token where it does, and two runs whose measured round times differ can choose
 differently.
+
+With `--spec dflash2` (N in 1..15, at least `--draft-tokens`) the drafter states no probabilities
+and drafts the whole block in the round that verifies it, so the policy picks the round's draft count
+before drafting, from each draft position's recent acceptance (a position's own counts shrunk toward
+the rate of all drafts tested lately, so a change of text moves the window within a few rounds) and
+each count's measured round time (its own average: with every weight on the GPU the round cost by
+count is stable). After a round that kept every draft, the next one is at least the next count up.
+The one-request counts with graphs of their own are 7, 10, 12 and 15 drafts above `--draft-tokens`
+(up to N): on the dense 27B at tensor-parallel width 2 a round of 5 or 6 drafts costs more than one
+of 7, whose verify GEMMs take A4 activations, and the drafter's blocks of 8 tokens and more draft
+better than smaller ones. The window never drops below `--draft-tokens`: a smaller block drafts worse,
+its rounds keep fewer drafts, and the measured rates would pull the window smaller still, for at
+most ~1 ms of a 13.6 ms round. Measured there (RTX 5080 + RTX 5070 Ti, greedy, decode tok/s), `--draft-tokens 10`
+against `--draft-tokens 7 --adaptive-draft 15`: JSON 727 -> 876, code edit 704 -> 862, prose
+180 -> 206, Czech essay 94 -> 102, six conversation prompts 217 -> 228; the graphs take about
+150 MiB more per device.

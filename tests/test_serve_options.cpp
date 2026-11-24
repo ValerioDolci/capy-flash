@@ -338,6 +338,28 @@ int main() {
         failures += check(rejected, "--prompt-lookup without --spec mtp was accepted");
     }
 
+    // --adaptive-draft: MTP 1..7, DFlash2 1..15, never below --draft-tokens, no other backend.
+    const ServeOptions adaptive_dflash =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--lm-head-draft", "--adaptive-draft", "15"});
+    failures += check(adaptive_dflash.speculative.adaptive_drafts == 15 &&
+                          adaptive_dflash.speculative.draft_tokens == 7,
+                      "--adaptive-draft with --spec dflash2 was not parsed");
+    for (const std::vector<std::string>& args :
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--adaptive-draft", "4"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                   "--draft-tokens", "7", "--adaptive-draft", "16"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                   "--draft-tokens", "7", "--adaptive-draft", "5"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                   "--draft-tokens", "3", "--adaptive-draft", "8"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an out-of-domain --adaptive-draft was accepted");
+    }
+
     const ServeOptions configured = parse({"ninfer-serve",
                                            "model.ninfer",
                                            "--no-prefix-reuse",

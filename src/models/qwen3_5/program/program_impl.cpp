@@ -2,6 +2,7 @@
 #include "artifact/host_residency.h"
 #include "ninfer/ops/ple.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
@@ -244,13 +245,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
-        if (speculative_backend == SpeculativeBackend::Mtp) {
-            for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
-                const auto i = static_cast<std::size_t>(w);
-                replay_records_at[i].emplace(replay_records->narrowed(w));
-                replay_fold_at[i].emplace(*replay_records_at[i],
-                                          state_images->linear().all_layers_view());
-            }
+        for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
+            const auto i = static_cast<std::size_t>(w);
+            replay_records_at[i].emplace(replay_records->narrowed(w));
+            replay_fold_at[i].emplace(*replay_records_at[i],
+                                      state_images->linear().all_layers_view());
         }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
@@ -271,8 +270,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const std::uint32_t t_mtp = mtp_base_width;
         const std::uint32_t t_max = draft_window + 1U;
         if (adaptive_enabled) {
-            // The more drafts at every window, the base one included (mtp_wide_graphs).
-            for (std::uint32_t w = 2U; w <= std::min(mtp_drafts + 1U, t_max); ++w) {
+            // The more drafts at the base window and every wider one (mtp_wide_graphs). The window
+            // never narrows below the base one: on Flash-Next a column less saves about 1 ms of a
+            // 12 ms round and the families for narrow windows cost expert slots.
+            for (std::uint32_t w = t_mtp; w <= std::min(mtp_drafts + 1U, t_max); ++w) {
                 lookup_widths |= 1U << w;
             }
         }
@@ -285,8 +286,31 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         lookup_policy->set_sizes(lookup_widths | (1U << t_mtp));
         // A size's first round captures its graph, and a slow round is not its cost.
         lookup_policy->set_robust(true);
+        // Adaptive window: drafting more is priced on its own (DraftPolicy::set_base_window).
+        if (adaptive_enabled && mtp_drafts + 1U > t_mtp) {
+            lookup_policy->set_base_window(static_cast<int>(t_mtp));
+        }
     }
     mtp_low_drafts = adaptive_enabled ? mtp_base_width - 1U : mtp_drafts;
+    if (speculative_backend == SpeculativeBackend::DFlash2) {
+        // Every batch size drafts --draft-tokens (dflash_graphs); with --adaptive-draft N a one-row
+        // round may draft any count of dflash_sizes up to N, each in its own one-row graphs.
+        dflash_base_drafts =
+            plan.inputs.mtp_base_drafts != 0 ? plan.inputs.mtp_base_drafts : draft_window;
+        if (plan.inputs.adaptive_window && draft_window > 0) {
+            dflash_sizes     = detail::dflash_adaptive_drafts(draft_window, dflash_base_drafts);
+            unsigned windows = 1U << (dflash_base_drafts + 1U);
+            for (std::uint32_t k = 1; k <= draft_window; ++k) {
+                if (((dflash_sizes >> k) & 1U) != 0) { windows |= 1U << (k + 1U); }
+            }
+            lookup_policy.emplace(static_cast<int>(draft_window + 1U));
+            lookup_policy->set_sizes(windows);
+            // A size's first round captures its graph, and a slow round is not its cost.
+            lookup_policy->set_robust(true);
+            // All weights on the GPU: a size's round time is stable, its own EMA prices it.
+            lookup_policy->set_plain_costs(true);
+        }
+    }
     if (plan.persistent.dflash) {
         CyclicKVCache* local = state_images->dflash_local();
         if (local == nullptr) {

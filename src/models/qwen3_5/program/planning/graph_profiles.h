@@ -17,5 +17,8 @@ mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, bool qsa_
 // The DFlash2 round's profiles.
 [[nodiscard]] std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                                        std::uint32_t draft_window);
+// DFlash2 adaptive draft window: the draft counts of the one-row graph families (bit k), at most
+// `maximum` and without `base` (the every-batch family drafts it).
+[[nodiscard]] unsigned dflash_adaptive_drafts(std::uint32_t maximum, std::uint32_t base);
 
 } // namespace ninfer::models::qwen3_5::detail

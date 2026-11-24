@@ -47,7 +47,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--prompt-lookup requires --spec mtp");
         }
         if (options.adaptive_drafts != 0) {
-            throw std::invalid_argument("--adaptive-draft requires --spec mtp");
+            throw std::invalid_argument("--adaptive-draft requires --spec mtp or --spec dflash2");
         }
         return;
     case SpeculativeBackend::Mtp:
@@ -68,8 +68,11 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.prompt_lookup) {
             throw std::invalid_argument("--prompt-lookup requires --spec mtp");
         }
-        if (options.adaptive_drafts != 0) {
-            throw std::invalid_argument("--adaptive-draft requires --spec mtp");
+        if (options.adaptive_drafts > 15) {
+            throw std::invalid_argument("--adaptive-draft with --spec dflash2 takes 1..15 drafts");
+        }
+        if (options.adaptive_drafts != 0 && options.adaptive_drafts < options.draft_tokens) {
+            throw std::invalid_argument("--adaptive-draft must be at least --draft-tokens");
         }
         return;
     }

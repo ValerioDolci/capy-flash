@@ -826,17 +826,21 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     if (!replay_fold) {
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
-    // An MTP-backend round wrote its records, target hidden and licensed tokens at the width it
-    // verified: prompt lookup picks that width per round.
-    const bool mtp_round = speculative_backend == SpeculativeBackend::Mtp;
-    const std::uint32_t round_width =
-        mtp_round && mtp_round_width != 0 ? mtp_round_width : draft_window + 1U;
+    // A round wrote its records, target hidden and licensed tokens at the width it verified: MTP
+    // prompt lookup and the adaptive window (MTP or DFlash2) pick that width per round.
+    const bool mtp_round            = speculative_backend == SpeculativeBackend::Mtp;
+    const bool dflash_round         = speculative_backend == SpeculativeBackend::DFlash2;
+    const std::uint32_t round_width = mtp_round && mtp_round_width != 0 ? mtp_round_width
+                                      : dflash_round && dflash_round_drafts != 0
+                                          ? dflash_round_drafts + 1U
+                                          : draft_window + 1U;
+    const bool narrowed_round       = mtp_round || dflash_round;
     const ops::GdnReplayFoldPlan& fold =
-        mtp_round && replay_fold_at[round_width] ? *replay_fold_at[round_width] : *replay_fold;
+        narrowed_round && replay_fold_at[round_width] ? *replay_fold_at[round_width] : *replay_fold;
     const auto round_hidden = [&](const Tensor& full, std::int32_t batch) {
-        return mtp_round ? Tensor(full.data, full.dtype,
-                                  {full.ne[0], static_cast<std::int32_t>(round_width), batch})
-                         : full.slice(2, 0, batch);
+        return narrowed_round ? Tensor(full.data, full.dtype,
+                                       {full.ne[0], static_cast<std::int32_t>(round_width), batch})
+                              : full.slice(2, 0, batch);
     };
 
     std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
@@ -896,25 +900,28 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 throw std::logic_error("tensor-parallel speculative batch has no rank 1 records");
             }
             const ScopedCurrentDevice rank1(peer->device.device);
-            const ops::GdnReplayFoldPlan& peer_fold = mtp_round && peer->replay_fold_at[round_width]
-                                                          ? *peer->replay_fold_at[round_width]
-                                                          : *peer->replay_fold;
+            const ops::GdnReplayFoldPlan& peer_fold =
+                narrowed_round && peer->replay_fold_at[round_width]
+                    ? *peer->replay_fold_at[round_width]
+                    : *peer->replay_fold;
             peer_fold.execute(
                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                 peer->device.stream);
         }
 
-        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
+        // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend. The
+        // round wrote its licensed tokens at its own width (DFlashDecodeState::narrowed): a row
+        // starts round_width tokens after the previous one, not the frame's full width.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
+            const Tensor licensed = io.dflash_decode->narrowed(round_width - 1U).licensed_tokens;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;
                 }
                 const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
-                Tensor ids =
-                    io.dflash_decode->licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
-                        .slice(0, 0, count)
-                        .view({count});
+                Tensor ids       = licensed.slice(1, static_cast<std::int32_t>(row), 1)
+                                 .slice(0, 0, count)
+                                 .view({count});
                 Tensor counts =
                     token_counts.slice(1, static_cast<std::int32_t>(lanes[row]), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
@@ -937,7 +944,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             } else if (speculative_backend == SpeculativeBackend::DFlash2 && io.dflash_decode) {
                 qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
-                hidden                            = frame.target_hidden.slice(2, 0, batch);
+                hidden                            = round_hidden(frame.target_hidden, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
             } else {
@@ -1070,11 +1077,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     }
                     // The next drafts' log-probabilities: calibration records them, the
                     // adaptive window's policy reads them at the next round.
-                    if (calibration || adaptive_enabled) {
+                    if (calibration || mtp_round_logprobs) {
                         for (std::uint32_t k = 0; k < mtp_drafts; ++k) {
                             sequence.mtp_draft_logprobs[k] =
                                 mtp_host_egress->next_draft_logprobs[k * max_concurrency + row];
                         }
+                    } else if (adaptive_enabled) {
+                        // A base round's drafts state no probabilities: the next window is the
+                        // base one.
+                        sequence.mtp_draft_logprobs.fill(std::numeric_limits<float>::quiet_NaN());
                     }
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {

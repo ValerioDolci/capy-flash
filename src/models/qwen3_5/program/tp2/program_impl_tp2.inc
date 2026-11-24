@@ -71,13 +71,11 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
     if (own.replay_records) {
         replay_records.emplace(backing, *own.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
-        if (plan.inputs.speculative_backend == SpeculativeBackend::Mtp) {
-            for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
-                const auto i = static_cast<std::size_t>(w);
-                replay_records_at[i].emplace(replay_records->narrowed(w));
-                replay_fold_at[i].emplace(*replay_records_at[i],
-                                          state_images->linear().all_layers_view());
-            }
+        for (std::int32_t w = 2; w <= replay_records->spec.width; ++w) {
+            const auto i = static_cast<std::size_t>(w);
+            replay_records_at[i].emplace(replay_records->narrowed(w));
+            replay_fold_at[i].emplace(*replay_records_at[i],
+                                      state_images->linear().all_layers_view());
         }
     }
     io             = qwen3_5::RoundState(backing, own.round);
@@ -531,6 +529,7 @@ bool ProgramImpl::degrade_peer_mailbox(std::string_view when) {
     mtp_graphs      = {};
     for (DecodeGraphFamily& family : mtp_wide_graphs) { family = {}; }
     for (DecodeGraphFamily& family : mtp_low_graphs) { family = {}; }
+    for (DecodeGraphFamily& family : dflash_wide_graphs) { family = {}; }
     dflash_graphs                     = {};
     const std::size_t slot_bytes      = peer_mailbox->slot_bytes();
     const std::size_t wide_slot_bytes = peer_mailbox->wide_slot_bytes();

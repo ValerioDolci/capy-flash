@@ -22,7 +22,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.16.3**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.16.4**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
@@ -470,6 +470,24 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.4** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.4)): adaptive draft windows for MTP
+and DFlash2, a streaming fix for benchmark clients; the defaults decode as in v0.16.3
+- The adaptive MTP window (`--adaptive-draft N`, off by default) no longer loses on agent work
+  ([PR #119](https://github.com/ValerioDolci/capy-flash/pull/119) by @Mici81, with three follow-up fixes). On the 64 GB
+  Flash-Next edition, 2 × RTX 5070 Ti, against MTP 3: a 53-turn agent replay −3.7 % → +0.1 %, a recorded 43-turn
+  coding-agent session +0.6 %, JSON +11-19 %, a code edit returned whole +22 %, quoting +14 %.
+- `--adaptive-draft N` also works with DFlash2 on the 27B ([PR #115](https://github.com/ValerioDolci/capy-flash/pull/115)
+  by @Mici81): JSON +23 %, a code edit +37 %, conversation unchanged, but −2.4 % on the agent session, so `--profile 27b`
+  keeps 7 fixed drafts. Fixed on the way: with `--adaptive-draft` and two or more requests in a round, presence and
+  frequency penalties counted the wrong tokens.
+- Streamed Chat Completions send the assistant-role chunk with the first token, as OpenAI, vLLM and llama.cpp do. Clients
+  that time the first chunk (llama-benchy) measured the request's admission instead of the prompt: 479k tok/s instead of
+  8.5k on a 24k-token prompt. During a long prompt the stream sends `: keep-alive` comments.
+- The converter stops on Qwen3.5-family checkpoints whose `tokenizer.json` was resaved by transformers 5 with the Qwen2
+  pre-tokenizer pattern, and shows the two `--resource` overrides
+  ([PR #118](https://github.com/ValerioDolci/capy-flash/pull/118) by @nnraiden).
+- Same machine code as v0.16.3 (no kernel source changed); without the new flags the gate's texts are identical.
 
 **v0.16.3** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.3)): Inkling 2 Mini decodes up to
 1.9× and prefills up to 3.6× faster than v0.16.0, with the same weights; nothing changes for the Qwen models

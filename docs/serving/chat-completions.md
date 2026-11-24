@@ -181,8 +181,10 @@ Conflicting explicit `enable_thinking` and effort values return `conflicting_tem
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
 thinking, effort and preservation options use the template's defaults.
 
-Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
-finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
+Streaming begins with an assistant-role chunk, sent with the first reasoning or content delta (as
+OpenAI, vLLM and llama.cpp do; before it, a long prompt sends only `: keep-alive` comments), then
+separate reasoning and content deltas, a finish-reason chunk and `[DONE]`. With `return_progress`
+the role chunk opens the stream, before the prompt-progress chunks. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage. Aggregate and streamed usage include cached prompt tokens
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not

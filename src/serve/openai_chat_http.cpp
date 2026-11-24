@@ -33,8 +33,19 @@ public:
         encoder_.emplace(identity_, include_usage_, timings_, progress_);
     }
 
+    // The assistant-role chunk goes out with the first delta, or with the closing chunks when there
+    // is none, as OpenAI, vLLM and llama.cpp stream it: a client that times the first chunk (a
+    // benchmark's prompt time) then times the prompt, not the request's admission. A long prompt
+    // keeps the connection through the transport's keep-alive comments. With prompt progress the
+    // role chunk opens the stream, before the progress chunks.
     void write_start(SseTransport& transport) override {
-        render_and_write(transport, [&] { return encoder_->start(); });
+        if (progress_) {
+            render_and_write(transport, [&] { return encoder_->start(); });
+            return;
+        }
+        try {
+            pending_start_ = encoder_->start();
+        } catch (const std::exception& exception) { throw ResponseRenderFailure(exception.what()); }
     }
 
     void attach(StreamSink& output, SseTransport& transport) override {
@@ -55,22 +66,34 @@ public:
             };
         }
         output.on_content = [this, &transport](const std::string& text) {
+            write_pending_start(transport);
             render_and_write(transport, [&] { return encoder_->content_delta(text); });
         };
         output.on_reasoning = [this, &transport](const std::string& text) {
+            write_pending_start(transport);
             render_and_write(transport, [&] { return encoder_->reasoning_delta(text); });
         };
     }
 
     std::vector<std::string> finish(const GenerationOutcome& outcome) override {
-        return encoder_->finish(outcome);
+        std::vector<std::string> closing = encoder_->finish(outcome);
+        if (!pending_start_.empty()) {
+            closing.insert(closing.begin(), std::exchange(pending_start_, std::string{}));
+        }
+        return closing;
     }
 
     void write_stream_error(SseTransport& transport, const ApiError& error) override {
+        write_pending_start(transport);
         render_and_write(transport, [&] { return "data: " + make_error_body(error) + "\n\n"; });
     }
 
 private:
+    void write_pending_start(SseTransport& transport) {
+        if (pending_start_.empty()) { return; }
+        transport.write(std::exchange(pending_start_, std::string{}));
+    }
+
     std::string model_;
     bool include_usage_;
     bool timings_;
@@ -78,6 +101,7 @@ private:
     OpenAIChatResponseIdentity identity_;
     std::string body_;
     std::optional<OpenAIChatStream> encoder_;
+    std::string pending_start_; // the role chunk, until the first delta (write_start)
 };
 
 } // namespace

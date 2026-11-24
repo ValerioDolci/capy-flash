@@ -47,10 +47,11 @@ struct MappedBank {
 class ReadAhead {
 public:
     ReadAhead() = default;
+
     explicit ReadAhead(const std::map<std::size_t, MappedBank>& banks) {
         constexpr int kThreads         = 8;
         constexpr std::uint64_t kChunk = std::uint64_t{64} << 20;
-        const auto page = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+        const auto page                = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
         std::vector<std::pair<const std::byte*, std::uint64_t>> chunks;
         for (const auto& [index, bank] : banks) {
             if (bank.data == nullptr || !bank.copy.empty()) { continue; }
@@ -64,16 +65,20 @@ public:
         for (int t = 0; t < kThreads && static_cast<std::size_t>(t) < chunks.size(); ++t) {
             threads_.emplace_back([chunks, page, t] {
                 unsigned sum = 0;
-                for (std::size_t c = static_cast<std::size_t>(t); c < chunks.size(); c += kThreads) {
-                    const auto* p = reinterpret_cast<const volatile unsigned char*>(chunks[c].first);
+                for (std::size_t c = static_cast<std::size_t>(t); c < chunks.size();
+                     c += kThreads) {
+                    const auto* p =
+                        reinterpret_cast<const volatile unsigned char*>(chunks[c].first);
                     for (std::uint64_t at = 0; at < chunks[c].second; at += page) { sum += p[at]; }
                 }
                 (void)sum;
             });
         }
     }
+
     ReadAhead(const ReadAhead&)            = delete;
     ReadAhead& operator=(const ReadAhead&) = delete;
+
     ~ReadAhead() {
         for (auto& thread : threads_) { thread.join(); }
     }
