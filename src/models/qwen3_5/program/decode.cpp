@@ -620,6 +620,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     const bool policy_on    = lookup_enabled || adaptive_enabled;
     const bool policy_round = policy_on && lanes.size() == 1 && !validation && !row_constrained(0);
     const auto round_start  = std::chrono::steady_clock::now();
+    // Without the previous round's outcome (a request's first round), no more drafts.
+    if (!lookup_observation.pending) { adaptive_draft_more = false; }
     if (policy_on && lookup_observation.pending) {
         // The previous one-row round's outcome. When this round is the same lane's next one, the
         // time between their starts covers that round's commit too (its replay fold runs at this
@@ -637,20 +639,25 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         // for it costs MTP steps the window does not verify.
         bool sure = true;
         for (int i = 0; o.chances && i + 1 < o.t; ++i) { sure = sure && o.chance[i] >= 0.9F; }
-        adaptive_draft_more = adaptive_enabled && o.accepted == o.t - 1 &&
-                              o.t - 1 >= static_cast<int>(mtp_low_drafts) && sure;
         if (o.chances) {
-            lookup_policy->observe_window(o.chance.data(), o.t, o.accepted, ms);
+            lookup_policy->observe_window(o.chance.data(), o.t, o.accepted, ms, o.more, o.avail);
         } else {
             lookup_policy->observe(o.lookup, o.t, o.accepted, o.match, ms);
         }
+        // Drafting more also has to pay for itself (DraftPolicy::draft_more), asked last: a
+        // declined chance counts toward its next probe.
+        adaptive_draft_more = adaptive_enabled && o.accepted == o.t - 1 &&
+                              o.t - 1 >= static_cast<int>(mtp_low_drafts) && sure &&
+                              lookup_policy->draft_more();
         o.pending = false;
     }
+    int policy_avail = 0; // the drafts the policy chose this round's window from
     if (policy_round) {
         const std::uint32_t lane      = lanes[0];
         const SequenceState& sequence = active_sequence(lane);
         // The drafts' stated probabilities: none after a prompt (its proposals carry none).
         const std::uint32_t drafted = std::min(sequence.mtp_draft_count, mtp_drafts);
+        policy_avail                = static_cast<int>(drafted);
         if (adaptive_enabled && drafted > 0) {
             chances = true;
             for (std::uint32_t i = 0; i < drafted && chances; ++i) {
@@ -695,22 +702,21 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         pick.t = static_cast<int>(mtp_width);
         if (chances) {
             pick = lookup_policy->choose_window(chance.data(), static_cast<int>(drafted), k,
-                                                lookup_match);
+                                                lookup_match, adaptive_draft_more);
         } else if (k > 0) {
             pick = lookup_policy->choose(static_cast<int>(mtp_width), k, lookup_match);
         }
         if (pick.lookup) {
             lookup_round = true;
-            // Without the adaptive window every allowed lookup width is the MTP's or wider
-            // (Program: lookup_widths); with it, any window of 2..draft_window + 1.
-            width           = adaptive_enabled ? std::max(static_cast<std::uint32_t>(pick.t), 2U)
-                                               : std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
+            // Every lookup window is the MTP's or wider (Program: lookup_widths); a shorter
+            // proposal runs in the MTP's own window.
+            width           = std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
             looked_up_count = std::min(static_cast<std::uint32_t>(k), width - 1U);
             chances         = false;
         } else if (chances) {
-            // The MTP's own drafts, cut to the policy's window (one draft at least: a round
-            // verifies two columns or more).
-            width = std::max(static_cast<std::uint32_t>(pick.t), 2U);
+            // The MTP's own drafts, cut to the policy's window; never below the base window (its
+            // family verifies fewer drafts when fewer were made).
+            width = std::max(static_cast<std::uint32_t>(pick.t), mtp_width);
         }
     }
     // The drafts this round makes for the next one: the base drafts, or with the adaptive window
@@ -729,6 +735,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
     DecodeGraphFamily& graph_family = *family;
     mtp_round_width                 = width;
+    // The adaptive window reads the drafts' stated probabilities only after a round that drafted
+    // more (the policy picks among those drafts); the base family drafts without them, as without
+    // the adaptive window (DraftPolicy::draft_more).
+    mtp_round_logprobs = adaptive_enabled && round_drafts == mtp_drafts;
 
     const auto started = Clock::now();
     try {
@@ -839,7 +849,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             state_images->continuation_hidden_store(),
             peer ? &*peer->io.mtp_decode : nullptr,
             peer ? &peer->state_images->continuation_hidden_store() : nullptr,
-            (validation && validation->mtp_calib()) || adaptive_enabled};
+            (validation && validation->mtp_calib()) || mtp_round_logprobs};
 
         // An eager round gathers its n-gram rows before the body; a graph round after the launch
         // (on the stager thread).
@@ -935,6 +945,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     .started  = round_start,
                     .round_seconds =
                         std::chrono::duration<double>(Clock::now() - round_start).count(),
+                    .more  = round_drafts == mtp_drafts && mtp_drafts > mtp_low_drafts,
+                    .avail = chances ? policy_avail : 0,
                 };
             }
             record_speculative_row(request, pcur, accepted_i);

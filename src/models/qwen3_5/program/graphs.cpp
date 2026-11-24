@@ -417,7 +417,7 @@ void ProgramImpl::prepare_graphs() {
             // window the draft policy may choose for one row (its rounds are solo).
             const auto capture_mtp_family = [&](DecodeGraphFamily& family, std::uint32_t width,
                                                 std::uint32_t batch_limit, std::uint32_t drafts) {
-                representative_mtp_width    = width;
+                representative_mtp_width = width;
                 const auto planned_profiles =
                     mtp_graph_profiles(capacity, width, drafts, qsa_split_topk);
                 validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
@@ -427,8 +427,9 @@ void ProgramImpl::prepare_graphs() {
                     peer ? &*peer->io.mtp_decode : nullptr,
                     peer ? &peer->state_images->continuation_hidden_store() : nullptr,
                     // Each draft's log-probability: calibration, and the adaptive window's
-                    // policy.
-                    (validation && validation->mtp_calib()) || adaptive_enabled};
+                    // policy in the families that draft the more drafts.
+                    (validation && validation->mtp_calib()) ||
+                        (adaptive_enabled && drafts == mtp_drafts)};
                 // The records at this width, on both ranks.
                 mtp_state.execution.replay_records = &*replay_records_at[width];
                 std::optional<execution::TpExecution> tp_width;
@@ -474,10 +475,6 @@ void ProgramImpl::prepare_graphs() {
             for (std::uint32_t w = 2; w <= qwen3_5::kMtpDecodeMaximumWidth; ++w) {
                 if (((lookup_widths >> w) & 1U) != 0) {
                     capture_mtp_family(mtp_wide_graphs[w], w, 1U, mtp_drafts);
-                }
-                // Adaptive window: the base drafts at the windows below the base one.
-                if (adaptive_enabled && w < mtp_base_width && mtp_low_drafts < mtp_drafts) {
-                    capture_mtp_family(mtp_low_graphs[w], w, 1U, mtp_low_drafts);
                 }
             }
         }
@@ -546,13 +543,6 @@ void ProgramImpl::prepare_graphs() {
                 // The representative lays out this family's columns.
                 representative_mtp_width = w;
                 instantiate_graph_family(mtp_wide_graphs[w], "MTP window", device,
-                                         prepare_representative, synchronize_graphs);
-                representative_mtp_width = 0;
-            }
-            for (std::uint32_t w = 2; w < mtp_base_width; ++w) {
-                if (!adaptive_enabled || mtp_low_drafts >= mtp_drafts) { break; }
-                representative_mtp_width = w;
-                instantiate_graph_family(mtp_low_graphs[w], "MTP narrow window", device,
                                          prepare_representative, synchronize_graphs);
                 representative_mtp_width = 0;
             }

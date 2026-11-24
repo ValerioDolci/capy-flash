@@ -427,13 +427,19 @@ The lookup widths have their own one-request CUDA Graphs (more startup time and 
 ## Adaptive draft window
 
 `--adaptive-draft N` (with `--spec mtp`, N in 1..7 and at least `--draft-tokens`): the MTP layer states each draft's probability; for a one-request round
-the policy verifies the window of 2..N+1 tokens with the most expected committed tokens per
-millisecond, where a draft's chance is calibrated online (how often drafts stated at about that
-probability were accepted) and each window's cost is the measured round time on this machine. On a
-Flash-Next machine a wider window costs its extra experts on the CPU, so the window grows only where
-its drafts pay. A round drafts N tokens only after a round that kept every draft it verified, each
-stated at 0.9 or more, or when its own window is wider than the base one; otherwise it drafts
-`--draft-tokens`. Rounds of several requests and validation rounds verify `--draft-tokens` + 1. With
+the policy verifies the window of `--draft-tokens`+1..N+1 tokens with the most expected committed
+tokens per millisecond, where a draft's chance is calibrated online (how often drafts stated at about
+that probability were accepted) and each window's cost is the measured round time on this machine. On
+a Flash-Next machine a wider window costs its extra experts on the CPU, so the window grows only where
+its drafts pay; it never narrows below the base window (a column less saves little of a round, and
+the narrow windows' CUDA Graphs would cost expert slots). Drafting N tokens costs MTP steps in the
+round that drafts them, whatever the next round verifies, so the policy prices it on its own: a round
+drafts N tokens after a round that kept every draft it verified (each stated at 0.9 or more, when
+stated) while drafting more has paid lately (the tokens the wider windows kept past the base window's,
+less the time they cost, at the current tokens per millisecond), or when its own window is wider than
+the base one; otherwise it drafts `--draft-tokens`, without the drafts' probabilities. While drafting
+more does not pay it is still tried now and then (ever more rarely, down to one chance in 512), so a
+change of text opens it again. Rounds of several requests and validation rounds verify `--draft-tokens` + 1. With
 `--prompt-lookup` too, a lookup window is taken only when it beats the best MTP window. Verification
 keeps the method; a different window is a different verifier batch, so greedy text can change from
 the first token where it does, and two runs whose measured round times differ can choose

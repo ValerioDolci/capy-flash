@@ -271,8 +271,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const std::uint32_t t_mtp = mtp_base_width;
         const std::uint32_t t_max = draft_window + 1U;
         if (adaptive_enabled) {
-            // The more drafts at every window, the base one included (mtp_wide_graphs).
-            for (std::uint32_t w = 2U; w <= std::min(mtp_drafts + 1U, t_max); ++w) {
+            // The more drafts at the base window and every wider one (mtp_wide_graphs). The window
+            // never narrows below the base one: on Flash-Next a column less saves about 1 ms of a
+            // 12 ms round and the families for narrow windows cost expert slots.
+            for (std::uint32_t w = t_mtp; w <= std::min(mtp_drafts + 1U, t_max); ++w) {
                 lookup_widths |= 1U << w;
             }
         }
@@ -285,6 +287,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         lookup_policy->set_sizes(lookup_widths | (1U << t_mtp));
         // A size's first round captures its graph, and a slow round is not its cost.
         lookup_policy->set_robust(true);
+        // Adaptive window: drafting more is priced on its own (DraftPolicy::set_base_window).
+        if (adaptive_enabled && mtp_drafts + 1U > t_mtp) {
+            lookup_policy->set_base_window(static_cast<int>(t_mtp));
+        }
     }
     mtp_low_drafts = adaptive_enabled ? mtp_base_width - 1U : mtp_drafts;
     if (plan.persistent.dflash) {

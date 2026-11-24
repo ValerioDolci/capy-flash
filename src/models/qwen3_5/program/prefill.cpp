@@ -1070,11 +1070,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     }
                     // The next drafts' log-probabilities: calibration records them, the
                     // adaptive window's policy reads them at the next round.
-                    if (calibration || adaptive_enabled) {
+                    if (calibration || mtp_round_logprobs) {
                         for (std::uint32_t k = 0; k < mtp_drafts; ++k) {
                             sequence.mtp_draft_logprobs[k] =
                                 mtp_host_egress->next_draft_logprobs[k * max_concurrency + row];
                         }
+                    } else if (adaptive_enabled) {
+                        // A base round's drafts state no probabilities: the next window is the
+                        // base one.
+                        sequence.mtp_draft_logprobs.fill(std::numeric_limits<float>::quiet_NaN());
                     }
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {

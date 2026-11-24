@@ -54,15 +54,39 @@ public:
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
     // A drafter with stated chances: the window (1 + up to `n` drafts) with the most expected
-    // tokens per ms.
-    [[nodiscard]] int window(const float* chance, int n) const;
+    // tokens per ms. `more`: this round drafts the more drafts for the next one (adaptive window),
+    // so a window of the base size or less costs its own time plus the measured cost of those
+    // drafts.
+    [[nodiscard]] int window(const float* chance, int n, bool more = false) const;
     // The drafter's window against a lookup proposal of `lookup_k` tokens behind a match of
     // `match`: the lookup window when its expected tokens per ms beat the drafter's best by the
     // margin.
-    [[nodiscard]] Pick choose_window(const float* chance, int n, int lookup_k, int match) const;
+    [[nodiscard]] Pick choose_window(const float* chance, int n, int lookup_k, int match,
+                                     bool more = false) const;
     // After a drafter window: the chances of its t - 1 drafts, the drafts accepted, and the round's
     // time.
-    void observe_window(const float* chance, int t, int accepted, double round_ms);
+    // `more`: the round drafted the more drafts for the next one; `avail`: the drafts the round had
+    // to choose from (more than the base window's: the previous round drafted more).
+    void observe_window(const float* chance, int t, int accepted, double round_ms,
+                        bool more = false, int avail = 0);
+
+    // Adaptive window (set_base_window): the more drafts cost MTP steps in the round that drafts
+    // them, whatever the next round verifies. A round whose window is the base size or less and
+    // that drafted more is not that size's cost: its time past the size's cost is the cost of
+    // drafting more (its own EMA). After every round that had the more drafts to choose from, the
+    // policy books what they brought: the tokens past what the base window could have kept, less
+    // the time they cost (drafting them, and the wider window past the base one's cost) at the
+    // current tokens per ms. Drafting more opens at a balance of 0.1 tokens and closes below zero;
+    // while it is closed a chance to draft more is still taken now and then (every 16th, then
+    // every 32nd, ... up to every 512th), so a change of text (a long repetitive answer) opens it
+    // again.
+    void set_base_window(int t) { base_t_ = t; }
+
+    [[nodiscard]] bool draft_more();
+
+    [[nodiscard]] double more_balance() const { return gain_; }
+
+    [[nodiscard]] double more_cost_ms() const { return extra_n_ > 0 ? extra_ms_ : 0.0; }
 
     [[nodiscard]] double lookup_rate(int match) const; // current q for a match length
     [[nodiscard]] double
@@ -123,6 +147,14 @@ private:
         mtp_n_{};                                    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};      // lookup drafts accepted / windows cut short
     std::array<double, kChanceBins> c_ok_{}, c_n_{}; // drafter drafts accepted / tested, by chance
+    int base_t_       = 0;   // the base window (0: drafting more is not priced on its own)
+    double extra_ms_  = 0.0; // EMA: the time drafting more adds to a round
+    double extra_n_   = 0.0;
+    double gain_      = 0.5;  // EMA: tokens the more drafts brought past their cost (prior: open)
+    double rate_      = 0.0;  // EMA: tokens per ms of all rounds
+    long more_tries_  = 0;    // chances to draft more since the last probe
+    long probe_every_ = 16;   // the current probe interval
+    bool more_open_   = true; // drafting more pays (hysteresis on the balance)
 };
 
 } // namespace ninfer::spec

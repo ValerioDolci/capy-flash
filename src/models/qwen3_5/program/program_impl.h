@@ -833,10 +833,14 @@ public:
         std::uint32_t lane = 0;
         std::chrono::steady_clock::time_point started{};
         double round_seconds = 0.0; // launch to completion, when the next round is not this lane's
+        bool more            = false; // adaptive window: the round drafted the more drafts
+        int avail            = 0;     // the drafts it chose its window from
     } lookup_observation;
 
     // The verified columns of the last launched MTP round (its commit reads them).
     std::uint32_t mtp_round_width = 0;
+    // Whether that round's drafts carry their log-probabilities (adaptive window).
+    bool mtp_round_logprobs = false;
     // The columns the graph representative of an MTP capture lays out (0 = mtp_base_width).
     std::uint32_t representative_mtp_width = 0;
 

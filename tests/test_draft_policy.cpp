@@ -14,6 +14,10 @@
 //   9. rows that cost little take more drafts at the same chances;
 //  10. against a lookup proposal, a long reliable copy wins and a failing short one loses;
 //  11. an untimed policy's picks do not depend on the round times.
+// Drafting more (adaptive window, set_base_window):
+//  12. a base-window round that drafted more prices drafting more, not the base window;
+//  13. more drafts that bring nothing close drafting more, and it is then probed ever more rarely;
+//  14. more drafts that are kept and cheap keep it open.
 #include "core/draft_policy.h"
 
 #include <algorithm>
@@ -142,6 +146,70 @@ void drafter_cases() {
     }
 }
 
+// Rounds of an adaptive MTP window (base window 4, the more drafts 7): a round drafts more when the
+// policy lets it (draft_more), and the next round, with the more drafts in hand, keeps `wide_got`
+// tokens from a window of `wide_t`. Base rounds cost base(4) ms, drafting more adds `extra` ms, a
+// wide window costs `wide_ms`. Returns how many of the chances to draft more were taken.
+int more_rounds(DraftPolicy& p, int rounds, double extra, int wide_t, int wide_got,
+                double wide_ms) {
+    const float ch[7] = {0.95F, 0.95F, 0.95F, 0.95F, 0.95F, 0.95F, 0.95F};
+    bool more         = false;
+    int taken         = 0;
+    for (int i = 0; i < rounds; ++i) {
+        const bool had_more = more;
+        if (had_more) {
+            // The round after drafting more: a wide window that drafts more for the next one.
+            p.observe_window(ch, wide_t, wide_got - 1, wide_ms, true, 7);
+        } else {
+            p.observe_window(ch, 4, 3, ds_cost(4), false, 3);
+        }
+        more = !had_more && p.draft_more();
+        taken += more ? 1 : 0;
+        if (more) {
+            // The round that drafts more verifies the base window.
+            p.observe_window(ch, 4, 3, ds_cost(4) + extra, true, 3);
+        }
+    }
+    return taken;
+}
+
+void more_cases() {
+    {
+        DraftPolicy p(8);
+        p.set_robust(true);
+        p.set_base_window(4);
+        const float ch[3] = {0.95F, 0.95F, 0.95F};
+        for (int i = 0; i < 30; ++i) { p.observe_window(ch, 4, 3, ds_cost(4), false, 3); }
+        for (int i = 0; i < 30; ++i) { p.observe_window(ch, 4, 3, ds_cost(4) + 3.0, true, 3); }
+        check(p.cost_ms(4) < 1.02 * ds_cost(4),
+              "more: drafting more does not price the base window");
+        check(p.more_cost_ms() > 2.5 && p.more_cost_ms() < 3.5,
+              "more: its time past the base window is the cost of drafting more");
+    }
+    {
+        // Wide windows that keep no more than the base one would (4 tokens) at 3 ms of drafting.
+        DraftPolicy p(8);
+        p.set_robust(true);
+        p.set_base_window(4);
+        p.set_sizes(0x1F0U);
+        more_rounds(p, 400, 3.0, 8, 4, ds_cost(8));
+        check(p.more_balance() < 0, "more: drafts that bring nothing close drafting more");
+        const int late = more_rounds(p, 2000, 3.0, 8, 4, ds_cost(8));
+        check(late > 0 && late < 40, "more: closed, it is still probed, ever more rarely");
+    }
+    {
+        // Wide windows that keep all 8 tokens at little cost.
+        DraftPolicy p(8);
+        p.set_robust(true);
+        p.set_base_window(4);
+        p.set_sizes(0x1F0U);
+        more_rounds(p, 400, 1.0, 8, 8, ds_cost(4) + 2.0);
+        check(p.more_balance() > 0, "more: kept, cheap drafts keep drafting more open");
+        const int open = more_rounds(p, 200, 1.0, 8, 8, ds_cost(4) + 2.0);
+        check(open > 80, "more: and it drafts more whenever it can");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -244,6 +312,7 @@ int main() {
               "robust: a new context bucket starts from the nearest measured one");
     }
     drafter_cases();
+    more_cases();
     std::printf("draft_policy: %s\n", g_fail != 0 ? "FAILED" : "PASS");
     return g_fail != 0 ? 1 : 0;
 }

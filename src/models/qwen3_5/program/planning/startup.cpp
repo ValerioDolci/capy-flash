@@ -1558,13 +1558,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                             "MTP exact-b graph allowance");
             unsigned widths = 0;
             if (impl->inputs.adaptive_window) {
-                for (std::uint32_t w = 2U; w <= std::min(drafts + 1U, t_max); ++w) {
+                // The base window and the wider ones, drafting the more drafts (ProgramImpl:
+                // the window never narrows below the base one).
+                for (std::uint32_t w = t_mtp; w <= std::min(drafts + 1U, t_max); ++w) {
                     widths |= 1U << w;
-                }
-                for (std::uint32_t w = 2U; w < t_mtp && low < drafts; ++w) {
-                    impl->graph_allowance_bytes =
-                        checked_add(impl->graph_allowance_bytes, family_allowance(w, low),
-                                    "adaptive window graph allowance");
                 }
             }
             if (impl->inputs.prompt_lookup) {
