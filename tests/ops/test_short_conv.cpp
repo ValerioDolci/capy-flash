@@ -277,6 +277,73 @@ int run_rejections() {
     return failures;
 }
 
+// short_conv_pair against the two Ops, bit for bit: outputs and states, in place, both kinds.
+int run_pair(std::int32_t C, std::int32_t T, std::int32_t G, std::uint32_t seed) {
+    const std::string id = "short_conv_pair C=" + std::to_string(C) + " T=" + std::to_string(T) +
+                           " G=" + std::to_string(G);
+    const std::size_t n = static_cast<std::size_t>(C) * T;
+
+    struct Call {
+        DeviceBuffer x, w, dyn, state, out;
+    };
+
+    const auto make_call = [&](std::uint32_t s) {
+        Call c;
+        c.x = to_device_bf16(make_values(n, s, -2.0F, 2.0F));
+        c.w = to_device_f32(make_values(static_cast<std::size_t>(C) * 4, s + 1, -0.5F, 0.5F));
+        if (G > 0) {
+            c.dyn = to_device_bf16(
+                make_values(static_cast<std::size_t>(4 * G) * T, s + 2, -0.3F, 0.3F));
+        }
+        c.state =
+            to_device_bf16(make_values(static_cast<std::size_t>(C) * kHistory, s + 3, -2.0F, 2.0F));
+        c.out = DeviceBuffer(n * 2);
+        return c;
+    };
+    Call a = make_call(seed), b = make_call(seed + 10);
+    const std::vector<std::uint16_t> state_a = from_device<std::uint16_t>(a.state, C * kHistory);
+    const std::vector<std::uint16_t> state_b = from_device<std::uint16_t>(b.state, C * kHistory);
+    const auto call                          = [&](Call& c) {
+        Tensor st(c.state.p, DType::BF16, {C, kHistory});
+        return ops::ShortConvCall{Tensor(c.x.p, DType::BF16, {C, T}),
+                                  G > 0 ? Tensor(c.w.p, DType::FP32, {C, 4})
+                                                                 : Tensor(c.w.p, DType::FP32, {4, C}),
+                                  G > 0 ? Tensor(c.dyn.p, DType::BF16, {4 * G, T}) : Tensor{},
+                                  0.4472136F,
+                                  st,
+                                  st,
+                                  Tensor(c.out.p, DType::BF16, {C, T})};
+    };
+    ops::short_conv_pair(call(a), call(b), nullptr);
+    cuda_synchronize();
+    const auto pair_out_a = from_device<std::uint16_t>(a.out, n);
+    const auto pair_out_b = from_device<std::uint16_t>(b.out, n);
+    const auto pair_st_a  = from_device<std::uint16_t>(a.state, C * kHistory);
+    const auto pair_st_b  = from_device<std::uint16_t>(b.state, C * kHistory);
+    a.state.copy_from_host(state_a.data(), state_a.size() * 2);
+    b.state.copy_from_host(state_b.data(), state_b.size() * 2);
+    for (Call* c : {&a, &b}) {
+        ops::ShortConvCall x = call(*c);
+        if (G > 0) {
+            ops::short_conv_dynamic(x.x, x.weight, x.dyn, x.scale, x.state_in, x.state_out, x.out,
+                                    nullptr);
+        } else {
+            ops::short_conv_static(x.x, x.weight, x.scale, x.state_in, x.state_out, x.out, nullptr);
+        }
+    }
+    cuda_synchronize();
+    int failures =
+        verify_exact((id + " first out").c_str(), pair_out_a, from_device<std::uint16_t>(a.out, n));
+    failures += verify_exact((id + " second out").c_str(), pair_out_b,
+                             from_device<std::uint16_t>(b.out, n));
+    failures += verify_exact((id + " first state").c_str(), pair_st_a,
+                             from_device<std::uint16_t>(a.state, C * kHistory));
+    failures += verify_exact((id + " second state").c_str(), pair_st_b,
+                             from_device<std::uint16_t>(b.state, C * kHistory));
+    std::cout << (failures ? "FAIL " : "OK ") << id << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -302,6 +369,11 @@ int main() {
             for (const std::int32_t T : {1, 4, 16, 17, 512}) {
                 failures += run_case(C, T, G, seed += 10);
             }
+        }
+        for (const std::int32_t T : {1, 4}) {
+            failures += run_pair(512, T, 0, seed += 20);
+            failures += run_pair(512, T, 4, seed += 20);
+            failures += run_pair(2304, T, 0, seed += 20);
         }
     } catch (const std::exception& error) {
         std::cerr << "short_conv: " << error.what() << '\n';

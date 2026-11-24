@@ -22,7 +22,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.16.2**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.16.3**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
@@ -156,16 +156,16 @@ same way. The drafter leaves the generated text unchanged.
   curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
     -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is 17*23?"}],"max_tokens":512}'
   ```
-  The launcher runs `--tp 2 --devices 0,1 --max-context 253952 --prefill-chunk 2048 --spec mtp --draft-tokens 3`
-  (`NINFER_MAX_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_DEVICES`, `NINFER_PORT`, `NINFER_MODEL_ID`, `NINFER_DRAFTER`
-  change them; extra flags after the artifact win). The context is reserved at startup: 253,952 tokens with
-  2048-token prefill blocks and the drafter leave about 300 MiB free per 16 GB card (without the drafter 319,488
-  fit). Larger prefill blocks (4096) make the prefill faster and leave less context (221,184 with the drafter),
-  smaller ones (1024) the opposite (270,336). The block size does not change results on prompts whose last block has
+  The launcher runs `--tp 2 --devices 0,1 --max-context 253952 --prefill-chunk 4096 --embedding-host --spec mtp
+  --draft-tokens 3` (`NINFER_MAX_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_DEVICES`, `NINFER_PORT`, `NINFER_MODEL_ID`,
+  `NINFER_DRAFTER` change them; extra flags after the artifact win, except that `--embedding-host` has no off switch and changes no result). The context is reserved at startup: 253,952 tokens
+  with 4096-token prefill blocks and the drafter leave about 580 MiB free per 16 GB card, with the token embedding in
+  pinned host memory (`--embedding-host`: one 0.9 GB copy in RAM that both cards read in place, identical results).
+  Smaller prefill blocks (2048) prefill 6-13 % slower. The block size does not change results on prompts whose last block has
   at least 128 tokens, and can change the rounding of the few tokens of a shorter tail (a mean KL of 1.8e-3 measured
   on a 10-token tail, within the noise between two valid routes); it is not a reduction of precision. `NINFER_DEVICES=0` starts it on one GPU only if that GPU has 32 GB (not
   verified); with 16 GB the launcher refuses. From a build: `build/apps/ninfer-serve <artifact> --tp 2 --max-context
-  253952 --prefill-chunk 2048`.
+  253952 --prefill-chunk 4096 --embedding-host`.
 - **Drafter:** the launcher turns it on (`--spec mtp --draft-tokens 3`); `ninfer-serve` (or `capy-serve`) started
   by hand leaves it off unless given those flags. To turn it off in the launcher:
   ```bash
@@ -174,7 +174,7 @@ same way. The drafter leaves the generated text unchanged.
   `--spec off`, or another `--draft-tokens`, after the artifact also wins over the launcher's. The drafter proposes
   tokens that the model verifies in one pass; it works with greedy and sampled requests, and the text is the same
   as without it (at temperature 0, and with sampling for the same seed). Steps that run forced tokens (thinking
-  budgets) or reach the end of the context are ordinary steps. `--draft-tokens` accepts 1 to 5; 3 was the best
+  budgets), reach the end of the context or run beyond 245,760 tokens of context are ordinary steps. `--draft-tokens` accepts 1 to 5; 3 was the best
   measured. It takes about 1.0 GiB more VRAM per card at the launcher's 253,952-token context (0.7 GiB at 131,072). When few drafts are accepted it
   can decode slower than without it. An artifact without the drafter starts with `--spec mtp` and decodes without
   it. Speed with and without the drafter: [benchmarks](#benchmarks).
@@ -186,14 +186,14 @@ same way. The drafter leaves the generated text unchanged.
 - **What it does not do (yet):** images (`--vision` is refused); `--spec dflash2` and `--lm-head-draft` (refused);
   more than one request at a time (`--max-concurrency` must be 1; further requests queue); one 16 GB card; structured
   output and grammars; `tool_choice` other than automatic; the RAM and disk tiers of the context cache
-  (`--disk-cache-dir` is refused) and shared prefixes between conversations; `--embedding-host` (refused); a
+  (`--disk-cache-dir` is refused) and shared prefixes between conversations; a
   `--kv-dtype` other than `bf16` (refused); continuing a final assistant message. The empty-reply EOS guard is off
   for this model (the server says so at startup).
 - **Quality:** not measured with GSM8K or MMLU-Pro. The engine's output is checked against the reference
   implementation with the checkpoint's exact weights, token by token and on greedy generations
   ([validation](docs/maintainer/inkling2-model.md#numerics-and-validation)). With the drafter, the server's text was
   compared with the text without it: identical at temperature 0 and, with sampling, for the same seed. Test suite
-  of this release: 263 of 263 tests pass, 26 of them on two GPUs.
+  of this release: 273 of 273 tests pass, 28 of them on two GPUs.
 
 How the engine implements it: [Inkling 2 model reference](docs/maintainer/inkling2-model.md).
 
@@ -352,11 +352,14 @@ prompt, 512 tokens).
 | Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | decode, `--profile 27b` (DFlash2 7): conversation / JSON / code edit / Italian essay / quoting from 30K | 277 / 415 / 520 / 140 / 385 tok/s |
 | Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | agentic replay decode (53 turns, up to 81K tokens), `--profile 27b` | 234 tok/s (MTP 3: 205) |
 | Qwen3.8-27B 3-bit | 1 | v0.16.2, 2026-11-23 | decode, `--profile 27b-16gb` (prompt lookup): conversation / JSON / code edit / Italian essay / quoting | 145 / 212 / 318 / 106 / 304 tok/s |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode without the drafter, 68-token / 12.8k-token prompt | 127.5 / 112.8 tok/s |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode with `--spec mtp --draft-tokens 3` (the launcher's default), temperature 0: 68-token / 12.8k-token prompt / a coding task | 149.0 / 166.6 / 193.9 tok/s |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | the same with the model's default sampling (one seed): 68-token prompt / an essay / a coding task | 146.1 / 129.6 / 173.9 tok/s (124.7 / 124.4 / 124.9 without the drafter) |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | prefill 512 / 4k / 12.8k / 99k tokens | 4,002 / 5,032 / 4,524 / 2,522 tok/s |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | VRAM per GPU at the launcher's 253,952-token context, without / with the drafter | 14.2 / 15.2 GiB |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode without the drafter, 68-token / 12.8k-token prompt | 204.5 / 185.9 tok/s (v0.16.0: 127.5 / 112.8) |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode with `--spec mtp --draft-tokens 3` (the launcher's default), temperature 0: 68-token / 12.8k-token prompt / a coding task | 209.8 / 239.6 / 255.8 tok/s (v0.16.0: 149.0 / 166.6 / 193.9) |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode with the drafter, temperature 0, reasoning capped at 32 tokens (`--default-thinking-budget 32`), after a ~4k-token prompt: writing code / an essay | 307.6 / 205.1 tok/s (v0.16.0: 230.2 / 149.2) |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode, summarizing a 130k / 247k-token document (the drafter stops at 245,760 tokens of context) | 140.4 / 87.5 tok/s (v0.16.0: 72.6 / 53.4) |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode with the drafter and the model's default sampling (one seed): 68-token prompt / an essay / a coding task | 146.1 / 129.6 / 173.9 tok/s (124.7 / 124.4 / 124.9 without the drafter) |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | prefill 512 / 4k / 12.8k / 99k tokens | 5,020 / 8,209 / 7,804 / 6,610 tok/s (v0.16.0: 4,002 / 5,032 / 4,524 / 2,522) |
+| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | prefill 247k tokens | 5,078 tok/s (v0.16.0: 1,413) |
+| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | VRAM per GPU at 253,952 tokens of context with v0.16.0's launcher (2048-token blocks, embedding on the GPUs), without / with the drafter | 14.2 / 15.2 GiB |
 
 More on the 27B NVFP4 (`--profile 27b`, MTP; 280 prompts in three languages, v0.6): the same tokens as v0.5.4 on 280 of
 280 answers (and with DFlash2), decode +5 % (Italian 168 → 176 tok/s), prefill at 4k / 16k / 64k 5,777 / 5,585 / 4,352
@@ -467,6 +470,30 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.3** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.3)): Inkling 2 Mini decodes up to
+1.9× and prefills up to 3.6× faster than v0.16.0, with the same weights; nothing changes for the Qwen models
+- Same precision as before: the checkpoint's NVFP4 and MXFP8 experts as released, dense weights in BF16, KV cache and
+  activations at 16 bits. Only the engine changed (the order of some sums, and some partial sums in FP16 or BF16, checked
+  against the reference with the exact weights).
+- Decode without the drafter 127.5 → 204.5 tok/s on a short prompt (a decode step takes 4.87 ms: reading the weights at the
+  cards' 896 GB/s is now 65 % of the step, from 40 %). With the drafter, after a 4k-token prompt: writing code 230 → 308,
+  an essay 149 → 205; summarizing a 130k-token document 73 → 140 ([benchmarks](#benchmarks)).
+- Prefill 5,032 → 8,209 tok/s at 4k tokens, 2,522 → 6,610 at 99k, 1,413 → 5,078 at 247k.
+- How: every selected expert is split across the two GPUs by its intermediate size (both cards read half of each, none
+  waits for the other); wider expert kernels at prefill (128 × 128 tiles, 4-bit weights decoded in registers); a
+  FlashAttention-2-style prefill attention; decode attention in one launch that reads the paged keys once; batched
+  gates and router; dense weights prefetched into L2 next to the small kernels; prefill exchanges between the cards in
+  BF16 and overlapped with compute by halves, as on the 27B.
+- `capy-serve-inkling2-mini.sh` uses 4096-token prefill blocks and `--embedding-host` (the token embedding in one pinned
+  host copy, identical results): the same 253,952-token context, prefill 6-13 % faster than with 2048-token blocks.
+- The drafter now stays on up to 245,760 tokens of context (it stopped at 98,304): +12 % at 130k and +9 % at 196k
+  over decoding without it.
+- Quality: against the reference with the checkpoint's exact weights, the KL of the generated tokens is 0.99×
+  v0.16.2's; over a 13k-token document the prompt's per-token KL and NLL move less than two valid prefill block sizes
+  already make them move. The text can differ from v0.16.2 where two tokens are nearly tied.
+- Qwen3.8-Flash-Next and Qwen3.8-27B run the same machine code as v0.16.2 (kernel fingerprint: only Inkling's kernels
+  changed).
 
 **v0.16.2** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.2)): the 27B decodes with
 DFlash2 by default, prompt lookup on the one-GPU 27B

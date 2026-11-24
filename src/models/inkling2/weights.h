@@ -46,7 +46,8 @@ namespace ninfer::models::inkling2 {
 //
 // The experts of a layer are stored as two banks per matrix, IDs [0, E/2) and [E/2, E): each
 // bank is one parent (an NVFP4 bank keeps one weight divisor per expert), whose rows are its
-// experts' rows in ID order.
+// experts' rows in ID order. The model maps them from the file and cuts the banks it computes
+// with, every expert at half the intermediate width (expert_bank.h).
 //
 // The DSpark drafter (component mtp, draft/config.h; <i> its layer, nh/nkv/D its heads, F its
 // MLP width, r the recurrent rank), every parameter BF16. Under mtp/:

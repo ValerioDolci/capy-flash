@@ -80,4 +80,55 @@ void short_conv_dynamic(const Tensor& x, const Tensor& static_weight, const Tens
     detail::short_conv_launch(x, static_weight, &dyn, scale, state_in, state_out, out, stream);
 }
 
+void short_conv_pair(const ShortConvCall& first, const ShortConvCall& second, cudaStream_t stream) {
+    constexpr const char* op = "short_conv_pair";
+    const bool dynamic       = first.dyn.data != nullptr;
+    require(dynamic == (second.dyn.data != nullptr), op, "both calls must be of the same kind");
+    require(first.x.ne[1] == second.x.ne[1], op, "both calls must have the same T");
+    for (const ShortConvCall* a : {&first, &second}) {
+        const ShortConvCall* b = a == &first ? &second : &first;
+        for (const Tensor* in : {&a->x, &a->weight, &a->dyn, &a->state_in}) {
+            if (in->data == nullptr) { continue; }
+            require(!detail::overlaps(*in, b->out) && !detail::overlaps(*in, b->state_out), op,
+                    "an operand of one call must not be an output of the other");
+        }
+    }
+    const auto validate = [&](const ShortConvCall& c) {
+        // The single Op's checks (without launching): run them through a copy of the call.
+        Tensor state = c.state_out, out = c.out;
+        if (c.dyn.data == nullptr) {
+            require_common("short_conv_static", c.x, c.scale, c.state_in, state, out);
+            require_dense(c.weight, DType::FP32, "short_conv_static", "weight");
+            require(is_matrix(c.weight, kShortConvTaps, c.x.ne[0]), "short_conv_static",
+                    "weight must be ne={4,C}");
+        } else {
+            require_common("short_conv_dynamic", c.x, c.scale, c.state_in, state, out);
+            require_dense(c.weight, DType::FP32, "short_conv_dynamic", "static_weight");
+            require(is_matrix(c.weight, c.x.ne[0], kShortConvTaps), "short_conv_dynamic",
+                    "static_weight must be ne={C,4}");
+            require_dense(c.dyn, DType::BF16, "short_conv_dynamic", "dyn");
+            require(is_matrix(c.dyn, c.dyn.ne[0], c.x.ne[1]) && c.dyn.ne[0] % kShortConvTaps == 0 &&
+                        c.x.ne[0] % (c.dyn.ne[0] / kShortConvTaps) == 0,
+                    "short_conv_dynamic", "dyn must be ne={4G,T} with C a multiple of G");
+        }
+    };
+    validate(first);
+    validate(second);
+    Tensor s0 = first.state_out, o0 = first.out, s1 = second.state_out, o1 = second.out;
+    if (detail::short_conv_pair_launch(first.x, first.weight, dynamic ? &first.dyn : nullptr,
+                                       first.scale, first.state_in, s0, o0, second.x, second.weight,
+                                       dynamic ? &second.dyn : nullptr, second.scale,
+                                       second.state_in, s1, o1, stream)) {
+        return;
+    }
+    for (const ShortConvCall* c : {&first, &second}) {
+        Tensor state = c->state_out, out = c->out;
+        if (dynamic) {
+            short_conv_dynamic(c->x, c->weight, c->dyn, c->scale, c->state_in, state, out, stream);
+        } else {
+            short_conv_static(c->x, c->weight, c->scale, c->state_in, state, out, stream);
+        }
+    }
+}
+
 } // namespace ninfer::ops

@@ -49,6 +49,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/short_conv/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/short_conv_record/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/dspark_draft/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softcap/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/l2_preload/sources.cmake")
 
 # GGUF routed-expert Op geometry helpers (the Op kernels: moe_slots_gguf/sources.cmake).
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/moe_slots_gguf/moe_gguf_format.cpp")

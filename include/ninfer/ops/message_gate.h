@@ -74,16 +74,22 @@ struct MessageGateNormed {
  *   normed_g = rmsnorm_f32(out_g, norm_g, norm_eps)
  *
  * Numeric:
- *   Bit-identical to message_gate then rmsnorm_f32 for every gate.
+ *   message_gate's math and BF16 roundings, then rmsnorm_f32's; the sums are reduced in another
+ *   order than those Ops' (results within message_gate's tolerance, not bit-identical). A
+ *   column's bits depend neither on T nor on the batch nor on the gate's place in it. Outside the
+ *   batch route (operands not 16-byte aligned, R > 64 or not a multiple of 8, H > 2304 or not a
+ *   multiple of 256) the Op is message_gate then rmsnorm_f32 per gate, bit for bit.
  *
  * Shapes and domain:
  *   1 <= gates.size() <= kMessageGateMaxBatch; every gate as message_gate.h with the same H, R and
  *   T; norm BF16 ne {H}, normed contiguous BF16 [H, T]; norm_eps finite and positive. normed
- *   overlaps no operand; the gates' outputs overlap no other gate's operands.
+ *   overlaps no operand; the gates' outputs overlap no other gate's operands. forget and gain
+ *   hold BF16 values: FP32 storage (the batch route narrows them, exactly) or BF16 storage of the
+ *   same ne (the batch route only; same bits), one dtype for the whole batch.
  *
  * Execution:
- *   One kernel on message_gate's cluster route (the gates' clusters run concurrently), else the two
- *   Ops per gate. Stream ordered on `stream`, CUDA Graph capturable. Workspace: none.
+ *   One kernel of clusters (the gates' clusters run concurrently), else the two Ops per gate.
+ *   Stream ordered on `stream`, CUDA Graph capturable. Workspace: none.
  */
 void message_gates_rmsnorm(std::span<const MessageGateNormed> gates, float eps, float norm_eps,
                            cudaStream_t stream);

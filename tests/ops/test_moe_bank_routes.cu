@@ -1,10 +1,10 @@
-// moe_bank_capped_swiglu (narrow route, up to 24 tokens) and moe_sigmoid_route against their
-// reference executions: the first,
-// one-warp-per-row implementation of the contract, kept here (not in the library) as the bit
-// reference of the production routes. Every route of the Op must give the same partial bit for bit,
-// Store and Accumulate, at the synthetic and the real geometry, nvfp4 and bf16 banks, decode and
-// prefill widths. The mathematical acceptance is test_moe_bank.cpp (FP64 oracle); this suite pins
-// the arithmetic so a faster route cannot drift silently.
+// moe_bank_capped_swiglu (narrow route, up to 47 tokens) and moe_sigmoid_route against their
+// reference executions: a direct implementation of the contract in the narrow route's summation
+// order, kept here (not in the library) as the bit reference of the production routes. Every route
+// of the Op must give the same partial bit for bit, Store and Accumulate, at the synthetic and the
+// real geometry, nvfp4 and bf16 banks, decode and prefill widths. The mathematical acceptance is
+// test_moe_bank.cpp (FP64 oracle); this suite pins the arithmetic so a faster route cannot drift
+// silently.
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/weight_view.h"
@@ -67,7 +67,9 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
-__device__ float row_dot(const Plane& plane, std::int64_t row, const __nv_bfloat16* v, int lane) {
+// Lane `lane` of `lanes`: NVFP4 16-column groups and BF16 8-column pieces dealt round robin.
+__device__ float row_dot(const Plane& plane, std::int64_t row, const __nv_bfloat16* v, int lane,
+                         int lanes = 32) {
     const int columns = plane.columns;
     float acc         = 0.0F;
     if (plane.nvfp4) {
@@ -77,7 +79,7 @@ __device__ float row_dot(const Plane& plane, std::int64_t row, const __nv_bfloat
         const std::int64_t inner   = row % 128;
         const std::int64_t tile_base =
             (row / 128) * k_tiles * 512 + (inner % 32) * 16 + (inner / 32) * 4;
-        for (int g = lane; g < columns / 16; g += 32) {
+        for (int g = lane; g < columns / 16; g += lanes) {
             const uint2 packed       = *reinterpret_cast<const uint2*>(codes + g * 8);
             const std::uint8_t scale = scales[tile_base + (g / 4) * 512 + g % 4];
             const __nv_bfloat16* vg  = v + g * 16;
@@ -93,7 +95,7 @@ __device__ float row_dot(const Plane& plane, std::int64_t row, const __nv_bfloat
         }
     } else {
         const auto* w = reinterpret_cast<const __nv_bfloat16*>(plane.data) + row * columns;
-        for (int c = lane * 8; c < columns; c += 32 * 8) {
+        for (int c = lane * 8; c < columns; c += lanes * 8) {
             const uint4 wq = *reinterpret_cast<const uint4*>(w + c);
             const uint4 vq = *reinterpret_cast<const uint4*>(v + c);
             const auto* wp = reinterpret_cast<const __nv_bfloat162*>(&wq);
@@ -109,15 +111,22 @@ __device__ float row_dot(const Plane& plane, std::int64_t row, const __nv_bfloat
     return acc;
 }
 
-__device__ float full_dot(const Plane& plane, std::int64_t row, const __nv_bfloat16* v, int lane) {
-    const float dot = warp_sum(row_dot(plane, row, v, lane));
-    if (!plane.nvfp4) return dot;
-    const auto* words = reinterpret_cast<const float*>(plane.data + plane.divisor_offset);
-    return dot / words[row / plane.rows_per_divisor];
-}
-
 __device__ __forceinline__ float softcap(float v, float cap) { return cap * tanhf(v / cap); }
 
+// A dot as `lanes` lane partials (row_dot) summed pairwise in lane order: (l0 + l1) + (l2 + l3) ...
+__device__ float tree_dot(const Plane& plane, std::int64_t row, const __nv_bfloat16* v, int lanes) {
+    float p[32];
+    for (int q = 0; q < lanes; ++q) p[q] = row_dot(plane, row, v, q, lanes);
+    for (int width = 1; width < lanes; width *= 2) {
+        for (int q = 0; q < lanes; q += 2 * width) p[q] = __fadd_rn(p[q], p[q + width]);
+    }
+    if (!plane.nvfp4) return p[0];
+    const auto* words = reinterpret_cast<const float*>(plane.data + plane.divisor_offset);
+    return p[0] / words[row / plane.rows_per_divisor];
+}
+
+// gate_up in the order of the production kernel, by one thread per channel: the gate and the up
+// dot each as 16 lane partials summed pairwise.
 __global__ void gate_up_kernel(const __nv_bfloat16* x, const std::int32_t* ids, Plane gate_up,
                                Shape shape, float gate_cap, float up_cap, __nv_bfloat16* hidden) {
     const int assignment = static_cast<int>(blockIdx.x);
@@ -125,43 +134,55 @@ __global__ void gate_up_kernel(const __nv_bfloat16* x, const std::int32_t* ids, 
     if (ids[assignment] < 0 || b < 0 || b >= shape.experts) return;
     const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
     const int channel = static_cast<int>(blockIdx.y) * kWarps + warp;
-    if (channel >= shape.intermediate) return;
+    if (channel >= shape.intermediate || lane != 0) return;
     const int token        = assignment / shape.top_k;
     const __nv_bfloat16* u = x + static_cast<std::int64_t>(token) * shape.hidden;
     const std::int64_t base =
         gate_up.row_begin + static_cast<std::int64_t>(b) * 2 * shape.intermediate;
-    const float g = bf16_round(full_dot(gate_up, base + channel, u, lane));
-    const float a = bf16_round(full_dot(gate_up, base + shape.intermediate + channel, u, lane));
-    if (lane == 0) {
-        const float sig = 1.0F / (1.0F + expf(-g));
-        const float h   = softcap(g, gate_cap) * sig * softcap(a, up_cap);
-        hidden[static_cast<std::int64_t>(assignment) * shape.intermediate + channel] =
-            __float2bfloat16_rn(h);
-    }
+    const float g   = bf16_round(tree_dot(gate_up, base + channel, u, 16));
+    const float a   = bf16_round(tree_dot(gate_up, base + shape.intermediate + channel, u, 16));
+    const float sig = 1.0F / (1.0F + expf(-g));
+    const float h   = softcap(g, gate_cap) * sig * softcap(a, up_cap);
+    hidden[static_cast<std::int64_t>(assignment) * shape.intermediate + channel] =
+        __float2bfloat16_rn(h);
 }
 
+// The down projection in the order of the production kernel, by one thread per (token, row):
+// positions in passes of 8, each position's dot as four lane partials (16-column groups or
+// 8-column pieces dealt round robin) summed (l0 + l1) + (l2 + l3), divided, rounded to BF16 and
+// weighted; a pass's eight terms summed pairwise ((t0 + t1) + (t2 + t3)) + ((t4 + t5) + (t6 + t7))
+// (+0 for a position outside the bank or past k); the passes summed in order.
 __global__ void down_kernel(const std::int32_t* ids, const float* weights,
                             const __nv_bfloat16* hidden, Plane down, Shape shape, bool accumulate,
                             float* partial) {
     const int token = static_cast<int>(blockIdx.x);
     const int warp = static_cast<int>(threadIdx.x) >> 5, lane = static_cast<int>(threadIdx.x) & 31;
     const int row = static_cast<int>(blockIdx.y) * kWarps + warp;
-    if (row >= shape.hidden) return;
+    if (row >= shape.hidden || lane != 0) return;
+    constexpr int kLanes = 4, kSlots = 8;
     float sum = 0.0F;
-    for (int j = 0; j < shape.top_k; ++j) {
-        const int assignment = token * shape.top_k + j;
-        const int id = ids[assignment], b = id - shape.first_expert;
-        if (id < 0 || b < 0 || b >= shape.experts) continue;
-        const std::int64_t prow =
-            down.row_begin + static_cast<std::int64_t>(b) * shape.hidden + row;
-        const float o = bf16_round(full_dot(
-            down, prow, hidden + static_cast<std::int64_t>(assignment) * shape.intermediate, lane));
-        sum           = __fadd_rn(sum, __fmul_rn(weights[assignment], o));
+    for (int j0 = 0; j0 < shape.top_k; j0 += kSlots) {
+        float term[kSlots];
+        for (int s = 0; s < kSlots; ++s) {
+            term[s]              = 0.0F;
+            const int j          = j0 + s;
+            const int assignment = token * shape.top_k + j;
+            if (j >= shape.top_k) continue;
+            const int id = ids[assignment], b = id - shape.first_expert;
+            if (id < 0 || b < 0 || b >= shape.experts) continue;
+            const std::int64_t prow =
+                down.row_begin + static_cast<std::int64_t>(b) * shape.hidden + row;
+            const __nv_bfloat16* h =
+                hidden + static_cast<std::int64_t>(assignment) * shape.intermediate;
+            term[s] = __fmul_rn(weights[assignment], bf16_round(tree_dot(down, prow, h, kLanes)));
+        }
+        const float pass =
+            __fadd_rn(__fadd_rn(__fadd_rn(term[0], term[1]), __fadd_rn(term[2], term[3])),
+                      __fadd_rn(__fadd_rn(term[4], term[5]), __fadd_rn(term[6], term[7])));
+        sum = __fadd_rn(sum, pass);
     }
-    if (lane == 0) {
-        float* out = partial + static_cast<std::int64_t>(token) * shape.hidden + row;
-        *out       = accumulate ? __fadd_rn(*out, sum) : sum;
-    }
+    float* out = partial + static_cast<std::int64_t>(token) * shape.hidden + row;
+    *out       = accumulate ? __fadd_rn(*out, sum) : sum;
 }
 
 } // namespace reference

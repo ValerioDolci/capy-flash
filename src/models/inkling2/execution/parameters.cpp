@@ -26,7 +26,9 @@ public:
         out.token_embedding = tensor(w.token_embedding);
         out.embedding_norm  = tensor(w.embedding_norm);
         out.layers.reserve(w.layers.size());
-        for (const auto& layer : w.layers) { out.layers.push_back(this->layer(layer)); }
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(layer(w.layers[i], static_cast<std::uint32_t>(i)));
+        }
         out.final_queries = tensor(w.final_queries);
         out.final_norm    = tensor(w.final_norm);
         out.output_head   = ops::prepare_linear_weight(model_.input(w.output_head_use, device_));
@@ -87,73 +89,12 @@ private:
         return out;
     }
 
-    // The whole parent one bank's expert matrices are consecutive row blocks of.
-    static const WeightParent& bank_parent(const BoundWeight& first) {
-        if (first.view.parts.size() != 1 || first.view.parts.front().begin != 0) {
-            throw std::invalid_argument(first.name + ": an expert bank starts at its first row");
-        }
-        return *first.view.parts.front().parent;
-    }
-
-    static WeightView whole_view(const WeightParent& parent) {
-        return WeightView{parent.geometry.shape, {{&parent, 0, parent.geometry.elements}}};
-    }
-
-    ExpertBankParameters bank(const MoeWeights& w, std::uint32_t first, std::uint32_t count) const {
-        const auto& gate_up = bank_parent(model_.weight(w.experts.at(first).gate_up, device_));
-        const auto& down    = bank_parent(model_.weight(w.experts.at(first).down, device_));
-        for (std::uint32_t i = 0; i < count; ++i) {
-            for (const auto& [id, parent] : {std::pair{w.experts[first + i].gate_up, &gate_up},
-                                             std::pair{w.experts[first + i].down, &down}}) {
-                const auto& bound = model_.weight(id, device_);
-                const auto rows   = weight_element_count(bound.view.shape);
-                if (bound.view.parts.size() != 1 || bound.view.parts[0].parent != parent ||
-                    bound.view.parts[0].begin != i * rows ||
-                    parent->geometry.elements != count * rows) {
-                    throw std::invalid_argument(bound.name +
-                                                ": experts are not the consecutive row blocks "
-                                                "of one bank parent");
-                }
-            }
-        }
-        const auto format = gate_up.geometry.format;
-        const bool nvfp4 =
-            format == QType::NVFP4 && gate_up.geometry.layout == QuantLayout::BlockScaleK16M128x4;
-        const bool mxfp8 = format == QType::MXFP8_E4M3FN_G32_UE8M0 &&
-                           gate_up.geometry.layout == QuantLayout::BlockScaleK32;
-        const bool bf16 =
-            format == QType::BF16 && gate_up.geometry.layout == QuantLayout::Contiguous;
-        if ((!nvfp4 && !mxfp8 && !bf16) || down.geometry.format != format ||
-            down.geometry.layout != gate_up.geometry.layout) {
-            throw std::invalid_argument("expert banks are block-scaled NVFP4, MXFP8 or BF16, one "
-                                        "format for both matrices");
-        }
-        return {whole_view(gate_up), whole_view(down), static_cast<std::int32_t>(first),
-                static_cast<std::int32_t>(count)};
-    }
-
-    MoeParameters moe(const MoeWeights& w) const {
+    MoeParameters moe(const MoeWeights& w, std::uint32_t layer) const {
         MoeParameters out;
         out.router      = tensor(w.router);
         out.router_bias = tensor(w.router_bias);
-        // Consecutive resident experts that share one gate_up parent form a bank.
-        const auto experts  = static_cast<std::uint32_t>(w.experts.size());
-        std::uint32_t first = 0;
-        while (first < experts) {
-            if (!model_.resident(w.experts[first].gate_up, device_)) {
-                ++first;
-                continue;
-            }
-            const auto* parent =
-                model_.weight(w.experts[first].gate_up, device_).view.parts.front().parent;
-            std::uint32_t last = first + 1;
-            while (last < experts && model_.resident(w.experts[last].gate_up, device_) &&
-                   model_.weight(w.experts[last].gate_up, device_).view.parts.front().parent ==
-                       parent) {
-                ++last;
-            }
-            out.banks.push_back(bank(w, first, last - first));
-            first = last;
+        for (const auto& bank : model_.expert_banks(layer, device_)) {
+            out.banks.push_back({bank->gate_up, bank->down, bank->first_expert, bank->experts});
         }
         if (out.banks.empty()) {
             throw std::invalid_argument("a rank holds no routed-expert bank");
@@ -166,12 +107,13 @@ private:
         out.message_queries = tensor(w.message_queries);
         for (std::size_t i = 0; i < w.gates.size(); ++i) {
             out.gates[i] = {tensor(w.gates[i].down), tensor(w.gates[i].forget),
-                            tensor(w.gates[i].gain)};
+                            tensor(w.gates[i].gain), model_.narrowed(w.gates[i].forget, device_),
+                            model_.narrowed(w.gates[i].gain, device_)};
         }
         return out;
     }
 
-    LayerParameters layer(const LayerWeights& w) const {
+    LayerParameters layer(const LayerWeights& w, std::uint32_t index) const {
         LayerParameters out;
         if (w.attention_queries) { out.attention_queries = tensor(*w.attention_queries); }
         for (const auto id : w.input_norms) { out.input_norms.push_back(tensor(id)); }
@@ -179,7 +121,7 @@ private:
         out.post_attention_conv = tensor(w.post_attention_conv);
         out.ffn_queries         = tensor(w.ffn_queries);
         out.ffn_norm            = tensor(w.ffn_norm);
-        out.moe                 = moe(w.moe);
+        out.moe                 = moe(w.moe, index);
         out.post_ffn_conv       = tensor(w.post_ffn_conv);
         if (w.core) { out.core = core(*w.core); }
         return out;

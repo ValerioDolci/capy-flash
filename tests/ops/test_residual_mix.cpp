@@ -1,8 +1,12 @@
-// residual_mix.h against the Ops it fuses, bit for bit: short_conv_static(_record) +
-// residual_add_f32 + depth_attention + rmsnorm_f32 (residual_conv_mix), depth_attention +
-// rmsnorm_f32 (depth_attention_rmsnorm), short_conv_static(_record) + residual_add_round_bf16
-// (residual_conv_round). Every source count 1..9, Q 1..4, T 1..16, the state advanced in place
-// (T = 1) and recorded (any T), a width that is a multiple of the CTA and one that is not.
+// residual_mix.h against the Ops it fuses: short_conv_static(_record) + residual_add_f32 +
+// depth_attention + rmsnorm_f32 (residual_conv_mix), depth_attention + rmsnorm_f32
+// (depth_attention_rmsnorm), short_conv_static(_record) + residual_add_round_bf16
+// (residual_conv_round). The elementwise outputs (residual, conv state, record, rounded sum) bit
+// for bit; the mix and the norms, which sum in another order, within FP32 reduction error (mix)
+// and one BF16 rounding step (norms); and a column of a T-column depth_attention_rmsnorm bit for
+// bit equal to the same column called alone. Every source count 1..9, Q 1..4, T 1..16, the state
+// advanced in place (T = 1) and recorded (any T), a width that is a multiple of the CTA and one
+// that is not.
 #include "ninfer/ops/depth_attention.h"
 #include "ninfer/ops/residual_f32.h"
 #include "ninfer/ops/residual_mix.h"
@@ -12,6 +16,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -94,6 +100,69 @@ void expect_same(const Buffer& a, const Buffer& b, const std::string& what) {
     }
 }
 
+std::vector<float> floats(const Buffer& b, DType dtype, std::size_t offset = 0,
+                          std::size_t count = 0) {
+    const auto h        = b.host();
+    const std::size_t n = count ? count : b.bytes / (dtype == DType::FP32 ? 4 : 2);
+    std::vector<float> out(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (dtype == DType::FP32) {
+            std::memcpy(&out[i], h.data() + (offset + i) * 4, 4);
+        } else {
+            std::uint32_t u = 0;
+            std::memcpy(&u, h.data() + (offset + i) * 2, 2);
+            u <<= 16;
+            std::memcpy(&out[i], &u, 4);
+        }
+    }
+    return out;
+}
+
+// The fused mix against depth_attention's: the same FP32 math summed in another order.
+void expect_close_mix(const Buffer& ref, const Buffer& got, const std::string& what) {
+    const auto a = floats(ref, DType::FP32), b = floats(got, DType::FP32);
+    double err = 0.0, norm = 0.0, worst = 0.0, top = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const double d = double(b[i]) - a[i];
+        err += d * d;
+        norm += double(a[i]) * a[i];
+        worst = std::max(worst, std::abs(d));
+        top   = std::max(top, std::abs(double(a[i])));
+    }
+    if (!(std::sqrt(err) <= 3e-6 * std::sqrt(norm) && worst <= 1e-5 * top)) {
+        std::printf("FAIL %s: rel_l2 %.3g, max abs %.3g of %.3g\n", what.c_str(),
+                    std::sqrt(err / std::max(norm, 1e-30)), worst, top);
+        ++failures;
+    }
+}
+
+// The fused norms against rmsnorm_f32's: at most one BF16 rounding step apart, rarely, beyond
+// the mix's FP32 reduction error carried through the norm (an absolute floor: elements near zero
+// come from cancelling sources).
+void expect_close_norm(const Buffer& ref, const Buffer& got, const std::string& what) {
+    const auto a = floats(ref, DType::BF16), b = floats(got, DType::BF16);
+    double top = 0.0;
+    for (const float x : a) { top = std::max(top, std::abs(double(x))); }
+    std::size_t flips = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i] == b[i]) { continue; }
+        ++flips;
+        const double step =
+            std::ldexp(1.0, std::ilogb(std::max(std::abs(a[i]), std::abs(b[i]))) - 7);
+        if (std::abs(double(a[i]) - b[i]) > step + 1e-5 * top) {
+            std::printf("FAIL %s: element %zu differs by more than a BF16 step (%g vs %g)\n",
+                        what.c_str(), i, a[i], b[i]);
+            ++failures;
+            return;
+        }
+    }
+    if (flips * 50 > a.size()) {
+        std::printf("FAIL %s: %zu of %zu elements a BF16 step apart\n", what.c_str(), flips,
+                    a.size());
+        ++failures;
+    }
+}
+
 // One case of each fused Op against the separate Ops on the same operands.
 void run_case(int H, int T, int stored, int Q, bool record, bool with_base, bool norms_on) {
     const std::string tag = "H=" + std::to_string(H) + " T=" + std::to_string(T) +
@@ -165,16 +234,42 @@ void run_case(int H, int T, int stored, int Q, bool record, bool with_base, bool
                                norms_on ? std::span<Tensor>(outs) : std::span<Tensor>(), nullptr);
     }
     expect_same(*ref_res, *f_res, "residual_conv_mix residual " + tag);
+    // depth_attention_rmsnorm over that FP32 residual: residual_conv_mix's mix and norms, bit for
+    // bit (the unfused decode steps rely on it).
+    {
+        auto g_mix = make(HT * Q, DType::FP32);
+        std::vector<BufferPtr> g_normed;
+        std::vector<Tensor> outs;
+        for (int q = 0; q < Q; ++q) {
+            g_normed.push_back(make(HT, DType::BF16));
+            outs.push_back(view(g_normed[q], DType::BF16, {H, T}));
+        }
+        Tensor q  = view(query, DType::FP32, {H, Q});
+        Tensor gm = view(g_mix, DType::FP32, {H, T, Q});
+        ops::depth_attention_rmsnorm(
+            st, view(f_res, DType::FP32, {H, T}), q, mix_eps, mix_scale,
+            norms_on ? std::span<const Tensor>(nw) : std::span<const Tensor>(), norm_eps,
+            norms_on ? std::span<Tensor>(outs) : std::span<Tensor>(), &gm, nullptr);
+        if (!(norms_on && Q == 1)) {
+            expect_same(*f_mix, *g_mix, "depth_attention_rmsnorm FP32 current mix " + tag);
+        }
+        if (norms_on) {
+            for (int j = 0; j < Q; ++j) {
+                expect_same(*f_normed[j], *g_normed[j],
+                            "depth_attention_rmsnorm FP32 current normed " + tag);
+            }
+        }
+    }
     if (record) {
         expect_same(*ref_record, *f_record, "residual_conv_mix record " + tag);
         expect_same(*state0, *f_state, "residual_conv_mix state untouched " + tag);
     } else {
         expect_same(*ref_state, *f_state, "residual_conv_mix state " + tag);
     }
-    if (!(norms_on && Q == 1)) expect_same(*ref_mix, *f_mix, "residual_conv_mix mix " + tag);
+    if (!(norms_on && Q == 1)) expect_close_mix(*ref_mix, *f_mix, "residual_conv_mix mix " + tag);
     if (norms_on) {
         for (int q = 0; q < Q; ++q) {
-            expect_same(*ref_normed[q], *f_normed[q], "residual_conv_mix normed " + tag);
+            expect_close_norm(*ref_normed[q], *f_normed[q], "residual_conv_mix normed " + tag);
         }
     }
 
@@ -193,9 +288,56 @@ void run_case(int H, int T, int stored, int Q, bool record, bool with_base, bool
             ops::rmsnorm_f32(m.slice(2, j, 1).view({H, T}), nw[j], norm_eps, o, nullptr);
             outs.push_back(view(d_out[j], DType::BF16, {H, T}));
         }
-        ops::depth_attention_rmsnorm(st, cur, q, mix_eps, mix_scale, nw, norm_eps, outs, nullptr);
+        auto d_mix = make(HT * Q, DType::FP32);
+        Tensor dm  = view(d_mix, DType::FP32, {H, T, Q});
+        ops::depth_attention_rmsnorm(st, cur, q, mix_eps, mix_scale, nw, norm_eps, outs, &dm,
+                                     nullptr);
+        expect_close_mix(*r_mix, *d_mix, "depth_attention_rmsnorm mix " + tag);
         for (int j = 0; j < Q; ++j) {
-            expect_same(*r_out[j], *d_out[j], "depth_attention_rmsnorm " + tag);
+            expect_close_norm(*r_out[j], *d_out[j], "depth_attention_rmsnorm " + tag);
+        }
+        // The mix alone (no norms) gives the same bits.
+        auto m_only = make(HT * Q, DType::FP32);
+        Tensor mo   = view(m_only, DType::FP32, {H, T, Q});
+        ops::depth_attention_rmsnorm(st, cur, q, mix_eps, mix_scale, {}, 0.0F, {}, &mo, nullptr);
+        expect_same(*d_mix, *m_only, "depth_attention_rmsnorm mix without norms " + tag);
+        // Every column alone gives the same bits as in the T-column call.
+        for (int t = 0; t < T && T > 1; ++t) {
+            const auto column = [&](const BufferPtr& b, DType dtype) {
+                return Tensor(static_cast<unsigned char*>(b->p) +
+                                  static_cast<std::size_t>(t) * H * (dtype == DType::FP32 ? 4 : 2),
+                              dtype, {H, 1});
+            };
+            std::vector<Tensor> st1;
+            for (auto& x : states) st1.push_back(column(x, DType::BF16));
+            auto one_mix = make(static_cast<std::size_t>(H) * Q, DType::FP32);
+            std::vector<BufferPtr> one_out;
+            std::vector<Tensor> outs1;
+            for (int j = 0; j < Q; ++j) {
+                one_out.push_back(make(H, DType::BF16));
+                outs1.push_back(view(one_out[j], DType::BF16, {H, 1}));
+            }
+            Tensor om = view(one_mix, DType::FP32, {H, 1, Q});
+            ops::depth_attention_rmsnorm(st1, column(base, DType::BF16), q, mix_eps, mix_scale, nw,
+                                         norm_eps, outs1, &om, nullptr);
+            const auto all_mix = floats(*d_mix, DType::FP32), alone = floats(*one_mix, DType::FP32);
+            for (int j = 0; j < Q; ++j) {
+                const auto all_norm = floats(*d_out[j], DType::BF16);
+                const auto one_norm = floats(*one_out[j], DType::BF16);
+                for (int h = 0; h < H; ++h) {
+                    const std::size_t at_all  = (static_cast<std::size_t>(j) * T + t) * H + h;
+                    const std::size_t at_one  = static_cast<std::size_t>(j) * H + h;
+                    const std::size_t norm_at = static_cast<std::size_t>(t) * H + h;
+                    if (std::memcmp(&all_mix[at_all], &alone[at_one], 4) != 0 ||
+                        std::memcmp(&all_norm[norm_at], &one_norm[h], 4) != 0) {
+                        std::printf("FAIL depth_attention_rmsnorm %s column %d alone differs\n",
+                                    tag.c_str(), t);
+                        ++failures;
+                        j = Q;
+                        break;
+                    }
+                }
+            }
         }
     }
 

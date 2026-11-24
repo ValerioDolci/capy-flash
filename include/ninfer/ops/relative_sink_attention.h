@@ -95,11 +95,19 @@ struct RelativeSinkAttentionParams {
  *   criterion accounts for that. v' crosses its FP16 persistent boundary before attention
  *   observes it, for cached and for block rows alike (exact for |v'| >= 2^-17; |v'| <= sqrt(D)).
  *   Non-finite inputs are outside the domain.
+ *   relative_sink_attention_paged with at most 16 tokens per row and D <= 128 evaluates a query
+ *   that sees more than 128 keys in one pass over the keys: it keeps exp(logit - m) unrounded
+ *   against running maxima and divides the combined value sum by Z, so prob is not rounded to
+ *   BF16 there (one rounding point fewer than the formula above; the qualification criterion
+ *   covers it). Every other query rounds prob as written.
  *   Bits by call extent: calls with at most 16 tokens per row, and every call with D > 128,
  *   give each query the same bits whatever the call's T or block boundaries (a split prefill
  *   equals token-by-token decode bit for bit). Longer calls with D <= 128 use tensor-core
- *   products (they also observe value elements below 2^-14 in magnitude rounded to BF16) and
- *   agree with them within the qualification criterion, not bit for bit; equal
+ *   products in one pass over the keys: exp(logit - m) against running maxima is rounded to FP16
+ *   (finer than BF16) as the operand of the value product, which sums each run of 64 keys in FP16
+ *   before the FP32 total, and the sum is divided by Z at the end, so prob is not rounded to BF16
+ *   there; they agree with the shorter calls within the
+ *   qualification criterion, not bit for bit; equal
  *   calls (same block boundaries) always give equal bits. The cache contents written by any
  *   call are the same bits in every case.
  *

@@ -28,7 +28,8 @@ The upstream authority is the Transformers implementation `models/inkling2_loop`
 | Prefix reuse on the one lane: the finished sequence's endpoint and its prompt-end anchor, device only | Shared prefixes, several catalogued conversations, `Retain` sources, Host and disk tiers (`--disk-cache-dir` is refused) |
 | Greedy decoding and host sampling (temperature, top-k up to 20, top-p, min-p, presence and frequency penalties) | Structured output and grammars |
 | Tool calls (JSON), thinking budget, stop tokens and strings | `tool_choice` other than automatic (`required`, allowed names, `parallel=false`, strict constraints) |
-| Decode replayed from one CUDA Graph (`--no-cuda-graph` keeps it eager) | `--embedding-host`; continuation of a final assistant message |
+| Decode replayed from one CUDA Graph (`--no-cuda-graph` keeps it eager) | Continuation of a final assistant message |
+| `--embedding-host`: the token embedding in one mapped page-locked host copy ([Embedding in host memory](embedding-host.md)) | |
 
 The refusals live in `parse_config` ([`config.cpp`](../../src/models/inkling2/config.cpp)),
 `validate_options` ([`instance.cpp`](../../src/models/inkling2/instance.cpp)) and the frontend.
@@ -334,8 +335,9 @@ block in order.
 | Columns by query heads | `attention/output` |
 | Columns by KV heads | `attention/{key,value}_conv_static` |
 | Rows by vocabulary (100,029 per rank) | `text/output_head` |
-| `SingleDevice(r)` | `moe/experts/*`: the bank of IDs [r·E/2, (r+1)·E/2) on rank r |
+| Rows / columns by intermediate channels | `moe/experts/*`: every expert at half its intermediate width F on each rank (gate and up rows [r·F/2, (r+1)·F/2), the matching `down` columns), cut by the model at load (`load/expert_banks.h`) |
 | Replicated | embedding and norms, block-residual, message and final queries, message gates, router and bias, `relative_profile`, post-attention and post-FFN convolutions |
+| HostMapped (`--embedding-host`, at tp 1 too) | `text/token_embedding`: one copy in mapped page-locked host memory that both ranks read in place |
 
 At tp 1 every parameter is whole on device 0 and the rank holds both banks.
 `shard_text_config` ([`execution/tp.cpp`](../../src/models/inkling2/execution/tp.cpp)) halves the
@@ -347,8 +349,10 @@ twice:
 
 1. the attention output projection, row-parallel (`linear_row_parallel`): each rank's BF16
    partial over its heads, one BF16 all-reduce;
-2. the MoE: each rank's bank into an FP32 partial, `allreduce_sum_f32` rounded to BF16 once
-   (the same bits as one device's Store + Accumulate + `moe_partial_to_bf16`).
+2. the MoE: each rank's half-width experts into an FP32 partial. Calls of up to 16 tokens
+   (decode and drafter verification) sum the two partials with `allreduce_sum_f32` and round to
+   BF16 once; wider calls (prefill) round each partial to BF16 and all-reduce in BF16 with FP32
+   accumulation, half the bytes ([`forward/moe.h`](../../src/models/inkling2/execution/forward/moe.h)).
 
 The head computes each rank's vocabulary half and gathers it on rank 0 (`concat_rows_rank0`,
 [`tp2/concat_rows.h`](../../include/ninfer/ops/tp2/concat_rows.h)), which applies the soft cap and
@@ -359,8 +363,8 @@ Weight bytes per rank at tp 2, computed from the shapes of Inkling 2 Mini:
 
 | Class | Per rank |
 |---|---:|
-| Expert banks (64 experts × 20 NVFP4 layers + 64 × 4 MXFP8 layers) | 7.83 GB |
-| Token embedding (replicated) | 0.93 GB |
+| Experts at half width (128 experts × 20 NVFP4 layers + 128 × 4 MXFP8 layers) | 7.83 GB |
+| Token embedding (replicated; host memory with `--embedding-host`) | 0.93 GB |
 | Attention shards | 0.65 GB |
 | Output head half | 0.46 GB |
 | Message gates, router, queries, convolutions, norms | 0.12 GB |
@@ -368,8 +372,7 @@ Weight bytes per rank at tp 2, computed from the shapes of Inkling 2 Mini:
 
 The whole model at tp 1 is about 18.9 GB. With `--spec mtp` and an `mtp` component, the
 drafter's weights, its context caches and the round's buffers take about 730 MiB more VRAM per
-board at `--max-context 131072` and about 1.0 GiB at the launcher's 253,952 (measured on this release:
-14.2 GiB per board without the drafter, 15.2 GiB with it).
+board at `--max-context 131072` and about 1.0 GiB at the launcher's 253,952.
 
 ## Per-sequence state
 
@@ -672,6 +675,8 @@ router and softmax compute in FP32 and round where the reference rounds; the MoE
 |---|---|
 | NVFP4 experts at their exact stored weights; Transformers dequantizes them to BF16 on load (`bf16(e2m1 · e4m3 · amax / denominator)`). The divisor is applied in FP32 to each accumulated dot | `moe_bank.h` |
 | At tp 2 each rank rounds its attention output partial to BF16 before the all-reduce | `linear_row_parallel` |
+| At tp 2, in calls of more than 16 tokens (prefill), each rank rounds its MoE partial to BF16 before a BF16 all-reduce with FP32 accumulation | `forward/moe.h` |
+| Attention calls of more than 16 tokens (prefill) round exp(logit − m) to FP16 as the operand of the value product and sum each run of 64 keys in FP16 before the FP32 total, without rounding prob to BF16; calls of up to 16 tokens whose query sees more than 128 keys keep exp(logit − m) unrounded | `relative_sink_attention.h` |
 | V crosses FP16 in the cache, for cached and current-block rows alike | `relative_sink_attention.h` |
 | The logits are rounded to BF16 by the output head before the soft cap, as the published Transformers does with a BF16 `lm_head`; the `bf16` and `native` references of `tools/ref_ink` keep `lm_head` in FP32 | `forward/head.h` |
 

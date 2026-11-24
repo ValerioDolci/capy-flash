@@ -22,7 +22,8 @@ namespace {
 
 namespace cg = cooperative_groups;
 
-// Columns of a narrow call get a cluster of 8 blocks of 16 warps each; from kClusterMaxColumns
+// Columns of a narrow call get a cluster of 8 blocks of 16 warps each (the decode route below
+// where one warp per expert covers the experts); from kClusterMaxColumns
 // columns on, one block of 8 warps per column, and from kTileMinColumns on a block per
 // kTileColumns columns (moe_sigmoid_route_tile_kernel) where the tile fits (same bits everywhere).
 constexpr int kClusterMaxColumns = 64;
@@ -148,6 +149,138 @@ __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kWarps * 32)
     } else {
         select_rounds<kWarps>(key, experts, top_k, chosen, best_key_of, best_id_of);
     }
+
+    if (threadIdx.x == 0) {
+        float total = 0.0F;
+        for (int j = 0; j < top_k; ++j) { total += score[chosen[j]]; }
+        const float denominator = total + 1e-20F;
+        for (int j = 0; j < top_k; ++j) {
+            out_ids[j]     = chosen[j];
+            out_weights[j] = score[chosen[j]] / denominator * route_scale;
+        }
+    }
+}
+
+// Decode route of the cluster kernel (one expert per warp: E <= kCluster * kWarps, and
+// H <= 32 * kDecodeLane): warp w of block b evaluates expert b * kWarps + w with its router row in
+// registers, loaded before the wait for the previous kernel (lane l holds h = l + 32 i, the
+// order of its chain), and the column staged in shared memory after the wait. The selection
+// counts each expert's place with kPlaceSplit threads. Same chains, butterfly, keys, selection
+// and weights as moe_sigmoid_route_kernel: the same bits.
+constexpr int kDecodeLane = 72;
+// Up to this many columns: past it the clusters (one SM each, the whole register file) no longer
+// fit beside the kernel before them, and the cluster kernel is faster (measured at 8).
+constexpr int kDecodeMaxColumns = 4;
+constexpr int kPlaceSplit       = 4;
+
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_wait() {
+    asm volatile("barrier.cluster.wait.acquire;" ::: "memory");
+}
+
+// A full cluster barrier: the stores to peers' shared memory before it are visible after it.
+__device__ __forceinline__ void cluster_barrier() {
+    asm volatile("barrier.cluster.arrive.release;\nbarrier.cluster.wait.acquire;" ::: "memory");
+}
+
+std::size_t decode_column_offset(std::int32_t experts) {
+    return (2 * static_cast<std::size_t>(experts) * sizeof(float) + 15) / 16 * 16;
+}
+
+template <int kCluster, int kWarps>
+__global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kWarps * 32)
+    moe_sigmoid_route_decode_kernel(const __nv_bfloat16* __restrict__ x,
+                                    const float* __restrict__ router,
+                                    const float* __restrict__ bias, std::int32_t hidden,
+                                    std::int32_t experts, std::int32_t top_k, float route_scale,
+                                    std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                    const std::int32_t* __restrict__ valid_columns,
+                                    std::int32_t lane_width, std::uint32_t column_offset) {
+    extern __shared__ __align__(16) unsigned char decode_shared[];
+    float* score = reinterpret_cast<float*>(decode_shared);                         // [E]
+    float* key   = score + experts;                                                 // [E]
+    auto* s_u    = reinterpret_cast<__nv_bfloat16*>(decode_shared + column_offset); // [H]
+    __shared__ int chosen[kMoeSigmoidRouteMaxTopK];
+
+    cluster_arrive_relaxed(); // waited for before the first store to the leader
+    constexpr int kThreads    = kWarps * 32;
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank            = static_cast<int>(cluster.block_rank());
+    const int column          = static_cast<int>(blockIdx.x) / kCluster;
+    const int warp            = static_cast<int>(threadIdx.x) >> 5;
+    const int lane            = static_cast<int>(threadIdx.x) & 31;
+    const int e               = rank * kWarps + warp;
+    float w[kDecodeLane];
+    const float* row = router + static_cast<std::int64_t>(e) * hidden;
+#pragma unroll
+    for (int i = 0; i < kDecodeLane; ++i) {
+        const int h = lane + 32 * i;
+        w[i]        = e < experts && h < hidden ? __ldg(row + h) : 0.0F;
+    }
+
+    pdl_enter();
+    std::int32_t* out_ids = ids + static_cast<std::int64_t>(column) * top_k;
+    float* out_weights    = weights + static_cast<std::int64_t>(column) * top_k;
+    if (valid_columns != nullptr && column % lane_width >= valid_columns[column / lane_width]) {
+        cluster_wait();
+        if (rank != 0) { return; }
+        for (int j = static_cast<int>(threadIdx.x); j < top_k; j += kThreads) {
+            out_ids[j]     = -1;
+            out_weights[j] = 0.0F;
+        }
+        return;
+    }
+    const __nv_bfloat16* u = x + static_cast<std::int64_t>(column) * hidden;
+    if (hidden % 8 == 0) {
+        // 16-byte copies (x is 16-byte aligned and every column starts on a multiple of 8).
+        const auto* src = reinterpret_cast<const uint4*>(u);
+        auto* dst       = reinterpret_cast<uint4*>(s_u);
+        for (int i = static_cast<int>(threadIdx.x); i < hidden / 8; i += kThreads) {
+            dst[i] = src[i];
+        }
+    } else {
+        for (int i = static_cast<int>(threadIdx.x); i < hidden; i += kThreads) { s_u[i] = u[i]; }
+    }
+    __syncthreads();
+    float sum = 0.0F;
+#pragma unroll
+    for (int i = 0; i < kDecodeLane; ++i) {
+        const int h = lane + 32 * i;
+        if (h < hidden) { sum = fmaf(w[i], __bfloat162float(s_u[h]), sum); }
+    }
+    sum = warp_sum(sum);
+    cluster_wait(); // every block of the cluster runs: the leader's shared memory may be written
+    if (lane == 0 && e < experts) {
+        const float sc                       = 1.0F / (1.0F + expf(-sum));
+        cluster.map_shared_rank(score, 0)[e] = sc;
+        cluster.map_shared_rank(key, 0)[e]   = sc + bias[e];
+    }
+    cluster_barrier();
+    if (rank != 0) { return; }
+
+    // An expert's place in the (key, id) order: the experts before it, counted by kPlaceSplit
+    // threads; the first k places are the k largest keys.
+    {
+        const int t    = static_cast<int>(threadIdx.x);
+        const int mine = t / kPlaceSplit;
+        const int part = t % kPlaceSplit;
+        int place      = 0;
+        if (mine < experts) {
+            const float k_mine = key[mine];
+            for (int f = part; f < experts; f += kPlaceSplit) {
+                place += better(key[f], f, k_mine, mine) ? 1 : 0;
+            }
+        }
+#pragma unroll
+        for (int offset = kPlaceSplit / 2; offset > 0; offset >>= 1) {
+            place += __shfl_xor_sync(kFullWarpMask, place, offset);
+        }
+        if (mine < experts && part == 0 && place < top_k) { chosen[place] = mine; }
+    }
+    __syncthreads();
 
     if (threadIdx.x == 0) {
         float total = 0.0F;
@@ -330,7 +463,20 @@ void moe_sigmoid_route_launch(const Tensor& x, const Tensor& router, const Tenso
             lane_width);
     };
     const std::size_t tile_bytes = tile_shared_bytes(hidden, experts);
-    if (columns < kClusterMaxColumns) {
+    constexpr int kDecodeCluster = 8, kDecodeWarps = 16;
+    if (columns <= kDecodeMaxColumns && experts <= kDecodeCluster * kDecodeWarps &&
+        experts * kPlaceSplit <= kDecodeWarps * 32 && hidden <= 32 * kDecodeLane) {
+        const std::size_t offset = decode_column_offset(experts);
+        launch_maybe_dependent(
+            columns <= kDependentLaunchMaxTokens,
+            dim3(static_cast<unsigned>(columns * kDecodeCluster)), dim3(kDecodeWarps * 32),
+            offset + static_cast<std::size_t>(hidden) * 2, stream,
+            moe_sigmoid_route_decode_kernel<kDecodeCluster, kDecodeWarps>,
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(router.data),
+            static_cast<const float*>(bias.data), hidden, experts, top_k, route_scale,
+            static_cast<std::int32_t*>(ids.data), static_cast<float*>(weights.data), valid,
+            lane_width, static_cast<std::uint32_t>(offset));
+    } else if (columns < kClusterMaxColumns) {
         launch(moe_sigmoid_route_kernel<8, 16>, 8, 16);
     } else if (columns >= kTileMinColumns && experts <= kTileThreads &&
                tile_bytes <= kTileMaxSharedBytes) {

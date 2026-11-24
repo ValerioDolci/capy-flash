@@ -8,6 +8,7 @@
 #include "models/inkling2/draft/parameters.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
+#include "models/inkling2/execution/prefetch_lane.h"
 #include "models/inkling2/execution/tp.h"
 #include "models/inkling2/program/program_impl.h"
 #include "models/inkling2/program/speculative/round.h"
@@ -206,6 +207,7 @@ public:
             if (layout_.context_cache) {
                 image_[at(r)] = std::make_unique<DeviceBuffer>(image_bytes(state_layout_[at(r)]));
             }
+            prefetch_[at(r)] = std::make_unique<exec::PrefetchLane>(execution_.dev[at(r)]->device);
         }
         const ScopedCurrentDevice scope(execution_.dev[0]->device);
         const std::size_t V = config_.unpadded_vocab_size;
@@ -259,7 +261,8 @@ public:
                                 .work       = work_[at(r)].get(),
                                 .stream     = stream(r),
                                 .device     = execution_.dev[at(r)]->device,
-                                .state      = state_[at(r)].get()};
+                                .state      = state_[at(r)].get(),
+                                .prefetch   = prefetch_[at(r)].get()};
             }
             round_ = std::make_unique<speculative::VerifyRound>(
                 config_, ranks, tp_,
@@ -377,9 +380,11 @@ public:
         out.device          = execution_.dev[0]->device;
         out.max_context     = layout_.capacity;
         out.kv_cache        = KvCacheStorage::BFloat16;
-        const auto& weights = parameters_[0]->model.storage_stats();
+        const auto& model   = parameters_[0]->model;
+        const auto& weights = model.storage_stats();
         const std::size_t weight_bytes =
-            tp_ == 2 ? weights.per_device_capacity_bytes[0] : weights.device_capacity_bytes;
+            (tp_ == 2 ? weights.per_device_capacity_bytes[0] : weights.device_capacity_bytes) +
+            model.expert_bank_bytes(0);
         out.weights                = ArenaMemorySummary{weight_bytes, weight_bytes, weight_bytes};
         std::size_t sequence_bytes = backing_[0]->bytes + ids_[0]->bytes + positions_[0]->bytes +
                                      logits_mem_->bytes + capped_mem_->bytes + argmax_mem_->bytes;
@@ -498,6 +503,10 @@ private:
         mailbox_.emplace(
             execution_, kMailboxSlotBytes, 2,
             drafter_ ? speculative::round_exchange_bytes(config_, speculative::kMaxDrafts) : 0);
+        // Every kernel that follows an exchange of the forward waits for its dependency before it
+        // reads the stream's data, so an exchange may release it at entry: it launches while the
+        // exchange waits on the peer.
+        mailbox_->set_release_dependents(true);
         events_->attach_mailbox(&*mailbox_);
         bridge_.emplace(execution_.dev[0]->device, execution_.dev[1]->device);
     }
@@ -530,7 +539,8 @@ private:
                                        .stream     = stream(r),
                                        .device     = execution_.dev[at(r)]->device,
                                        .state      = state_[at(r)].get(),
-                                       .positions  = &position_tensors[at(r)]};
+                                       .positions  = &position_tensors[at(r)],
+                                       .prefetch   = prefetch_[at(r)].get()};
         }
         // The drafter's context of the last round first: this call's features replace them.
         if (feed && drafter_ && pending_width_ > 0) {
@@ -635,7 +645,8 @@ private:
                                        .stream     = stream(r),
                                        .device     = execution_.dev[at(r)]->device,
                                        .state      = state_[at(r)].get(),
-                                       .positions  = &position_tensors[at(r)]};
+                                       .positions  = &position_tensors[at(r)],
+                                       .prefetch   = prefetch_[at(r)].get()};
         }
         exec::Forward<WorkspaceArena> forward(config_, ranks, tp_,
                                               {&execution_, events_ ? &*events_ : nullptr},
@@ -718,6 +729,7 @@ private:
     std::array<std::unique_ptr<DeviceBuffer>, 2> backing_, ids_, positions_, image_;
     std::array<std::unique_ptr<VisitState>, 2> state_;
     std::array<std::unique_ptr<WorkspaceArena>, 2> work_;
+    std::array<std::unique_ptr<exec::PrefetchLane>, 2> prefetch_;
     std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, argmax_mem_;
     Tensor logits_, capped_;
     // The drafter and its round (--spec mtp with the artifact's mtp component).

@@ -17,14 +17,17 @@
 #include "models/inkling2/execution/forward.h"
 
 #include "ninfer/ops/copy_rows.h"
+#include "ninfer/ops/inkling2_projection.h"
 #include "ninfer/ops/relative_sink_attention.h"
 #include "ninfer/ops/short_conv.h"
 #include "ninfer/ops/short_conv_record.h"
 #include "ninfer/ops/tp2/linear.h"
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <initializer_list>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -63,6 +66,19 @@ template <class Arena>
 void Forward<Arena>::project(int r, const Tensor& x, const LinearParameters& stacked,
                              std::initializer_list<std::pair<Tensor*, std::int32_t>> blocks) {
     Tensor out = work(r).alloc(DType::BF16, {stacked.weight.n, T_});
+    if constexpr (kExecute) {
+        // Wider than one column each block is written to its own buffer by the projection itself.
+        if (T_ > 1 && blocks.size() <= std::size_t(ops::kInkling2ProjectionMaxBlocks)) {
+            std::array<ops::Inkling2ProjectionBlock, ops::kInkling2ProjectionMaxBlocks> parts{};
+            std::size_t count = 0;
+            for (const auto& [block, rows] : blocks) { parts[count++] = {block->data, rows}; }
+            if (ops::inkling2_projection_blocks(
+                    x, stacked.weight,
+                    std::span<const ops::Inkling2ProjectionBlock>(parts.data(), count), s(r))) {
+                return;
+            }
+        }
+    }
     linear(r, x, stacked, out);
     std::int32_t row = 0;
     for (const auto& [block, rows] : blocks) {
@@ -128,6 +144,7 @@ void Forward<Arena>::attention_rank(std::uint32_t index, int r,
             linear(r, xv, p.value, vv);
         }
     }
+    prefetch(r, index, Prefetch::Output);
 
     const auto K = static_cast<float>(config_.conv_kernel);
     if (const auto* conv = std::get_if<StaticKvConvParameters>(&p.kv_conv)) {
@@ -139,8 +156,8 @@ void Forward<Arena>::attention_rank(std::uint32_t index, int r,
                 ops::short_conv_static_record(k, conv->key, scale, tk, record->key, kc, s(r));
                 ops::short_conv_static_record(vv, conv->value, scale, tv, record->value, vc, s(r));
             } else {
-                ops::short_conv_static(k, conv->key, scale, tk, tk, kc, s(r));
-                ops::short_conv_static(vv, conv->value, scale, tv, tv, vc, s(r));
+                ops::short_conv_pair({k, conv->key, {}, scale, tk, tk, kc},
+                                     {vv, conv->value, {}, scale, tv, tv, vc}, s(r));
             }
         }
     } else {
@@ -155,8 +172,8 @@ void Forward<Arena>::attention_rank(std::uint32_t index, int r,
                 ops::short_conv_dynamic_record(vv, dyn.value_static, dv, scale, tv, record->value,
                                                vc, s(r));
             } else {
-                ops::short_conv_dynamic(k, dyn.key_static, dk, scale, tk, tk, kc, s(r));
-                ops::short_conv_dynamic(vv, dyn.value_static, dv, scale, tv, tv, vc, s(r));
+                ops::short_conv_pair({k, dyn.key_static, dk, scale, tk, tk, kc},
+                                     {vv, dyn.value_static, dv, scale, tv, tv, vc}, s(r));
             }
         } else {
             (void)dyn;

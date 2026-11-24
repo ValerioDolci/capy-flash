@@ -90,11 +90,15 @@ struct FeatureSink {
     Tensor features;
 };
 
+class PrefetchLane; // prefetch_lane.h
+
 // One rank's operands. `config` is the rank's geometry (shard_text_config at tp 2, the logical
 // config at one device); `device` is the CUDA device (read at tp 2); `state`, `positions` and
 // `features` are read only when executing. With `record` (a speculative verification call) every
 // short convolution writes its input history into the record and leaves its tail as it was; the
-// caller folds the tails after the committed tokens (ConvRecord::fold).
+// caller folds the tails after the committed tokens (ConvRecord::fold). With `prefetch`, calls of
+// up to kPrefetchMaxTokens columns preload their dense projection weights into L2 on that lane
+// (forward/prefetch.h).
 template <class Arena>
 struct ForwardRank {
     const TextConfig* config     = nullptr;
@@ -106,6 +110,7 @@ struct ForwardRank {
     const Tensor* positions      = nullptr; // device I32 [T]: first_position + t
     const ConvRecord* record     = nullptr;
     const FeatureSink* features  = nullptr;
+    const PrefetchLane* prefetch = nullptr;
 };
 
 // The two-device transport of an executing tp 2 forward.
@@ -198,22 +203,51 @@ private:
 
     // ---- The schedule (forward/visit.h) ---------------------------------------------------------
     void embed(const RankTensors& ids, RankTensors& x);
+    // The visits in execution order from the embedding, whole or (split > 0) as two halves of
+    // `split` and T - split columns (forward/overlap.h); returns the last visit's output.
+    const RankTensors* visits(Block& b, std::int32_t split);
     void visit(std::uint32_t index, Block& b, const RankTensors& x, RankTensors& out);
+
+    // ---- The half-chunk overlap of a wide tp 2 call (forward/overlap.h) -------------------------
+    struct Half; // one half's columns, exchange buffers and open exchange
+    // The width of the first half of a T-column call, or 0 to run it in one piece.
+    [[nodiscard]] std::int32_t overlap_split(std::int32_t T) const;
+    [[nodiscard]] std::array<Half, 2> halves(std::int32_t split);
+    // Visit `index` with its attention inputs, output projections and FFN by halves around the
+    // attention of the whole call; `captured` (or null) receives the visit input's columns once
+    // they are complete.
+    void visit_halves(std::uint32_t index, Block& b, const RankTensors& x, RankTensors& out,
+                      RankTensors* captured, std::array<Half, 2>& halves);
+    void half_inputs(std::uint32_t index, Block& b, const RankTensors& x, RankTensors* captured,
+                     std::array<RankTensors, 3>& xin, Half& half);
+    void half_ffn(std::uint32_t index, Block& b, const RankTensors& x, RankTensors& out,
+                  Half& half);
+    // Finishes the half's open exchange: the attention output's, or the MoE partials' with the
+    // close of their visit (sum, post-FFN convolution, BF16 output). Called on the half's columns.
+    void close_half(Half& half);
+    void abandon_halves(std::array<Half, 2>& halves) noexcept;
+    // Runs body() with the call narrowed to the half's columns (T_ and the taps' first position).
+    template <class Body>
+    void on_half(Half& half, Body&& body);
+    [[nodiscard]] RankTensors window(const RankTensors& t, const Half& half) const;
 
     // ---- Block residuals, messages, norms, convolutions (forward/residual.h)
     // --------------------- depth_attention of `queries` over the block states and `current` on
-    // every rank: FP32 ne {H, T, Q}.
+    // every rank: FP32 ne {H, T, Q}. At decode and verification widths with a BF16 current, the
+    // depth_attention_rmsnorm kernel (residual_mix.h) writes it.
     void depth(const std::vector<const RankTensors*>& states, const RankTensors& current,
                std::array<const Tensor*, 2> queries, RankTensors& out);
 
-    // The attention inputs xq, xk, xv (BF16 [H,T]; one tensor for all three outside the message
-    // passes of a local visit) from the visit input.
+    // The attention inputs xq, xk, xv (BF16 [H,T], the caller's; one tensor for all three outside
+    // the message passes of a local visit: xin[1] and xin[2] then become views of xin[0]) from the
+    // visit input.
     void attention_inputs(std::uint32_t index, Block& b, const RankTensors& x,
                           std::array<RankTensors, 3>& xin);
 
     // Whether the visit's residual steps run fused (residual_mix.h): decode and verification
-    // widths, the conv state advanced in place only for one token, no tap.
-    [[nodiscard]] bool fused_residual(std::uint32_t slot) const;
+    // widths, the conv state advanced in place only for one token, no tap of the steps the
+    // fusion does not write (attn_conv, ain, min).
+    [[nodiscard]] bool fused_residual(std::uint32_t index) const;
 
     // The static short convolution with `state` as its tail, or into `record` (not null) without
     // advancing the tail.
@@ -234,11 +268,23 @@ private:
     // --------------------------------------------------------------------- Router (replicated),
     // the rank's bank(s) into an FP32 partial, one BF16 rounding into z.
     void moe(std::uint32_t index, const RankTensors& u, RankTensors& z);
+    // Router and the rank's bank(s) into the rank's FP32 partial [H, T].
+    void moe_partial(std::uint32_t index, const RankTensors& u, RankTensors& partial);
 
     // ---- Head (forward/head.h)
     // -------------------------------------------------------------------
     void head(Block& b, const RankTensors& x, const ForwardColumns& columns,
               const ForwardLogits& out);
+
+    // ---- L2 preload of the projection weights (forward/prefetch.h) ------------------------------
+    enum class Prefetch { Early, Inputs, Output };
+    // Rank r (its device current): forks its lane and preloads into L2 there visit `index`'s input
+    // projections (Early: their leading part, at one column; Inputs: the rest) or its output
+    // projection (at one column followed by the next visit's Early). No-op without a lane, past
+    // the last visit or above kPrefetchMaxTokens columns.
+    void prefetch(int r, std::uint32_t index, Prefetch what);
+    // Joins every lane forked in this call back into its rank's stream.
+    void join_prefetch();
 
     const TextConfig& config_;
     std::array<Rank, 2> r_;
@@ -252,6 +298,7 @@ private:
     std::int32_t T_              = 1;
     std::int32_t first_position_ = 0;
     ForwardTap* tap_             = nullptr;
+    std::array<bool, 2> forked_{};
 };
 
 extern template class Forward<WorkspaceArena>;

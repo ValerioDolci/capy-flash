@@ -454,15 +454,14 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
     return progress;
 }
 
-// The frontier from which speculative rounds stop paying: every verified column rereads the
-// global visits' keys, and the drafter's own global attention grows with the context. Measured
-// from the server (2x RTX 5070 Ti, K = 3, temperature 0, 256-token summaries): decode with /
-// without the drafter 126.8 / 100.3 tok/s at 31k, 102.2 / 88.3 at 64k, 77.8 / 77.3 at 98k, 62.4
-// / 72.1 at 130k, 43.7 / 60.3 at 194k. Beyond it rows take ordinary steps, which do not feed the
-// drafter's context: a sequence's frontier only grows, and a resume below the limit restarts at a
-// prompt anchor or an endpoint whose context the drafter already holds. The choice depends on the
+// The frontier from which speculative rounds stop paying: every verified column rereads the global
+// visits' keys, and the drafter's own global attention grows with the context. On two RTX 5070 Ti
+// (K = 3, rounds that read the paged keys once for all their columns) drafting still decodes faster
+// at 196k tokens and breaks even near 247k. Beyond it rows take ordinary steps, which do not feed
+// the drafter's context: a sequence's frontier only grows, and a resume below the limit restarts at
+// a prompt anchor or an endpoint whose context the drafter already holds. The choice depends on the
 // position alone, and both kinds of step give the target's tokens.
-constexpr std::uint32_t kSpeculativeContextLimit = 98304;
+constexpr std::uint32_t kSpeculativeContextLimit = 245760;
 
 std::optional<std::uint32_t>
 ProgramImpl::speculative_extent(const Lane& lane,

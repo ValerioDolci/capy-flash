@@ -742,7 +742,15 @@ int qualify(Totals& totals) {
             fails += run_sequence(h, 0, {1024, 1, 4}, {false, true, true});
         }
     }
-    // The model's ring (window + 7 slots): one-token calls take the cluster route, longer blocks
+    // Verification-width paged blocks whose tokens straddle 8192 visible keys: two chunk sizes in
+    // one call, each token equal to its one-token decode bit for bit.
+    {
+        Harness h({"paged-12/4-straddle", Mode::Paged, G{128, 12, 4}, 16, 1024, 0, 0, 0.1f, 8192.0f,
+                   8300},
+                  1010, totals);
+        fails += run_sequence(h, 8190, {4, 8}, {true, true});
+    }
+    // The model's ring (window + 7 slots): one-token calls take the decode route, longer blocks
     // the split route (up to 16 tokens) with the same bits.
     {
         Harness h({"windowed-12/4-ring1031", Mode::Windowed, G{128, 12, 4}, 16, 1024, 1024, 1031,

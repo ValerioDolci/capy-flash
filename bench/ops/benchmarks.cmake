@@ -79,3 +79,4 @@ ninfer_add_op_bench(ninfer_residual_stream_ops_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/residual_stream_ops_bench.cu")
 ninfer_add_op_bench(ninfer_inkling2_linear_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/inkling2_linear_bench.cu")
+ninfer_add_op_bench(ninfer_inkling2_l2_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/inkling2_l2_bench.cu")

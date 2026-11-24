@@ -7,6 +7,8 @@
 #include "models/inkling2/execution/forward/attention.h"
 #include "models/inkling2/execution/forward/head.h"
 #include "models/inkling2/execution/forward/moe.h"
+#include "models/inkling2/execution/forward/overlap.h"
+#include "models/inkling2/execution/forward/prefetch.h"
 #include "models/inkling2/execution/forward/residual.h"
 #include "models/inkling2/execution/forward/visit.h"
 

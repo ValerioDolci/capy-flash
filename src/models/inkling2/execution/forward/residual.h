@@ -20,6 +20,7 @@
 #include <cmath>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 
 namespace ninfer::models::inkling2::execution {
 
@@ -39,15 +40,22 @@ void Forward<Arena>::depth(const std::vector<const RankTensors*>& states,
         throw std::logic_error("Inkling 2 forward: more block states than depth attention takes");
     }
     const float scale = 1.0F / std::sqrt(static_cast<float>(hidden()));
+    const bool decode = T_ <= ops::kResidualMixMaxTokens && hidden() <= ops::kResidualMixMaxHidden;
     each([&](int r) {
         if constexpr (kExecute) {
             std::array<Tensor, ops::kDepthAttentionMaxStates> rank_states;
             for (std::size_t i = 0; i < states.size(); ++i) {
                 rank_states[i] = (*states[i])[at(r)];
             }
-            ops::depth_attention(std::span<const Tensor>(rank_states.data(), states.size()),
-                                 current[at(r)], *queries[at(r)], kDepthAttentionEpsilon, scale,
-                                 out[at(r)], s(r));
+            const std::span<const Tensor> rank_span(rank_states.data(), states.size());
+            if (decode) {
+                ops::depth_attention_rmsnorm(rank_span, current[at(r)], *queries[at(r)],
+                                             kDepthAttentionEpsilon, scale, {}, 0.0F, {},
+                                             &out[at(r)], s(r));
+                return;
+            }
+            ops::depth_attention(rank_span, current[at(r)], *queries[at(r)], kDepthAttentionEpsilon,
+                                 scale, out[at(r)], s(r));
         } else {
             (void)current, (void)queries, (void)out, (void)scale;
         }
@@ -55,9 +63,14 @@ void Forward<Arena>::depth(const std::vector<const RankTensors*>& states,
 }
 
 template <class Arena>
-bool Forward<Arena>::fused_residual(std::uint32_t slot) const {
-    return kExecute && tap_ == nullptr && T_ <= ops::kResidualMixMaxTokens &&
-           hidden() <= ops::kResidualMixMaxHidden && (T_ == 1 || records(0, slot).has_value());
+bool Forward<Arena>::fused_residual(std::uint32_t index) const {
+    const auto vi    = static_cast<std::int32_t>(index);
+    const auto split = [&](std::string_view part) {
+        return tap_ != nullptr && tap_->wants(vi, part);
+    };
+    return kExecute && !split("attn_conv") && !split("ain") && !split("min") &&
+           T_ <= ops::kResidualMixMaxTokens && hidden() <= ops::kResidualMixMaxHidden &&
+           (T_ == 1 || records(0, config_.visits[index].slot).has_value());
 }
 
 template <class Arena>
@@ -68,7 +81,6 @@ void Forward<Arena>::attention_inputs(std::uint32_t index, Block& b, const RankT
     const auto vi        = static_cast<std::int32_t>(index);
     const float eps      = config_.rms_norm_eps;
     const bool global    = v.kind == LayerKind::Global;
-    for (auto& t : xin) { t = alloc(DType::BF16, {H, T_}); }
     if (v.layer == 0) {
         each([&](int r) {
             if constexpr (kExecute) {
@@ -82,8 +94,12 @@ void Forward<Arena>::attention_inputs(std::uint32_t index, Block& b, const RankT
     }
     const auto Q = static_cast<std::int32_t>(config_.attention_queries(v.layer));
     auto a       = alloc(DType::FP32, {H, T_, Q});
-    // Outside the message passes the mix and the input norms run as one Op.
-    if (!v.messages && fused_residual(v.slot)) {
+    // Outside the message passes the mix and the input norms run as one Op at decode and
+    // verification widths, fused or not (the same bits either way); unfused it also writes the mix
+    // for the taps.
+    const bool fused = fused_residual(index);
+    if (!v.messages && kExecute && T_ <= ops::kResidualMixMaxTokens &&
+        H <= ops::kResidualMixMaxHidden) {
         const bool shared = !global;
         each([&](int r) {
             std::array<Tensor, ops::kDepthAttentionMaxStates> rank_states;
@@ -101,8 +117,9 @@ void Forward<Arena>::attention_inputs(std::uint32_t index, Block& b, const RankT
                 *layer(r, v.layer).attention_queries, kDepthAttentionEpsilon,
                 1.0F / std::sqrt(static_cast<float>(H)),
                 std::span<const Tensor>(weights.data(), at(Q)), eps,
-                std::span<Tensor>(outs.data(), at(Q)), s(r));
+                std::span<Tensor>(outs.data(), at(Q)), fused ? nullptr : &a[at(r)], s(r));
         });
+        if (!fused) { tap(vi, "ain", a); }
         if (shared) {
             xin[1] = xin[0];
             xin[2] = xin[0];
@@ -120,8 +137,11 @@ void Forward<Arena>::attention_inputs(std::uint32_t index, Block& b, const RankT
         if (b.previous == nullptr) {
             throw std::logic_error("Inkling 2 forward: a message visit without a previous pass");
         }
-        b.messages_storage = alloc(DType::FP32, {H, T_, 4});
-        b.messages         = &b.messages_storage;
+        // A half of an overlapped call brings its storage (forward/overlap.h).
+        if (b.messages == nullptr) {
+            b.messages_storage = alloc(DType::FP32, {H, T_, 4});
+            b.messages         = &b.messages_storage;
+        }
         depth(b.bank, *b.previous,
               {&layer(0, v.layer).core->message_queries,
                width_ == 2 ? &layer(1, v.layer).core->message_queries : nullptr},
@@ -138,8 +158,8 @@ void Forward<Arena>::attention_inputs(std::uint32_t index, Block& b, const RankT
                         batch[at(j)]     = {a[at(r)].slice(2, global ? j : 0, 1).view({H, T_}),
                                             b.messages_storage[at(r)].slice(2, j, 1).view({H, T_}),
                                             gate.down,
-                                            gate.forget,
-                                            gate.gain,
+                                            gate.forget_bf16,
+                                            gate.gain_bf16,
                                             gated[at(j)][at(r)],
                                             norms.at(global ? at(j) : 0),
                                             xin[at(j)][at(r)]};

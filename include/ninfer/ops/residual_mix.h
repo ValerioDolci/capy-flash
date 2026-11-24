@@ -42,14 +42,19 @@ struct ResidualConv {
  *   The conv state advances (or the record is written) as short_conv_static(_record) does.
  *
  * Numeric:
- *   Bit-identical to short_conv_static(_record), residual_add_f32, depth_attention and
- *   rmsnorm_f32 called in sequence on the same operands.
+ *   residual and the conv state (or record) are bit-identical to short_conv_static(_record) then
+ *   residual_add_f32. mix and normed have depth_attention's and rmsnorm_f32's math with the sums
+ *   in another order (a logit is dot(q, s) * inv(s) * scale; results within those Ops'
+ *   tolerances, not bit-identical); every sum's order is fixed per column, so a column's bits
+ *   depend neither on T nor on the other columns, and depth_attention_rmsnorm with the same
+ *   sources gives the same mix bits.
  *
  * Shapes and domain:
- *   1 <= T <= kResidualMixMaxTokens, 1 <= H <= kResidualMixMaxHidden; base BF16 [H, T] or null;
- *   states, query, eps and scale as depth_attention.h; norms BF16 ne {H} (0 or Q of them; with 0,
- *   `mix` must be given); residual FP32 [H, T]; mix FP32 ne {H, T, Q} or null; normed BF16 [H, T],
- *   one per norm. Outputs overlap no input and no other output.
+ *   1 <= T <= kResidualMixMaxTokens, H a multiple of 8 in 8..kResidualMixMaxHidden; every tensor
+ *   16-byte aligned; base BF16 [H, T] or null; states, query, eps and scale as depth_attention.h;
+ *   norms BF16 ne {H} (0 or Q of them; with 0, `mix` must be given); residual FP32 [H, T]; mix
+ *   FP32 ne {H, T, Q} or null; normed BF16 [H, T], one per norm. Outputs overlap no input and no
+ *   other output.
  *
  * Execution: one kernel, stream ordered on `stream`, CUDA Graph capturable. Workspace: none.
  */
@@ -59,18 +64,21 @@ void residual_conv_mix(const ResidualConv& conv, const Tensor* base, std::span<c
                        std::span<Tensor> normed, cudaStream_t stream);
 
 /**
- * Op: depth_attention_rmsnorm - depth attention of a BF16 current state, then RMS norms
+ * Op: depth_attention_rmsnorm - depth attention of a BF16 or FP32 current state, then RMS norms
  *
  * Math: mix = depth_attention(states, current, query, mix_eps, mix_scale);
- *       normed[q] = rmsnorm_f32(mix[:, :, q], norms[q], norm_eps) for q < Q.
- * Numeric: bit-identical to depth_attention then rmsnorm_f32 on the same operands.
- * Shapes and domain: current BF16 [H, T]; Q norms and Q outputs; T and H as residual_conv_mix.
+ *       normed[q] = rmsnorm_f32(mix[:, :, q], norms[q], norm_eps) for q < norms.size().
+ * Numeric: as residual_conv_mix's mix and normed.
+ * Shapes and domain: current BF16 or FP32 [H, T] (with the FP32 residual of residual_conv_mix as
+ *   current it gives residual_conv_mix's mix and normed bits); 0 or Q norms, one output each; mix
+ *   FP32 ne {H, T, Q}
+ *   or null (with 0 norms it must be given); T, H, alignment and overlaps as residual_conv_mix.
  * Execution: one kernel, stream ordered, CUDA Graph capturable. Workspace: none.
  */
 void depth_attention_rmsnorm(std::span<const Tensor> states, const Tensor& current,
                              const Tensor& query, float mix_eps, float mix_scale,
                              std::span<const Tensor> norms, float norm_eps,
-                             std::span<Tensor> normed, cudaStream_t stream);
+                             std::span<Tensor> normed, Tensor* mix, cudaStream_t stream);
 
 /**
  * Op: residual_conv_round - out = bf16(residual + short_conv_static(conv.x))

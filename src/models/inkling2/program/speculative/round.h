@@ -84,6 +84,7 @@ struct RoundRank {
     cudaStream_t stream                     = nullptr;
     int device                              = 0;
     const VisitState* state                 = nullptr;
+    const execution::PrefetchLane* prefetch = nullptr; // optional: execution/forward/prefetch.h
 };
 
 class VerifyRound {

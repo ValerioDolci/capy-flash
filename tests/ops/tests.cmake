@@ -55,7 +55,8 @@ set(ninfer_op_tests
   concat_rows_split
   moe_sigmoid_route
   moe_bank
-  moe_route)
+  moe_route
+  l2_preload)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"

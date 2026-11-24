@@ -195,12 +195,10 @@ bool is_inkling2(const artifact::Directory& directory) {
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     try {
-        if (options.vision ||
-            (options.speculative != SpeculativeBackend::None &&
-             options.speculative != SpeculativeBackend::Mtp) ||
-            options.embedding_host) {
+        if (options.vision || (options.speculative != SpeculativeBackend::None &&
+                               options.speculative != SpeculativeBackend::Mtp)) {
             throw ArtifactError("only the Text backbone and its mtp drafter are implemented (no "
-                                "Vision, other speculative backend or host-mapped embedding)");
+                                "Vision or other speculative backend)");
         }
         if (options.purpose != EnginePurpose::Generation &&
             options.purpose != EnginePurpose::CausalScoring) {

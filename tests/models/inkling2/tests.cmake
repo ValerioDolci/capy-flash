@@ -36,10 +36,17 @@ add_test(NAME ninfer_inkling2_loading_tp1_test
   COMMAND ninfer_inkling2_loading_tp2_test ${inkling2_synth_args} --tp 1)
 add_test(NAME ninfer_inkling2_loading_tp2_real_test
   COMMAND ninfer_inkling2_loading_tp2_test ${inkling2_real_args} --tp 2)
+# The same with the token embedding in one mapped page-locked host copy (--embedding-host).
+add_test(NAME ninfer_inkling2_loading_embedding_host_tp2_test
+  COMMAND ninfer_inkling2_loading_tp2_test ${inkling2_synth_args} --tp 2 --embedding-host)
+add_test(NAME ninfer_inkling2_loading_embedding_host_tp1_test
+  COMMAND ninfer_inkling2_loading_tp2_test ${inkling2_synth_args} --tp 1 --embedding-host)
 set_tests_properties(
   ninfer_inkling2_loading_tp2_test
   ninfer_inkling2_loading_tp1_test
   ninfer_inkling2_loading_tp2_real_test
+  ninfer_inkling2_loading_embedding_host_tp2_test
+  ninfer_inkling2_loading_embedding_host_tp1_test
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ninfer_gpu_memory)
 # Inkling 2 frontend against the Hugging Face reference ids (tokenizer_fixture.json, written by
 # tools/ref_ink/tokenizer_fixtures.py). Point NINFER_TEST_INKLING2_TOKENIZER_DIR at an Inkling 2 Mini
@@ -115,6 +122,11 @@ add_test(NAME ninfer_inkling2_drafter_round_test
 add_test(NAME ninfer_inkling2_drafter_round_tp2_test
   COMMAND ninfer_inkling2_tf_driver ${inkling2_forward_args} --mode spec --tp 2 --block 16
   --max-new 64 --draft-tokens 1,3,7 --drafter)
+# The same with the token embedding read in place from host memory (--embedding-host): prefill,
+# the decode graph and the drafter's anchor gather it from the one mapped copy.
+add_test(NAME ninfer_inkling2_drafter_round_embedding_host_tp2_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_forward_args} --mode spec --tp 2 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --drafter --embedding-host)
 set_tests_properties(
   ninfer_inkling2_forward_tp2_test
   ninfer_inkling2_forward_blocks_test
@@ -123,6 +135,7 @@ set_tests_properties(
   ninfer_inkling2_features_tp2_test
   ninfer_inkling2_drafter_round_test
   ninfer_inkling2_drafter_round_tp2_test
+  ninfer_inkling2_drafter_round_embedding_host_tp2_test
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ninfer_gpu_memory)
 
 # Prefix reuse through the public Engine on the real artifact at tp 2 (test_prefix_reuse.cpp):

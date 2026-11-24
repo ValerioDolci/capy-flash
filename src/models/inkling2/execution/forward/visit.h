@@ -105,6 +105,25 @@ void Forward<Arena>::run(const RankTensors& ids, const ForwardColumns& columns,
     embed(ids, b.embedding);
     tap(ForwardTap::kHeadTap, "embed", b.embedding);
 
+    const std::int32_t split = overlap_split(T_);
+    if constexpr (!kExecute) {
+        // The workspace holds either schedule of a call that may overlap.
+        if (split > 0) { (void)visits(b, 0); }
+    }
+    const RankTensors* x = visits(b, split);
+    head(b, *x, columns, out);
+    join_prefetch();
+}
+
+template <class Arena>
+auto Forward<Arena>::visits(Block& b, std::int32_t split) -> const RankTensors* {
+    b.states.clear();
+    b.bank.clear();
+    b.previous      = nullptr;
+    b.messages      = nullptr;
+    const auto held = scopes();
+    std::array<Half, 2> parts;
+    if (split > 0) { parts = halves(split); }
     const RankTensors* x = &b.embedding;
     // Saved at the first core visit of pass 1, restored at the start of every later pass.
     const RankTensors* core_input = nullptr;
@@ -141,7 +160,9 @@ void Forward<Arena>::run(const RankTensors& ids, const ForwardColumns& columns,
                 b.states.resize(core_blocks);
             }
         }
-        if (RankTensors* captured = sink_of(index); captured != nullptr && captured != x) {
+        RankTensors* captured = sink_of(index);
+        if (captured == x) { captured = nullptr; }
+        if (captured != nullptr && split == 0) {
             each([&](int r) {
                 if constexpr (kExecute) {
                     CUDA_CHECK(::ninfer::memcpy_device_async(
@@ -157,14 +178,34 @@ void Forward<Arena>::run(const RankTensors& ids, const ForwardColumns& columns,
         } else {
             target = x == &b.temporary[0] ? &b.temporary[1] : &b.temporary[0];
         }
-        visit(index, b, *x, *target);
+        if (split == 0) {
+            visit(index, b, *x, *target);
+        } else {
+            try {
+                visit_halves(index, b, *x, *target, captured, parts);
+            } catch (...) {
+                abandon_halves(parts);
+                throw;
+            }
+        }
         x = target;
         if (config_.core(v.layer) && v.layer + 1 == config_.core_end) {
             pass_states = b.states;
             pass_output = x;
         }
     }
-    head(b, *x, columns, out);
+    if (split > 0) {
+        // The last visit's exchanges close before the head reads its output.
+        try {
+            for (Half& half : parts) {
+                on_half(half, [&] { close_half(half); });
+            }
+        } catch (...) {
+            abandon_halves(parts);
+            throw;
+        }
+    }
+    return x;
 }
 
 template <class Arena>
@@ -188,6 +229,7 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
     const auto vi        = static_cast<std::int32_t>(index);
 
     std::array<RankTensors, 3> xin;
+    for (auto& t : xin) { t = alloc(DType::BF16, {H, T_}); }
     attention_inputs(index, b, x, xin);
 
     auto y = alloc(DType::BF16, {H, T_});
@@ -195,7 +237,7 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
     tap(vi, "attn", y);
 
     // Fused: conv + residual + mix (+ the norm outside the message passes) in one Op per rank.
-    const bool fused       = fused_residual(v.slot);
+    const bool fused       = fused_residual(index);
     const float conv_scale = 1.0F / std::sqrt(static_cast<float>(config_.conv_kernel + 1));
     const auto conv        = [&](const Tensor& in, const Tensor& weight, const Tensor& tail,
                           const std::optional<Tensor>& record) {
@@ -226,8 +268,9 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
     const bool boundary = v.block_boundary;
     if (v.block_boundary) { b.states.push_back(&x); }
 
-    auto ffn_in = alloc(DType::FP32, {H, T_, 1});
-    auto u      = alloc(DType::BF16, {H, T_});
+    auto ffn_in      = alloc(DType::FP32, {H, T_, 1});
+    auto u           = alloc(DType::BF16, {H, T_});
+    bool normed_here = false; // u written with the mix
     if (fused) {
         each([&](int r) {
             if constexpr (kExecute) {
@@ -251,6 +294,25 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
                     v.messages ? std::span<Tensor>() : std::span<Tensor>(&normed, 1), s(r));
             }
         });
+    } else if (!v.messages && kExecute && T_ <= ops::kResidualMixMaxTokens &&
+               H <= ops::kResidualMixMaxHidden) {
+        // Unfused at decode and verification widths: the mix and its norm in one Op over the
+        // FP32 residual, the bits of the fused residual_conv_mix.
+        each([&](int r) {
+            std::array<Tensor, ops::kDepthAttentionMaxStates> rank_states;
+            for (std::size_t i = 0; i < b.states.size(); ++i) {
+                rank_states[i] = (*b.states[i])[at(r)];
+            }
+            const Tensor norm = layer(r, v.layer).ffn_norm;
+            Tensor normed     = u[at(r)];
+            Tensor mix        = ffn_in[at(r)];
+            ops::depth_attention_rmsnorm(
+                std::span<const Tensor>(rank_states.data(), b.states.size()), residual[at(r)],
+                layer(r, v.layer).ffn_queries, kDepthAttentionEpsilon,
+                1.0F / std::sqrt(static_cast<float>(H)), std::span<const Tensor>(&norm, 1),
+                config_.rms_norm_eps, std::span<Tensor>(&normed, 1), &mix, s(r));
+        });
+        normed_here = true;
     } else {
         depth(b.states, residual,
               {&layer(0, v.layer).ffn_queries,
@@ -268,8 +330,8 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
                 const ops::MessageGateNormed one{in,
                                                  (*b.messages)[at(r)].slice(2, 3, 1).view({H, T_}),
                                                  gate.down,
-                                                 gate.forget,
-                                                 gate.gain,
+                                                 gate.forget_bf16,
+                                                 gate.gain_bf16,
                                                  in,
                                                  layer(r, v.layer).ffn_norm,
                                                  u[at(r)]};
@@ -287,7 +349,7 @@ void Forward<Arena>::visit(std::uint32_t index, Block& b, const RankTensors& x, 
             }
         });
     }
-    if (!gate_norm && (!fused || v.messages)) {
+    if (!gate_norm && (!fused || v.messages) && !normed_here) {
         each([&](int r) {
             if constexpr (kExecute) {
                 ops::rmsnorm_f32(ffn_in[at(r)].view({H, T_}), layer(r, v.layer).ffn_norm,

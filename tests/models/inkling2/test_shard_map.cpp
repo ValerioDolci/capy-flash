@@ -4,7 +4,9 @@
 //    list, written out here from the config) at tp 2: axis, holder and per-rank ranges against
 //    the name table of expected_placement.h; whole and Replicated at tp 1.
 // 2. The rank config (12/4 heads, half the output rows) and the rejections: a parameter without
-//    a rule, a layer outside the model, tensor parallelism 3, indivisible heads.
+//    a rule, a layer outside the model, tensor parallelism 3, indivisible heads, an expert width
+//    that does not halve into 64-column parts.
+// 3. With embedding_host, text/token_embedding alone is HostMapped, at tp 1 and tp 2.
 
 #include "artifact/fixture.h"
 #include "models/inkling2/config.h"
@@ -109,7 +111,14 @@ std::size_t check_geometry(const inkling2::TextConfig& c) {
         const auto expect = ninfer::test::inkling2::expected_placement(name, c.num_experts);
         const auto shard  = loading::logical_shard(name, shape, c, tp2);
         bool ok           = shard.axis == expect.axis && shard.device == expect.holder;
-        if (artifact::is_sharded(expect.axis)) {
+        if (name.find("/moe/experts/") != std::string::npos && expect.axis == ShardAxis::Rows) {
+            // gate_up [2F, H]: rank r's gate rows [r F/2, (r+1) F/2) and the matching up rows.
+            const auto f = shape.front() / 2;
+            ok           = ok &&
+                 shard.ranges[0] == std::vector<artifact::SliceRange>{{0, f / 2}, {f, f / 2}} &&
+                 shard.ranges[1] ==
+                     std::vector<artifact::SliceRange>{{f / 2, f / 2}, {f + f / 2, f / 2}};
+        } else if (artifact::is_sharded(expect.axis)) {
             const auto extent = expect.axis == ShardAxis::Rows ? shape.front() : shape.back();
             ok = ok && shard.ranges[0] == std::vector<artifact::SliceRange>{{0, extent / 2}} &&
                  shard.ranges[1] == std::vector<artifact::SliceRange>{{extent / 2, extent / 2}};
@@ -132,6 +141,19 @@ void released() {
     std::printf("released geometry, tp 2:\n");
     const auto count = check_geometry(c);
     std::printf("  %zu parameters\n", count);
+    for (const int tp : {1, 2}) {
+        const LoadOptions host{.tp = tp, .embedding_host = true};
+        const LoadOptions device{.tp = tp};
+        for (const auto& [name, shape] : parameters(c)) {
+            const auto shard = loading::logical_shard(name, shape, c, host);
+            const auto plain = loading::logical_shard(name, shape, c, device);
+            const auto want  = name == "text/token_embedding" ? ShardAxis::HostMapped : plain.axis;
+            if (shard.axis != want || shard.ranges != plain.ranges) {
+                throw std::runtime_error(name + ": unexpected placement with embedding_host");
+            }
+        }
+    }
+    std::printf("  embedding_host: text/token_embedding HostMapped at tp 1 and 2\n");
     const auto rank = inkling2::execution::shard_text_config(c, 2);
     require(rank.num_attention_heads == 12 && rank.num_key_value_heads == 4 &&
                 rank.unpadded_vocab_size == 100029 && rank.num_experts == 128 &&
@@ -154,6 +176,14 @@ void released() {
         "indivisible KV heads");
     rejects<std::invalid_argument>([&] { (void)inkling2::execution::shard_text_config(odd, 2); },
                                    "indivisible rank config");
+    auto narrow                = c;
+    narrow.expert_intermediate = 1120;
+    rejects<std::invalid_argument>(
+        [&] {
+            (void)loading::logical_shard("text/layers/0/moe/experts/0/down", {2304, 1120}, narrow,
+                                         tp2);
+        },
+        "an expert width without 64-column halves");
 }
 
 void synthetic() {

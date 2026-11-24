@@ -55,23 +55,43 @@ std::uint32_t number(std::string_view name, std::string_view digits) {
     return value;
 }
 
-// The rank holding an expert's bank: IDs [r E/tp, (r+1) E/tp) on rank r.
-int expert_rank(std::string_view name, std::string_view leaf, const TextConfig& c, int tp) {
+// An expert's channels of the intermediate width F, halved: rank r computes channels
+// [r F/tp, (r+1) F/tp), i.e. those gate and up rows and those down columns (load/expert_banks.h
+// cuts them from the artifact's banks).
+LogicalShard expert_shard(std::string_view name, std::string_view leaf,
+                          const artifact::Shape& shape, const TextConfig& c, int tp) {
     const auto rest  = leaf.substr(std::string_view("moe/experts/").size());
     const auto slash = rest.find('/');
     if (slash == std::string_view::npos) { reject(name, "has a malformed expert name"); }
-    const auto expert = number(name, rest.substr(0, slash));
-    if (c.num_experts % static_cast<std::uint32_t>(tp) || expert >= c.num_experts) {
-        reject(name, "requires the experts to divide into one bank per rank");
+    if (number(name, rest.substr(0, slash)) >= c.num_experts) { reject(name, "names no expert"); }
+    const std::uint64_t f = c.expert_intermediate, part = f / static_cast<std::uint64_t>(tp);
+    if (f % (static_cast<std::uint64_t>(tp) * 64)) {
+        reject(name, "requires the expert width to divide into 64-column parts per rank");
     }
-    return static_cast<int>(expert / (c.num_experts / static_cast<std::uint32_t>(tp)));
+    const auto role = rest.substr(slash + 1);
+    LogicalShard out;
+    if (role == "gate_up" && shape.size() == 2 && shape.front() == 2 * f) {
+        out.axis = ShardAxis::Rows;
+        for (int device = 0; device < tp; ++device) {
+            const auto begin = static_cast<std::uint64_t>(device) * part;
+            out.ranges[static_cast<std::size_t>(device)] = {{begin, part}, {f + begin, part}};
+        }
+        return out;
+    }
+    if (role == "down" && shape.size() == 2 && shape.back() == f) {
+        out.axis = ShardAxis::Columns;
+        for (int device = 0; device < tp; ++device) {
+            out.ranges[static_cast<std::size_t>(device)] = {
+                {static_cast<std::uint64_t>(device) * part, part}};
+        }
+        return out;
+    }
+    reject(name, "is not an expert gate_up [2F,H] or down [H,F]");
 }
 
 LogicalShard layer_shard(std::string_view name, std::string_view leaf, const artifact::Shape& shape,
                          const TextConfig& c, int tp) {
-    if (leaf.starts_with("moe/experts/")) {
-        return whole(ShardAxis::SingleDevice, expert_rank(name, leaf, c, tp));
-    }
+    if (leaf.starts_with("moe/experts/")) { return expert_shard(name, leaf, shape, c, tp); }
     if (leaf == "attention/query" || leaf == "attention/gate" || leaf == "attention/relative" ||
         leaf == "attention/sink" || leaf == "attention/query_scale" ||
         leaf == "attention/relative_scale") {
@@ -149,7 +169,11 @@ LogicalShard draft_shard(std::string_view name, const artifact::Shape& shape,
 }
 
 LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, const TextConfig& c,
-                        int tp, const draft::DraftConfig* draft) {
+                        const LoadOptions& options, const draft::DraftConfig* draft) {
+    if (options.embedding_host && name == "text/token_embedding") {
+        return whole(ShardAxis::HostMapped);
+    }
+    const int tp = options.tp;
     if (tp == 1) { return {}; }
     if (name.starts_with("mtp/")) { return draft_shard(name, shape, draft, tp); }
     if (name == "text/token_embedding" || name == "text/embedding_norm" ||
@@ -243,7 +267,7 @@ LogicalShard logical_shard(std::string_view name, const artifact::Shape& shape,
                            const TextConfig& config, const LoadOptions& options,
                            const draft::DraftConfig* draft) {
     validate_tp(options);
-    return shard_rule(name, shape, config, options.tp, draft);
+    return shard_rule(name, shape, config, options, draft);
 }
 
 std::vector<std::optional<artifact::ShardPlacement>>
@@ -255,8 +279,10 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
     std::vector<std::string> ids(object_count);
     for (const auto& weight : weights) {
         const auto& reference = weight.reference;
+        // The routed experts are mapped from the file and cut by the model (expert_banks.h).
+        if (reference.residency == artifact::Residency::HostFile) { continue; }
         const auto& name      = reference.name;
-        const auto shard      = shard_rule(name, reference.shape, config, options.tp, draft);
+        const auto shard      = shard_rule(name, reference.shape, config, options, draft);
         const auto row        = row_elements(reference.shape);
         std::uint64_t logical = 0; // Logical element offset of the current part.
         for (std::size_t i = 0; i < reference.binding.parts.size(); ++i) {
@@ -329,7 +355,7 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
 void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWeight> weights,
                             const TextConfig& config, const LoadOptions& options,
                             const draft::DraftConfig* draft) {
-    if (options.tp == 1) { return; }
+    if (options.tp == 1 && !options.embedding_host) { return; }
     if (binder.device_count() != options.tp) {
         throw std::logic_error("Binder device count differs from tensor parallelism");
     }

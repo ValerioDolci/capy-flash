@@ -49,9 +49,12 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p) {
     out.experts.reserve(c.num_experts);
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
         const auto ep = p + "moe/experts/" + std::to_string(e) + "/";
-        // NVFP4 or MXFP8, as the checkpoint stored the layer's experts (one format per bank).
-        out.experts.push_back({b.parameter(ep + "gate_up", {2ULL * f, h}, {p + "ffn_input"}),
-                               b.parameter(ep + "down", {h, f}, {ep + "product"})});
+        // NVFP4 or MXFP8, as the checkpoint stored the layer's experts (one format per bank),
+        // mapped from the file and cut into the ranks' banks at load (load/expert_banks.h).
+        constexpr auto mapped = artifact::Residency::HostFile;
+        out.experts.push_back(
+            {b.parameter(ep + "gate_up", {2ULL * f, h}, {p + "ffn_input"}, {}, mapped),
+             b.parameter(ep + "down", {h, f}, {ep + "product"}, {}, mapped)});
     }
     return out;
 }

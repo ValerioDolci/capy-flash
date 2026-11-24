@@ -10,6 +10,13 @@ BF16 scale per row, 1,271,895,040 B (1.18 GiB). At `--tp 2` the default placemen
 so the option frees 1.18 GiB on **each** GPU (2.37 GiB in total) for the KV pool and costs 1.18 GiB
 of pinned host RAM once. At `--tp 1` it frees 1.18 GiB on the one GPU.
 
+Inkling 2 Mini stores the table in BF16: 201,024 rows of 2,304 values, 926,318,592 B (0.86 GiB),
+replicated at `--tp 2` by default. Its own `loading::shard_rule`
+([`inkling2/load/sharding.cpp`](../../src/models/inkling2/load/sharding.cpp)) places it HostMapped
+under the same option, at tp 1 too; the prefill and decode gathers and the drafter's anchor
+gather (`ops::embedding` → `embed_gather_dense_kernel`) read 4.5 KiB per token from it. The
+drafter's own `mtp/markov/token_embedding` stays replicated.
+
 ## Placement
 
 The table gets its own placement kind, `artifact::ShardAxis::HostMapped`

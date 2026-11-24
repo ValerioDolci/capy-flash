@@ -46,7 +46,9 @@
 //             rank's features equal its tapped visit inputs and head input bit for bit, the ranks
 //             agree and the logits are those of the same blocks without sinks; --out writes them.
 // Ids: a whitespace-separated text file, or a reference JSON whose prompt_ids (+ generated_ids
-// when scoring) are used. Exit 77 without the artifact or the CUDA devices.
+// when scoring) are used. --embedding-host loads every mode's model with the token embedding in
+// one mapped page-locked host copy (LoadOptions::embedding_host). Exit 77 without the artifact or
+// the CUDA devices.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -58,6 +60,7 @@
 #include "models/inkling2/draft/parameters.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
+#include "models/inkling2/execution/prefetch_lane.h"
 #include "models/inkling2/execution/tp.h"
 #include "models/inkling2/load.h"
 #include "models/inkling2/program/speculative/round.h"
@@ -354,6 +357,9 @@ private:
     std::size_t compared_ = 0, differing_ = 0;
 };
 
+// --embedding-host, for every Session of the run.
+bool embedding_host = false;
+
 std::uint64_t used_bytes(int device) {
     const ScopedCurrentDevice scope(device);
     std::size_t free = 0, total = 0;
@@ -380,12 +386,13 @@ public:
         }
         reader_.emplace(artifact);
         models::LoadOptions options{};
-        options.tp          = tp;
-        options.speculative = drafter ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
-        auto plan           = ink::plan_load(*reader_, options);
-        model_              = ink::materialize_model(std::move(plan), *execution_);
-        config_             = model_->config().text;
-        rank_config_        = tp == 2 ? exec::shard_text_config(config_, 2) : config_;
+        options.tp             = tp;
+        options.speculative    = drafter ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+        options.embedding_host = embedding_host;
+        auto plan              = ink::plan_load(*reader_, options);
+        model_                 = ink::materialize_model(std::move(plan), *execution_);
+        config_                = model_->config().text;
+        rank_config_           = tp == 2 ? exec::shard_text_config(config_, 2) : config_;
         for (int r = 0; r < tp; ++r) {
             const ScopedCurrentDevice scope(r);
             parameters_[r] = std::make_unique<exec::Parameters>(*model_, r);
@@ -408,6 +415,7 @@ public:
             work_[r]      = std::make_unique<WorkspaceArena>(workspace_bytes_);
             ids_[r]       = std::make_unique<DeviceBuffer>(std::size_t(max_block) * 4);
             positions_[r] = std::make_unique<DeviceBuffer>(std::size_t(max_block) * 4);
+            prefetch_[r]  = std::make_unique<exec::PrefetchLane>(r);
         }
         {
             const ScopedCurrentDevice scope(0);
@@ -523,6 +531,10 @@ public:
         mailbox_.emplace(
             *execution_, std::size_t{16} << 10, 2,
             ink::speculative::round_exchange_bytes(config_, ink::speculative::kMaxDrafts));
+        // Every kernel that follows an exchange of the forward waits for its dependency before it
+        // reads the stream's data, so an exchange may release it at entry: it launches while the
+        // exchange waits on the peer.
+        mailbox_->set_release_dependents(true);
         events_->attach_mailbox(&*mailbox_);
         bridge_.emplace(0, 1);
     }
@@ -538,7 +550,8 @@ public:
                         .work       = work_[r].get(),
                         .stream     = stream(r),
                         .device     = r,
-                        .state      = state_[r].get()};
+                        .state      = state_[r].get(),
+                        .prefetch   = prefetch_[r].get()};
         }
         return std::make_unique<ink::speculative::VerifyRound>(
             config_, ranks, tp_,
@@ -628,6 +641,7 @@ private:
             ranks[r].device      = r;
             ranks[r].state       = state_[r].get();
             ranks[r].positions   = &position_tensors_[r];
+            ranks[r].prefetch    = prefetch_[r].get();
         }
         return ranks;
     }
@@ -660,6 +674,7 @@ private:
     std::array<std::unique_ptr<DeviceBuffer>, 2> backing_, ids_, positions_;
     std::array<std::unique_ptr<ink::VisitState>, 2> state_;
     std::array<std::unique_ptr<WorkspaceArena>, 2> work_;
+    std::array<std::unique_ptr<exec::PrefetchLane>, 2> prefetch_;
     std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, argmax_mem_;
     Tensor logits_, capped_;
     std::array<Tensor, 2> position_tensors_;
@@ -1440,6 +1455,8 @@ int main(int argc, char** argv) {
                 o.eager = true;
             } else if (arg == "--context") {
                 o.context = static_cast<std::uint32_t>(std::stoul(next()));
+            } else if (arg == "--embedding-host") {
+                embedding_host = true;
             } else {
                 std::cerr
                     << "usage: --artifact PATH --ids FILE [--mode score|generate|tp-parity|"
@@ -1448,7 +1465,7 @@ int main(int argc, char** argv) {
                        "[--logit-rows SPEC] [--parts LIST] [--max-new N] [--eos ID] "
                        "[--context N] [--kl-mean X --kl-max X] [--identical] [--profile-block K] "
                        "[--profile-steps N] [--graph] [--drafts JSON] [--draft-tokens K,...] "
-                       "[--draft-rule right|wrong|random,...] [--eager]\n";
+                       "[--draft-rule right|wrong|random,...] [--eager] [--embedding-host]\n";
                 return 2;
             }
         }

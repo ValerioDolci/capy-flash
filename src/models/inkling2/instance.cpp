@@ -191,10 +191,16 @@ ConstructedModel construct_model(const EngineOptions& options, ExecutionContext&
     summary.model_name        = instance->model->info().name;
     summary.prefill_signature = signature;
     std::set<std::string> formats;
-    for (int rank = 0; rank < instance->model->device_count(); ++rank) {
-        for (const auto& weight : instance->model->weight_data(rank)) {
+    const auto& loaded = *instance->model;
+    for (int rank = 0; rank < loaded.device_count(); ++rank) {
+        for (const auto& weight : loaded.weight_data(rank)) {
             for (const auto& part : weight.view.parts) {
                 formats.emplace(artifact::format_name(part.parent->geometry.format));
+            }
+        }
+        for (std::uint32_t layer = 0; layer < loaded.config().text.num_hidden_layers; ++layer) {
+            for (const auto& bank : loaded.expert_banks(layer, rank)) {
+                formats.emplace(artifact::format_name(bank->gate_up_parent.geometry.format));
             }
         }
     }

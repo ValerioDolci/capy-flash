@@ -48,9 +48,10 @@ struct AttentionParameters {
     std::variant<StaticKvConvParameters, DynamicKvConvParameters> kv_conv;
 };
 
-// One bank of routed experts, IDs [first_expert, first_expert + experts): whole views of the
-// bank parents, gate_up [experts*2F, H] (per expert F gate rows then F up rows) and down
-// [experts*H, F], NVFP4 (one divisor per expert) or BF16. These are the operands of
+// One bank of routed experts, IDs [first_expert, first_expert + experts), at half the
+// intermediate width F (models/inkling2/expert_bank.h): whole views of the bank's parents,
+// gate_up [experts*F, H] (per expert F/2 gate rows then the F/2 matching up rows) and down
+// [experts*H, F/2], NVFP4 (one divisor per expert), MXFP8 or BF16. These are the operands of
 // ops::moe_bank_capped_swiglu (MoeBank{gate_up, down, first_expert}).
 struct ExpertBankParameters {
     WeightView gate_up, down;
@@ -61,13 +62,14 @@ struct ExpertBankParameters {
 struct MoeParameters {
     Tensor router;      // FP32 [E, H]
     Tensor router_bias; // FP32 [E]
-    // The banks this rank holds: both at tp 1, rank r's at tp 2.
+    // The banks this rank computes: both halves of F at tp 1, rank r's half at tp 2.
     std::vector<ExpertBankParameters> banks;
 };
 
 struct MessageGateParameters {
-    Tensor down;         // BF16 [r, 2H]
-    Tensor forget, gain; // FP32 [H, r]
+    Tensor down;                   // BF16 [r, 2H]
+    Tensor forget, gain;           // FP32 [H, r]
+    Tensor forget_bf16, gain_bf16; // the same values in BF16 (message_gates_rmsnorm)
 };
 
 struct CoreParameters {

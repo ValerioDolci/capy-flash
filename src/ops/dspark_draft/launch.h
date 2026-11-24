@@ -9,7 +9,10 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kBlockAttentionChunks   = 64; // key chunks per KV head
+// Key chunks per KV head: at most kBlockAttentionChunks, each at least kBlockAttentionMinKeys keys
+// (a 32-key tile per warp), so a short context takes few blocks and a long one all of them.
+inline constexpr int kBlockAttentionChunks   = 64;
+inline constexpr int kBlockAttentionMinKeys  = 128;
 inline constexpr int kBlockAttentionMaxBlock = 8;
 inline constexpr int kRecurrentRank          = 256;
 inline constexpr int kRecurrentMaxSteps      = 15;

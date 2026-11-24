@@ -3,12 +3,13 @@
 # Two 16 GB sm_120 boards in tensor parallel (no P2P needed): text only, one request at a time (more
 # requests queue), 253,952-token context. Environment overrides, as in the other launchers:
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1)  NINFER_MAX_CONTEXT (253952)
-#   NINFER_PREFILL_CHUNK (2048: prompt tokens per prefill block, a multiple of 128)
+#   NINFER_PREFILL_CHUNK (4096: prompt tokens per prefill block, a multiple of 128)
 #   NINFER_MODEL_ID (inkling-2-mini: the `model` name requests must use)
 #   NINFER_DRAFTER=0 turns the drafter off (no --spec mtp --draft-tokens 3)
-# The context and the prefill blocks are reserved at startup: 253,952 tokens with 2048-token blocks and the
-# drafter leave about 300 MiB free per 16 GB board. Larger blocks (4096) prefill faster and leave less context
-# (221,184), smaller ones (1024) the opposite (270,336); without the drafter 319,488 fit with 2048-token blocks.
+# The context and the prefill blocks are reserved at startup: 253,952 tokens with 4096-token blocks and the
+# drafter leave about 580 MiB free per 16 GB board, with the token embedding in pinned host memory
+# (--embedding-host: one 0.9 GB copy in RAM that both boards read in place, identical results).
+# Smaller blocks (2048) prefill 6-13 % slower and reserve less.
 # One device in NINFER_DEVICES runs at tp 1, which needs a 32 GB board (the weights are 20 GB): this
 # is not verified, and the launcher refuses a smaller board.
 # Speculative decoding with the checkpoint's DSpark drafter is on (--spec mtp --draft-tokens 3): the
@@ -40,5 +41,5 @@ drafter=(--spec mtp --draft-tokens 3)
 export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$here/bin/ninfer-serve" "$artifact" "${parallel[@]}" "${drafter[@]}" \
   --host "${NINFER_HOST:-127.0.0.1}" --port "${NINFER_PORT:-8080}" \
-  --max-context "${NINFER_MAX_CONTEXT:-253952}" --prefill-chunk "${NINFER_PREFILL_CHUNK:-2048}" \
+  --max-context "${NINFER_MAX_CONTEXT:-253952}" --prefill-chunk "${NINFER_PREFILL_CHUNK:-4096}" --embedding-host \
   --model-id "${NINFER_MODEL_ID:-inkling-2-mini}" "$@"

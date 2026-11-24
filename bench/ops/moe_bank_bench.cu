@@ -37,6 +37,7 @@ struct Options {
     std::vector<int> tokens{1, 4, 8, 512};
     int hidden = 2304, intermediate = 1152, bank_experts = 64, experts = 128, top_k = 8;
     int nvfp4_banks = 3, mxfp8_banks = 2, bf16_banks = 2, calls = 24, wide_calls = 4, warmup = 3, repeat = 20;
+    int pool        = 0; // experts a call's tokens choose from (0: all of them)
     double peak_gbs = 896.0;
     bool route      = true;
 };
@@ -61,7 +62,8 @@ Options parse(int argc, char** argv) {
             std::puts("usage: ninfer_moe_bank_bench [--format nvfp4,mxfp8,bf16] [--tokens 1,4,8,512] "
                       "[--hidden 2304] [--intermediate 1152] [--bank-experts 64] [--experts 128] "
                       "[--top-k 8] [--nvfp4-banks 3] [--mxfp8-banks 2] [--bf16-banks 2] [--calls 24] "
-                      "[--wide-calls 4] [--warmup 3] [--repeat 20] [--peak-gbs 896] [--no-route]");
+                      "[--wide-calls 4] [--warmup 3] [--repeat 20] [--peak-gbs 896] [--pool N] "
+                      "[--no-route]");
             std::exit(0);
         }
         if (arg == "--no-route") {
@@ -99,6 +101,8 @@ Options parse(int argc, char** argv) {
             o.warmup = std::stoi(v);
         } else if (arg == "--repeat") {
             o.repeat = std::stoi(v);
+        } else if (arg == "--pool") {
+            o.pool = std::stoi(v);
         } else if (arg == "--peak-gbs") {
             o.peak_gbs = std::stod(v);
         } else {
@@ -158,14 +162,18 @@ struct Bank {
     WeightView gate_up_view, down_view;
 };
 
-// Routing of one call: 8 distinct experts of `experts` per token, random weights.
+// Routing of one call: 8 distinct experts of `experts` per token, random weights. With --pool N
+// the call's tokens choose among the same N random experts (8: every token the same experts), as
+// the tokens of a verification round share experts.
 std::vector<int> make_ids(const Options& o, int tokens, std::mt19937& rng, int& distinct) {
     std::vector<int> ids(static_cast<std::size_t>(tokens) * o.top_k);
     std::vector<int> all(static_cast<std::size_t>(o.experts));
     std::iota(all.begin(), all.end(), 0);
+    const int pool = o.pool >= o.top_k && o.pool < o.experts ? o.pool : o.experts;
+    if (pool < o.experts) std::shuffle(all.begin(), all.end(), rng);
     std::set<int> in_bank;
     for (int t = 0; t < tokens; ++t) {
-        std::shuffle(all.begin(), all.end(), rng);
+        std::shuffle(all.begin(), all.begin() + pool, rng);
         for (int j = 0; j < o.top_k; ++j) {
             ids[static_cast<std::size_t>(t) * o.top_k + j] = all[static_cast<std::size_t>(j)];
             if (all[static_cast<std::size_t>(j)] < o.bank_experts) in_bank.insert(all[j]);

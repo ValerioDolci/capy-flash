@@ -29,13 +29,13 @@ WeightUseId Bindings::use(WeightId id, std::string_view input) const {
 }
 
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
-                             std::vector<std::string> inputs, std::optional<QType> exact_format) {
+                             std::vector<std::string> inputs, std::optional<QType> exact_format,
+                             artifact::Residency residency) {
     if (parameters_.contains(name)) {
         throw artifact::ArtifactError(name + ": duplicate model parameter declaration");
     }
     PendingWeight pending;
-    pending.reference =
-        binder.parameter(name, std::move(shape), artifact::Residency::Device, exact_format);
+    pending.reference = binder.parameter(name, std::move(shape), residency, exact_format);
     for (auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (use.activation_policy != artifact::ActivationPolicy::A16Only ||
@@ -64,7 +64,9 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (auto& item : pending) {
-        auto view = artifact::bind_view(item.reference, materialized);
+        auto view = item.reference.residency == artifact::Residency::HostFile
+                        ? WeightView{}
+                        : artifact::bind_view(item.reference, materialized);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});
     }
@@ -78,7 +80,11 @@ std::vector<BoundWeight> resolve_weights(std::span<const PendingWeight> pending,
     out.reserve(pending.size());
     for (const auto& item : pending) {
         const auto& reference = item.reference;
-        std::size_t held      = 0;
+        if (reference.residency == artifact::Residency::HostFile) {
+            out.push_back({reference.name, item.source_objects, WeightView{}, item.uses});
+            continue;
+        }
+        std::size_t held = 0;
         for (const auto& part : reference.binding.parts) {
             held += materialized.has_device(part.object, device) ? 1 : 0;
         }

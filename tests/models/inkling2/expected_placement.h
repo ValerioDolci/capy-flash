@@ -25,10 +25,11 @@ inline bool ends_with(const std::string& name, const std::string& suffix) {
 
 inline Expectation expected_placement(const std::string& name, std::uint32_t experts) {
     using artifact::ShardAxis;
-    const auto at = name.find("/moe/experts/");
-    if (at != std::string::npos) {
-        const auto expert = std::stoul(name.substr(at + 13));
-        return {ShardAxis::SingleDevice, expert >= experts / 2 ? 1 : 0, "experts"};
+    // Every expert on both ranks at half the intermediate width: gate_up by rows (half the gate
+    // rows and the matching up rows), down by columns.
+    if (name.find("/moe/experts/") != std::string::npos) {
+        (void)experts;
+        return {ends_with(name, "/down") ? ShardAxis::Columns : ShardAxis::Rows, 0, "experts"};
     }
     if (name == "text/output_head") { return {ShardAxis::Rows, 0, "output head"}; }
     if (name == "text/token_embedding") { return {ShardAxis::Replicated, 0, "embedding"}; }

@@ -173,7 +173,8 @@ void VerifyRound::body() {
                                 .state      = rank.state,
                                 .positions  = &own.positions_view,
                                 .record     = &*own.record,
-                                .features   = drafter_ ? drafter_->sink(r, T) : nullptr};
+                                .features   = drafter_ ? drafter_->sink(r, T) : nullptr,
+                                .prefetch   = rank.prefetch};
     }
 
     // 3. The forward at T = K + 1 with every column's logits; the convolutions record.

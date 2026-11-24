@@ -2,8 +2,11 @@
 
 #include "artifact/reader.h"
 #include "models/inkling2/load/bindings.h"
+#include "models/inkling2/load/expert_banks.h"
 #include "models/inkling2/load/sharding.h"
 
+#include <array>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -80,11 +83,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto data    = std::move(plan.impl_);
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer);
+    const std::array<const DeviceContext*, 1> devices{&device};
+    auto banks = loading::cut_expert_banks(data->pending, data->weights.text, data->config.text,
+                                           backing, devices);
     Model::DeviceWeights bound;
-    bound[0] = loading::resolve_weights(std::move(data->pending), backing);
-    return std::unique_ptr<Model>(
-        new Model(std::move(data->config), data->options, std::move(data->weights),
-                  std::move(bound), 1, data->resources, std::move(data->info), std::move(backing)));
+    bound[0]   = loading::resolve_weights(std::move(data->pending), backing);
+    auto model = std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(banks), 1, data->resources, std::move(data->info), std::move(backing)));
+    model->narrow_message_gates();
+    return model;
 }
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, ExecutionContext& execution,
@@ -99,14 +107,22 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, ExecutionContext& exec
     auto data    = std::move(plan.impl_);
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), execution, observer);
+    std::array<const DeviceContext*, artifact::kMaximumDevices> devices{};
     Model::DeviceWeights bound;
     for (int device = 0; device < tp; ++device) {
+        devices[static_cast<std::size_t>(device)] =
+            &*execution.dev[static_cast<std::size_t>(device)];
         bound[static_cast<std::size_t>(device)] =
             loading::resolve_weights(data->pending, backing, device);
     }
-    return std::unique_ptr<Model>(new Model(
-        std::move(data->config), data->options, std::move(data->weights), std::move(bound), tp,
-        data->resources, std::move(data->info), std::move(backing)));
+    auto banks = loading::cut_expert_banks(
+        data->pending, data->weights.text, data->config.text, backing,
+        std::span<const DeviceContext* const>(devices.data(), static_cast<std::size_t>(tp)));
+    auto model = std::unique_ptr<Model>(new Model(
+        std::move(data->config), data->options, std::move(data->weights), std::move(bound),
+        std::move(banks), tp, data->resources, std::move(data->info), std::move(backing)));
+    model->narrow_message_gates();
+    return model;
 }
 
 } // namespace ninfer::models::inkling2

@@ -24,6 +24,7 @@ struct ResidualConvArgs {
 struct MixArgs {
     const __nv_bfloat16* state[kDepthAttentionMaxStates] = {};
     const __nv_bfloat16* current                         = nullptr; // depth_attention_rmsnorm only
+    const float* current_f32                             = nullptr; // or an FP32 current
     const float* query                                   = nullptr;
     int queries                                          = 1;
     float eps                                            = 0.0F;

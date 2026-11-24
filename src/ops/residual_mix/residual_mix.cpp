@@ -7,6 +7,7 @@
 #include "ops/residual_mix/launch.h"
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,8 +19,10 @@ void require(bool condition, const char* op, const std::string& message) {
     if (!condition) { throw std::invalid_argument(std::string(op) + ": " + message); }
 }
 
+// Contiguous, non-empty and 16-byte aligned (the kernels move 8 elements per access).
 bool is_dense(const Tensor& t, DType dtype) {
-    return t.dtype == dtype && t.data != nullptr && t.is_contiguous() && t.numel() > 0;
+    return t.dtype == dtype && t.data != nullptr && t.is_contiguous() && t.numel() > 0 &&
+           (reinterpret_cast<std::uintptr_t>(t.data) & 15U) == 0;
 }
 
 bool is_matrix(const Tensor& t, std::int32_t rows, std::int32_t columns) {
@@ -30,8 +33,8 @@ bool is_matrix(const Tensor& t, std::int32_t rows, std::int32_t columns) {
 void check_extent(const char* op, const Tensor& x) {
     require(is_dense(x, DType::BF16) && x.ne[2] == 1 && x.ne[3] == 1, op,
             "the branch/current must be contiguous BF16 [H,T]");
-    require(x.ne[0] >= 1 && x.ne[0] <= kResidualMixMaxHidden, op,
-            "H must be 1..kResidualMixMaxHidden");
+    require(x.ne[0] >= 8 && x.ne[0] <= kResidualMixMaxHidden && x.ne[0] % 8 == 0, op,
+            "H must be a multiple of 8 in 8..kResidualMixMaxHidden");
     require(x.ne[1] >= 1 && x.ne[1] <= kResidualMixMaxTokens, op,
             "T must be 1..kResidualMixMaxTokens");
 }
@@ -153,19 +156,44 @@ void residual_conv_mix(const ResidualConv& conv, const Tensor* base, std::span<c
 void depth_attention_rmsnorm(std::span<const Tensor> states, const Tensor& current,
                              const Tensor& query, float mix_eps, float mix_scale,
                              std::span<const Tensor> norms, float norm_eps,
-                             std::span<Tensor> normed, cudaStream_t stream) {
+                             std::span<Tensor> normed, Tensor* mix, cudaStream_t stream) {
     constexpr const char* op = "depth_attention_rmsnorm";
-    check_extent(op, current);
+    const bool wide          = current.dtype == DType::FP32;
+    if (wide) {
+        require(is_dense(current, DType::FP32) && current.ne[2] == 1 && current.ne[3] == 1, op,
+                "an FP32 current must be contiguous [H,T]");
+        // The extent rules of a BF16 current, on a BF16 view of the same extent.
+        check_extent(op, Tensor(current.data, DType::BF16, {current.ne[0], current.ne[1]}));
+    } else {
+        check_extent(op, current);
+    }
     const std::int32_t H = current.ne[0], T = current.ne[1];
     detail::MixArgs m =
         mix_args(op, states, query, mix_eps, mix_scale, norms, norm_eps, normed, H, T);
-    require(!norms.empty(), op, "one norm per query");
-    m.current = static_cast<const __nv_bfloat16*>(current.data);
-    for (std::size_t q = 0; q < normed.size(); ++q) {
-        require(!detail::overlaps(normed[q], current) && !detail::overlaps(normed[q], query), op,
-                "outputs must not overlap an input");
-        for (std::size_t j = q + 1; j < normed.size(); ++j) {
-            require(!detail::overlaps(normed[q], normed[j]), op, "outputs must be disjoint");
+    require(mix != nullptr || !norms.empty(), op, "nothing to write: no mix and no norms");
+    if (wide) {
+        m.current_f32 = static_cast<const float*>(current.data);
+    } else {
+        m.current = static_cast<const __nv_bfloat16*>(current.data);
+    }
+    std::vector<const Tensor*> outputs;
+    if (mix != nullptr) {
+        require(is_dense(*mix, DType::FP32) && mix->ne[0] == H && mix->ne[1] == T &&
+                    mix->ne[2] == m.queries && mix->ne[3] == 1,
+                op, "mix must be contiguous FP32 ne={H,T,Q}");
+        m.mix = static_cast<float*>(mix->data);
+        outputs.push_back(mix);
+    }
+    for (const Tensor& t : normed) outputs.push_back(&t);
+    std::vector<const Tensor*> inputs{&current, &query};
+    for (const Tensor& t : states) inputs.push_back(&t);
+    for (const Tensor& t : norms) inputs.push_back(&t);
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        for (const Tensor* in : inputs) {
+            require(!detail::overlaps(*outputs[i], *in), op, "outputs must not overlap an input");
+        }
+        for (std::size_t j = i + 1; j < outputs.size(); ++j) {
+            require(!detail::overlaps(*outputs[i], *outputs[j]), op, "outputs must be disjoint");
         }
     }
     detail::depth_attention_rmsnorm_launch(m, static_cast<int>(states.size()) + 1, H, T, stream);

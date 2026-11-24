@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "ninfer/ops/inkling2_projection.h"
 #include "ops/linear/bf16/bf16_shapes.h"
 
 #include <cuda_bf16.h>
@@ -49,6 +50,32 @@ __device__ __forceinline__ void butterfly(float& value) {
         value += __shfl_xor_sync(0xFFFFFFFFU, value, offset);
 }
 
+// Where row `row` of token `t` goes: the Linear's [n, T] output, or for a stacked projection the
+// [rows, T] buffer of the row's block (inkling2_projection_blocks).
+struct PlainOut {
+    __nv_bfloat16* data;
+    int n;
+
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int t) const {
+        return data + static_cast<std::size_t>(t) * n + row;
+    }
+};
+
+struct BlockOut {
+    int count;
+    int first[kInkling2ProjectionMaxBlocks]; // ascending, first[0] = 0
+    int rows[kInkling2ProjectionMaxBlocks];
+    __nv_bfloat16* data[kInkling2ProjectionMaxBlocks];
+
+    __device__ __forceinline__ __nv_bfloat16* at(int row, int t) const {
+        int b = 0;
+#pragma unroll
+        for (int i = 1; i < kInkling2ProjectionMaxBlocks; ++i)
+            if (i < count && row >= first[i]) b = i;
+        return data[b] + static_cast<std::size_t>(t) * rows[b] + (row - first[b]);
+    }
+};
+
 // Lane `lane` of a row's 32-lane group g reads the 8-wide vectors g * 32 + lane + j * Stride.
 template <int K, int Rows, int Tokens, int Stride>
 __device__ __forceinline__ void
@@ -94,11 +121,11 @@ accumulate_rows(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __rest
 
 // Rows below 4096: the eight warps of the CTA are the eight 32-lane groups of each of its Rows
 // rows; the row's value is the sum of the eight group totals, from 0 and in group order.
-template <int K, int Rows, int Tokens>
+template <int K, int Rows, int Tokens, class Out>
 __global__ void __launch_bounds__(kThreads)
     inkling2_gemv_split_kernel(const __nv_bfloat16* __restrict__ x,
-                               const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
-                               int n, int tokens) {
+                               const __nv_bfloat16* __restrict__ w, const Out out, int n,
+                               int tokens) {
     __shared__ float partial[Rows][kWarps][Tokens];
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
@@ -127,17 +154,17 @@ __global__ void __launch_bounds__(kThreads)
             float sum = 0.0F;
 #pragma unroll
             for (int g = 0; g < kWarps; ++g) sum += partial[r][g][t];
-            out[static_cast<std::size_t>(t0 + t) * n + row0 + r] = __float2bfloat16(sum);
+            *out.at(row0 + r, t0 + t) = __float2bfloat16(sum);
         }
     }
 }
 
 // Rows from 4096: one warp is the row's only 32-lane group; each warp takes Rows rows.
-template <int K, int Rows, int Tokens>
+template <int K, int Rows, int Tokens, class Out>
 __global__ void __launch_bounds__(kThreads)
     inkling2_gemv_warp_kernel(const __nv_bfloat16* __restrict__ x,
-                              const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
-                              int n, int tokens) {
+                              const __nv_bfloat16* __restrict__ w, const Out out, int n,
+                              int tokens) {
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
     const int row0  = (static_cast<int>(blockIdx.x) * kWarps + warp) * Rows;
@@ -155,16 +182,37 @@ __global__ void __launch_bounds__(kThreads)
         for (int t = 0; t < Tokens; ++t) {
             butterfly(acc[r][t]);
             if (lane == 0 && row0 + r < n && t < count)
-                out[static_cast<std::size_t>(t0 + t) * n + row0 + r] = __float2bfloat16(acc[r][t]);
+                *out.at(row0 + r, t0 + t) = __float2bfloat16(acc[r][t]);
         }
     }
 }
 
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 0xFU) == 0; }
 
-// Split (fewer than 4096 rows): two rows per CTA at T = 1, one beyond (T = 4 and 8 were slower
-// with two or more: more accumulators, fewer CTAs). Warp (from 4096 rows): one row per warp, T = 1
-// only (cold-L2 sweep on RTX 5070 Ti: at T >= 4 it was no faster than the generic GEMV).
+// The split kernel (fewer than 4096 rows): two rows per CTA at T = 1, one beyond (T = 4 and 8 were
+// slower with two or more: more accumulators, fewer CTAs).
+template <int K, class Out>
+void launch_split(const __nv_bfloat16* xp, const __nv_bfloat16* wp, const Out& out, int n,
+                  int tokens, cudaStream_t stream) {
+    const auto token_blocks =
+        static_cast<unsigned>((tokens + kTokensPerBlock - 1) / kTokensPerBlock);
+    const auto split = [&]<int Rows, int Tokens>() {
+        const auto blocks = static_cast<unsigned>((n + Rows - 1) / Rows);
+        inkling2_gemv_split_kernel<K, Rows, Tokens>
+            <<<dim3(blocks, token_blocks), kThreads, 0, stream>>>(xp, wp, out, n, tokens);
+    };
+    if (tokens == 1)
+        split.template operator()<2, 1>();
+    else if (tokens == 2)
+        split.template operator()<1, 2>();
+    else if (tokens <= 4)
+        split.template operator()<1, 4>();
+    else
+        split.template operator()<1, 8>();
+}
+
+// Split (fewer than 4096 rows): launch_split. Warp (from 4096 rows): one row per warp, T = 1 only
+// (cold-L2 sweep on RTX 5070 Ti: at T >= 4 it was no faster than the generic GEMV).
 template <int K, bool Split>
 void launch_inkling2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const int n = w.n, tokens = x.ne[1];
@@ -177,25 +225,40 @@ void launch_inkling2_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStr
         launch_bf16_generic(x, w, out, stream);
         return;
     }
-    const auto token_blocks =
-        static_cast<unsigned>((tokens + kTokensPerBlock - 1) / kTokensPerBlock);
-    const auto split = [&]<int Rows, int Tokens>() {
-        const auto blocks = static_cast<unsigned>((n + Rows - 1) / Rows);
-        inkling2_gemv_split_kernel<K, Rows, Tokens>
-            <<<dim3(blocks, token_blocks), kThreads, 0, stream>>>(xp, wp, op, n, tokens);
-    };
+    const PlainOut plain{op, n};
     if constexpr (Split) {
-        if (tokens == 1)
-            split.template operator()<2, 1>();
-        else if (tokens == 2)
-            split.template operator()<1, 2>();
-        else if (tokens <= 4)
-            split.template operator()<1, 4>();
-        else
-            split.template operator()<1, 8>();
+        launch_split<K>(xp, wp, plain, n, tokens, stream);
     } else {
         const auto blocks = static_cast<unsigned>((n + kWarps - 1) / kWarps);
-        inkling2_gemv_warp_kernel<K, 1, 1><<<blocks, kThreads, 0, stream>>>(xp, wp, op, n, tokens);
+        inkling2_gemv_warp_kernel<K, 1, 1>
+            <<<blocks, kThreads, 0, stream>>>(xp, wp, plain, n, tokens);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Stacked projections at verification widths (inkling2_projection_blocks): the T > 1 routes of
+// ops::linear on these shapes, the split kernel below 4096 rows (launch_split) and one warp per
+// row from 4096 rows (the generic GEMV's arithmetic), with every block of rows stored in its own
+// buffer.
+template <int K>
+void launch_inkling2_blocks(const __nv_bfloat16* xp, const __nv_bfloat16* wp, const BlockOut& out,
+                            int n, int tokens, cudaStream_t stream) {
+    if (n < kSplitBelowRows) {
+        launch_split<K>(xp, wp, out, n, tokens, stream);
+    } else {
+        const auto token_blocks =
+            static_cast<unsigned>((tokens + kTokensPerBlock - 1) / kTokensPerBlock);
+        const auto warp = [&]<int Tokens>() {
+            inkling2_gemv_warp_kernel<K, 1, Tokens>
+                <<<dim3(static_cast<unsigned>((n + kWarps - 1) / kWarps), token_blocks), kThreads,
+                   0, stream>>>(xp, wp, out, n, tokens);
+        };
+        if (tokens == 2)
+            warp.template operator()<2>();
+        else if (tokens <= 4)
+            warp.template operator()<4>();
+        else
+            warp.template operator()<8>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -366,3 +429,37 @@ template Bf16Launch select_bf16_inkling2<528, 2304>(std::int32_t);
 template Bf16Launch select_bf16_inkling2<512, 2304>(std::int32_t);
 template Bf16Launch select_bf16_inkling2<2304, 1536>(std::int32_t);
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+bool inkling2_projection_blocks(const Tensor& x, const Weight& w,
+                                std::span<const Inkling2ProjectionBlock> blocks,
+                                cudaStream_t stream) {
+    constexpr int K  = 2304;
+    const int n      = w.n;
+    const int tokens = x.ne[1];
+    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* wp   = static_cast<const __nv_bfloat16*>(w.qdata);
+    if (w.qtype != QType::BF16 || w.k != K || (n != 4300 && n != 3276 && n != 528) ||
+        x.dtype != DType::BF16 || x.ne[0] != K || !x.is_contiguous() || tokens < 2 ||
+        tokens > detail::kMaxTokens || xp == nullptr || wp == nullptr || !detail::aligned16(xp) ||
+        !detail::aligned16(wp) || blocks.empty() ||
+        blocks.size() > static_cast<std::size_t>(kInkling2ProjectionMaxBlocks)) {
+        return false;
+    }
+    detail::BlockOut out{};
+    int first = 0;
+    for (std::size_t b = 0; b < blocks.size(); ++b) {
+        if (blocks[b].data == nullptr || blocks[b].rows <= 0) return false;
+        out.first[b] = first;
+        out.rows[b]  = blocks[b].rows;
+        out.data[b]  = static_cast<__nv_bfloat16*>(blocks[b].data);
+        first += blocks[b].rows;
+    }
+    if (first != n) return false;
+    out.count = static_cast<int>(blocks.size());
+    detail::launch_inkling2_blocks<K>(xp, wp, out, n, tokens, stream);
+    return true;
+}
+
+} // namespace ninfer::ops

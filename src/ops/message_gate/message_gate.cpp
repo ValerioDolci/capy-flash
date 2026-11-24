@@ -73,8 +73,9 @@ void message_gates_rmsnorm(std::span<const MessageGateNormed> gates, float eps, 
     require(!gates.empty() && gates.size() <= static_cast<std::size_t>(kMessageGateMaxBatch),
             "1 to kMessageGateMaxBatch gates");
     require(std::isfinite(norm_eps) && norm_eps > 0.0F, "norm eps must be finite and positive");
-    const Tensor& first = gates.front().hidden;
-    bool aligned        = true;
+    const Tensor& first       = gates.front().hidden;
+    const DType first_weights = gates.front().forget.dtype;
+    bool aligned              = true;
     detail::MessageGateBatch batch;
     for (std::size_t g = 0; g < gates.size(); ++g) {
         const MessageGateNormed& x = gates[g];
@@ -98,6 +99,8 @@ void message_gates_rmsnorm(std::span<const MessageGateNormed> gates, float eps, 
         for (const Tensor* t : {&x.hidden, &x.message, &x.down, &x.forget, &x.gain, &x.out}) {
             aligned = aligned && (reinterpret_cast<std::uintptr_t>(t->data) & 15U) == 0;
         }
+        require(x.forget.dtype == first_weights && x.gain.dtype == first_weights,
+                "forget and gain must have one dtype in a batch");
         batch.gates[g] = {static_cast<const float*>(x.hidden.data),
                           static_cast<const float*>(x.message.data),
                           static_cast<const __nv_bfloat16*>(x.down.data),
@@ -110,6 +113,30 @@ void message_gates_rmsnorm(std::span<const MessageGateNormed> gates, float eps, 
     // Every gate's own contract (shapes, eps, in place) as message_gate checks it, without
     // launching.
     const auto& g0 = gates.front();
+    if (first_weights == DType::BF16) {
+        // BF16 forget/gain (the checkpoint's values): the batch route only.
+        require(aligned, "BF16 forget/gain need 16-byte aligned operands");
+        for (const MessageGateNormed& x : gates) {
+            const std::int32_t rank = x.down.ne[1], width = x.hidden.ne[0];
+            for (const Tensor* t : {&x.forget, &x.gain}) {
+                require(is_dense(*t, DType::BF16) && is_matrix(*t, rank, width) &&
+                            !detail::overlaps(*t, x.out),
+                        "BF16 forget and gain must be ne={R,H} and not overlap out");
+            }
+            // The rest of the gate's contract, with FP32 stand-ins of the right shape for the
+            // weights (their storage is the down matrix's: never written, never overlapping out).
+            Tensor out = x.out;
+            const Tensor standin(x.down.data, DType::FP32, {rank, width});
+            require(static_cast<std::size_t>(x.down.bytes()) >= standin.bytes(),
+                    "down smaller than a forget stand-in");
+            check_gate(x.hidden, x.message, x.down, standin, standin, eps, out);
+        }
+        require(detail::message_gate_batch_launch(batch, static_cast<int>(gates.size()), g0.hidden,
+                                                  g0.message, g0.down, g0.forget, g0.gain, g0.out,
+                                                  eps, norm_eps, stream),
+                "BF16 forget/gain outside the batch route");
+        return;
+    }
     if (aligned) {
         for (const MessageGateNormed& x : gates) {
             Tensor out = x.out;

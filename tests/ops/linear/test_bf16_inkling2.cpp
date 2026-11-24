@@ -3,9 +3,12 @@
 // of a T-column call equals the same column computed alone (T = 1) up to T = 16 and the same
 // column of any other prefill width beyond, captured graphs replay the same bits, unaligned
 // operands fall back to the generic route, and sampled outputs stay within one BF16 rounding of a
-// float64 oracle.
+// float64 oracle. The stacked projections written block by block (inkling2_projection_blocks)
+// give every block the bits of the same rows of ops::linear at T = 2..16, and decline other
+// operands.
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/inkling2_projection.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_shapes.h"
@@ -235,6 +238,64 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         cudaGraphExecDestroy(exec);
         cudaGraphDestroy(graph);
         cudaStreamDestroy(stream);
+    }
+
+    // Stacked projections block by block: the blocks of the forward's projections (queries: q,
+    // gate, relative, sink; all: those and k, v; keys/values: k or v and its dynamic taps).
+    std::vector<std::int32_t> stacked;
+    if (n == 3276) stacked = {1536, 1536, 192, 12};
+    if (n == 4300) stacked = {1536, 1536, 192, 12, 512, 512};
+    if (n == 528) stacked = {512, 16};
+    for (int tokens = 2; tokens <= 16 && !stacked.empty(); ++tokens) {
+        const std::size_t count = std::size_t(n) * tokens;
+        Tensor tx(x.p, DType::BF16, {k, tokens});
+        Tensor tr(route.p, DType::BF16, {n, tokens});
+        ops::linear(tx, weight, tr, nullptr);
+        CHECK_CUDA(cudaMemset(generic.p, 0xFF, count * 2));
+        std::vector<ops::Inkling2ProjectionBlock> blocks;
+        std::size_t offset = 0;
+        for (const std::int32_t rows : stacked) {
+            blocks.push_back({static_cast<std::uint16_t*>(generic.p) + offset, rows});
+            offset += std::size_t(rows) * tokens;
+        }
+        if (!ops::inkling2_projection_blocks(tx, weight, blocks, nullptr)) {
+            std::printf("FAIL %s T=%d: stacked projection declined\n", shape.c_str(), tokens);
+            ++failures;
+            continue;
+        }
+        CHECK_CUDA(cudaDeviceSynchronize());
+        const auto r = download(route.p, count), b = download(generic.p, count);
+        std::size_t first = 0, base = 0;
+        bool same = true;
+        for (const std::int32_t rows : stacked) {
+            for (int t = 0; t < tokens; ++t) {
+                const auto from = b.begin() + std::ptrdiff_t(base + std::size_t(t) * rows);
+                same            = same && std::equal(from, from + rows,
+                                                     r.begin() + std::ptrdiff_t(std::size_t(t) * n + first));
+            }
+            first += std::size_t(rows);
+            base += std::size_t(rows) * tokens;
+        }
+        if (!same) {
+            std::printf("FAIL %s T=%d: stacked blocks differ from the Linear\n", shape.c_str(),
+                        tokens);
+            ++failures;
+        }
+    }
+    {
+        // Declined: one column, rows that do not add up, an unstacked shape.
+        Tensor t1(x.p, DType::BF16, {k, 1});
+        Tensor t4(x.p, DType::BF16, {k, 4});
+        const std::vector<ops::Inkling2ProjectionBlock> whole{{generic.p, n}};
+        const std::vector<ops::Inkling2ProjectionBlock> short_rows{{generic.p, n - 1}};
+        const bool stackable = !stacked.empty();
+        if (ops::inkling2_projection_blocks(t1, weight, whole, nullptr) ||
+            ops::inkling2_projection_blocks(t4, weight, short_rows, nullptr) ||
+            (!stackable && ops::inkling2_projection_blocks(t4, weight, whole, nullptr))) {
+            std::printf("FAIL %s: stacked projection accepted operands it must decline\n",
+                        shape.c_str());
+            ++failures;
+        }
     }
 
     // An activation 2 bytes past a 16-byte boundary takes the generic route: same bits as it.

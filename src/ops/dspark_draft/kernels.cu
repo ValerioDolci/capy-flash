@@ -145,8 +145,17 @@ __global__ void context_kv_store_kernel(StoreLayers layers, int kv_heads, int wi
 
 // ---- block attention
 // ----------------------------------------------------------------------------- Grid (Hkv,
-// kChunks), 4 warps. Each lane owns four of the 128 dimensions; every warp walks its keys of the
-// chunk with an online softmax for the Q = G * B queries of the KV head.
+// kChunks), 4 warps; block (g, c) takes the c-th chunk of max(kBlockAttentionMinKeys,
+// ceil(keys / kChunks)) keys (the cache's [lo, P), then the block's B columns) for the Q = G * B
+// queries of KV head g; the blocks past the last chunk exit. A warp walks its
+// keys 32 at a time with a lane per key: the lane computes its key's scores for every query
+// against the queries in shared memory, the warp updates each query's running maximum, and the
+// lane owning four of the 128 dimensions adds every key's weighted value from the weights the
+// warp stored in shared memory. Online softmax per warp; the four warps merge at the end.
+__device__ __forceinline__ int block_attention_chunk_keys(int total, int chunks) {
+    return max(kBlockAttentionMinKeys, (total + chunks - 1) / chunks);
+}
+
 template <int G>
 __global__ void __launch_bounds__(128)
     block_attention_partial_kernel(const __nv_bfloat16* __restrict__ qkv, int rows, int query_heads,
@@ -157,23 +166,40 @@ __global__ void __launch_bounds__(128)
                                    float* __restrict__ partial) {
     constexpr int Q = G * kBlockAttentionMaxBlock;
     __shared__ float q_s[Q][kD];
+    // The warps' weights of a tile ([4][Q][32]) during the walk, the merged accumulators ([Q][kD])
+    // after it: the same size.
+    __shared__ float scratch[Q * kD];
     __shared__ float m_s[4][Q], l_s[4][Q];
-    __shared__ float acc_s[Q][kD];
     const int g = blockIdx.x, chunk = blockIdx.y;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int queries = G * block;
-    for (int e = threadIdx.x; e < queries * kD; e += blockDim.x) {
+    const auto p_s   = [&](int w, int q, int k) -> float& { return scratch[(w * Q + q) * 32 + k]; };
+    const auto acc_s = [&](int q, int d) -> float& { return scratch[q * kD + d]; };
+    const int P      = *frontier;
+    const int lo     = window > 0 ? max(0, P - window) : 0;
+    const int n_ctx  = P - lo;
+    const int total  = n_ctx + block;
+    const int len    = block_attention_chunk_keys(total, gridDim.y);
+    const int first = chunk * len, end = min(total, first + len);
+    if (first >= total) { return; } // block-uniform: past the last chunk
+    // Rows past the block's queries are zero: every loop below runs over all Q (fully unrolled,
+    // in registers) and their results are never stored.
+    for (int e = threadIdx.x; e < Q * kD; e += blockDim.x) {
         const int q = e / kD, d = e % kD;
         const int b = q / G, h = g * G + q % G;
-        q_s[q][d] = load(qkv + std::size_t(b) * rows + std::size_t(h) * kD + d);
+        q_s[q][d] = q < queries
+                        ? load(qkv + std::size_t(b) * rows + std::size_t(h) * kD + d) * scale
+                        : 0.0F;
     }
     __syncthreads();
-    const int P     = *frontier;
-    const int lo    = window > 0 ? max(0, P - window) : 0;
-    const int n_ctx = P - lo;
-    const int total = n_ctx + block;
-    const int len   = (total + gridDim.y - 1) / gridDim.y;
-    const int first = chunk * len, end = min(total, first + len);
+    const auto key_row = [&](int j, bool value) -> const __nv_bfloat16* {
+        if (j < n_ctx) {
+            const std::size_t slot = std::size_t((lo + j) % capacity);
+            return (value ? v_cache : k_cache) + (slot * kv_heads + g) * kD;
+        }
+        const std::size_t column = std::size_t(j - n_ctx) * rows;
+        return qkv + column + std::size_t(query_heads + (value ? kv_heads : 0) + g) * kD;
+    };
     float m[Q], l[Q], acc[Q][4];
 #pragma unroll
     for (int q = 0; q < Q; ++q) {
@@ -182,59 +208,92 @@ __global__ void __launch_bounds__(128)
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[q][i] = 0.0F;
     }
-    for (int j = first + warp; j < end; j += 4) {
-        const __nv_bfloat16 *kp, *vp;
-        if (j < n_ctx) {
-            const std::size_t slot = std::size_t((lo + j) % capacity);
-            kp                     = k_cache + (slot * kv_heads + g) * kD;
-            vp                     = v_cache + (slot * kv_heads + g) * kD;
-        } else {
-            const std::size_t column = std::size_t(j - n_ctx) * rows;
-            kp                       = qkv + column + std::size_t(query_heads + g) * kD;
-            vp                       = qkv + column + std::size_t(query_heads + kv_heads + g) * kD;
-        }
-        float k4[4], v4[4];
+    for (int j0 = first + warp * 32; j0 < end; j0 += 4 * 32) {
+        const int j      = j0 + lane;
+        const bool alive = j < end;
+        // Scores of this lane's key for every query.
+        float score[Q];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            k4[i] = load(kp + lane * 4 + i);
-            v4[i] = load(vp + lane * 4 + i);
+        for (int q = 0; q < Q; ++q) score[q] = 0.0F;
+        if (alive) {
+            const uint4* kp = reinterpret_cast<const uint4*>(key_row(j, false));
+#pragma unroll 4
+            for (int d8 = 0; d8 < kD / 8; ++d8) {
+                const uint4 packed = kp[d8];
+                const auto* h      = reinterpret_cast<const __nv_bfloat162*>(&packed);
+                float k8[8];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = __bfloat1622float2(h[i]);
+                    k8[2 * i]      = f.x;
+                    k8[2 * i + 1]  = f.y;
+                }
+#pragma unroll
+                for (int q = 0; q < Q; ++q) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        score[q] = fmaf(q_s[q][d8 * 8 + i], k8[i], score[q]);
+                }
+            }
         }
+        // Running maxima (warp-uniform), weights into shared memory, lane sums of the weights.
 #pragma unroll
         for (int q = 0; q < Q; ++q) {
-            if (q >= queries) break;
-            float dot = 0.0F;
+            float tile = alive ? score[q] : -INFINITY;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) dot = fmaf(q_s[q][lane * 4 + i], k4[i], dot);
-            const float s      = warp_sum(dot) * scale;
-            const float m_new  = fmaxf(m[q], s);
+            for (int o = 16; o > 0; o >>= 1)
+                tile = fmaxf(tile, __shfl_xor_sync(0xffffffffu, tile, o));
+            const float m_new  = fmaxf(m[q], tile);
             const float corr   = expf(m[q] - m_new);
-            const float weight = expf(s - m_new);
+            const float weight = alive ? expf(score[q] - m_new) : 0.0F;
             l[q]               = l[q] * corr + weight;
+            p_s(warp, q, lane) = weight;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) acc[q][i] = fmaf(acc[q][i], corr, weight * v4[i]);
+            for (int i = 0; i < 4; ++i) acc[q][i] *= corr;
             m[q] = m_new;
         }
+        __syncwarp();
+        // Values: this lane's four dimensions of every key of the tile.
+        const int keys = min(32, end - j0);
+        for (int k = 0; k < keys; ++k) {
+            const __nv_bfloat162* vp =
+                reinterpret_cast<const __nv_bfloat162*>(key_row(j0 + k, true) + lane * 4);
+            const float2 v01 = __bfloat1622float2(vp[0]);
+            const float2 v23 = __bfloat1622float2(vp[1]);
+#pragma unroll
+            for (int q = 0; q < Q; ++q) {
+                const float w = p_s(warp, q, k);
+                acc[q][0]     = fmaf(w, v01.x, acc[q][0]);
+                acc[q][1]     = fmaf(w, v01.y, acc[q][1]);
+                acc[q][2]     = fmaf(w, v23.x, acc[q][2]);
+                acc[q][3]     = fmaf(w, v23.y, acc[q][3]);
+            }
+        }
+        __syncwarp();
     }
+    // Each lane holds part of every query's weight sum: the warp's total.
+#pragma unroll
+    for (int q = 0; q < Q; ++q) l[q] = warp_sum(l[q]);
     if (lane == 0) {
-        for (int q = 0; q < queries; ++q) {
+#pragma unroll
+        for (int q = 0; q < Q; ++q) {
             m_s[warp][q] = m[q];
             l_s[warp][q] = l[q];
         }
     }
-    __syncthreads();
+    __syncthreads(); // also: every warp is done with its weights in `scratch`
     // Warp 0's lanes rescale their accumulators first, then the others add theirs.
     for (int w = 0; w < 4; ++w) {
         if (warp == w) {
 #pragma unroll
             for (int q = 0; q < Q; ++q) {
-                if (q >= queries) break;
                 float M = -INFINITY;
                 for (int x = 0; x < 4; ++x) M = fmaxf(M, m_s[x][q]);
-                const float f = M == -INFINITY ? 0.0F : expf(m[q] - M);
+                const float f = M == -INFINITY || m[q] == -INFINITY ? 0.0F : expf(m[q] - M);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const float value      = acc[q][i] * f;
-                    acc_s[q][lane * 4 + i] = w == 0 ? value : acc_s[q][lane * 4 + i] + value;
+                    acc_s(q, lane * 4 + i) = w == 0 ? value : acc_s(q, lane * 4 + i) + value;
                 }
             }
         }
@@ -245,30 +304,38 @@ __global__ void __launch_bounds__(128)
         float M = -INFINITY;
         for (int x = 0; x < 4; ++x) M = fmaxf(M, m_s[x][q]);
         float L = 0.0F;
-        for (int x = 0; x < 4; ++x) L += M == -INFINITY ? 0.0F : l_s[x][q] * expf(m_s[x][q] - M);
+        for (int x = 0; x < 4; ++x) {
+            L += M == -INFINITY || m_s[x][q] == -INFINITY ? 0.0F : l_s[x][q] * expf(m_s[x][q] - M);
+        }
         float* dst = partial + (base + q) * (kD + 2);
         if (lane == 0) {
             dst[0] = M;
             dst[1] = L;
         }
-        for (int d = lane; d < kD; d += 32) dst[2 + d] = acc_s[q][d];
+        for (int d = lane; d < kD; d += 32) dst[2 + d] = acc_s(q, d);
     }
 }
 
 template <int G>
 __global__ void block_attention_combine_kernel(const float* __restrict__ partial, int chunks,
                                                int query_heads, int block,
+                                               const int* __restrict__ frontier, int window,
                                                __nv_bfloat16* __restrict__ out) {
     constexpr int Q = G * kBlockAttentionMaxBlock;
     const int g = blockIdx.x, q = blockIdx.y, d = threadIdx.x;
     if (q >= G * block) return;
-    float M = -INFINITY;
-    for (int c = 0; c < chunks; ++c) {
+    // The chunks the partial kernel wrote (the same cut).
+    const int P     = *frontier;
+    const int total = P - (window > 0 ? max(0, P - window) : 0) + block;
+    const int len   = block_attention_chunk_keys(total, chunks);
+    const int used  = min(chunks, (total + len - 1) / len);
+    float M         = -INFINITY;
+    for (int c = 0; c < used; ++c) {
         const float* p = partial + ((std::size_t(g) * chunks + c) * Q + q) * (kD + 2);
         if (p[1] > 0.0F) M = fmaxf(M, p[0]);
     }
     float L = 0.0F, A = 0.0F;
-    for (int c = 0; c < chunks; ++c) {
+    for (int c = 0; c < used; ++c) {
         const float* p = partial + ((std::size_t(g) * chunks + c) * Q + q) * (kD + 2);
         if (p[1] > 0.0F) {
             const float f = expf(p[0] - M);
@@ -511,8 +578,8 @@ void block_attention_launch(const void* qkv, int rows, int query_heads, int kv_h
         block_attention_partial_kernel<G>                                                          \
             <<<grid, 128, 0, stream>>>(q, rows, query_heads, kv_heads, block, kc, vc, capacity,    \
                                        frontier, window, scale, partial);                          \
-        block_attention_combine_kernel<G>                                                          \
-            <<<combine, kD, 0, stream>>>(partial, kBlockAttentionChunks, query_heads, block, o);   \
+        block_attention_combine_kernel<G><<<combine, kD, 0, stream>>>(                             \
+            partial, kBlockAttentionChunks, query_heads, block, frontier, window, o);              \
         break;
         NINFER_BLOCK_ATTENTION(1)
         NINFER_BLOCK_ATTENTION(2)

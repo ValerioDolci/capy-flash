@@ -1,8 +1,8 @@
 // Implements: include/ninfer/ops/message_gate.h
-// Two routes with one arithmetic. Every reduction keeps the same order in both, so they give the
-// same bits: each norm is a fixed 256-thread block sum, each bottleneck row is one warp whose lane
-// l sums the elements i = l mod 32 in increasing i and then a warp tree, and each gate argument
-// sums r = 0..R-1 in order.
+// message_gate: two routes with one arithmetic. Every reduction keeps the same order in both, so
+// they give the same bits: each norm is a fixed 256-thread block sum, each bottleneck row is one
+// warp whose lane l sums the elements i = l mod 32 in increasing i and then a warp tree, and each
+// gate argument sums r = 0..R-1 in order.
 //   cluster route: a cluster of kCluster CTAs per tile of up to kTile tokens (at most kMaxClusters
 //     clusters while the tiles allow). CTA c stages its R / kCluster rows of `down` in shared
 //     memory with asynchronous copies and prefetches its
@@ -10,6 +10,7 @@
 //     and message held in registers), the cluster exchanges them through distributed shared memory,
 //     and CTA c then gates its slice of H, reading each forget/gain row once for the whole tile.
 //   token route: one CTA per token reading every weight (shapes outside the cluster route).
+// message_gates_rmsnorm: the batch route below, with its own reduction order (see there).
 #include "ops/message_gate/launch.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -319,46 +320,321 @@ __global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kBlock)
                               static_cast<int>(blockIdx.x) / kCluster * tile, scratch);
 }
 
-// rmsnorm_f32_kernel's arithmetic on one row x (written by this cluster in this kernel: plain
-// loads).
-__device__ __forceinline__ void norm_row(const float* x, const __nv_bfloat16* __restrict__ weight,
-                                         float eps, __nv_bfloat16* out, int width, float* scratch) {
-    float squares = 0.0F;
-    for (int i = static_cast<int>(threadIdx.x); i < width; i += kBlock) { squares += x[i] * x[i]; }
-    squares        = warp_sum(squares);
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    if (lane == 0) { scratch[warp] = squares; }
-    __syncthreads();
-    float total = 0.0F;
-#pragma unroll
-    for (int w = 0; w < kWarps; ++w) { total += scratch[w]; }
-    const float inv = rsqrtf(total / static_cast<float>(width) + eps);
-    for (int i = static_cast<int>(threadIdx.x); i < width; i += kBlock) {
-        out[i] = __float2bfloat16_rn(x[i] * inv * __bfloat162float(weight[i]));
-    }
-    __syncthreads(); // scratch is reused by the next row
+// Batch route (message_gates_rmsnorm at decode and verification widths): a cluster of kCluster
+// CTAs per gate and token tile, H / 8 threads per CTA. Thread j owns elements [8j, 8j + 8) of
+// hidden and message (norms and bottleneck) and row i = c H / 8 + j of the gate and of its norm.
+// Before the wait for the previous kernel, CTA c holds its R / kCluster rows of down in registers
+// and its H / kCluster rows of forget and gain as BF16 in shared memory (exact: they are BF16
+// values widened to FP32). Per token, every reduction is fixed: a thread's 8 (bottleneck: 16)
+// terms in order, a warp xor tree, the warps in order, then the CTAs of the cluster in order; a
+// gate argument is a thread's R terms in four interleaved partial sums. So a column gets the same
+// bits at every width, tile and batch size. After the wait: one block sum for the
+// two input norms, one for the CTA's bottleneck rows, the rows pushed to every CTA of the cluster
+// (one cluster barrier), the gate, the CTA's output squares pushed likewise (one barrier), the
+// norm.
+constexpr int kBatchThreads  = 288; // H <= 8 * kBatchThreads on this route
+constexpr int kBatchWarps    = kBatchThreads / 32;
+constexpr int kBatchMaxRows  = 8; // rows of down per CTA: R <= kCluster * kBatchMaxRows
+constexpr int kBatchMaxRank  = kCluster * kBatchMaxRows;
+constexpr int kBatchVectorsR = kBatchMaxRank / 8; // 16-byte chunks of a forget or gain row
+
+std::size_t batch_shared_bytes(int width, int rank) {
+    return static_cast<std::size_t>(2) * (rank / 8) * (width / 8) * sizeof(uint4);
 }
 
-// Gate blockIdx.y of the batch on the cluster route, then the norms of the tile's rows: after
-// the cluster barrier every slice of the tile is written, and CTA c norms rows c, c + 8, ...
-template <int kTileT>
-__global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kBlock)
-    message_gate_batch_kernel(MessageGateBatch batch, float eps, float norm_eps, int width,
-                              int rank, int tokens, int tile) {
-    __shared__ float scratch[32];
-    const MessageGateBatchItem& g = batch.gates[blockIdx.y];
-    const int c                   = static_cast<int>(blockIdx.x) % kCluster;
-    const int t0                  = static_cast<int>(blockIdx.x) / kCluster * tile;
-    gate_cluster_tile<kTileT>(g.hidden, g.message, g.down, g.forget, g.gain, eps, g.out, width,
-                              rank, tokens, tile, c, t0, scratch);
-    __threadfence();
-    cooperative_groups::this_cluster().sync();
-    const int count = min(tile, tokens - t0);
-    for (int t = c; t < count; t += kCluster) {
-        const std::int64_t row = static_cast<std::int64_t>(t0 + t) * width;
-        norm_row(g.out + row, g.norm, norm_eps, g.normed + row, width, scratch);
+// The dynamic shared memory opt-in of the batch kernel: the largest shape of the route.
+constexpr int kBatchMaxShared = 2 * kBatchVectorsR * kBatchThreads * 16;
+
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed;" ::: "memory");
+}
+
+// A full cluster barrier: the stores to peers' shared memory before it are visible after it.
+__device__ __forceinline__ void cluster_barrier() {
+    asm volatile("barrier.cluster.arrive.release;\nbarrier.cluster.wait.acquire;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_wait() {
+    asm volatile("barrier.cluster.wait.acquire;" ::: "memory");
+}
+
+// The CTA's threads issue bulk L2 prefetches of [base, base + bytes) in 4 KiB chunks (the copy
+// engine fetches them: the loads that follow hit L2 instead of waiting on DRAM). Only a lone
+// gate's launch uses them: its 8 SMs are limited by their own outstanding loads, while a batch of
+// gates already keeps DRAM busy and the prefetches then slow it down (measured at T = 1).
+__device__ __forceinline__ void bulk_prefetch_l2(const void* base, std::uint32_t bytes) {
+    constexpr std::uint32_t kChunk = 4096U;
+    const auto* bytes_base         = static_cast<const unsigned char*>(base);
+    for (std::uint32_t offset = threadIdx.x * kChunk; offset < bytes;
+         offset += blockDim.x * kChunk) {
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(bytes_base + offset),
+                     "r"(min(kChunk, bytes - offset))
+                     : "memory");
     }
+}
+
+__device__ __forceinline__ void bf16x8_to_float(const uint4& v, float (&out)[8]) {
+    const auto* p = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 f = __bfloat1622float2(p[k]);
+        out[2 * k]     = f.x;
+        out[2 * k + 1] = f.y;
+    }
+}
+
+__device__ __forceinline__ float sum_warps(const float* partial, int warps) {
+    float total = 0.0F;
+    for (int w = 0; w < warps; ++w) { total += partial[w]; }
+    return total;
+}
+
+template <int kTileT>
+__global__ void __cluster_dims__(kCluster, 1, 1) __launch_bounds__(kBatchThreads, 1)
+    message_gate_batch_kernel(MessageGateBatch batch, float eps, float norm_eps, int width,
+                              int rank, int tokens, int tile, bool prefetch, bool bf16_weights) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ float input_partial[kTileT][2][kBatchWarps];
+    __shared__ float row_partial[kTileT][kBatchMaxRows][kBatchWarps];
+    __shared__ float out_partial[kTileT][kBatchWarps];
+    __shared__ __align__(16) float bottleneck[kTileT][kBatchMaxRank]; // written by every CTA
+    __shared__ float out_squares[kTileT][kCluster];                   // written by every CTA
+
+    cluster_arrive_relaxed(); // waited for before the first store to a peer
+    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+    const MessageGateBatchItem& g             = batch.gates[blockIdx.y];
+    const int c                               = static_cast<int>(blockIdx.x) % kCluster;
+    const int t0                              = static_cast<int>(blockIdx.x) / kCluster * tile;
+    const int count                           = min(tile, tokens - t0);
+    const int j                               = static_cast<int>(threadIdx.x);
+    const int lane                            = j & 31;
+    const int warp                            = j >> 5;
+    const int threads                         = width / 8;
+    const int warps                           = threads / 32;
+    const int rows                            = rank / kCluster;
+    const int vectors                         = rank / 8;
+    const int i                               = c * threads + j; // this thread's row of the gate
+    auto* staged = reinterpret_cast<uint4*>(smem);               // [2][vectors][threads]
+
+    // Weights: rows c * rows + r of down (this thread's 8 hidden and 8 message columns), and the
+    // CTA's forget and gain rows narrowed to BF16 in chunks of 8 ranks, chunk q of row j at
+    // q * threads + j (a warp reads 512 consecutive bytes). Non-coherent global loads, all of a
+    // matrix issued before its first use (they do not wait on the shared stores).
+    if (prefetch) {
+        const auto slice_bytes = static_cast<std::uint32_t>(threads) * rank * sizeof(float);
+        bulk_prefetch_l2(g.down + static_cast<std::int64_t>(c) * rows * 2 * width,
+                         static_cast<std::uint32_t>(rows) * 2 * width * sizeof(__nv_bfloat16));
+        bulk_prefetch_l2(g.forget + static_cast<std::int64_t>(c) * threads * rank, slice_bytes);
+        bulk_prefetch_l2(g.gain + static_cast<std::int64_t>(c) * threads * rank, slice_bytes);
+    }
+    uint4 down_h[kBatchMaxRows];
+    uint4 down_m[kBatchMaxRows];
+#pragma unroll
+    for (int r = 0; r < kBatchMaxRows; ++r) {
+        if (r < rows) {
+            const auto* row = reinterpret_cast<const uint4*>(
+                g.down + static_cast<std::int64_t>(c * rows + r) * 2 * width);
+            down_h[r] = __ldg(row + j);
+            down_m[r] = __ldg(row + threads + j);
+        }
+    }
+    const __nv_bfloat16 gamma = g.norm[i];
+    const int quads           = rank / 4; // float4 per row
+    if (bf16_weights) {
+        // forget/gain stored as BF16: chunk q of row j copied as is.
+#pragma unroll
+        for (int which = 0; which < 2; ++which) {
+            const auto* source = reinterpret_cast<const uint4*>(
+                reinterpret_cast<const __nv_bfloat16*>(which == 0 ? g.forget : g.gain) +
+                static_cast<std::int64_t>(c) * threads * rank);
+            uint4 x[kBatchVectorsR];
+#pragma unroll
+            for (int k = 0; k < kBatchVectorsR; ++k) {
+                if (k < vectors) { x[k] = __ldg(source + j + k * threads); }
+            }
+#pragma unroll
+            for (int k = 0; k < kBatchVectorsR; ++k) {
+                if (k < vectors) {
+                    const int v   = j + k * threads;
+                    const int row = v / vectors;
+                    staged[(which * vectors + (v - row * vectors)) * threads + row] = x[k];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int which = 0; which < 2 && !bf16_weights; ++which) {
+        const auto* source = reinterpret_cast<const float4*>(
+            (which == 0 ? g.forget : g.gain) + static_cast<std::int64_t>(c) * threads * rank);
+        auto* target = reinterpret_cast<uint2*>(staged + which * vectors * threads);
+        float4 x[2 * kBatchVectorsR];
+#pragma unroll
+        for (int k = 0; k < 2 * kBatchVectorsR; ++k) {
+            if (k < quads) { x[k] = __ldg(source + j + k * threads); }
+        }
+#pragma unroll
+        for (int k = 0; k < 2 * kBatchVectorsR; ++k) {
+            if (k < quads) {
+                const int v             = j + k * threads;
+                const int row           = v / quads;
+                const int quad          = v - row * quads;
+                const __nv_bfloat162 lo = __floats2bfloat162_rn(x[k].x, x[k].y);
+                const __nv_bfloat162 hi = __floats2bfloat162_rn(x[k].z, x[k].w);
+                uint2 packed;
+                packed.x = *reinterpret_cast<const unsigned*>(&lo);
+                packed.y = *reinterpret_cast<const unsigned*>(&hi);
+                target[2 * ((quad >> 1) * threads + row) + (quad & 1)] = packed;
+            }
+        }
+    }
+
+    pdl_enter();
+    const float inv_width = 1.0F / static_cast<float>(width);
+
+    // The two input norms of every token of the tile.
+#pragma unroll
+    for (int t = 0; t < kTileT; ++t) {
+        if (t < count) {
+            const std::int64_t base = static_cast<std::int64_t>(t0 + t) * width + 8 * j;
+            const float4 h0         = *reinterpret_cast<const float4*>(g.hidden + base);
+            const float4 h1         = *reinterpret_cast<const float4*>(g.hidden + base + 4);
+            const float4 m0         = *reinterpret_cast<const float4*>(g.message + base);
+            const float4 m1         = *reinterpret_cast<const float4*>(g.message + base + 4);
+            const float hh = h0.x * h0.x + h0.y * h0.y + h0.z * h0.z + h0.w * h0.w + h1.x * h1.x +
+                             h1.y * h1.y + h1.z * h1.z + h1.w * h1.w;
+            const float mm = m0.x * m0.x + m0.y * m0.y + m0.z * m0.z + m0.w * m0.w + m1.x * m1.x +
+                             m1.y * m1.y + m1.z * m1.z + m1.w * m1.w;
+            const float hs = warp_sum(hh);
+            const float ms = warp_sum(mm);
+            if (lane == 0) {
+                input_partial[t][0][warp] = hs;
+                input_partial[t][1][warp] = ms;
+            }
+        }
+    }
+    __syncthreads();
+
+    // The CTA's bottleneck rows: this thread's 16 terms, then the warps.
+#pragma unroll
+    for (int t = 0; t < kTileT; ++t) {
+        if (t < count) {
+            const float inv_h = rsqrtf(sum_warps(input_partial[t][0], warps) * inv_width + eps);
+            const float inv_m = rsqrtf(sum_warps(input_partial[t][1], warps) * inv_width + eps);
+            const std::int64_t base = static_cast<std::int64_t>(t0 + t) * width + 8 * j;
+            const float4 h0         = *reinterpret_cast<const float4*>(g.hidden + base);
+            const float4 h1         = *reinterpret_cast<const float4*>(g.hidden + base + 4);
+            const float4 m0         = *reinterpret_cast<const float4*>(g.message + base);
+            const float4 m1         = *reinterpret_cast<const float4*>(g.message + base + 4);
+            const float hv[8]       = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            const float mv[8]       = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+            float zh[8], zm[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                zh[k] = __bfloat162float(__float2bfloat16_rn(hv[k] * inv_h));
+                zm[k] = __bfloat162float(__float2bfloat16_rn(mv[k] * inv_m));
+            }
+#pragma unroll
+            for (int r = 0; r < kBatchMaxRows; ++r) {
+                if (r < rows) {
+                    float wh[8], wm[8];
+                    bf16x8_to_float(down_h[r], wh);
+                    bf16x8_to_float(down_m[r], wm);
+                    float dot = 0.0F;
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { dot = fmaf(wh[k], zh[k], dot); }
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) { dot = fmaf(wm[k], zm[k], dot); }
+                    dot = warp_sum(dot);
+                    if (lane == 0) { row_partial[t][r][warp] = dot; }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    cluster_wait(); // every CTA of the cluster runs: its shared memory may be written
+    for (int k = j; k < count * rows; k += threads) {
+        const int t   = k / rows;
+        const int r   = k - t * rows;
+        const float d = __bfloat162float(__float2bfloat16_rn(sum_warps(row_partial[t][r], warps)));
+        const int place = c * rows + r;
+#pragma unroll
+        for (int p = 0; p < kCluster; ++p) {
+            cluster.map_shared_rank(&bottleneck[t][0], p)[place] = d;
+        }
+    }
+    cluster_barrier();
+
+    // The gate of row i, then the CTA's squares of the output.
+    float out[kTileT];
+#pragma unroll
+    for (int t = 0; t < kTileT; ++t) {
+        out[t] = 0.0F;
+        if (t < count) {
+            const std::int64_t index = static_cast<std::int64_t>(t0 + t) * width + i;
+            const float hv           = g.hidden[index];
+            const float mv           = g.message[index];
+            float f[4]               = {0.0F, 0.0F, 0.0F, 0.0F};
+            float a[4]               = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+            for (int q = 0; q < kBatchVectorsR; ++q) {
+                if (q < vectors) {
+                    float fw[8], gw[8];
+                    bf16x8_to_float(staged[q * threads + j], fw);
+                    bf16x8_to_float(staged[(vectors + q) * threads + j], gw);
+                    const float4 d0   = *reinterpret_cast<const float4*>(&bottleneck[t][8 * q]);
+                    const float4 d1   = *reinterpret_cast<const float4*>(&bottleneck[t][8 * q + 4]);
+                    const float dv[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        f[k & 3] = fmaf(fw[k], dv[k], f[k & 3]);
+                        a[k & 3] = fmaf(gw[k], dv[k], a[k & 3]);
+                    }
+                }
+            }
+            const float fs = (f[0] + f[1]) + (f[2] + f[3]);
+            const float gs = (a[0] + a[1]) + (a[2] + a[3]);
+            out[t]         = (1.0F - tanhf(fs)) * hv + tanhf(gs) * mv;
+            g.out[index]   = out[t];
+            const float sq = warp_sum(out[t] * out[t]);
+            if (lane == 0) { out_partial[t][warp] = sq; }
+        }
+    }
+    __syncthreads();
+    for (int t = j; t < count; t += threads) {
+        const float s = sum_warps(out_partial[t], warps);
+#pragma unroll
+        for (int p = 0; p < kCluster; ++p) {
+            cluster.map_shared_rank(&out_squares[t][0], p)[c] = s;
+        }
+    }
+    cluster_barrier();
+
+    const float weight = __bfloat162float(gamma);
+#pragma unroll
+    for (int t = 0; t < kTileT; ++t) {
+        if (t < count) {
+            float total = 0.0F;
+#pragma unroll
+            for (int p = 0; p < kCluster; ++p) { total += out_squares[t][p]; }
+            const float inv = rsqrtf(total * inv_width + norm_eps);
+            g.normed[static_cast<std::int64_t>(t0 + t) * width + i] =
+                __float2bfloat16_rn(out[t] * inv * weight);
+        }
+    }
+}
+
+bool batch_route(const Tensor& hidden, const Tensor& message, const Tensor& down,
+                 const Tensor& forget, const Tensor& gain, const Tensor& out) {
+    const int width    = hidden.ne[0];
+    const int rank     = down.ne[1];
+    const auto aligned = [](const Tensor& t) {
+        return (reinterpret_cast<std::uintptr_t>(t.data) & 15U) == 0;
+    };
+    return rank % kCluster == 0 && rank % 8 == 0 && rank <= kBatchMaxRank && width % 256 == 0 &&
+           width <= 8 * kBatchThreads &&
+           batch_shared_bytes(width, rank) <= static_cast<std::size_t>(kBatchMaxShared) &&
+           aligned(down) && aligned(forget) && aligned(gain) && aligned(hidden) &&
+           aligned(message) && aligned(out);
 }
 
 bool cluster_route(const Tensor& hidden, const Tensor& message, const Tensor& down,
@@ -431,21 +707,21 @@ bool message_gate_batch_launch(const MessageGateBatch& batch, int gates, const T
                                const Tensor& message, const Tensor& down, const Tensor& forget,
                                const Tensor& gain, const Tensor& out, float eps, float norm_eps,
                                cudaStream_t stream) {
-    if (!cluster_route(hidden, message, down, forget, gain, out)) { return false; }
+    if (!batch_route(hidden, message, down, forget, gain, out)) { return false; }
     const int width  = hidden.ne[0];
     const int rank   = down.ne[1];
     const int tokens = hidden.ne[1];
-    const auto bytes = static_cast<int>(ClusterLayout(width, rank).bytes);
     // The gates share the clusters a single gate would take.
     const int clusters = std::max(1, kMaxClusters / gates);
     const int tile     = std::clamp((tokens + clusters - 1) / clusters, 1, kTile);
     const dim3 grid(static_cast<unsigned>((tokens + tile - 1) / tile * kCluster),
                     static_cast<unsigned>(gates));
     const auto launch = [&](auto kernel, FuncAttrPerDevice& attr) {
-        attr.ensure(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxClusterSmem);
-        launch_maybe_dependent(tokens <= kDependentLaunchMaxTokens, grid, dim3(kBlock),
-                               static_cast<std::size_t>(bytes), stream, kernel, batch, eps,
-                               norm_eps, width, rank, tokens, tile);
+        attr.ensure(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kBatchMaxShared);
+        launch_maybe_dependent(
+            tokens <= kDependentLaunchMaxTokens, grid, dim3(static_cast<unsigned>(width / 8)),
+            batch_shared_bytes(width, rank), stream, kernel, batch, eps, norm_eps, width, rank,
+            tokens, tile, gates == 1, forget.dtype == DType::BF16);
     };
     if (tile == 1) {
         static FuncAttrPerDevice attr;

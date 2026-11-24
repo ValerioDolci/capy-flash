@@ -90,4 +90,25 @@ void short_conv_dynamic(const Tensor& x, const Tensor& static_weight, const Tens
                         float scale, const Tensor& state_in, Tensor& state_out, Tensor& out,
                         cudaStream_t stream);
 
+// One call of short_conv_pair: short_conv_static's operands (dyn empty, data == nullptr) or
+// short_conv_dynamic's (weight = static_weight).
+struct ShortConvCall {
+    Tensor x, weight, dyn;
+    float scale = 1.0F;
+    Tensor state_in, state_out, out;
+};
+
+/**
+ * Op: short_conv_pair - two independent short convolutions of the same kind
+ *
+ * Math, domain, numeric and effects: each call as short_conv_static or short_conv_dynamic, bit
+ * for bit; both static or both dynamic, with the same T. No operand of one call is an output of
+ * the other.
+ *
+ * Execution:
+ *   One launch at decode width (T = 1), else the two Ops in order. Stream ordered on `stream`,
+ *   CUDA Graph capturable. Workspace: none.
+ */
+void short_conv_pair(const ShortConvCall& first, const ShortConvCall& second, cudaStream_t stream);
+
 } // namespace ninfer::ops

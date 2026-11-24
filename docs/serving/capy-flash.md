@@ -24,7 +24,7 @@ the profile:
 RAM, disk and download size of each model: [Pick a model](../../README.md#pick-a-model).
 
 Launcher environment (defaults in brackets): `NINFER_HOST` (`127.0.0.1`), `NINFER_PORT` (`8080`),
-`NINFER_MAX_CONTEXT` (the profile's; `253952` for Inkling, with `NINFER_PREFILL_CHUNK` `2048`), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b`
+`NINFER_MAX_CONTEXT` (the profile's; `253952` for Inkling, with `NINFER_PREFILL_CHUNK` `4096`), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b`
 for the 27B, `inkling-2-mini` for Inkling),
 `NINFER_DEVICES` (`0,1`; `serve-flash-next.sh` switches to `flash-next-1gpu` when it holds one id),
 `NINFER_DEVICE` (`0`, `serve-27b-16gb.sh`), `NINFER_VISION=0` (the two 27B launchers: `--no-vision`) and
@@ -238,28 +238,30 @@ On the Qwen models, the context cache keeps retained conversations in VRAM, in R
 
 ### On Inkling 2 Mini
 
-- Both GPUs hold half of the attention heads, half of the output head and half of each layer's 128 experts; nothing
+- Both GPUs hold half of the attention heads, half of the output head and every expert at half its intermediate width; nothing
   runs on the CPU, so RAM and CPU threads do not matter. Weights take about 10 GB per GPU.
 - One request at a time (`--max-concurrency 1`, the default; another value stops the start); further requests
   queue. Decode runs from one CUDA Graph (`--no-cuda-graph` keeps it eager).
 - `--max-context` is reserved whole at startup and does not grow: 16 KiB per token per GPU, 18 KiB with the drafter.
-  On two 16 GB boards the launcher's 253,952 tokens with 2048-token prefill blocks and the drafter leave about
-  300 MiB free per GPU; the largest with the same margin are 270,336 / 253,952 / 221,184 with the drafter and
-  335,872 / 319,488 / 286,720 without it, for prefill blocks of 1024 / 2048 / 4096 tokens (larger blocks prefill
-  faster and leave less context). A `--kv-capacity` that does not match it stops the start.
+  On two 16 GB boards the launcher's 253,952 tokens with 4096-token prefill blocks, the drafter and the token
+  embedding in pinned host memory (`--embedding-host`, which the launcher passes) leave about 580 MiB free per GPU.
+  Without `--embedding-host` each GPU keeps its own 0.9 GB copy of the embedding: then 253,952 tokens fit with
+  2048-token blocks (about 300 MiB free) and 4096-token blocks need a context of at most 229,376. Larger blocks
+  prefill faster. A `--kv-capacity` that does not match it stops the start.
 - Speculative decoding with the checkpoint's DSpark drafter: `--spec mtp --draft-tokens K` (`K` from 1 to 5, 3 was
   the best measured). The launcher passes `--spec mtp --draft-tokens 3` (`NINFER_DRAFTER=0`, or `--spec off` after
   the artifact, turns it off); `ninfer-serve` started without those flags runs without a drafter. The artifact needs the drafter component (conversion
   with `--components text,mtp`, [weight conversion](../weight-conversion.md)); an artifact without it starts with
   `--spec mtp` and decodes without a drafter. Greedy and sampled requests both use it, and the text is the same as
   without it (at temperature 0, and with sampling for the same seed). Steps that run forced tokens (thinking
-  budgets) or would pass `--max-context` are ordinary steps. It takes about 1.0 GiB more VRAM per GPU at the launcher's 253,952-token context (0.7 GiB at 131,072; measured
+  budgets), would pass `--max-context` or run beyond 245,760 tokens of context are ordinary steps. It takes about 1.0 GiB more VRAM per GPU at the launcher's 253,952-token context (0.7 GiB at 131,072; measured
   on this release); when few drafts are accepted it can decode slower than without it. The request log reports drafted and accepted tokens.
 - The context cache keeps the previous conversation on the GPUs (its end and the end of its prompt), so the next
   turn of the same conversation resumes instead of re-reading it; there is no RAM or disk tier (`--disk-cache-dir`
   stops the start) and no prefix shared between conversations. `--no-prefix-reuse` turns it off.
 - Stops the start: `--vision`, `--spec dflash2`, `--lm-head-draft`, `--max-concurrency` above 1, `--disk-cache-dir`,
-  `--embedding-host`, a `--kv-dtype` other than `bf16` (the cache keeps K in BF16 and V in FP16). Refused per request:
+  a `--kv-dtype` other than `bf16` (the cache keeps K in BF16 and V in FP16). `--embedding-host` keeps the token
+  embedding (0.86 GiB) in one copy in host RAM instead of on each GPU, with identical results. Refused per request:
   structured output and grammars, `tool_choice` other than automatic, continuing a final assistant message.
 - The chat template is the checkpoint's own (embedded in the artifact); `--chat-template` replaces it. Reasoning is
   always on: `enable_thinking=false` selects the lowest reasoning effort. Thinking budgets work. The reasoning EOS
