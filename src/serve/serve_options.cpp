@@ -10,6 +10,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -43,6 +44,12 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<float>(value);
+}
+
+// The shortest text that reads back as `value` ("0.5").
+std::string float_text(float value) {
+    std::array<char, 32> text{};
+    return {text.data(), std::to_chars(text.data(), text.data() + text.size(), value).ptr};
 }
 
 // --api-key-file: the whole file is the key, minus one trailing newline.
@@ -374,6 +381,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--unload-release-host] [--load-wait-seconds N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash2|off --draft-tokens N] "
+           "[--loopcd off|hidden|logits|adaptive --loopcd-omega W [--loopcd-pass B]] "
            "[--rope-yarn-factor F] [--rope-original-max-position N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
@@ -661,6 +669,22 @@ std::string serve_usage_text(const char* argv0) {
            "    (1..15) tokens, as many as its recent acceptance and the measured round\n"
            "    costs favour; several requests keep --draft-tokens.\n"
            "\n"
+           "Loop contrast (Inkling 2):\n"
+           "  --loopcd <off|hidden|logits|adaptive>\n"
+           "    Contrastive decoding against the state after an earlier pass of the looped\n"
+           "    core: hidden extrapolates the coda's input away from it (no extra cost);\n"
+           "    logits runs a second coda and head on it and pushes the logits away from\n"
+           "    theirs (adaptive: by 1 - (p1 - p2) of each step's top two probabilities).\n"
+           "    default: off\n"
+           "  --loopcd-omega <W>\n"
+           "    Strength (the largest with adaptive); 0 turns the contrast off. hidden and\n"
+           "    logits need it.\n"
+           "    default with adaptive: " +
+           float_text(kDefaultAdaptiveLoopContrastStrength) +
+           "\n"
+           "  --loopcd-pass <B>\n"
+           "    Reference pass, before the last (default 1).\n"
+           "\n"
            "Prefill and response store:\n"
            "  --prefill-chunk <N>\n"
            "    Prefill chunk size in tokens, a multiple of 128.\n"
@@ -851,6 +875,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool detail_steps_explicit     = false;
     bool prefill_miss_tuned        = false;
     std::optional<std::size_t> vram_headroom_mib;
+    std::optional<float> loopcd_omega;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -1259,6 +1284,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--loopcd") {
+            const std::string_view mode = require_value("--loopcd");
+            if (mode != "off" && mode != "hidden" && mode != "logits" && mode != "adaptive") {
+                throw std::invalid_argument("--loopcd must be off, hidden, logits or adaptive");
+            }
+            options.loop_contrast.mode     = mode == "off"      ? LoopContrast::Off
+                                             : mode == "hidden" ? LoopContrast::Hidden
+                                                                : LoopContrast::Logits;
+            options.loop_contrast.adaptive = mode == "adaptive";
+        } else if (arg == "--loopcd-omega") {
+            loopcd_omega =
+                parse_float_in(require_value("--loopcd-omega"), "loopcd-omega", 0.0f, 4.0f);
+        } else if (arg == "--loopcd-pass") {
+            options.loop_contrast.reference_pass = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--loopcd-pass"), "loopcd-pass"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -1447,6 +1487,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (loopcd_omega) {
+        options.loop_contrast.strength = *loopcd_omega;
+    } else if (options.loop_contrast.adaptive) {
+        options.loop_contrast.strength = kDefaultAdaptiveLoopContrastStrength;
+    } else if (options.loop_contrast.mode != LoopContrast::Off) {
+        throw std::invalid_argument("--loopcd hidden and logits need --loopcd-omega");
+    }
     if (options.load_wait_seconds != 0 && !options.load_min_free_mib &&
         !options.load_min_free_auto) {
         throw std::invalid_argument("--load-wait-seconds requires --load-min-free-mib");

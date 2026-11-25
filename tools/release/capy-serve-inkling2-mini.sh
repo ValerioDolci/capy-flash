@@ -6,12 +6,18 @@
 #   NINFER_PREFILL_CHUNK (4096: prompt tokens per prefill block, a multiple of 128)
 #   NINFER_MODEL_ID (inkling-2-mini: the `model` name requests must use)
 #   NINFER_DRAFTER=0 turns the drafter off (no --spec mtp --draft-tokens 3)
+#   NINFER_LOOPCD=1 turns LoopCD on (--loopcd adaptive: contrastive decoding against the looped
+#   core's first pass, off by default), NINFER_LOOPCD_OMEGA its strength (--loopcd-omega, else
+#   the server's default)
 # The context and the prefill blocks are reserved at startup: 253,952 tokens with 4096-token blocks and the
 # drafter leave about 580 MiB free per 16 GB board, with the token embedding in pinned host memory
 # (--embedding-host: one 0.9 GB copy in RAM that both boards read in place, identical results).
 # Smaller blocks (2048) prefill 6-13 % slower and reserve less.
 # One device in NINFER_DEVICES runs at tp 1, which needs a 32 GB board (the weights are 20 GB): this
 # is not verified, and the launcher refuses a smaller board.
+# LoopCD decodes about 16 % slower with the drafter and takes 0.5 GiB more per board: at 253,952
+# tokens about 30 MiB stay free, so a board that also drives a display needs a smaller
+# NINFER_MAX_CONTEXT (229376 leaves about 500 MiB).
 # Speculative decoding with the checkpoint's DSpark drafter is on (--spec mtp --draft-tokens 3): the
 # text is the same as without it, and it takes VRAM from the context. An artifact without the mtp
 # component (tools.convert --components text) starts and decodes without a drafter. `--spec off`
@@ -38,8 +44,13 @@ case $devices in
 esac
 drafter=(--spec mtp --draft-tokens 3)
 [ "${NINFER_DRAFTER:-1}" = 0 ] && drafter=()
+loopcd=()
+if [ "${NINFER_LOOPCD:-0}" = 1 ]; then
+  loopcd=(--loopcd adaptive)
+  if [ -n "${NINFER_LOOPCD_OMEGA:-}" ]; then loopcd+=(--loopcd-omega "$NINFER_LOOPCD_OMEGA"); fi
+fi
 export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$here/bin/ninfer-serve" "$artifact" "${parallel[@]}" "${drafter[@]}" \
+exec "$here/bin/ninfer-serve" "$artifact" "${parallel[@]}" "${drafter[@]}" "${loopcd[@]}" \
   --host "${NINFER_HOST:-127.0.0.1}" --port "${NINFER_PORT:-8080}" \
   --max-context "${NINFER_MAX_CONTEXT:-253952}" --prefill-chunk "${NINFER_PREFILL_CHUNK:-4096}" --embedding-host \
   --model-id "${NINFER_MODEL_ID:-inkling-2-mini}" "$@"

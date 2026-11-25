@@ -23,7 +23,9 @@ enum class LayerKind : std::uint8_t { Local, Global };
 // One execution of a physical layer. The forward runs the visits in order: the prelude, the core
 // layers once per pass, then the coda. Passes after the first reuse the core layers' weights with
 // cross-pass messages and their own state slots; `slot` indexes the per-visit state (K/V and the
-// four convolution tails) and does not follow the execution order.
+// four convolution tails) and does not follow the execution order. With the Logits loop contrast
+// a reference coda follows (`reference`): the coda's layers again, on the state after the
+// reference pass, with slots after all the others.
 struct Visit {
     std::uint32_t layer = 0;
     std::uint32_t pass  = 1; // 1-based; layers outside the core run in pass 1
@@ -31,6 +33,7 @@ struct Visit {
     LayerKind kind      = LayerKind::Local;
     bool messages       = false; // core layer in a pass after the first
     bool block_boundary = false; // layer % block_layers == 0: the input becomes a block source
+    bool reference      = false; // a visit of the Logits loop contrast's reference coda
 };
 
 struct TextConfig {
@@ -69,6 +72,9 @@ struct TextConfig {
     std::uint32_t core_end     = 0;
     std::uint32_t num_passes   = 0;
     std::uint32_t gate_rank    = 0; // message gate rank
+
+    // EngineOptions::loop_contrast as applied (with_loop_contrast): mode Off when disabled.
+    LoopContrastOptions contrast;
 
     std::vector<LayerKind> layer_types; // per physical layer
     std::vector<Visit> visits;          // execution order
@@ -111,6 +117,17 @@ struct Config {
     TextConfig text;
     std::optional<draft::DraftConfig> draft; // the `mtp` component, with the speculative backend
 };
+
+// The visits of `config` in execution order for its num_passes and contrast: parse_text_config
+// fills TextConfig::visits with it, and a caller that lowers num_passes rebuilds them with it (the
+// model with fewer passes of the core: the same weights and the same slots of the remaining
+// visits).
+[[nodiscard]] std::vector<Visit> visit_schedule(const TextConfig& config);
+
+// `config` with the loop contrast `options` (EngineOptions::loop_contrast) and its schedule: a
+// zero strength turns it off; otherwise the reference pass must precede the last pass and the
+// strength be finite and positive (adaptive only with Logits).
+[[nodiscard]] TextConfig with_loop_contrast(TextConfig config, const LoopContrastOptions& options);
 
 // The Text component config: the checkpoint's text_config verbatim plus `architectures`
 // (kTextArchitecture). Every member is read or checked against the one value this implementation

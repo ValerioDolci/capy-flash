@@ -224,6 +224,7 @@ $( case "$model" in 27b|27b-16gb) echo "
 (text only, more room for the KV: NINFER_VISION=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;;
   inkling2-mini) echo "
 (the drafter is on, same text; to turn it off: NINFER_DRAFTER=0 $dir/current/$launcher $dir/models/$model/$artifact)
+(LoopCD, opt-in for agentic coding: NINFER_LOOPCD=1 $dir/current/$launcher $dir/models/$model/$artifact)
 (one 32 GB GPU, not verified: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;; esac )
 
 then, from another shell (the first start takes a minute or two):

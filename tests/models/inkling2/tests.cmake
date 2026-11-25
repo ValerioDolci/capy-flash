@@ -169,3 +169,33 @@ set_tests_properties(
   ninfer_inkling2_decode_graph_tp1_test
   ninfer_inkling2_decode_graph_tp2_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ninfer_gpu_memory)
+
+# The loop contrast (--loopcd) on the same checks: the drafter's verification rounds against the
+# greedy without it, both reading the guided logits (Logits at tp 1, adaptive at the default
+# strength and Hidden at tp 2, synthetic artifact); the decode graph against eager with the
+# adaptive contrast (synthetic and real, tp 2); prefix reuse with the drafter on the real artifact,
+# the reference coda's slots in the images.
+add_test(NAME ninfer_inkling2_loopcd_drafter_round_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_forward_args} --mode spec --tp 1 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --drafter --loopcd logits --loopcd-omega 0.3)
+add_test(NAME ninfer_inkling2_loopcd_drafter_round_tp2_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_forward_args} --mode spec --tp 2 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --drafter --loopcd adaptive)
+add_test(NAME ninfer_inkling2_loopcd_hidden_drafter_round_tp2_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_forward_args} --mode spec --tp 2 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --drafter --loopcd hidden --loopcd-omega 0.3)
+add_test(NAME ninfer_inkling2_loopcd_decode_graph_tp2_test
+  COMMAND ninfer_inkling2_decode_graph_tp2_test ${inkling2_synth_args} --tp 2 --loopcd adaptive)
+add_test(NAME ninfer_inkling2_loopcd_decode_graph_tp2_real_test
+  COMMAND ninfer_inkling2_decode_graph_tp2_test ${inkling2_real_args} --tp 2 --loopcd adaptive)
+add_test(NAME ninfer_inkling2_loopcd_prefix_reuse_spec_test
+  COMMAND ninfer_inkling2_prefix_reuse_test ${inkling2_real_args} --tp 2 --prefill-chunk 1 --spec 3
+  --loopcd adaptive)
+set_tests_properties(
+  ninfer_inkling2_loopcd_drafter_round_test
+  ninfer_inkling2_loopcd_drafter_round_tp2_test
+  ninfer_inkling2_loopcd_hidden_drafter_round_tp2_test
+  ninfer_inkling2_loopcd_decode_graph_tp2_test
+  ninfer_inkling2_loopcd_decode_graph_tp2_real_test
+  ninfer_inkling2_loopcd_prefix_reuse_spec_test
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ninfer_gpu_memory)

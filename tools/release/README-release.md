@@ -17,7 +17,7 @@ since v0.16 also **Inkling 2 Mini** (text only) on two 16 GB boards. Source and 
 | `serve-flash-next.sh` | launcher with the Qwen3.8-Flash-Next profile |
 | `serve-tp2.sh` | launcher with the Qwen3.8-27B two-GPU production profile (as in ninfer-tp2) |
 | `serve-27b-16gb.sh` | launcher for the 3-bit Qwen3.8-27B on one 16 GB board (`--profile 27b-16gb`) |
-| `capy-serve-inkling2-mini.sh` | launcher for Inkling 2 Mini on two 16 GB boards (text only, one request at a time, 253,952-token context with 2048-token prefill blocks, its drafter on) |
+| `capy-serve-inkling2-mini.sh` | launcher for Inkling 2 Mini on two 16 GB boards (text only, one request at a time, 253,952-token context with 4096-token prefill blocks, its drafter on; `NINFER_LOOPCD=1` adds LoopCD) |
 | `chat_templates/` | `qwen3_8.jinja` (NInfer's Qwen3.8 chat template, which the launchers pass with `--chat-template`; it accepts the `developer` role and Responses `instructions`, needed by Codex CLI) and its `LICENSE` |
 | `SHA256SUMS` | digests of every file above; check with `sha256sum -c SHA256SUMS` |
 
@@ -50,6 +50,7 @@ NINFER_DEVICES=0 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.n
 ./serve-27b-16gb.sh /path/to/qwen3_8_27b_gsq3.ninfer                              # Qwen3.8-27B 3-bit, one GPU
 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer       # Inkling 2 Mini, two GPUs
 NINFER_DRAFTER=0 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                 # without its drafter
+NINFER_LOOPCD=1 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                  # with LoopCD (opt-in)
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```
 The launchers add `--chat-template chat_templates/qwen3_8.jinja`, the model id and the profile; extra flags win

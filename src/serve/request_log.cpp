@@ -549,6 +549,14 @@ std::string format_server_start_json(
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+             {"loop_contrast",
+              Json{{"mode", engine_options.loop_contrast.mode == ninfer::LoopContrast::Off ? "off"
+                            : engine_options.loop_contrast.mode == ninfer::LoopContrast::Hidden
+                                ? "hidden"
+                                : "logits"},
+                   {"strength", engine_options.loop_contrast.strength},
+                   {"reference_pass", engine_options.loop_contrast.reference_pass},
+                   {"adaptive", engine_options.loop_contrast.adaptive}}},
              {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},
                                    {"prefill_source", ninfer::context_cost_preset_source_name(

@@ -19,7 +19,7 @@ the profile:
 | `flash-next-64gb` | `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` | `serve-flash-next.sh` (install.sh adds `--host-kv-mib 1024 --host-state-slots 2`); `NINFER_DEVICES=0` for one GPU | `flash-next`; one GPU: `flash-next-1gpu` | 1 or 2 |
 | `27b` | `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` | `serve-tp2.sh` | `27b` | 2 |
 | `27b-16gb` | `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` | `serve-27b-16gb.sh` | `27b-16gb` | 1 |
-| `inkling2-mini` | `Feyd89/Inkling-2-Mini-NVFP4-capy-flash` | `capy-serve-inkling2-mini.sh` (text only, one request at a time; drafter on, `NINFER_DRAFTER=0` turns it off; `NINFER_DEVICES=0` = one 32 GB GPU, not verified) | none (flags in the launcher) | 2 |
+| `inkling2-mini` | `Feyd89/Inkling-2-Mini-NVFP4-capy-flash` | `capy-serve-inkling2-mini.sh` (text only, one request at a time; drafter on, `NINFER_DRAFTER=0` turns it off; `NINFER_LOOPCD=1` turns LoopCD on; `NINFER_DEVICES=0` = one 32 GB GPU, not verified) | none (flags in the launcher) | 2 |
 
 RAM, disk and download size of each model: [Pick a model](../../README.md#pick-a-model).
 
@@ -28,7 +28,8 @@ Launcher environment (defaults in brackets): `NINFER_HOST` (`127.0.0.1`), `NINFE
 for the 27B, `inkling-2-mini` for Inkling),
 `NINFER_DEVICES` (`0,1`; `serve-flash-next.sh` switches to `flash-next-1gpu` when it holds one id),
 `NINFER_DEVICE` (`0`, `serve-27b-16gb.sh`), `NINFER_VISION=0` (the two 27B launchers: `--no-vision`) and
-`NINFER_DRAFTER=0` (`capy-serve-inkling2-mini.sh`: no `--spec mtp --draft-tokens 3`).
+`NINFER_DRAFTER=0` (`capy-serve-inkling2-mini.sh`: no `--spec mtp --draft-tokens 3`), `NINFER_LOOPCD=1` (the same
+launcher: `--loopcd adaptive`) with `NINFER_LOOPCD_OMEGA` (its `--loopcd-omega`).
 
 ### Profiles
 
@@ -256,6 +257,21 @@ On the Qwen models, the context cache keeps retained conversations in VRAM, in R
   without it (at temperature 0, and with sampling for the same seed). Steps that run forced tokens (thinking
   budgets), would pass `--max-context` or run beyond 245,760 tokens of context are ordinary steps. It takes about 1.0 GiB more VRAM per GPU at the launcher's 253,952-token context (0.7 GiB at 131,072; measured
   on this release); when few drafts are accepted it can decode slower than without it. The request log reports drafted and accepted tokens.
+- LoopCD, opt-in ([arXiv 2610.02185](https://arxiv.org/abs/2610.02185)): `--loopcd adaptive` (`NINFER_LOOPCD=1` in
+  the launcher) runs the last six layers and the output head a second time, with their own K/V, on the state after the
+  first of the core's three passes (`--loopcd-pass`), and moves each step's soft-capped logits z away from that
+  weaker prediction z₁: z + ω (z − z₁), with ω = ω_max (1 − (p₁ − p₂)) from the two largest probabilities, so
+  confident steps barely change. ω_max is `--loopcd-omega` (default 0.5). Greedy decoding, sampling and the drafter's
+  verification all read the guided logits: the text is the same with and without the drafter (verified at
+  temperature 0), and CUDA Graphs and prefix reuse work with it. Measured on this release after a 4.5k-token prompt:
+  decode −16.5 % with the drafter (8 points fewer drafts accepted), −11.5 % without, prefill −10 %. It takes about
+  0.5 GiB more per GPU (the K/V of one more global layer): at the launcher's 253,952 tokens about 30 MiB stay free,
+  so a GPU that also drives a display needs a smaller `--max-context` (229,376 leaves about 500 MiB). Meant for
+  agentic coding: on a private 9-task coding-agent bench (3 runs per task, ω_max 0.3) the judge's score went from 0.22
+  to 0.38, still being confirmed (the 95 % interval includes no change; more of its patches failed to compile, 6 of
+  21 against 2 of 14). It makes the prediction of existing text worse at every strength; chat, prose and math were
+  not measured. `--loopcd hidden` and `--loopcd logits` (a fixed strength) exist for experiments only: not validated,
+  not recommended ([options](options.md); [design](../maintainer/inkling2-model.md#loop-contrast-loopcd)).
 - The context cache keeps the previous conversation on the GPUs (its end and the end of its prompt), so the next
   turn of the same conversation resumes instead of re-reading it; there is no RAM or disk tier (`--disk-cache-dir`
   stops the start) and no prefix shared between conversations. `--no-prefix-reuse` turns it off.

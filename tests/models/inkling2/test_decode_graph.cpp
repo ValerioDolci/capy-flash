@@ -2,7 +2,9 @@
 // executions over one loaded model, one with CUDA Graphs and one without, run the same prompt and
 // the same sampled decode steps. After the prompt and after every step the visit state of every
 // rank and the soft-capped FP32 logits of the step must be the same bytes, and so the tokens.
-// Usage: --artifact PATH [--tp 1|2] [--steps N]; without an artifact it skips (77).
+// Usage: --artifact PATH [--tp 1|2] [--steps N] [--loopcd hidden|logits|adaptive [--loopcd-omega W]
+// [--loopcd-pass B]] (the model loaded with that loop contrast, W as in ninfer-serve); without an
+// artifact it skips (77).
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -20,6 +22,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -43,14 +46,15 @@ std::optional<std::size_t> first_difference(const std::vector<std::uint8_t>& a,
     return std::nullopt;
 }
 
-int run(const std::filesystem::path& path, int tp, std::uint32_t steps) {
+int run(const std::filesystem::path& path, int tp, std::uint32_t steps,
+        const LoopContrastOptions& contrast) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < tp) {
         std::cout << "SKIP: needs " << tp << " CUDA devices\n";
         return 77;
     }
     artifact::Reader reader(path);
-    auto plan = ink::plan_load(reader, models::LoadOptions{.tp = tp});
+    auto plan = ink::plan_load(reader, models::LoadOptions{.tp = tp, .loop_contrast = contrast});
     std::vector<int> ids;
     for (int device = 0; device < tp; ++device) { ids.push_back(device); }
     ExecutionContext execution(ids);
@@ -126,6 +130,8 @@ int main(int argc, char** argv) {
         std::filesystem::path path;
         int tp              = 2;
         std::uint32_t steps = 24;
+        LoopContrastOptions contrast;
+        std::optional<float> omega;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (arg == "--artifact" && i + 1 < argc) {
@@ -134,16 +140,32 @@ int main(int argc, char** argv) {
                 tp = std::stoi(argv[++i]);
             } else if (arg == "--steps" && i + 1 < argc) {
                 steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--loopcd" && i + 1 < argc) {
+                const std::string mode(argv[++i]);
+                contrast.mode     = mode == "hidden" ? LoopContrast::Hidden : LoopContrast::Logits;
+                contrast.adaptive = mode == "adaptive";
+            } else if (arg == "--loopcd-omega" && i + 1 < argc) {
+                omega = std::stof(argv[++i]);
+            } else if (arg == "--loopcd-pass" && i + 1 < argc) {
+                contrast.reference_pass = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             } else {
-                std::cerr << "usage: --artifact PATH [--tp 1|2] [--steps N]\n";
+                std::cerr << "usage: --artifact PATH [--tp 1|2] [--steps N] [--loopcd MODE "
+                             "[--loopcd-omega W] [--loopcd-pass B]]\n";
                 return 2;
             }
+        }
+        if (omega) {
+            contrast.strength = *omega;
+        } else if (contrast.adaptive) {
+            contrast.strength = kDefaultAdaptiveLoopContrastStrength;
+        } else if (contrast.mode != LoopContrast::Off) {
+            throw std::invalid_argument("--loopcd hidden and logits need --loopcd-omega");
         }
         if (path.empty()) {
             std::cout << "SKIP: supply --artifact (an Inkling 2 artifact)\n";
             return 77;
         }
-        const int failures = run(path, tp, steps);
+        const int failures = run(path, tp, steps, contrast);
         if (failures == 77) { return 77; }
         std::cout << (failures ? "FAIL" : "OK") << " inkling2 decode graph against eager, tp " << tp
                   << '\n';

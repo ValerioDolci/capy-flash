@@ -931,6 +931,38 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--embedding-host") != std::string::npos,
               "serve help omits --embedding-host");
+    {
+        // --loopcd: off by default; adaptive without --loopcd-omega takes the default strength,
+        // an explicit one wins in either order; hidden and logits need it.
+        using ninfer::LoopContrast;
+        const ServeOptions adaptive =
+            parse({"ninfer-serve", "model.ninfer", "--loopcd", "adaptive"});
+        const ServeOptions before = parse(
+            {"ninfer-serve", "model.ninfer", "--loopcd-omega", "0.3", "--loopcd", "adaptive"});
+        const ServeOptions hidden = parse({"ninfer-serve", "model.ninfer", "--loopcd", "hidden",
+                                           "--loopcd-omega", "0.3", "--loopcd-pass", "2"});
+        failures += check(defaults.loop_contrast == ninfer::LoopContrastOptions{},
+                          "the loop contrast is on by default");
+        failures += check(adaptive.loop_contrast.mode == LoopContrast::Logits &&
+                              adaptive.loop_contrast.adaptive &&
+                              adaptive.loop_contrast.strength ==
+                                  ninfer::kDefaultAdaptiveLoopContrastStrength &&
+                              adaptive.loop_contrast.reference_pass == 1,
+                          "--loopcd adaptive did not take the default strength");
+        failures += check(before.loop_contrast.adaptive && before.loop_contrast.strength == 0.3F,
+                          "--loopcd-omega before --loopcd adaptive was not kept");
+        failures += check(
+            hidden.loop_contrast.mode == LoopContrast::Hidden && !hidden.loop_contrast.adaptive &&
+                hidden.loop_contrast.strength == 0.3F && hidden.loop_contrast.reference_pass == 2,
+            "--loopcd hidden --loopcd-omega --loopcd-pass were not parsed");
+        failures += check(rejects({"ninfer-serve", "model.ninfer", "--loopcd", "hidden"}) &&
+                              rejects({"ninfer-serve", "model.ninfer", "--loopcd", "logits"}) &&
+                              rejects({"ninfer-serve", "model.ninfer", "--loopcd", "on"}) &&
+                              rejects({"ninfer-serve", "model.ninfer", "--loopcd", "adaptive",
+                                       "--loopcd-omega", "5"}),
+                          "a --loopcd without strength, an unknown mode or a strength above 4 "
+                          "was accepted");
+    }
     const ServeOptions vision =
         parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1", "--vision",
                "--vision-device", "1", "--max-vision-tokens", "4096"});

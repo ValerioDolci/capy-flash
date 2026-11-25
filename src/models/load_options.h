@@ -26,6 +26,8 @@ struct LoadOptions {
     std::uint64_t host_pinned_max_bytes = 0;
     // RoutedExpertOptions::exclusive_layers (models/qwen3_5/qwen4_layer_profile.h).
     std::optional<std::uint32_t> exclusive_layers;
+    // EngineOptions::loop_contrast (Inkling 2 only).
+    LoopContrastOptions loop_contrast;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -75,7 +77,8 @@ struct LoadOptions {
             .vision_rank           = vision_rank(options),
             .embedding_host        = options.embedding_host,
             .host_pinned_max_bytes = options.host_pinned_max_bytes,
-            .exclusive_layers      = options.routed_experts.exclusive_layers};
+            .exclusive_layers      = options.routed_experts.exclusive_layers,
+            .loop_contrast         = options.loop_contrast};
 }
 
 } // namespace ninfer::models

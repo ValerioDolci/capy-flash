@@ -47,8 +47,14 @@
 //             agree and the logits are those of the same blocks without sinks; --out writes them.
 // Ids: a whitespace-separated text file, or a reference JSON whose prompt_ids (+ generated_ids
 // when scoring) are used. --embedding-host loads every mode's model with the token embedding in
-// one mapped page-locked host copy (LoadOptions::embedding_host). Exit 77 without the artifact or
-// the CUDA devices.
+// one mapped page-locked host copy (LoadOptions::embedding_host). --passes N runs the model with N
+// passes of the core instead of the artifact's num_passes (the schedule rebuilt by visit_schedule:
+// the same weights, the coda reading the state after pass N), without the drafter. --loopcd MODE
+// [--loopcd-omega W] [--loopcd-pass B] loads with that loop contrast
+// (EngineOptions::loop_contrast; W as in ninfer-serve: hidden and logits need it, adaptive defaults
+// to kDefaultAdaptiveLoopContrastStrength); with the Logits one, score also writes
+// reference_logits.npy (the reference head's soft-capped logits, the rows of logits.npy). Exit 77
+// without the artifact or the CUDA devices.
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -360,6 +366,23 @@ private:
 // --embedding-host, for every Session of the run.
 bool embedding_host = false;
 
+[[nodiscard]] std::string contrast_name(const LoopContrastOptions& c) {
+    if (c.mode == LoopContrast::Off) { return "off"; }
+    std::ostringstream out;
+    out << (c.mode == LoopContrast::Hidden ? "hidden"
+            : c.adaptive                   ? "adaptive"
+                                           : "logits")
+        << " w " << c.strength << " b " << c.reference_pass;
+    return out.str();
+}
+
+// --passes N: every Session of the run is the model with N passes of the core (0: the
+// artifact's num_passes).
+std::uint32_t passes = 0;
+
+// --loopcd MODE --loopcd-omega W --loopcd-pass B: every Session's loop contrast.
+LoopContrastOptions contrast;
+
 std::uint64_t used_bytes(int device) {
     const ScopedCurrentDevice scope(device);
     std::size_t free = 0, total = 0;
@@ -389,10 +412,20 @@ public:
         options.tp             = tp;
         options.speculative    = drafter ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
         options.embedding_host = embedding_host;
+        options.loop_contrast  = contrast;
         auto plan              = ink::plan_load(*reader_, options);
         model_                 = ink::materialize_model(std::move(plan), *execution_);
         config_                = model_->config().text;
-        rank_config_           = tp == 2 ? exec::shard_text_config(config_, 2) : config_;
+        if (passes != 0) {
+            if (passes > config_.num_passes || drafter ||
+                config_.contrast.mode != LoopContrast::Off) {
+                throw std::invalid_argument("--passes takes 1 to the artifact's num_passes, "
+                                            "without the drafter and the loop contrast");
+            }
+            config_.num_passes = passes;
+            config_.visits     = ink::visit_schedule(config_);
+        }
+        rank_config_ = tp == 2 ? exec::shard_text_config(config_, 2) : config_;
         for (int r = 0; r < tp; ++r) {
             const ScopedCurrentDevice scope(r);
             parameters_[r] = std::make_unique<exec::Parameters>(*model_, r);
@@ -423,6 +456,9 @@ public:
             logits_mem_  = std::make_unique<DeviceBuffer>(std::size_t(V) * max_logits * 2);
             capped_mem_  = std::make_unique<DeviceBuffer>(std::size_t(V) * max_logits * 4);
             argmax_mem_  = std::make_unique<DeviceBuffer>(4);
+            if (config_.contrast.mode == LoopContrast::Logits) {
+                reference_mem_ = std::make_unique<DeviceBuffer>(std::size_t(V) * max_logits * 4);
+            }
         }
         if (drafter) {
             const auto& draft = *model_->config().draft;
@@ -488,7 +524,9 @@ public:
         bind_logits(logits);
         const ScopedCurrentDevice scope(0);
         forward.run(ids_tensors(T), exec::ForwardColumns{T, position_, logits},
-                    exec::ForwardLogits{&logits_, capped ? &capped_ : nullptr}, tap);
+                    exec::ForwardLogits{&logits_, capped ? &capped_ : nullptr,
+                                        capped && reference_mem_ ? &reference_ : nullptr},
+                    tap);
         synchronize();
         position_ += T;
     }
@@ -607,6 +645,14 @@ public:
         return download(capped_, stream(0));
     }
 
+    // The Logits loop contrast's reference logits of the last step with `capped` (empty without
+    // the contrast).
+    [[nodiscard]] std::vector<float> reference_host() const {
+        if (!reference_mem_) { return {}; }
+        const ScopedCurrentDevice scope(0);
+        return download(reference_, stream(0));
+    }
+
     [[nodiscard]] cudaStream_t stream(int r) const { return execution_->dev[r]->stream; }
 
 private:
@@ -650,6 +696,9 @@ private:
         const auto V = static_cast<std::int32_t>(config_.unpadded_vocab_size);
         logits_      = Tensor(logits_mem_->p, DType::BF16, {V, std::max(logits, 1)});
         capped_      = Tensor(capped_mem_->p, DType::FP32, {V, std::max(logits, 1)});
+        if (reference_mem_) {
+            reference_ = Tensor(reference_mem_->p, DType::FP32, {V, std::max(logits, 1)});
+        }
     }
 
     void synchronize() const {
@@ -675,8 +724,8 @@ private:
     std::array<std::unique_ptr<ink::VisitState>, 2> state_;
     std::array<std::unique_ptr<WorkspaceArena>, 2> work_;
     std::array<std::unique_ptr<exec::PrefetchLane>, 2> prefetch_;
-    std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, argmax_mem_;
-    Tensor logits_, capped_;
+    std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, argmax_mem_, reference_mem_;
+    Tensor logits_, capped_, reference_;
     std::array<Tensor, 2> position_tensors_;
     std::int32_t position_ = 0;
     // The captured decode step (capture_decode).
@@ -837,7 +886,7 @@ int run_score(const Options& o) {
     const auto logit_rows = select_rows(o.logit_rows, length);
     const auto V          = session.config().unpadded_vocab_size;
     std::vector<std::int64_t> rows;
-    std::vector<float> logits;
+    std::vector<float> logits, reference;
     session.reset();
     double busy = 0;
     for (std::int64_t first = 0, width = o.first_block > 0 ? o.first_block : block; first < length;
@@ -848,12 +897,17 @@ int run_score(const Options& o) {
         const auto t0 = Clock::now();
         session.step(chunk, n, true, &tap);
         busy += seconds(t0, Clock::now());
-        const auto host = session.capped_host();
+        const auto host  = session.capped_host();
+        const auto guide = session.reference_host();
         for (std::int32_t t = 0; t < n; ++t) {
             if (logit_rows.count(first + t) == 0) { continue; }
             rows.push_back(first + t);
             logits.insert(logits.end(), host.begin() + std::ptrdiff_t(t) * V,
                           host.begin() + std::ptrdiff_t(t + 1) * V);
+            if (!guide.empty()) {
+                reference.insert(reference.end(), guide.begin() + std::ptrdiff_t(t) * V,
+                                 guide.begin() + std::ptrdiff_t(t + 1) * V);
+            }
         }
     }
     fs::create_directories(o.out);
@@ -861,10 +915,16 @@ int run_score(const Options& o) {
     std::vector<std::int64_t> tokens(seq.begin(), seq.end());
     write_npy(o.out / "tokens.npy", "<i8", tokens.data(), 8, {tokens.size()});
     write_npy(o.out / "logits.npy", "<f4", logits.data(), 4, {rows.size(), std::size_t(V)});
+    if (!reference.empty()) {
+        write_npy(o.out / "reference_logits.npy", "<f4", reference.data(), 4,
+                  {rows.size(), std::size_t(V)});
+    }
     write_rows(o.out / "rows.npy", rows);
     std::ofstream meta(o.out / "meta.json");
     meta << "{\"format\": \"tfdump/1\", \"producer\": \"ninfer_inkling2_tf_driver\", \"tp\": "
-         << o.tp << ", \"block\": " << block << ", \"T\": " << length << ", \"artifact\": \""
+         << o.tp << ", \"block\": " << block << ", \"T\": " << length
+         << ", \"passes\": " << session.config().num_passes << ", \"loopcd\": \""
+         << contrast_name(session.config().contrast) << "\", \"artifact\": \""
          << o.artifact.string() << "\"}\n";
     std::printf("score: %lld tokens, blocks of %d, tp %d, %.2f s (with taps)\n",
                 static_cast<long long>(length), block, o.tp, busy);
@@ -1397,6 +1457,7 @@ int run_blocks(const Options& o) {
 int main(int argc, char** argv) {
     try {
         Options o;
+        std::optional<float> omega;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             auto next = [&]() -> std::string {
@@ -1457,6 +1518,21 @@ int main(int argc, char** argv) {
                 o.context = static_cast<std::uint32_t>(std::stoul(next()));
             } else if (arg == "--embedding-host") {
                 embedding_host = true;
+            } else if (arg == "--passes") {
+                passes = static_cast<std::uint32_t>(std::stoul(next()));
+            } else if (arg == "--loopcd") {
+                const std::string mode = next();
+                contrast.mode          = mode == "hidden" ? LoopContrast::Hidden
+                                         : mode == "off"  ? LoopContrast::Off
+                                                          : LoopContrast::Logits;
+                contrast.adaptive      = mode == "adaptive";
+                if (mode != "hidden" && mode != "off" && mode != "logits" && mode != "adaptive") {
+                    throw std::invalid_argument("--loopcd takes off|hidden|logits|adaptive");
+                }
+            } else if (arg == "--loopcd-omega") {
+                omega = std::stof(next());
+            } else if (arg == "--loopcd-pass") {
+                contrast.reference_pass = static_cast<std::uint32_t>(std::stoul(next()));
             } else {
                 std::cerr
                     << "usage: --artifact PATH --ids FILE [--mode score|generate|tp-parity|"
@@ -1465,9 +1541,18 @@ int main(int argc, char** argv) {
                        "[--logit-rows SPEC] [--parts LIST] [--max-new N] [--eos ID] "
                        "[--context N] [--kl-mean X --kl-max X] [--identical] [--profile-block K] "
                        "[--profile-steps N] [--graph] [--drafts JSON] [--draft-tokens K,...] "
-                       "[--draft-rule right|wrong|random,...] [--eager] [--embedding-host]\n";
+                       "[--draft-rule right|wrong|random,...] [--eager] [--embedding-host] "
+                       "[--passes N] [--loopcd off|hidden|logits|adaptive [--loopcd-omega W] "
+                       "[--loopcd-pass B]]\n";
                 return 2;
             }
+        }
+        if (omega) {
+            contrast.strength = *omega;
+        } else if (contrast.adaptive) {
+            contrast.strength = kDefaultAdaptiveLoopContrastStrength;
+        } else if (contrast.mode != LoopContrast::Off) {
+            throw std::invalid_argument("--loopcd hidden and logits need --loopcd-omega");
         }
         if (o.artifact.empty() || o.ids.empty()) {
             std::cout << "SKIP: supply --artifact and --ids\n";

@@ -435,6 +435,7 @@ ninfer::EngineOptions to_engine_options(const ServeOptions& options) {
     out.host_pinned_max_bytes      = options.host_pinned_max_bytes;
     out.lossy_prefill              = options.lossy_prefill;
     out.speculative                = options.speculative;
+    out.loop_contrast              = options.loop_contrast;
     out.context_cache              = options.context_cache;
     out.context_cost.preset_path   = options.context_cost_presets;
     out.media_cache_bytes          = options.media_cache_bytes;

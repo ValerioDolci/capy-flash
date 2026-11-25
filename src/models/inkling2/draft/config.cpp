@@ -2,6 +2,7 @@
 
 #include "models/inkling2/config.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -94,7 +95,11 @@ DraftConfig parse_draft_config(const Json& value, const TextConfig& text) {
         if (!targets.is_array() || targets.size() != kFeatures) {
             throw ArtifactError("target_layer_ids must name four states");
         }
-        const auto visits = static_cast<std::uint64_t>(text.visits.size());
+        // The model's own visits: a loop contrast's reference coda is not part of the schedule
+        // the drafter was trained on.
+        const auto visits = static_cast<std::uint64_t>(
+            std::count_if(text.visits.begin(), text.visits.end(),
+                          [](const Visit& visit) { return !visit.reference; }));
         for (std::size_t j = 0; j < kFeatures; ++j) {
             const auto id = artifact::require_u64(targets[j], "target_layer_ids", false);
             if (j + 1 < kFeatures) {

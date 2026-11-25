@@ -30,6 +30,7 @@ The upstream authority is the Transformers implementation `models/inkling2_loop`
 | Tool calls (JSON), thinking budget, stop tokens and strings | `tool_choice` other than automatic (`required`, allowed names, `parallel=false`, strict constraints) |
 | Decode replayed from one CUDA Graph (`--no-cuda-graph` keeps it eager) | Continuation of a final assistant message |
 | `--embedding-host`: the token embedding in one mapped page-locked host copy ([Embedding in host memory](embedding-host.md)) | |
+| Loop contrast (LoopCD, `--loopcd`, off by default): [below](#loop-contrast-loopcd) | Guidance limited to the answer or to some tokens (other implementations: [differences](#loop-contrast-loopcd)) |
 
 The refusals live in `parse_config` ([`config.cpp`](../../src/models/inkling2/config.cpp)),
 `validate_options` ([`instance.cpp`](../../src/models/inkling2/instance.cpp)) and the frontend.
@@ -558,6 +559,66 @@ the top-k best (k ≤ 20; 0 means 20), temperature, min-p, top-p, one draw from 
 (seed, position). Scoring runs blocks of at most 64 columns with `capped` and a host FP32
 log-softmax.
 
+### Loop contrast (LoopCD)
+
+Contrastive decoding inside the looped model ([LoopCD, arXiv 2610.02185](https://arxiv.org/abs/2610.02185)):
+the readout of the state after an earlier pass b of the core is a weaker model, and the last pass
+R is pushed away from it with strength w. `EngineOptions::loop_contrast` (`LoopContrastOptions`:
+mode, strength, reference pass, adaptive) reaches the config through `LoadOptions`;
+`with_loop_contrast` ([`config.cpp`](../../src/models/inkling2/config.cpp)) applies it: mode Off or
+w = 0 leaves the config and the schedule of the model as trained (no allocation, the same
+bits), otherwise b must lie in [1, num_passes) and `adaptive` needs the Logits mode. The Engine
+refuses the option for every model that is not looped. The server's flags are `--loopcd
+off|hidden|logits|adaptive`, `--loopcd-omega W` and `--loopcd-pass B`; `--loopcd adaptive`
+without `--loopcd-omega` takes `kDefaultAdaptiveLoopContrastStrength` (`include/ninfer/types.h`,
+0.5), `hidden` and `logits` need it. The launcher turns it on with `NINFER_LOOPCD=1`.
+
+- **State of pass b.** Inkling does not iterate one state: every pass restarts from the
+  prelude's output with the previous pass's messages, and the coda reads the core's output x and
+  the block states B of the final pass. The state of pass b is (x at the end of pass b, B of pass
+  b); pass 1 has no messages.
+- **Logits** (`logits`, `adaptive`). `visit_schedule` appends a reference coda: the coda's six
+  layers again (`Visit::reference`), on slots after all the others (48-53 on the released model:
+  one global and five local layers with their own K/V and convolution tails). It runs after the
+  main coda on every column of every call, prefill included, so its readout z_b is exactly the
+  model configured with b passes (`num_passes = b`; the TF driver's `--passes b` gives the same
+  logits bit for bit). A second head (depth attention over the reference states, final norm,
+  output projection, no drafter sinks) reads it; up to 16 columns (decode, verification rounds)
+  both heads' columns go through one stacked projection (`kStackedHeadColumns`), with the bits of
+  one column each. On rank 0, after both soft caps, `ops::loop_contrast_logits` writes in FP32
+  z' = z + w_t (z − z_b), w_t = w or, adaptive, w (1 − (p1 − p2)) from the two largest
+  probabilities of softmax(z), and the BF16 logits as bf16(z'). Greedy argmax, sampling,
+  penalties and the drafter's verification read z'; the drafter's features stay those of the
+  main path, and the drafter config counts only the model's own visits.
+- **Hidden** (`hidden`). Before the first coda visit, x and the core block states that pass R
+  produced become s + w (s − s_b) (`ops::loop_extrapolate`, FP32, stored BF16); the states that
+  every pass shares stay. One coda and head, no extra slots.
+- **Graphs and reuse.** The reference visits are ordinary visits: the decode graph captures
+  them, the verification round runs them on its columns, and their slots are part of the prefix
+  images. Logits adds the K/V of one more global layer: about 0.5 GiB per GPU at 253,952 tokens
+  (startup with the drafter: 15,815 MiB against 15,273 MiB per GPU, about 30 MiB left free).
+- **Cost** (2 × RTX 5070 Ti, perf-max, 4.5k-token prompt, greedy, adaptive w 0.5): decode
+  −11.5 % without the drafter (173.0 against 195.4 tok/s), −16.5 % with it (242.8 against 290.7;
+  acceptance 0.687 against 0.770), prefill −10 %. Hidden: decode unchanged without the drafter,
+  −3.7 % with it (acceptance −4.8 points: the drafter's features come from the guided path).
+
+**Tests.** `ninfer_loop_contrast_test` (both Ops against host FP32/FP64 oracles; a column alone
+equals the same column among others, bit for bit), `ninfer_inkling2_config_test` (the schedule
+with each mode, the refusals), `ninfer_serve_options_test` (flags and default), and the
+`ninfer_inkling2_loopcd_*` tests: the drafter's verification rounds against the greedy without
+drafter, both with the contrast (Logits at tp 1, adaptive and Hidden at tp 2, bit for bit), the
+decode graph against eager (synthetic and real), and prefix reuse with the drafter on the real
+artifact. Checked once by hand on the real model with the TF driver: w = 0 gives logits identical
+to the model without the option, the reference logits equal those of `--passes 1` bit for bit
+(796 rows), and the guided logits match an FP64 combination of the two dumps within 6.4e-6.
+
+**Other implementations.** omlx and inference.rs ship the same recipe for Inkling (Logits,
+adaptive, w 0.5, reference pass 1, a reference coda with its own K/V), opt-in. Not implemented
+here, because nothing validates them on this engine: omlx's option to exclude the thinking
+blocks (guidance only on the answer and the tool calls) and inference.rs's control tokens (ids ≥
+199998) left to the last pass's logits. Here the contrast applies to every generated token,
+reasoning and control tokens included.
+
 ## Program and Engine integration
 
 ### The contract
@@ -725,6 +786,8 @@ reference at visit 0.
    the greedy without drafter and every committed column's logits, bit for bit. The `dspark_draft`
    Ops have their FP64-oracle test. From the server, the text with `--spec mtp` must equal the
    text without it, at temperature 0 and with sampling at the same seed.
+8. **Loop contrast**: the `ninfer_inkling2_loopcd_*` tests and `ninfer_loop_contrast_test`
+   ([above](#loop-contrast-loopcd)); with the option off the model must keep its bits.
 
 A change whose produced values are bit-identical, proven by exact comparison of two dumps
 (`tools/ref_ink/bitcmp.py` compares dump trees byte for byte), needs only that proof.
@@ -748,7 +811,7 @@ A change whose produced values are bit-identical, proven by exact comparison of 
 | `draft/config.{h,cpp}`, `draft/parameters.{h,cpp}`, `draft/draft.{h,cpp}`, `load/draft.cpp` | the DSpark drafter: config, per-rank operands, context and proposals, bindings |
 | `instance.{h,cpp}`, `engine_family.{h,cpp}` | model instance, startup checks, KV capacity, Engine family |
 | `frontend/` | tokenizer, chat template, prompt layout, output parser and session |
-| `include/ninfer/ops/{relative_sink_attention,moe_sigmoid_route,moe_bank,short_conv,short_conv_record,depth_attention,message_gate,residual_mix,rmsnorm_f32,residual_f32,softcap,dspark_draft}.h`, `tp2/concat_rows.h` | the Op contracts this family added; implementations in `src/ops/<family>/` |
+| `include/ninfer/ops/{relative_sink_attention,moe_sigmoid_route,moe_bank,short_conv,short_conv_record,depth_attention,message_gate,residual_mix,rmsnorm_f32,residual_f32,softcap,dspark_draft,loop_contrast}.h`, `tp2/concat_rows.h` | the Op contracts this family added; implementations in `src/ops/<family>/` |
 | `src/ops/linear/bf16/shapes/inkling2.cu` | the family's BF16 shard shapes (generic route's bits) |
 | `tools/convert/inkling2.py`, `inkling2_recipes.py` | checkpoint adapter and recipe (`text`, optional `mtp`) |
 | `tools/ref_ink/` | references, dumps, comparisons, synthetic checkpoint and drafter, conversion check |

@@ -183,6 +183,9 @@ public:
                                                              sampling_defaults);
             return;
         }
+        if (options.loop_contrast.mode != LoopContrast::Off) {
+            throw std::invalid_argument("loop contrast needs a looped model (Inkling 2)");
+        }
         auto constructed    = runtime::construct_model(options, execution);
         active              = std::move(constructed.instance);
         load                = std::move(constructed.load);

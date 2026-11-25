@@ -64,6 +64,7 @@ struct ServeOptions {
     float rope_yarn_factor                   = 1.0F;
     std::uint32_t rope_original_max_position = 262144;
     SpeculativeOptions speculative;
+    LoopContrastOptions loop_contrast; // --loopcd (Inkling 2)
     ContextCacheOptions context_cache;
     bool enable_vision = false;
     std::optional<int> vision_device;               // CUDA device of the Vision tower

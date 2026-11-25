@@ -58,7 +58,8 @@ namespace ninfer::models::inkling2::execution {
 // ne {H,T,4}: q, k, v, ffn), "min" (FFN input after the block residual, FP32), "moe_in" (the
 // normed FFN input, BF16), "moe" (the MoE output after the exchange, BF16), "route_ids" (I32 {k,T},
 // in decreasing key order) and "route_weights" (FP32 {k,T}); `visit` = kHeadTap
-// with part "embed" (the normed embedding) or "final" (the output head's input, BF16 [H,T]).
+// with part "embed" (the normed embedding), "final" (the output head's input, BF16 [H,T]) or
+// "reference" (the Logits loop contrast's reference head input, BF16 [H,T]).
 // Column t is sequence position first_position + t. capture() receives rank 0's copy with rank
 // 0's device current; at tp 2 compare_ranks() also receives both copies of the replicated value.
 class ForwardTap {
@@ -130,9 +131,13 @@ struct ForwardColumns {
 
 // Rank 0's logits of the last `logit_columns` columns: `logits` BF16 [Vu, n] as the output head
 // rounds them (argmax reads these), `capped` FP32 [Vu, n] = softcap(logits) (null: not written).
+// With the Logits loop contrast (TextConfig::contrast) `capped` holds the guided logits and
+// `logits` their BF16 rounding, and `reference` (null: not written) receives the reference head's
+// soft-capped logits FP32 [Vu, n].
 struct ForwardLogits {
-    Tensor* logits = nullptr;
-    Tensor* capped = nullptr;
+    Tensor* logits    = nullptr;
+    Tensor* capped    = nullptr;
+    Tensor* reference = nullptr;
 };
 
 template <class Arena>
@@ -275,6 +280,19 @@ private:
     // -------------------------------------------------------------------
     void head(Block& b, const RankTensors& x, const ForwardColumns& columns,
               const ForwardLogits& out);
+    // The head input bf16(final_norm(depth attention of `states` and x)) [H, T] into `hn`.
+    void head_input(const std::vector<const RankTensors*>& states, const RankTensors& x,
+                    RankTensors& hn);
+    // The output head over the columns `last` [H, n], gathered on rank 0 into `logits`.
+    void head_logits(const RankTensors& last, Tensor& logits);
+
+    // ---- Loop contrast (forward/visit.h)
+    // --------------------------------------------------------- Hidden: before the coda, x and the
+    // block states produced by the last pass become their extrapolation away from the reference
+    // pass's (into b.guided); states shared by every pass stay.
+    void extrapolate(Block& b, const RankTensors*& x,
+                     const std::vector<const RankTensors*>& reference_states,
+                     const RankTensors& reference_output);
 
     // ---- L2 preload of the projection weights (forward/prefetch.h) ------------------------------
     enum class Prefetch { Early, Inputs, Output };

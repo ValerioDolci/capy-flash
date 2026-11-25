@@ -22,7 +22,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.16.4**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.16.5**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen, NVIDIA or Thinking Machines.
 
 ## Pick a model
@@ -82,7 +82,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   `serve-27b-16gb.sh` (27B 3-bit, one GPU) start `ninfer-serve` with the tested profile, the model id (`capy-flash` or
   `qwen3.8-27b`, the `model` name requests must use) and the chat template. `capy-serve-inkling2-mini.sh` (Inkling 2
   Mini, two GPUs, model id `inkling-2-mini`) passes its flags without a profile or template and turns the drafter on
-  (`--spec mtp --draft-tokens 3`; `NINFER_DRAFTER=0` turns it off). `NINFER_PORT=9000` changes the port;
+  (`--spec mtp --draft-tokens 3`; `NINFER_DRAFTER=0` turns it off; `NINFER_LOOPCD=1` turns on
+  [LoopCD](#inkling-2-mini)). `NINFER_PORT=9000` changes the port;
   extra `ninfer-serve` flags go after the model path and win over the profile.
 - **Vision.** The two 27B artifacts include the vision tower and their launchers load it (it takes VRAM from the
   context); `NINFER_VISION=0` before the launcher, or `--no-vision` after the model path, turns it off. The Flash-Next
@@ -158,7 +159,7 @@ same way. The drafter leaves the generated text unchanged.
   ```
   The launcher runs `--tp 2 --devices 0,1 --max-context 253952 --prefill-chunk 4096 --embedding-host --spec mtp
   --draft-tokens 3` (`NINFER_MAX_CONTEXT`, `NINFER_PREFILL_CHUNK`, `NINFER_DEVICES`, `NINFER_PORT`, `NINFER_MODEL_ID`,
-  `NINFER_DRAFTER` change them; extra flags after the artifact win, except that `--embedding-host` has no off switch and changes no result). The context is reserved at startup: 253,952 tokens
+  `NINFER_DRAFTER` change them, `NINFER_LOOPCD` and `NINFER_LOOPCD_OMEGA` add LoopCD; extra flags after the artifact win, except that `--embedding-host` has no off switch and changes no result). The context is reserved at startup: 253,952 tokens
   with 4096-token prefill blocks and the drafter leave about 580 MiB free per 16 GB card, with the token embedding in
   pinned host memory (`--embedding-host`: one 0.9 GB copy in RAM that both cards read in place, identical results).
   Smaller prefill blocks (2048) prefill 6-13 % slower. The block size does not change results on prompts whose last block has
@@ -178,6 +179,19 @@ same way. The drafter leaves the generated text unchanged.
   measured. It takes about 1.0 GiB more VRAM per card at the launcher's 253,952-token context (0.7 GiB at 131,072). When few drafts are accepted it
   can decode slower than without it. An artifact without the drafter starts with `--spec mtp` and decodes without
   it. Speed with and without the drafter: [benchmarks](#benchmarks).
+- **LoopCD (opt-in, for agentic coding):** contrastive decoding inside the loop
+  ([arXiv 2610.02185](https://arxiv.org/abs/2610.02185)). The last six layers and the output head run a second time on
+  the state after the first of the core's three passes, and each step's logits move away from that weaker prediction,
+  more strongly when the top two tokens are close (ω_max 0.5; `NINFER_LOOPCD_OMEGA` changes it):
+  ```bash
+  NINFER_LOOPCD=1 ~/capy-flash/current/capy-serve-inkling2-mini.sh ~/capy-flash/models/inkling2-mini/capy-flash-inkling2-mini-nvfp4.ninfer
+  ```
+  (`--loopcd adaptive` for `ninfer-serve`). Cost after a 4.5k-token prompt: decode −16.5 % with the drafter, −11.5 %
+  without, prefill −10 %; about 0.5 GiB more per card, which leaves about 30 MiB free at 253,952 tokens (with a display
+  on one card, `NINFER_MAX_CONTEXT=229376`). On our private 9-task coding-agent bench (3 runs per task, ω_max 0.3) the
+  judge's score went from 0.22 to 0.38, still being confirmed (the 95 % interval includes no change, and more of its
+  patches failed to compile). It changes the text; chat, prose and math were not measured. Details:
+  [serving guide](docs/serving/capy-flash.md#on-inkling-2-mini).
 - **What it does:** chat over the same OpenAI and Anthropic endpoints, streaming, reasoning in its own field, tool
   calls, thinking budgets, stop strings, temperature / top-k (up to 20) / top-p / min-p and penalties, reuse of
   the previous conversation's prefix (on the GPUs only), and speculative decoding with the checkpoint's drafter.
@@ -470,6 +484,22 @@ greedy texts against a recorded reference ([tools/tp2/README.md](tools/tp2/READM
 The app's tests run without a GPU: `cd app && python3 -m unittest discover -s tests`.
 
 ## What's new
+
+**v0.16.5** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.5)): LoopCD for Inkling 2 Mini,
+opt-in; without it the engine decodes as in v0.16.4
+- LoopCD ([arXiv 2610.02185](https://arxiv.org/abs/2610.02185), no training): the last six layers and the output head
+  also read the state after the first of the core's three passes, and each step's logits move away from that weaker
+  prediction, z₃ + ω (z₃ − z₁) with ω = ω_max (1 − (p₁ − p₂)): strong only where the top two tokens are close.
+  `NINFER_LOOPCD=1` in `capy-serve-inkling2-mini.sh` (`--loopcd adaptive`); ω_max 0.5, `NINFER_LOOPCD_OMEGA` /
+  `--loopcd-omega` changes it ([details](#inkling-2-mini)).
+- On our private 9-task coding-agent bench (3 runs per task, ω_max 0.3) the judge's score went from 0.22 to 0.38: it
+  writes the fix in 21 of 27 runs instead of 15, but more of its patches do not compile (6 of 21 against 2 of 14), and
+  the 95 % interval of the gain still includes no change.
+- Cost: decode −16.5 % with the drafter, −11.5 % without, prefill −10 %; about 0.5 GiB more per GPU (at 253,952 tokens
+  about 30 MiB stay free: with a display on one GPU, `NINFER_MAX_CONTEXT=229376`). It predicts existing text worse at
+  every strength: meant for agent work, not for chat or translation.
+- Same text with and without the drafter; CUDA Graphs and prefix reuse work with it. Existing kernels unchanged (2 new
+  ones); the 27B gate texts and the coding-agent replay are identical to v0.16.4's.
 
 **v0.16.4** ([release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.16.4)): adaptive draft windows for MTP
 and DFlash2, a streaming fix for benchmark clients; the defaults decode as in v0.16.3

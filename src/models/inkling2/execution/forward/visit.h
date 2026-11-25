@@ -17,6 +17,7 @@
 #include "models/inkling2/execution/forward.h"
 
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/loop_contrast.h"
 #include "ninfer/ops/residual_f32.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rmsnorm_f32.h"
@@ -37,7 +38,9 @@ namespace ninfer::models::inkling2::execution {
 // The call's block states. `keep` holds the outputs of the visits that end a block (layer + 1 a
 // multiple of block_layers): they are the block sources of later visits, the pre-core state, the
 // message bank and the previous pass's output, so they live for the whole call; every other
-// visit output alternates between two temporaries.
+// visit output alternates between two temporaries. With the loop contrast, `guided` holds the
+// Hidden extrapolations for the whole call, and the Logits reference coda leaves its block states
+// and output for the reference head.
 template <class Arena>
 struct Forward<Arena>::Block {
     RankTensors embedding, temporary[2];
@@ -47,6 +50,9 @@ struct Forward<Arena>::Block {
     const RankTensors* previous = nullptr;  // messages: the previous pass's output
     const RankTensors* messages = nullptr;  // this visit's messages, FP32 {H, T, 4}
     RankTensors messages_storage;
+    std::vector<RankTensors> guided;
+    std::vector<const RankTensors*> reference_states;
+    const RankTensors* reference_output = nullptr;
 };
 
 template <class Arena>
@@ -101,6 +107,15 @@ void Forward<Arena>::run(const RankTensors& ids, const ForwardColumns& columns,
     for (const Visit& v : config_.visits) { kept += (v.layer + 1) % config_.block_layers == 0; }
     b.keep.reserve(kept);
     for (std::size_t i = 0; i < kept; ++i) { b.keep.push_back(alloc(DType::BF16, {H, T_})); }
+    if (config_.contrast.mode == LoopContrast::Hidden) {
+        // The last pass's output and the block states it produced after its input (which every
+        // pass shares): one per block of the core.
+        const std::uint32_t guided = config_.core_layers() / config_.block_layers;
+        b.guided.reserve(guided);
+        for (std::uint32_t i = 0; i < guided; ++i) {
+            b.guided.push_back(alloc(DType::BF16, {H, T_}));
+        }
+    }
 
     embed(ids, b.embedding);
     tap(ForwardTap::kHeadTap, "embed", b.embedding);
@@ -146,8 +161,35 @@ auto Forward<Arena>::visits(Block& b, std::int32_t split) -> const RankTensors* 
         return index < config_.visits.size() && config_.visits[index].layer == config_.core_start &&
                config_.visits[index].pass > 1;
     };
+    const auto close_halves = [&] {
+        try {
+            for (Half& half : parts) {
+                on_half(half, [&] { close_half(half); });
+            }
+        } catch (...) {
+            abandon_halves(parts);
+            throw;
+        }
+    };
+    // The loop contrast: the block states and output at the end of the reference pass, and the
+    // main coda's while the Logits reference coda runs.
+    const LoopContrastOptions& contrast = config_.contrast;
+    std::vector<const RankTensors*> reference_states, main_states;
+    const RankTensors* reference_output = nullptr;
+    const RankTensors* main_output      = nullptr;
     for (std::uint32_t index = 0; index < config_.visits.size(); ++index) {
         const Visit& v = config_.visits[index];
+        if (contrast.mode == LoopContrast::Hidden && v.layer == config_.core_end) {
+            // The extrapolation reads the last pass's output whole.
+            if (split > 0) { close_halves(); }
+            extrapolate(b, x, reference_states, *reference_output);
+        }
+        if (v.reference && main_output == nullptr) {
+            main_output = x;
+            main_states = b.states;
+            x           = reference_output;
+            b.states    = reference_states;
+        }
         if (v.layer == config_.core_start) {
             if (v.pass == 1) {
                 core_input  = x;
@@ -192,20 +234,49 @@ auto Forward<Arena>::visits(Block& b, std::int32_t split) -> const RankTensors* 
         if (config_.core(v.layer) && v.layer + 1 == config_.core_end) {
             pass_states = b.states;
             pass_output = x;
+            if (contrast.mode != LoopContrast::Off && v.pass == contrast.reference_pass) {
+                reference_states = b.states;
+                reference_output = x;
+            }
         }
     }
-    if (split > 0) {
-        // The last visit's exchanges close before the head reads its output.
-        try {
-            for (Half& half : parts) {
-                on_half(half, [&] { close_half(half); });
-            }
-        } catch (...) {
-            abandon_halves(parts);
-            throw;
-        }
+    // The last visit's exchanges close before the head reads its output.
+    if (split > 0) { close_halves(); }
+    if (main_output != nullptr) {
+        b.reference_states = b.states;
+        b.reference_output = x;
+        b.states           = main_states;
+        x                  = main_output;
     }
     return x;
+}
+
+template <class Arena>
+void Forward<Arena>::extrapolate(Block& b, const RankTensors*& x,
+                                 const std::vector<const RankTensors*>& reference_states,
+                                 const RankTensors& reference_output) {
+    if (reference_states.size() != b.states.size()) {
+        throw std::logic_error("Inkling 2 forward: the reference pass has other block states");
+    }
+    const float w     = config_.contrast.strength;
+    std::size_t next  = 0;
+    const auto guided = [&](const RankTensors& last, const RankTensors& reference) {
+        RankTensors& out = b.guided.at(next++);
+        each([&](int r) {
+            if constexpr (kExecute) {
+                ops::loop_extrapolate(last[at(r)], reference[at(r)], w, out[at(r)], s(r));
+            } else {
+                (void)last, (void)reference, (void)w;
+            }
+        });
+        return &out;
+    };
+    for (std::size_t i = 0; i < b.states.size(); ++i) {
+        if (b.states[i] != reference_states[i]) {
+            b.states[i] = guided(*b.states[i], *reference_states[i]);
+        }
+    }
+    x = guided(*x, reference_output);
 }
 
 template <class Arena>

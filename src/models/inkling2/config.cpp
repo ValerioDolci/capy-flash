@@ -45,6 +45,8 @@ void equal_dimension(const Json& config, const char* name, std::uint32_t expecte
     }
 }
 
+} // namespace
+
 std::vector<Visit> visit_schedule(const TextConfig& c) {
     std::vector<Visit> out;
     const auto visit = [&](std::uint32_t layer, std::uint32_t pass, std::uint32_t slot) {
@@ -60,10 +62,31 @@ std::vector<Visit> visit_schedule(const TextConfig& c) {
     for (std::uint32_t layer = c.core_end; layer < c.num_hidden_layers; ++layer) {
         visit(layer, 1, layer);
     }
+    if (c.contrast.mode == LoopContrast::Logits) {
+        const auto slots = static_cast<std::uint32_t>(out.size());
+        for (std::uint32_t layer = c.core_end; layer < c.num_hidden_layers; ++layer) {
+            visit(layer, 1, slots + layer - c.core_end);
+            out.back().reference = true;
+        }
+    }
     return out;
 }
 
-} // namespace
+TextConfig with_loop_contrast(TextConfig config, const LoopContrastOptions& options) {
+    config.contrast = options;
+    if (options.mode == LoopContrast::Off || options.strength == 0.0F) {
+        config.contrast = {};
+    } else if (!std::isfinite(options.strength) || options.strength < 0.0F ||
+               options.reference_pass < 1 || options.reference_pass >= config.num_passes ||
+               (options.adaptive && options.mode != LoopContrast::Logits)) {
+        throw ArtifactError("loop contrast: the strength must be finite and positive, the "
+                            "reference pass in [1, " +
+                            std::to_string(config.num_passes - 1) +
+                            "], adaptive only on the logits");
+    }
+    config.visits = visit_schedule(config);
+    return config;
+}
 
 TextConfig parse_text_config(const Json& value) {
     artifact::require_members(value,
@@ -204,7 +227,9 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.purpose != EnginePurpose::CausalScoring) {
             throw ArtifactError("unknown loading purpose");
         }
-        Config out{parse_text_config(directory.component("text").config), std::nullopt};
+        Config out{with_loop_contrast(parse_text_config(directory.component("text").config),
+                                      options.loop_contrast),
+                   std::nullopt};
         if (options.speculative == SpeculativeBackend::Mtp) {
             // An artifact without the drafter decodes without it.
             if (directory.components.contains("mtp")) {

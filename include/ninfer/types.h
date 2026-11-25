@@ -120,6 +120,32 @@ struct SpeculativeOptions {
     std::uint32_t draft_shortlist_rows = 0;
 };
 
+// Contrastive decoding inside a looped model (Inkling 2 only): the readout of the state after an
+// earlier pass `reference_pass` (b) of the looped core is a weak model that the last pass is
+// pushed away from with strength `strength` (w). Off, or a zero strength, runs the model as
+// trained and allocates nothing.
+//   Hidden  before the coda, the last pass's output and the core's block states s that differ
+//           between passes become s + w (s - s_b), in FP32 stored as BF16: one coda and head.
+//   Logits  a second coda (its own K/V and convolution tails) and head read the state after pass
+//           b, so its logits c_b are those of the model with b passes; the soft-capped logits of
+//           every column become c + w_t (c - c_b) in FP32 on rank 0, w_t = w, or with `adaptive`
+//           w (1 - (p1 - p2)) for the two largest probabilities p1, p2 of softmax(c). Greedy
+//           selection, sampling and speculative verification read the guided logits.
+enum class LoopContrast : std::uint8_t { Off, Hidden, Logits };
+
+// The strength w of the adaptive Logits loop contrast when the command line gives none
+// (`--loopcd adaptive` without `--loopcd-omega`, in the server and the test drivers).
+inline constexpr float kDefaultAdaptiveLoopContrastStrength = 0.5F;
+
+struct LoopContrastOptions {
+    LoopContrast mode            = LoopContrast::Off;
+    float strength               = 0.0F;
+    std::uint32_t reference_pass = 1;
+    bool adaptive                = false; // Logits only
+
+    bool operator==(const LoopContrastOptions&) const = default;
+};
+
 enum class StartupPhase : std::uint8_t {
     EngineStartup,
     CudaInitialize,
@@ -424,6 +450,7 @@ struct EngineOptions {
     // The native window YaRN scales from (Hugging Face original_max_position_embeddings).
     std::uint32_t rope_original_max_position = 262144;
     SpeculativeOptions speculative;
+    LoopContrastOptions loop_contrast;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.

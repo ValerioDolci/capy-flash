@@ -52,6 +52,7 @@ set(ninfer_op_tests
   residual_f32
   residual_mix
   softcap
+  loop_contrast
   concat_rows_split
   moe_sigmoid_route
   moe_bank

@@ -19,14 +19,19 @@
 // --draft-tokens K): the anchor image and the endpoint then carry the drafter's context too, and
 // the criterion is the same (the target verifies every token).
 //
+// With --loopcd MODE [--loopcd-omega W] [--loopcd-pass B] the model runs with that loop contrast
+// (EngineOptions::loop_contrast; W as in ninfer-serve): the Logits contrast's reference slots are
+// part of the images.
+//
 // Usage: ninfer_inkling2_prefix_reuse_test --artifact X.ninfer [--tp 2] [--prefill-chunk N]
-//        [--spec K].
+//        [--spec K] [--loopcd hidden|logits|adaptive [--loopcd-omega W] [--loopcd-pass B]].
 // Without --artifact it skips (77).
 
 #include "ninfer/engine.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -102,6 +107,8 @@ int main(int argc, char** argv) {
     int tp                      = 2;
     std::uint32_t prefill_chunk = 1024;
     std::uint32_t draft_tokens  = 0;
+    LoopContrastOptions contrast;
+    std::optional<float> omega;
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string_view option = argv[i];
         if (option == "--artifact") {
@@ -112,7 +119,23 @@ int main(int argc, char** argv) {
             prefill_chunk = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
         } else if (option == "--spec") {
             draft_tokens = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+        } else if (option == "--loopcd") {
+            const std::string_view mode = argv[i + 1];
+            contrast.mode     = mode == "hidden" ? LoopContrast::Hidden : LoopContrast::Logits;
+            contrast.adaptive = mode == "adaptive";
+        } else if (option == "--loopcd-omega") {
+            omega = std::strtof(argv[i + 1], nullptr);
+        } else if (option == "--loopcd-pass") {
+            contrast.reference_pass = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
         }
+    }
+    if (omega) {
+        contrast.strength = *omega;
+    } else if (contrast.adaptive) {
+        contrast.strength = kDefaultAdaptiveLoopContrastStrength;
+    } else if (contrast.mode != LoopContrast::Off) {
+        std::printf("FAIL: --loopcd hidden and logits need --loopcd-omega\n");
+        return 2;
     }
     if (artifact.empty()) {
         std::printf("skip: no --artifact\n");
@@ -126,6 +149,7 @@ int main(int argc, char** argv) {
     options.kv_capacity     = KvCapacityPolicy::explicit_capacity(4096);
     options.max_concurrency = 1;
     options.prefill_chunk   = prefill_chunk;
+    options.loop_contrast   = contrast;
     if (draft_tokens > 0) {
         options.speculative.backend      = SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = draft_tokens;

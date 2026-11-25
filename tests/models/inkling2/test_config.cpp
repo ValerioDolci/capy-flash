@@ -6,6 +6,9 @@
 // 2. Rejections: unknown members, unsupported fixed values, a layer schedule or looped core this
 //    implementation does not run, options other than the Text backbone.
 // 3. The Qwen path does not accept the Inkling Text component.
+// 4. The loop contrast (with_loop_contrast): a zero strength is the model's own schedule, Hidden
+//    keeps it, Logits appends the reference coda on six slots after the others; options outside
+//    the domain are refused.
 
 #include "artifact/fixture.h"
 #include "models/inkling2/config.h"
@@ -171,6 +174,48 @@ void rejections() {
     require(!inkling2::is_inkling2(qwen), "a Qwen component is not Inkling");
 }
 
+void loop_contrast() {
+    const auto base = inkling2::parse_text_config(component("config_real.json"));
+    const auto with = [&](const LoopContrastOptions& options) {
+        return inkling2::with_loop_contrast(base, options);
+    };
+    const auto zero = with({.mode = LoopContrast::Logits, .strength = 0.0F, .adaptive = true});
+    require(zero.contrast == LoopContrastOptions{}, "a zero strength is not off");
+    check_schedule(zero);
+    const auto hidden = with({.mode = LoopContrast::Hidden, .strength = 0.3F});
+    require(hidden.contrast.mode == LoopContrast::Hidden, "Hidden not applied");
+    check_schedule(hidden);
+
+    const auto logits = with({.mode = LoopContrast::Logits, .strength = 0.5F, .adaptive = true});
+    require(logits.contrast.adaptive && logits.visits.size() == 54, "54 visits with Logits");
+    for (std::size_t i = 0; i < 48; ++i) {
+        const auto& v = logits.visits[i];
+        require(!v.reference && v.layer == base.visits[i].layer && v.pass == base.visits[i].pass &&
+                    v.slot == base.visits[i].slot,
+                "the model's visits change with Logits");
+    }
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        const auto& v = logits.visits[48 + i];
+        require(v.reference && v.layer == 18 + i && v.pass == 1 && v.slot == 48 + i &&
+                    !v.messages && v.block_boundary == (i == 0) &&
+                    (v.kind == inkling2::LayerKind::Global) == (i == 5),
+                "reference coda visit");
+    }
+
+    rejects(
+        [&] { (void)with({.mode = LoopContrast::Logits, .strength = 0.5F, .reference_pass = 3}); },
+        "the last pass accepted as the reference");
+    rejects(
+        [&] { (void)with({.mode = LoopContrast::Logits, .strength = 0.5F, .reference_pass = 0}); },
+        "pass 0 accepted as the reference");
+    rejects([&] { (void)with({.mode = LoopContrast::Hidden, .strength = -0.3F}); },
+            "a negative strength accepted");
+    rejects([&] { (void)with({.mode = LoopContrast::Hidden, .strength = std::nanf("")}); },
+            "a NaN strength accepted");
+    rejects([&] { (void)with({.mode = LoopContrast::Hidden, .strength = 0.3F, .adaptive = true}); },
+            "adaptive Hidden accepted");
+}
+
 } // namespace
 
 int main() {
@@ -178,6 +223,7 @@ int main() {
         released();
         synthetic();
         rejections();
+        loop_contrast();
         std::cout << "OK inkling2 config\n";
         return 0;
     } catch (const std::exception& error) {
