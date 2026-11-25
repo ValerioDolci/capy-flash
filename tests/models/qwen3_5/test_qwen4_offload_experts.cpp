@@ -175,10 +175,11 @@ struct Memory {
     Tensor identity;
 
     Memory() {
-        const auto planes = Qwen4OffloadExperts::pool_plane_bytes(kLayers, kSlots);
-        for (std::size_t q = 0; q < 4; ++q) {
-            view.pool[q] = static_cast<std::byte*>(alloc(static_cast<std::size_t>(planes[q])));
-        }
+        // The slot-major pool, as the Program binds it (Qwen4PersistentLayout::bind_pool).
+        auto* pool = static_cast<std::byte*>(
+            alloc(static_cast<std::size_t>(Qwen4OffloadExperts::slot_bytes(kLayers) * kSlots)));
+        const auto offsets = Qwen4OffloadExperts::slot_plane_offsets();
+        for (std::size_t q = 0; q < 4; ++q) { view.pool[q] = pool + offsets[q]; }
         view.table = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * kLayers * kExperts));
         view.divisors = static_cast<float*>(
             alloc(sizeof(float) * kLayers * Qwen4OffloadExperts::kDivisorsPerLayer));

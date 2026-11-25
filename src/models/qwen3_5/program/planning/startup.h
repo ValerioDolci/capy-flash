@@ -66,7 +66,8 @@ struct Qwen4PersistentLayout {
     std::optional<TensorLayout> stage_table;
     std::optional<TensorLayout> stage_picks;
     std::array<LayoutRegion, 4> stage_pool{};
-    // The planar slot pool (one array per plane); bind_pool() gives the plane bases.
+    // The NVFP4 slot-major pool in cache_pool[0] (Qwen4OffloadExperts::kSlotBytes per slot,
+    // cache_pool[1..3] placeholders); bind_pool() gives the plane bases of slot 0.
     std::array<LayoutRegion, 4> cache_pool{};
     std::size_t cache_pool_bytes = 0;
     // ggml block banks (Qwen4OffloadExperts::gguf_pool): cache_pool[0] is one

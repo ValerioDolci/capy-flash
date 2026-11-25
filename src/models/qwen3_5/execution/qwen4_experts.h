@@ -396,8 +396,9 @@ struct Qwen4OffloadSplitCounters {
 
 class Qwen4OffloadExperts final : public Qwen4RoutedExperts {
 public:
-    // Program-owned device memory: four planar pool arrays of `layers * slots_per_layer` slots
-    // each (moe_slots plane sizes), the I32 slot table [layers * 512] and the FP32 divisor copy
+    // Program-owned device memory: the slot-major pool of `layers * slots_per_layer` slots
+    // (pool[q] = plane q of slot 0, kSlotBytes apart: slot_plane_offsets()), the I32 slot table
+    // [layers * 512] and the FP32 divisor copy
     // [layers * 1536] (per layer the gate|up divisors 1024 then the down divisors 512).
     struct DeviceMemory {
         std::array<std::byte*, 4> pool{};
@@ -583,16 +584,27 @@ public:
                                                       std::int32_t text_layers,
                                                       std::int32_t partitions);
     static constexpr std::int32_t kGgufExperts = 512;
-    // Bytes of one plane array of the pool (all layers' slots).
+    // Bytes of four planar arrays of `layers * slots_per_layer` slots (the miss split's scratch).
     [[nodiscard]] static std::array<std::int64_t, 4> pool_plane_bytes(std::int32_t layers,
                                                                       std::int32_t slots_per_layer);
-    // Bytes of one plane slot (the planar pool's stride of plane q).
-    [[nodiscard]] static std::int64_t plane_slot_bytes(std::int32_t plane);
+    // The NVFP4 slot pool is slot-major: slot s is one contiguous run of kSlotBytes bytes holding
+    // its four planes at slot_plane_offsets(), so plane q of slot s begins at
+    // pool[0] + s * kSlotBytes + slot_plane_offsets()[q] and every plane strides by kSlotBytes
+    // (pool_strides()). A run of slots is then one region of all their bytes, which a prompt can
+    // borrow whole.
+    static constexpr std::int64_t kSlotBytes =
+        ops::kMoeSlotsGateUpCodeBytes + ops::kMoeSlotsGateUpScaleBytes +
+        ops::kMoeSlotsDownCodeBytes + ops::kMoeSlotsDownScaleBytes;
+    [[nodiscard]] static std::array<std::int64_t, 4> slot_plane_offsets() noexcept;
+    [[nodiscard]] static std::array<std::int64_t, 4> pool_strides() noexcept;
+    // Bytes of one slot in the pool's region of plane q (the planner's cache_pool[q]): the whole
+    // slot in region 0, nothing in the placeholders 1..3.
+    [[nodiscard]] static std::int64_t region_slot_bytes(std::int32_t plane);
     // Device bytes of one slot of every layer (the four planes).
     [[nodiscard]] static std::int64_t slot_bytes(std::int32_t layers);
-    // Borrowed prompt workspace: the lent layers' slots of the gate/up code plane (the largest
-    // plane, one contiguous region of the planar pool) hold it.
-    static constexpr std::int64_t kLendPlaneBytes = ops::kMoeSlotsGateUpCodeBytes;
+    // Borrowed prompt workspace: the lent layers' whole slots (one contiguous region of the
+    // slot-major pool) hold it.
+    static constexpr std::int64_t kLendSlotBytes = kSlotBytes;
 
     // Whether a prompt may lend the last `layers` Text layers (ring + workspace): they hold at most
     // a fraction of the Text layers' base slots (`layer_base`, layer_slot_profile), so the other
