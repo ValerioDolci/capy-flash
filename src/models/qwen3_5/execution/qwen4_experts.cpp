@@ -1900,18 +1900,17 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     Qwen4ColumnGroups* groups = qwen4_column_groups;
     const std::int32_t G      = groups != nullptr ? groups->group_columns : 0;
     if (G > 0 && !host_experts && T > G && groups->done == 0) {
-        // In column groups, each reported as soon as it is enqueued (its exchange overlaps
-        // the next group). Groups are whole pieces of the grouped kernel: the same bits.
-        for (std::int32_t first = 0; first < T; first += G) {
-            const std::int32_t n = std::min(G, T - first);
-            Tensor out           = partial.slice(1, first, n);
-            ops::moe_grouped_nvfp4(x.slice(1, first, n), ids.slice(1, first, n),
-                                   weights.slice(1, first, n), view, pool, out, scratch, stream);
-            if (first + n < T) {
-                groups->ready(first, n);
-                groups->done = first + n;
-            }
-        }
+        // In column groups, each reported as soon as its last piece is enqueued (its exchange
+        // overlaps the later pieces). gate/up runs once over the whole call (each expert's
+        // weights read once, not once per group); groups are whole pieces: the same bits.
+        ops::moe_grouped_nvfp4(x, ids, weights, view, pool, partial, scratch, stream,
+                               [&](std::int32_t first, std::int32_t n) {
+                                   const std::int32_t end = first + n;
+                                   if (end < T && end % G == 0) {
+                                       groups->ready(groups->done, end - groups->done);
+                                       groups->done = end;
+                                   }
+                               });
     } else {
         ops::moe_grouped_nvfp4(x, ids, weights, view, pool, partial, scratch, stream);
     }

@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace ninfer::ops {
 
@@ -58,5 +59,20 @@ inline constexpr std::int32_t kMoeGroupedChunkColumns = 2048;
 void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
                        const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
                        WorkspaceArena& workspace, cudaStream_t stream);
+
+// Columns [first, first + count) of `out` are final once the work enqueued before this call runs.
+using MoeGroupedPieceDone = std::function<void(std::int32_t first, std::int32_t count)>;
+
+/**
+ * moe_grouped_nvfp4 that reports each piece: a call wider than kMoeGroupedChunkColumns calls
+ * `piece_done` on the host, in column order, right after enqueuing the down projection and the
+ * merge of each piece (gate/up has run once over the whole call before the first piece), so the
+ * caller can enqueue work on the final columns while later pieces run; a narrower call reports
+ * [0, T) once. Same results as moe_grouped_nvfp4.
+ */
+void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
+                       const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
+                       WorkspaceArena& workspace, cudaStream_t stream,
+                       const MoeGroupedPieceDone& piece_done);
 
 } // namespace ninfer::ops
