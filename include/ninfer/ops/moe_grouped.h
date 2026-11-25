@@ -40,8 +40,10 @@ inline constexpr std::int32_t kMoeGroupedChunkColumns = 2048;
  *
  * Logical shapes: x BF16 [2560,T]; routed_ids I32 [10,T]; routed_weights FP32 [10,T];
  *   out FP32 [2560,T].
- * Supported domain: T >= 1; E == 512; 1 <= pool.slots and pool.slots * 2560 < 2^31; planar
- *   pool (each plane's stride equals its per-expert bytes: one array per plane, slot-major);
+ * Supported domain: T >= 1; E == 512; 1 <= pool.slots and pool.slots * 2560 < 2^31; every plane's
+ *   stride at least its per-expert bytes and a multiple of 16 (planar: one array per plane, the
+ *   stride = the plane's bytes; slot-major: one contiguous slot of all four planes, every stride =
+ *   the slot's bytes);
  *   finite positive input divisors. Slot contents must be valid NVFP4 (finite scales).
  * Numeric (W4A4, the recipe of moe_slots_nvfp4): x and h quantized to E2M1 with one E4M3FN scale
  *   per 16 values against the layer's input divisors; block products on the NVFP4 tensor cores

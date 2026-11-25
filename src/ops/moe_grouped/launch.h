@@ -42,6 +42,7 @@ struct MoeGroupedPiece {
     float gate_up_input_divisor;
     float down_input_divisor;
     const std::uint8_t* planes[4]; // gate/up codes, gate/up scales, down codes, down scales
+    std::int64_t strides[4];       // bytes from one slot's plane to the next's
     std::uint8_t* input_codes;     // [columns, H/2]
     std::uint8_t* input_scales;    // [columns, H/16]
     std::int32_t* counts;          // [E]

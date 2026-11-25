@@ -42,8 +42,9 @@ void require_plane(const MoeSlotPlane& plane, std::int64_t bytes, std::int64_t a
     require(base % static_cast<std::uintptr_t>(alignment) == 0,
             std::string(label) + " plane base must be " + std::to_string(alignment) +
                 "-byte aligned");
-    require(plane.stride == bytes,
-            std::string(label) + " plane must be planar (stride = one expert's plane bytes)");
+    require(plane.stride >= bytes && plane.stride % alignment == 0,
+            std::string(label) + " plane stride must hold one expert's plane and be " +
+                std::to_string(alignment) + "-byte aligned");
 }
 
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
@@ -205,6 +206,10 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.planes[1]             = static_cast<const std::uint8_t*>(pool.gate_up_scales.base);
         c.planes[2]             = static_cast<const std::uint8_t*>(pool.down_codes.base);
         c.planes[3]             = static_cast<const std::uint8_t*>(pool.down_scales.base);
+        c.strides[0]            = pool.gate_up_codes.stride;
+        c.strides[1]            = pool.gate_up_scales.stride;
+        c.strides[2]            = pool.down_codes.stride;
+        c.strides[3]            = pool.down_scales.stride;
     };
     if (wide) {
         const detail::MoeGroupedWideLayout l = detail::moe_grouped_wide_layout(tokens);
@@ -262,6 +267,10 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.planes[1]             = static_cast<const std::uint8_t*>(pool.gate_up_scales.base);
         c.planes[2]             = static_cast<const std::uint8_t*>(pool.down_codes.base);
         c.planes[3]             = static_cast<const std::uint8_t*>(pool.down_scales.base);
+        c.strides[0]            = pool.gate_up_codes.stride;
+        c.strides[1]            = pool.gate_up_scales.stride;
+        c.strides[2]            = pool.down_codes.stride;
+        c.strides[3]            = pool.down_scales.stride;
         c.input_codes           = reinterpret_cast<std::uint8_t*>(base + layout.input_codes);
         c.input_scales          = reinterpret_cast<std::uint8_t*>(base + layout.input_scales);
         c.counts                = reinterpret_cast<std::int32_t*>(base + layout.counts);

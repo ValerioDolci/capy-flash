@@ -554,6 +554,25 @@ int permutation_case(const Model& m, Runner& runner, const DevicePool& pool,
     return failures;
 }
 
+// (2b) A slot-major pool (each slot one contiguous run of its four planes, the slot pool a wide
+// prefill lends whole slots of) is read through the plane strides: bit-equal to the planar pool,
+// also for a call wider than one down piece.
+int slot_major_case(const Model& m, Runner& runner, const DevicePool& planar,
+                    const std::vector<std::vector<int>>& place, int slots) {
+    int failures       = 0;
+    const DevicePool d = make_pool(m, place, slots, Layout::Contiguous, 230U);
+    for (const int tokens : {1, 64, 300, 2 * ops::kMoeGroupedChunkColumns + 77}) {
+        Call c          = make_call(m, tokens, 231U + static_cast<std::uint32_t>(tokens));
+        c.table         = table_from(m, place);
+        c.a1            = 2688.0F / 4.5F * kDivisorJitter;
+        c.a2            = 2688.0F / 60.0F;
+        const auto base = runner.run(c, planar.pool, true, failures, "slot-major base");
+        failures += verify_exact("slot-major == planar",
+                                 runner.run(c, d.pool, true, failures, "slot-major"), base);
+    }
+    return failures;
+}
+
 // (3) Routes without a slot (not resident, -1, out of range) are skipped: oracle on the resident
 // experts and bit-equal to zero-weight resident routes.
 int missing_case(const Model& m, Runner& runner, const DevicePool& pool,
@@ -742,9 +761,14 @@ int validation_cases(const Model& m, Runner& runner, const DevicePool& pool,
     const auto layer = runner.layer(c, dt.p);
     Tensor tx(dx.p, DType::BF16, {kH, 20}), ti(di.p, DType::I32, {kK, 20}),
         tw(dw.p, DType::FP32, {kK, 20}), to(dout.p, DType::FP32, {kH, 20});
-    expect_throw("contiguous-slot pool", [&] {
+    expect_throw("stride below one expert's plane", [&] {
         auto p                 = pool.pool;
-        p.gate_up_codes.stride = kSlotBytes;
+        p.gate_up_codes.stride = ops::kMoeSlotsGateUpCodeBytes - 16;
+        ops::moe_grouped_nvfp4(tx, ti, tw, layer, p, to, runner.workspace(), runner.stream());
+    });
+    expect_throw("misaligned stride", [&] {
+        auto p              = pool.pool;
+        p.down_codes.stride = ops::kMoeSlotsDownCodeBytes + 8;
         ops::moe_grouped_nvfp4(tx, ti, tw, layer, p, to, runner.workspace(), runner.stream());
     });
     expect_throw("BF16 out", [&] {
@@ -794,6 +818,7 @@ int main(int argc, char** argv) {
         }
         failures += oracle_cases(m, runner, pool, place);
         failures += permutation_case(m, runner, pool, place);
+        failures += slot_major_case(m, runner, pool, place, slots);
         failures += missing_case(m, runner, pool, place);
         failures += piece_case(m, runner, pool, place, 77, 600U);
         failures += piece_case(m, runner, pool, place, 0, 610U);
