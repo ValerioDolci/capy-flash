@@ -605,9 +605,10 @@ public:
 
     // Base slots of each cache layer on one GPU (prod/cache): `slots_per_layer` for every layer,
     // or, for Flash-Next at tp 2 (48 Text layers, with or without the MTP layer), the same total
-    // divided by a fitted per-layer profile (the first layers and the MTP layer miss most), scaled
-    // to slots_per_layer and capped at the partition's experts minus the elastic columns. The
-    // pool size is the same either way (the elastic columns stay one per layer).
+    // divided by the per-layer slot demand curves (qwen4_slot_curves.h): each slot goes where the
+    // modelled GPU wait drops most at this pool size, at least kQwen4MinBaseSlots a layer and at
+    // most the partition's experts minus the elastic columns. The pool size is the same either
+    // way (the elastic columns stay one per layer).
     // `exclusive_layers`: qwen4_exclusive_layers(), whose base slots are floors.
     [[nodiscard]] static std::vector<std::int32_t>
     layer_slot_profile(std::int32_t layers, std::int32_t text_layers, std::int32_t slots_per_layer,

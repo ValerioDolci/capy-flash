@@ -13,9 +13,16 @@
 #include <stdexcept>
 #include <vector>
 
+#include "models/qwen3_5/qwen4_slot_curves.h"
+
 namespace ninfer::models::qwen3_5 {
 
-// One GPU's base slots per layer at 66 slots per layer + 21 elastic columns
+// Base slots every layer keeps in the curve allocation (Qwen4OffloadExperts::layer_slot_profile,
+// models/qwen3_5/qwen4_slot_curves.h), or slots_per_layer when that is smaller.
+inline constexpr std::int32_t kQwen4MinBaseSlots = 16;
+
+// The layers' usage ranking (the pinned fallback order and the exclusive tier's tail below):
+// one GPU's base slots per layer at 66 slots per layer + 21 elastic columns
 // (Flash-Next production, tp 2, MTP layer last), fitted greedily on the replayed routing of 30
 // prompts through the expert cache policy (marginal CPU experts per slot, at least 29 base
 // slots a layer); it lowers the CPU experts per decode round on held-out prompts.

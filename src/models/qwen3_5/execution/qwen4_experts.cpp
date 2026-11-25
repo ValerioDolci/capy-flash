@@ -2170,8 +2170,6 @@ std::vector<std::int32_t>
 Qwen4OffloadExperts::layer_slot_profile(std::int32_t layers, std::int32_t text_layers,
                                         std::int32_t slots_per_layer, std::int32_t elastic_columns,
                                         std::int32_t partitions, std::int32_t exclusive_layers) {
-    // The usage profile (models/qwen3_5/qwen4_layer_profile.h).
-    const auto& kWeights = kQwen4LayerSlotWeights;
     std::vector<std::int32_t> base(static_cast<std::size_t>(std::max(layers, 0)), slots_per_layer);
     const auto cap =
         static_cast<std::int64_t>(kExperts / std::max(partitions, 1)) - elastic_columns;
@@ -2179,78 +2177,64 @@ Qwen4OffloadExperts::layer_slot_profile(std::int32_t layers, std::int32_t text_l
         slots_per_layer < 1 || cap < slots_per_layer) {
         return base;
     }
-    // Scale the weights to layers * slots_per_layer, clamping at `cap` and at the exclusive floors
-    // (water filling), then round by largest remainder (ties to the lower layer) so the total is
-    // exact.
+    // The slot demand curves (models/qwen3_5/qwen4_slot_curves.h): one base slot at a time to the
+    // layer whose modelled GPU wait per decode window drops most (ties: the layer with fewer slots,
+    // then the lower layer), each layer from min(kQwen4MinBaseSlots, slots_per_layer) and within
+    // `cap`, until the pool (layers * slots_per_layer) is spent. A layer's curve is read at its
+    // base slots plus the elastic columns (its resident experts on one GPU).
     const std::int64_t total = static_cast<std::int64_t>(layers) * slots_per_layer;
+    const std::int32_t least = std::min(kQwen4MinBaseSlots, slots_per_layer);
+    const auto& grid         = kQwen4SlotCurveSlots;
+    auto wait                = [&](std::size_t l, std::int64_t slots) {
+        const auto& c = kQwen4LayerSlotCurves[l];
+        const auto x  = static_cast<double>(slots);
+        if (x >= grid.back()) { return static_cast<double>(c.back()); }
+        // Segment [grid[k], grid[k + 1]] holding x; the first one extends below the grid.
+        const auto it  = std::lower_bound(grid.begin() + 1, grid.end() - 1, x,
+                                                         [](std::int16_t g, double v) { return g < v; });
+        const auto k   = static_cast<std::size_t>(it - grid.begin()) - 1;
+        const double a = grid[k], b = grid[k + 1];
+        return c[k] + (static_cast<double>(c[k + 1]) - c[k]) * (x - a) / (b - a);
+    };
+    auto allocate = [&](std::span<const std::int32_t> floors) {
+        std::vector<std::int32_t> out(floors.begin(), floors.end());
+        std::int64_t left = total;
+        for (const std::int32_t f : out) { left -= f; }
+        for (; left > 0; --left) {
+            std::size_t best = out.size();
+            double gain      = 0.0;
+            for (std::size_t l = 0; l < out.size(); ++l) {
+                if (out[l] + 1 > cap) { continue; }
+                const double g =
+                    wait(l, out[l] + elastic_columns) - wait(l, out[l] + 1 + elastic_columns);
+                if (best == out.size() || g > gain || (g == gain && out[l] < out[best])) {
+                    best = l;
+                    gain = g;
+                }
+            }
+            ++out[best];
+        }
+        return out;
+    };
+    const std::vector<std::int32_t> plain(base.size(), least);
+    base = allocate(plain);
     // The exclusive tier keeps tail / 2 experts per GPU in its layers' base slots (they have no
-    // host copy): a floor taken from the other layers when the pool is short, so a smaller pool
-    // (less free VRAM) costs those layers slots instead of refusing the start. Floors that do not
-    // fit the pool are left to the startup check, which names the layer.
-    std::vector<double> floor_slots(base.size(), 0.0);
-    {
-        std::int64_t floors = 0;
-        bool within         = true;
-        for (std::size_t l = 0; l < base.size(); ++l) {
-            const std::int32_t f =
-                qwen4_exclusive_tail(static_cast<std::int32_t>(l), exclusive_layers) / 2;
-            floor_slots[l] = static_cast<double>(f);
-            floors += f;
-            within = within && f <= cap;
-        }
-        if (floors > total || !within) { std::fill(floor_slots.begin(), floor_slots.end(), 0.0); }
-    }
-    std::vector<double> target(base.size(), 0.0);
-    std::vector<bool> fixed(base.size(), false);
-    for (bool changed = true; changed;) {
-        changed          = false;
-        double weights   = 0.0;
-        double remaining = static_cast<double>(total);
-        for (std::size_t l = 0; l < base.size(); ++l) {
-            if (fixed[l]) {
-                remaining -= target[l];
-            } else {
-                weights += kWeights[l];
-            }
-        }
-        if (weights <= 0.0) { break; }
-        for (std::size_t l = 0; l < base.size(); ++l) {
-            if (fixed[l]) { continue; }
-            target[l] = std::max(1.0, kWeights[l] * remaining / weights);
-            if (target[l] > static_cast<double>(cap)) {
-                target[l] = static_cast<double>(cap);
-                fixed[l]  = true;
-                changed   = true;
-            } else if (target[l] < floor_slots[l]) {
-                target[l] = floor_slots[l];
-                fixed[l]  = true;
-                changed   = true;
-            }
-        }
-    }
+    // host copy): floors taken from the other layers when the allocation falls short, so a
+    // smaller pool (less free VRAM) costs those layers slots instead of refusing the start.
+    // Floors that do not fit the pool are left to the startup check, which names the layer.
+    std::vector<std::int32_t> floors(base.size(), least);
     std::int64_t sum = 0;
+    bool within      = true;
+    bool short_of    = false;
     for (std::size_t l = 0; l < base.size(); ++l) {
-        base[l] = static_cast<std::int32_t>(std::floor(target[l]));
-        sum += base[l];
+        const std::int32_t f =
+            qwen4_exclusive_tail(static_cast<std::int32_t>(l), exclusive_layers) / 2;
+        floors[l] = std::max(least, f);
+        sum += floors[l];
+        within   = within && f <= cap;
+        short_of = short_of || base[l] < f;
     }
-    std::vector<std::size_t> order(base.size());
-    std::iota(order.begin(), order.end(), std::size_t{0});
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-        return target[a] - std::floor(target[a]) > target[b] - std::floor(target[b]);
-    });
-    for (std::size_t i = 0; sum < total && i < order.size(); ++i) {
-        if (base[order[i]] < cap) {
-            ++base[order[i]];
-            ++sum;
-        }
-    }
-    for (std::size_t i = 0; sum > total && i < order.size(); ++i) {
-        const std::size_t l = order[order.size() - 1 - i];
-        if (base[l] > std::max(1.0, floor_slots[l])) {
-            --base[l];
-            --sum;
-        }
-    }
+    if (short_of && within && sum <= total) { base = allocate(floors); }
     return base;
 }
 

@@ -766,8 +766,22 @@ void test_slot_profile() {
         }
     }
     const auto b = Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 2, 0);
-    check(b[0] == 149 && b[1] == 119 && b[15] == 29 && b[47] == 59 && b[48] == 109,
-          "profile at the production 66 slots: the fitted table");
+    // Pinned against `tools/qwen4_slot_curves.py profile 66 21` (the same allocation from the
+    // same curves).
+    check(b[0] == 139 && b[1] == 115 && b[15] == 23 && b[31] == 19 && b[47] == 63 && b[48] == 87,
+          "profile at 66 slots + 21 elastic columns: the curve allocation");
+    const auto b108 = Qwen4OffloadExperts::layer_slot_profile(49, 48, 108, 3, 2, 0);
+    check(b108[0] == 181 && b108[15] == 57 && b108[31] == 53 && b108[48] == 141,
+          "profile at 108 slots + 3 elastic columns: the curve allocation");
+    // A larger pool gives every layer at least the slots it had: the curves are convex enough
+    // that the greedy allocation grows layer by layer.
+    bool grows = true;
+    for (std::int32_t K = 20; K <= 200; K += 4) {
+        const auto lo = Qwen4OffloadExperts::layer_slot_profile(49, 48, K, 3, 2, 0);
+        const auto hi = Qwen4OffloadExperts::layer_slot_profile(49, 48, K + 4, 3, 2, 0);
+        for (std::size_t l = 0; l < lo.size(); ++l) { grows = grows && hi[l] >= lo[l]; }
+    }
+    check(grows, "profile: more slots never take a layer's slots away");
     const std::vector<std::int32_t> uniform(49, 66);
     check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 66, 21, 1, 0) == uniform,
           "profile: tp 1 stays uniform");
@@ -787,10 +801,10 @@ void test_slot_profile() {
 // when the pool is short.
 void test_slot_profile_exclusive_floor() {
     constexpr std::int32_t kExclusive = 17;
-    const auto plain103 = Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2, 0);
+    const auto plain150 = Qwen4OffloadExperts::layer_slot_profile(49, 48, 150, 3, 2, 0);
     const auto plain80  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2, 0);
     const auto plain30  = Qwen4OffloadExperts::layer_slot_profile(49, 48, 30, 3, 2, 0);
-    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 103, 3, 2, kExclusive) == plain103,
+    check(Qwen4OffloadExperts::layer_slot_profile(49, 48, 150, 3, 2, kExclusive) == plain150,
           "exclusive floor: a profile already above the floors is unchanged");
     const auto b     = Qwen4OffloadExperts::layer_slot_profile(49, 48, 80, 3, 2, kExclusive);
     std::int64_t sum = 0;
