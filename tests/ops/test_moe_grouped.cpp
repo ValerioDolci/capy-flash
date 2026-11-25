@@ -800,6 +800,8 @@ int main(int argc, char** argv) {
         Runner runner(m, benchmark ? 16384 : 2 * ops::kMoeGroupedChunkColumns + 77);
         int failures = 0;
         if (benchmark) {
+            // Both pool layouts the op takes: planar, and slot-major (the Qwen4Exp slot pool).
+            const DevicePool slot_major = make_pool(m, place, slots, Layout::Contiguous, 23U);
             std::puts("case,size,columns,sample,us");
             for (int tokens : {1, 9, 64, 200, 256, 777, 2048, 2049, 4096, 4173, 16384}) {
                 for (bool skewed : {false, true}) {
@@ -812,6 +814,9 @@ int main(int argc, char** argv) {
                     }
                     runner.run(c, pool.pool, true, failures,
                                skewed ? "moe-grouped-skewed" : "moe-grouped", true);
+                    runner.run(c, slot_major.pool, true, failures,
+                               skewed ? "moe-grouped-skewed-slot-major" : "moe-grouped-slot-major",
+                               true);
                 }
             }
             return failures ? 1 : 0;
