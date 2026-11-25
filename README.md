@@ -190,7 +190,8 @@ same way. The drafter leaves the generated text unchanged.
   without, prefill −10 %; about 0.5 GiB more per card, which leaves about 30 MiB free at 253,952 tokens (with a display
   on one card, `NINFER_MAX_CONTEXT=229376`). On our private 9-task coding-agent bench (3 runs per task, ω_max 0.3) the
   judge's score went from 0.22 to 0.38, still being confirmed (the 95 % interval includes no change, and more of its
-  patches failed to compile). It changes the text; chat, prose and math were not measured. Details:
+  patches failed to compile). It changes the text, but not its quality on translation (FLORES-200 Italian↔English,
+  COMET, ω_max 0.5: unchanged within noise); chat and math were not measured. Details:
   [serving guide](docs/serving/capy-flash.md#on-inkling-2-mini).
 - **What it does:** chat over the same OpenAI and Anthropic endpoints, streaming, reasoning in its own field, tool
   calls, thinking budgets, stop strings, temperature / top-k (up to 20) / top-p / min-p and penalties, reuse of
@@ -497,7 +498,8 @@ opt-in; without it the engine decodes as in v0.16.4
   the 95 % interval of the gain still includes no change.
 - Cost: decode −16.5 % with the drafter, −11.5 % without, prefill −10 %; about 0.5 GiB more per GPU (at 253,952 tokens
   about 30 MiB stay free: with a display on one GPU, `NINFER_MAX_CONTEXT=229376`). It predicts existing text worse at
-  every strength: meant for agent work, not for chat or translation.
+  every strength, but the text it writes is not worse: on translation (FLORES-200 Italian↔English, 400 sentences plus
+  45 hard ones; COMET; ω_max 0.5) quality is unchanged within noise.
 - Same text with and without the drafter; CUDA Graphs and prefix reuse work with it. Existing kernels unchanged (2 new
   ones); the 27B gate texts and the coding-agent replay are identical to v0.16.4's.
 

@@ -269,9 +269,11 @@ On the Qwen models, the context cache keeps retained conversations in VRAM, in R
   so a GPU that also drives a display needs a smaller `--max-context` (229,376 leaves about 500 MiB). Meant for
   agentic coding: on a private 9-task coding-agent bench (3 runs per task, ω_max 0.3) the judge's score went from 0.22
   to 0.38, still being confirmed (the 95 % interval includes no change; more of its patches failed to compile, 6 of
-  21 against 2 of 14). It makes the prediction of existing text worse at every strength; chat, prose and math were
-  not measured. `--loopcd hidden` and `--loopcd logits` (a fixed strength) exist for experiments only: not validated,
-  not recommended ([options](options.md); [design](../maintainer/inkling2-model.md#loop-contrast-loopcd)).
+  21 against 2 of 14). It makes the prediction of existing text worse at every strength, but not the text it writes:
+  on translation (FLORES-200 Italian↔English, 400 sentences plus 45 hard ones; COMET; ω_max 0.5) quality is unchanged
+  within noise. Chat and math were not measured. `--loopcd hidden` and `--loopcd logits` (a fixed strength) exist for
+  experiments only: not validated, not recommended ([options](options.md);
+  [design](../maintainer/inkling2-model.md#loop-contrast-loopcd)).
 - The context cache keeps the previous conversation on the GPUs (its end and the end of its prompt), so the next
   turn of the same conversation resumes instead of re-reading it; there is no RAM or disk tier (`--disk-cache-dir`
   stops the start) and no prefix shared between conversations. `--no-prefix-reuse` turns it off.
