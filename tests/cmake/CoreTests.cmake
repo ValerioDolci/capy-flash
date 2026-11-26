@@ -109,6 +109,12 @@ add_executable(ninfer_expert_cache_replay "${CMAKE_CURRENT_LIST_DIR}/../expert_c
 ninfer_test_includes(ninfer_expert_cache_replay)
 target_link_libraries(ninfer_expert_cache_replay PRIVATE ninfer_core)
 
+# Per-layer slot demand curves from NINFER_QWEN4_ROUTING_DUMP files through the policy, for
+# tools/qwen4_slot_curves.py (needs routing dumps, so not a CTest).
+add_executable(ninfer_qwen4_slot_curves "${CMAKE_CURRENT_LIST_DIR}/../qwen4_slot_curves.cpp")
+ninfer_test_includes(ninfer_qwen4_slot_curves)
+target_link_libraries(ninfer_qwen4_slot_curves PRIVATE ninfer_core)
+
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
   LIBRARIES ninfer_core)

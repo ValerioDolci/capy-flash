@@ -440,7 +440,12 @@ Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
     as wide as the cache lends.
   - Slots per layer: `routed_experts.slots_per_layer`, or 0 = the device memory the rest of the
     Program leaves minus `slot_headroom_bytes` (Engine resolves it before the final plan;
-    `MemorySummary::routed_expert_slots`).
+    `MemorySummary::routed_expert_slots`). Flash-Next at tp 2 divides that pool between the
+    layers by their slot demand curves (`Qwen4OffloadExperts::layer_slot_profile`): each base
+    slot goes to the layer whose modelled GPU wait per decode window drops most at that pool
+    size. The curves (`models/qwen3_5/qwen4_slot_curves.h`) are generated from
+    `NINFER_QWEN4_ROUTING_DUMP` files by `ninfer_qwen4_slot_curves` (the policy replayed at every
+    slot count) and `tools/qwen4_slot_curves.py`, which also scores an allocation per dump.
   - Elastic KV (`EngineOptions::elastic_kv`, driver `--elastic [--kv-grow T]
     [--kv-budget-gib G]`): instead of a fixed partition sized for `max_context`, the KV pools keep
     max_context's addresses but are backed page by page, and the expert cache takes every other
