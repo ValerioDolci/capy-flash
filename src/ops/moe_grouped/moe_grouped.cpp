@@ -42,8 +42,9 @@ void require_plane(const MoeSlotPlane& plane, std::int64_t bytes, std::int64_t a
     require(base % static_cast<std::uintptr_t>(alignment) == 0,
             std::string(label) + " plane base must be " + std::to_string(alignment) +
                 "-byte aligned");
-    require(plane.stride == bytes,
-            std::string(label) + " plane must be planar (stride = one expert's plane bytes)");
+    require(plane.stride >= bytes && plane.stride % alignment == 0,
+            std::string(label) + " plane stride must hold one expert's plane and be " +
+                std::to_string(alignment) + "-byte aligned");
 }
 
 constexpr std::size_t align(std::size_t value) { return (value + 255) / 256 * 256; }
@@ -140,6 +141,13 @@ std::size_t moe_grouped_nvfp4_workspace_bytes(std::int32_t max_tokens) {
 void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
                        const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
                        WorkspaceArena& workspace, cudaStream_t stream) {
+    moe_grouped_nvfp4(x, routed_ids, routed_weights, layer, pool, out, workspace, stream, {});
+}
+
+void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
+                       const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
+                       WorkspaceArena& workspace, cudaStream_t stream,
+                       const MoeGroupedPieceDone& piece_done) {
     require_dense(x, DType::BF16, "x");
     const std::int32_t tokens = x.ne[1];
     require(tokens >= 1, "T must be positive");
@@ -198,6 +206,10 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.planes[1]             = static_cast<const std::uint8_t*>(pool.gate_up_scales.base);
         c.planes[2]             = static_cast<const std::uint8_t*>(pool.down_codes.base);
         c.planes[3]             = static_cast<const std::uint8_t*>(pool.down_scales.base);
+        c.strides[0]            = pool.gate_up_codes.stride;
+        c.strides[1]            = pool.gate_up_scales.stride;
+        c.strides[2]            = pool.down_codes.stride;
+        c.strides[3]            = pool.down_scales.stride;
     };
     if (wide) {
         const detail::MoeGroupedWideLayout l = detail::moe_grouped_wide_layout(tokens);
@@ -233,7 +245,7 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         w.piece_job_columns = reinterpret_cast<std::int32_t*>(at(l.piece_job_columns));
         w.piece_job_slots   = reinterpret_cast<std::int32_t*>(at(l.piece_job_slots));
         w.piece_job_count   = reinterpret_cast<std::int32_t*>(at(l.piece_job_count));
-        detail::moe_grouped_wide_launch(w, stream);
+        detail::moe_grouped_wide_launch(w, stream, piece_done);
         return;
     }
     for (std::int32_t begin = 0; begin < tokens; begin += chunk) {
@@ -255,6 +267,10 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.planes[1]             = static_cast<const std::uint8_t*>(pool.gate_up_scales.base);
         c.planes[2]             = static_cast<const std::uint8_t*>(pool.down_codes.base);
         c.planes[3]             = static_cast<const std::uint8_t*>(pool.down_scales.base);
+        c.strides[0]            = pool.gate_up_codes.stride;
+        c.strides[1]            = pool.gate_up_scales.stride;
+        c.strides[2]            = pool.down_codes.stride;
+        c.strides[3]            = pool.down_scales.stride;
         c.input_codes           = reinterpret_cast<std::uint8_t*>(base + layout.input_codes);
         c.input_scales          = reinterpret_cast<std::uint8_t*>(base + layout.input_scales);
         c.counts                = reinterpret_cast<std::int32_t*>(base + layout.counts);
@@ -271,6 +287,7 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.grouped               = reinterpret_cast<float*>(base + layout.grouped);
         detail::moe_grouped_launch(c, stream);
     }
+    if (piece_done) { piece_done(0, tokens); }
 }
 
 } // namespace ninfer::ops

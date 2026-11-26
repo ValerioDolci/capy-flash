@@ -230,10 +230,10 @@ union KernelShared {
 template <class G, class Schedule, class Epilogue, class OutputPolicy, class RowPolicy,
           bool PairRows, class TokenPolicy, class RasterPolicy, bool FloatStage = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void grouped_mma_kernel(
-    Activation activation, const std::uint8_t* __restrict__ weight_codes,
-    const std::uint8_t* __restrict__ weight_scales, float alpha, Epilogue epilogue,
-    OutputPolicy output, RowPolicy row_policy, TokenPolicy token_policy,
-    RasterPolicy raster_policy) {
+    Activation activation, const std::uint8_t* __restrict__ pool_codes,
+    const std::uint8_t* __restrict__ pool_scales, std::int64_t code_stride,
+    std::int64_t scale_stride, float alpha, Epilogue epilogue, OutputPolicy output,
+    RowPolicy row_policy, TokenPolicy token_policy, RasterPolicy raster_policy) {
     static_assert((G::kInputRows % Schedule::kBlockK) == 0);
     static_assert((G::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || ((G::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
@@ -245,7 +245,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     int block_row   = 0;
     int block_token = 0;
     raster_policy.blocks(block_row, block_token);
-    const int token_begin       = block_token * Schedule::kBlockM;
+    // The job's slot: plane q of slot s begins at base + s * stride (planar or slot-major pool).
+    const auto slot                               = static_cast<std::int64_t>(raster_policy.slot());
+    const std::uint8_t* __restrict__ weight_codes = pool_codes + slot * code_stride;
+    const std::uint8_t* __restrict__ weight_scales = pool_scales + slot * scale_stride;
+    const int token_begin                          = block_token * Schedule::kBlockM;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
     const int row_begin         = block_row * kRowsPerBlock;
     const int active            = token_policy.active_tokens();
@@ -462,31 +466,33 @@ struct GateUpRaster {
         block_token = jobs.column_base() / Schedule::kBlockM;
     }
 
+    __device__ __forceinline__ int slot() const { return jobs.slot(); }
+
     __device__ __forceinline__ bool live() const { return jobs.live(); }
 };
 
-// Down rows are contiguous inside a slot: folding the slot's row base into the block row lets the
-// identity row policy and the contiguous scale staging address the plane.
+// Down rows are contiguous inside a slot: the identity row policy and the contiguous scale staging
+// address the slot's planes from its base (the kernel adds slot * stride to each plane).
 struct DownRaster {
     Jobs jobs;
 
     __device__ __forceinline__ void blocks(int& block_row, int& block_token) const {
-        block_row   = jobs.slot() * (H / Schedule::kBlockN) + static_cast<int>(blockIdx.x);
+        block_row   = static_cast<int>(blockIdx.x);
         block_token = jobs.column_base() / Schedule::kBlockM;
     }
+
+    __device__ __forceinline__ int slot() const { return jobs.slot(); }
 
     __device__ __forceinline__ bool live() const { return jobs.live(); }
 };
 
-// A pair tile stages kPairRows gate rows and the matching up rows of the job's slot.
+// A pair tile stages kPairRows gate rows and the matching up rows of the job's slot (rows within
+// the slot: the kernel adds slot * stride to each plane).
 struct GateUpRows {
     static constexpr bool kContiguous = false;
-    Jobs jobs;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
-        const int within =
-            row_begin + (local_row & (kPairRows - 1)) + (local_row >= kPairRows ? I : 0);
-        return jobs.slot() * (2 * I) + within;
+        return row_begin + (local_row & (kPairRows - 1)) + (local_row >= kPairRows ? I : 0);
     }
 };
 
@@ -741,8 +747,9 @@ void gate_up_launch(const MoeGroupedPiece& c, const Jobs& jobs, std::int32_t max
     const dim3 grid(I / kPairRows, max_jobs);
     grouped_mma_kernel<GateUpGeometry, Schedule, GateUpDivisor, GateUpOutput, GateUpRows, true,
                        GatherTokens, GateUpRaster><<<grid, Schedule::kThreads, 0, stream>>>(
-        input, c.planes[0], c.planes[1], 1.0F / c.gate_up_input_divisor, epilogue, output,
-        GateUpRows{jobs}, GatherTokens{c.packed_token, c.offsets, jobs}, GateUpRaster{jobs});
+        input, c.planes[0], c.planes[1], c.strides[0], c.strides[1], 1.0F / c.gate_up_input_divisor,
+        epilogue, output, GateUpRows{}, GatherTokens{c.packed_token, c.offsets, jobs},
+        GateUpRaster{jobs});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -761,8 +768,9 @@ void moe_grouped_launch(const MoeGroupedPiece& c, cudaStream_t stream) {
         const dim3 grid(H / Schedule::kBlockN, max_jobs);
         grouped_mma_kernel<DownGeometry, Schedule, DownDivisor, DownOutput, IdentityRows, false,
                            PackedTokens, DownRaster, true><<<grid, Schedule::kThreads, 0, stream>>>(
-            middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
-            IdentityRows{}, PackedTokens{c.offsets, jobs}, DownRaster{jobs});
+            middle, c.planes[2], c.planes[3], c.strides[2], c.strides[3],
+            1.0F / c.down_input_divisor, epilogue, output, IdentityRows{},
+            PackedTokens{c.offsets, jobs}, DownRaster{jobs});
         CUDA_CHECK(cudaGetLastError());
     }
     moe_grouping_merge_kernel<H, K>
@@ -770,7 +778,9 @@ void moe_grouped_launch(const MoeGroupedPiece& c, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
+void moe_grouped_wide_launch(
+    const MoeGroupedWide& w, cudaStream_t stream,
+    const std::function<void(std::int32_t first, std::int32_t count)>& piece_done) {
     const MoeGroupedPiece& c = w.call;
     const Jobs jobs{c.job_experts, c.job_columns, c.job_slots, c.job_count};
     group_launch(c.ids, c.columns, c.table, c.slots, c.counts, c.rank, c.offsets, jobs,
@@ -794,13 +804,14 @@ void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
         const dim3 grid(H / Schedule::kBlockN, moe_grouped_max_jobs(columns));
         grouped_mma_kernel<DownGeometry, Schedule, DownDivisor, DownOutput, IdentityRows, false,
                            GatherMiddle, DownRaster, true><<<grid, Schedule::kThreads, 0, stream>>>(
-            middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
-            IdentityRows{}, GatherMiddle{w.piece_middle_row, w.piece_offsets, piece_jobs},
-            DownRaster{piece_jobs});
+            middle, c.planes[2], c.planes[3], c.strides[2], c.strides[3],
+            1.0F / c.down_input_divisor, epilogue, output, IdentityRows{},
+            GatherMiddle{w.piece_middle_row, w.piece_offsets, piece_jobs}, DownRaster{piece_jobs});
         CUDA_CHECK(cudaGetLastError());
         moe_grouping_merge_kernel<H, K><<<columns, H / 8, 0, stream>>>(
             c.grouped, w.piece_index, c.weights + k0, c.out + static_cast<std::int64_t>(begin) * H);
         CUDA_CHECK(cudaGetLastError());
+        if (piece_done) { piece_done(begin, columns); }
     }
 }
 

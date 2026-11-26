@@ -416,8 +416,20 @@ std::array<std::int64_t, 4> Qwen4OffloadExperts::pool_plane_bytes(std::int32_t l
             slots * ops::kMoeSlotsDownCodeBytes, slots * ops::kMoeSlotsDownScaleBytes};
 }
 
-std::int64_t Qwen4OffloadExperts::plane_slot_bytes(std::int32_t plane) {
-    return planar_strides().at(static_cast<std::size_t>(plane));
+std::array<std::int64_t, 4> Qwen4OffloadExperts::slot_plane_offsets() noexcept {
+    const auto p = planar_strides();
+    return {0, p[0], p[0] + p[1], p[0] + p[1] + p[2]};
+}
+
+std::array<std::int64_t, 4> Qwen4OffloadExperts::pool_strides() noexcept {
+    return {kSlotBytes, kSlotBytes, kSlotBytes, kSlotBytes};
+}
+
+std::int64_t Qwen4OffloadExperts::region_slot_bytes(std::int32_t plane) {
+    if (plane < 0 || plane >= 4) {
+        throw std::out_of_range("Qwen4Exp offload experts: plane out of range");
+    }
+    return plane == 0 ? kSlotBytes : 0;
 }
 
 bool Qwen4OffloadExperts::gguf_banks(std::span<const Qwen4ExpertBank> banks) {
@@ -465,7 +477,7 @@ Qwen4OffloadExperts::gguf_pool(std::span<const std::int64_t> layer_slot_bytes,
 
 std::int64_t Qwen4OffloadExperts::elastic_column_bytes(std::int32_t plane) const {
     if (gguf_) { return plane == 0 ? gguf_pool_.column_bytes : 0; }
-    return static_cast<std::int64_t>(layers_) * plane_slot_bytes(plane);
+    return static_cast<std::int64_t>(layers_) * region_slot_bytes(plane);
 }
 
 void Qwen4OffloadExperts::set_active_columns(std::int32_t columns) {
@@ -483,8 +495,7 @@ void Qwen4OffloadExperts::set_active_columns(std::int32_t columns) {
 }
 
 std::int64_t Qwen4OffloadExperts::slot_bytes(std::int32_t layers) {
-    const auto planes = pool_plane_bytes(layers, 1);
-    return planes[0] + planes[1] + planes[2] + planes[3];
+    return static_cast<std::int64_t>(layers) * kSlotBytes;
 }
 
 Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
@@ -829,7 +840,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         layout.plane_bytes = {ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes,
                               ops::kMoeSlotsDownCodeBytes, ops::kMoeSlotsDownScaleBytes};
         layout.bank_stride = layout.plane_bytes;
-        layout.pool_stride = layout.plane_bytes;
+        const auto strides = pool_strides();
+        std::copy(strides.begin(), strides.end(), layout.pool_stride.begin());
         layout.bank_base.reserve(static_cast<std::size_t>(layers_) * 4);
         for (const Qwen4ExpertBank& bank : banks) {
             for (const ops::MoeSlotPlane* plane :
@@ -980,7 +992,7 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         if (options_.base_chunk > 0 && options_.prompt_workspace_bytes > 0) {
             // Per planned width, where its workspace fits (workspace_layers: the planner's rule).
             for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
-                const std::int64_t slots = (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes;
+                const std::int64_t slots = (bytes + kLendSlotBytes - 1) / kLendSlotBytes;
                 const std::int32_t below = workspace_layers(layer_base_, text_layers_, lend_count_,
                                                             slots, partitions_, false);
                 if (below > 0) {
@@ -1068,10 +1080,11 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                         sc.bank_base.push_back(static_cast<const std::byte*>(plane->base));
                     }
                 }
-                sc.pool_base  = rank == 0 ? memory_.pool : peer->pool;
-                sc.tables     = rank == 0 ? memory_.stream_tables : peer->stream_tables;
-                sc.partitions = partitions_;
-                sc.partition  = rank;
+                sc.pool_base   = rank == 0 ? memory_.pool : peer->pool;
+                sc.pool_stride = pool_strides();
+                sc.tables      = rank == 0 ? memory_.stream_tables : peer->stream_tables;
+                sc.partitions  = partitions_;
+                sc.partition   = rank;
                 if (pageable_layers_ > 0) {
                     sc.streamable.resize(static_cast<std::size_t>(text_layers_));
                     for (std::int32_t l = 0; l < text_layers_; ++l) {
@@ -1549,7 +1562,7 @@ void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, c
     const float* divisors = memory_.divisors + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
     const ops::MoeSlotPool pool =
-        slot_pool(memory_.pool, planar_strides(),
+        slot_pool(memory_.pool, pool_strides(),
                   layers_ * (options_.slots_per_layer + options_.elastic_columns));
     auto scope = work.scope();
     WorkspaceArena scratch(work.alloc_bytes(
@@ -1881,7 +1894,7 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     const float* divisors     = divisor_base + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
     const ops::MoeSlotPool pool =
-        slot_pool(rank == 0 ? memory_.pool : peer_pool_, planar_strides(),
+        slot_pool(rank == 0 ? memory_.pool : peer_pool_, pool_strides(),
                   layers_ * (options_.slots_per_layer + options_.elastic_columns));
     if (rank == 0) {
         if (host_experts) {
@@ -1900,18 +1913,17 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     Qwen4ColumnGroups* groups = qwen4_column_groups;
     const std::int32_t G      = groups != nullptr ? groups->group_columns : 0;
     if (G > 0 && !host_experts && T > G && groups->done == 0) {
-        // In column groups, each reported as soon as it is enqueued (its exchange overlaps
-        // the next group). Groups are whole pieces of the grouped kernel: the same bits.
-        for (std::int32_t first = 0; first < T; first += G) {
-            const std::int32_t n = std::min(G, T - first);
-            Tensor out           = partial.slice(1, first, n);
-            ops::moe_grouped_nvfp4(x.slice(1, first, n), ids.slice(1, first, n),
-                                   weights.slice(1, first, n), view, pool, out, scratch, stream);
-            if (first + n < T) {
-                groups->ready(first, n);
-                groups->done = first + n;
-            }
-        }
+        // In column groups, each reported as soon as its last piece is enqueued (its exchange
+        // overlaps the later pieces). gate/up runs once over the whole call (each expert's
+        // weights read once, not once per group); groups are whole pieces: the same bits.
+        ops::moe_grouped_nvfp4(x, ids, weights, view, pool, partial, scratch, stream,
+                               [&](std::int32_t first, std::int32_t n) {
+                                   const std::int32_t end = first + n;
+                                   if (end < T && end % G == 0) {
+                                       groups->ready(groups->done, end - groups->done);
+                                       groups->done = end;
+                                   }
+                               });
     } else {
         ops::moe_grouped_nvfp4(x, ids, weights, view, pool, partial, scratch, stream);
     }
@@ -2261,8 +2273,8 @@ std::int32_t Qwen4OffloadExperts::workspace_layers_for(std::int32_t columns) con
         for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
             if (columns <= width) {
                 return workspace_layers(layer_base_, text_layers_, lend_count_,
-                                        (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes,
-                                        partitions_, ring_columns_ > 0);
+                                        (bytes + kLendSlotBytes - 1) / kLendSlotBytes, partitions_,
+                                        ring_columns_ > 0);
             }
         }
         return 0;
@@ -2429,10 +2441,10 @@ Qwen4OffloadExperts::prompt_workspace(std::span<const cudaStream_t> streams) {
     if (streams.size() != static_cast<std::size_t>(partitions_)) {
         throw std::invalid_argument("Qwen4Exp offload experts: one compute stream per GPU");
     }
-    // The workspace: the base slots of layers [first, workspace_end()) in each GPU's gate/up code
-    // plane (planar pool: one contiguous region), the lent layers below the ring.
-    std::int64_t begin = base_offset(first) * kLendPlaneBytes;
-    std::int64_t end   = base_offset(workspace_end()) * kLendPlaneBytes;
+    // The workspace: the base slots of layers [first, workspace_end()) of each GPU's slot-major
+    // pool (one contiguous region of whole slots), the lent layers below the ring.
+    std::int64_t begin = base_offset(first) * kLendSlotBytes;
+    std::int64_t end   = base_offset(workspace_end()) * kLendSlotBytes;
     if (gguf_) {
         // ggml block banks: the arena bytes of those base slots (base slots are layer-ordered).
         const auto at = [&](std::int32_t layer) {
@@ -2972,7 +2984,7 @@ void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& ban
         return;
     }
     const ops::MoeSlotPool pool =
-        slot_pool(memory_.pool, planar_strides(), layers_ * slots_per_layer_);
+        slot_pool(memory_.pool, Qwen4OffloadExperts::pool_strides(), layers_ * slots_per_layer_);
     auto scope = work.scope();
     WorkspaceArena scratch(work.alloc_bytes(
         ops::moe_slots_nvfp4_workspace_bytes(std::min<std::int32_t>(T, ops::kMoeSlotsMaxTokens))));

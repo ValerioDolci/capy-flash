@@ -30,6 +30,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -448,7 +449,8 @@ public:
 
     // grouped = true: moe_grouped_nvfp4 over the whole call; false: moe_slots_nvfp4 in slices.
     std::vector<float> run(const Call& c, const ops::MoeSlotPool& pool, bool grouped, int& failures,
-                           const std::string& label, bool benchmark = false) {
+                           const std::string& label, bool benchmark = false,
+                           const ops::MoeGroupedPieceDone* piece_done = nullptr) {
         const int T = c.tokens;
         table_.copy_from_host(c.table.data(), c.table.size() * sizeof(int));
         std::vector<std::uint16_t> xb(c.x.size());
@@ -463,7 +465,12 @@ public:
             Tensor tx(dx.p, DType::BF16, {kH, T}), ti(di.p, DType::I32, {kK, T}),
                 tw(dw.p, DType::FP32, {kK, T}), to(out.data(), DType::FP32, {kH, T});
             auto launch = [&] {
-                ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+                if (piece_done != nullptr) {
+                    ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_,
+                                           *piece_done);
+                } else {
+                    ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+                }
             };
             launch();
             if (benchmark) {
@@ -547,6 +554,25 @@ int permutation_case(const Model& m, Runner& runner, const DevicePool& pool,
     return failures;
 }
 
+// (2b) A slot-major pool (each slot one contiguous run of its four planes, the slot pool a wide
+// prefill lends whole slots of) is read through the plane strides: bit-equal to the planar pool,
+// also for a call wider than one down piece.
+int slot_major_case(const Model& m, Runner& runner, const DevicePool& planar,
+                    const std::vector<std::vector<int>>& place, int slots) {
+    int failures       = 0;
+    const DevicePool d = make_pool(m, place, slots, Layout::Contiguous, 230U);
+    for (const int tokens : {1, 64, 300, 2 * ops::kMoeGroupedChunkColumns + 77}) {
+        Call c          = make_call(m, tokens, 231U + static_cast<std::uint32_t>(tokens));
+        c.table         = table_from(m, place);
+        c.a1            = 2688.0F / 4.5F * kDivisorJitter;
+        c.a2            = 2688.0F / 60.0F;
+        const auto base = runner.run(c, planar.pool, true, failures, "slot-major base");
+        failures += verify_exact("slot-major == planar",
+                                 runner.run(c, d.pool, true, failures, "slot-major"), base);
+    }
+    return failures;
+}
+
 // (3) Routes without a slot (not resident, -1, out of range) are skipped: oracle on the resident
 // experts and bit-equal to zero-weight resident routes.
 int missing_case(const Model& m, Runner& runner, const DevicePool& pool,
@@ -613,6 +639,41 @@ int piece_case(const Model& m, Runner& runner, const DevicePool& pool,
             std::vector<float>(whole.begin() + static_cast<std::ptrdiff_t>(at),
                                whole.begin() + static_cast<std::ptrdiff_t>(at + part.size())));
         at += part.size();
+    }
+    return failures;
+}
+
+// (4b) Piece reports: a call with `piece_done` gives the bits of the call without it and reports
+// its pieces once each, in column order ([0, P), [P, 2P), [2P, T)); a call of at most one piece
+// reports [0, T) once.
+int piece_done_case(const Model& m, Runner& runner, const DevicePool& pool,
+                    const std::vector<std::vector<int>>& place) {
+    int failures = 0;
+    const int P  = ops::kMoeGroupedChunkColumns;
+    for (const int T : {2 * P + 77, 200}) {
+        Call c           = make_call(m, T, 620U + T);
+        c.table          = table_from(m, place);
+        c.a1             = 2688.0F / 4.5F * kDivisorJitter;
+        c.a2             = 2688.0F / 60.0F;
+        const auto plain = runner.run(c, pool.pool, true, failures, "reports plain");
+        std::vector<std::pair<int, int>> got;
+        const ops::MoeGroupedPieceDone done = [&](std::int32_t first, std::int32_t count) {
+            got.emplace_back(first, count);
+        };
+        const auto reported = runner.run(c, pool.pool, true, failures, "reports", false, &done);
+        failures += verify_exact(("piece reports T=" + std::to_string(T) + " == plain").c_str(),
+                                 reported, plain);
+        std::vector<std::pair<int, int>> want;
+        if (T <= P) {
+            want.emplace_back(0, T);
+        } else {
+            for (int b = 0; b < T; b += P) want.emplace_back(b, std::min(P, T - b));
+        }
+        if (got != want) {
+            std::cerr << "FAIL: piece reports T=" << T << ": " << got.size() << " reports, want "
+                      << want.size() << '\n';
+            ++failures;
+        }
     }
     return failures;
 }
@@ -700,9 +761,14 @@ int validation_cases(const Model& m, Runner& runner, const DevicePool& pool,
     const auto layer = runner.layer(c, dt.p);
     Tensor tx(dx.p, DType::BF16, {kH, 20}), ti(di.p, DType::I32, {kK, 20}),
         tw(dw.p, DType::FP32, {kK, 20}), to(dout.p, DType::FP32, {kH, 20});
-    expect_throw("contiguous-slot pool", [&] {
+    expect_throw("stride below one expert's plane", [&] {
         auto p                 = pool.pool;
-        p.gate_up_codes.stride = kSlotBytes;
+        p.gate_up_codes.stride = ops::kMoeSlotsGateUpCodeBytes - 16;
+        ops::moe_grouped_nvfp4(tx, ti, tw, layer, p, to, runner.workspace(), runner.stream());
+    });
+    expect_throw("misaligned stride", [&] {
+        auto p              = pool.pool;
+        p.down_codes.stride = ops::kMoeSlotsDownCodeBytes + 8;
         ops::moe_grouped_nvfp4(tx, ti, tw, layer, p, to, runner.workspace(), runner.stream());
     });
     expect_throw("BF16 out", [&] {
@@ -734,6 +800,8 @@ int main(int argc, char** argv) {
         Runner runner(m, benchmark ? 16384 : 2 * ops::kMoeGroupedChunkColumns + 77);
         int failures = 0;
         if (benchmark) {
+            // Both pool layouts the op takes: planar, and slot-major (the Qwen4Exp slot pool).
+            const DevicePool slot_major = make_pool(m, place, slots, Layout::Contiguous, 23U);
             std::puts("case,size,columns,sample,us");
             for (int tokens : {1, 9, 64, 200, 256, 777, 2048, 2049, 4096, 4173, 16384}) {
                 for (bool skewed : {false, true}) {
@@ -746,15 +814,20 @@ int main(int argc, char** argv) {
                     }
                     runner.run(c, pool.pool, true, failures,
                                skewed ? "moe-grouped-skewed" : "moe-grouped", true);
+                    runner.run(c, slot_major.pool, true, failures,
+                               skewed ? "moe-grouped-skewed-slot-major" : "moe-grouped-slot-major",
+                               true);
                 }
             }
             return failures ? 1 : 0;
         }
         failures += oracle_cases(m, runner, pool, place);
         failures += permutation_case(m, runner, pool, place);
+        failures += slot_major_case(m, runner, pool, place, slots);
         failures += missing_case(m, runner, pool, place);
         failures += piece_case(m, runner, pool, place, 77, 600U);
         failures += piece_case(m, runner, pool, place, 0, 610U);
+        failures += piece_done_case(m, runner, pool, place);
         failures += graph_case(m, runner, pool, place);
         failures += validation_cases(m, runner, pool, place);
         if (failures != 0) {

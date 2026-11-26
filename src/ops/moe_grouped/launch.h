@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace ninfer::ops::detail {
 
@@ -41,6 +42,7 @@ struct MoeGroupedPiece {
     float gate_up_input_divisor;
     float down_input_divisor;
     const std::uint8_t* planes[4]; // gate/up codes, gate/up scales, down codes, down scales
+    std::int64_t strides[4];       // bytes from one slot's plane to the next's
     std::uint8_t* input_codes;     // [columns, H/2]
     std::uint8_t* input_scales;    // [columns, H/16]
     std::int32_t* counts;          // [E]
@@ -87,6 +89,10 @@ struct MoeGroupedWide {
     std::int32_t* piece_job_count;
 };
 
-void moe_grouped_wide_launch(const MoeGroupedWide& wide, cudaStream_t stream);
+// `piece_done` (optional): called on the host after each piece's down projection and merge are
+// enqueued, with the piece's first column and count.
+void moe_grouped_wide_launch(
+    const MoeGroupedWide& wide, cudaStream_t stream,
+    const std::function<void(std::int32_t first, std::int32_t count)>& piece_done = {});
 
 } // namespace ninfer::ops::detail

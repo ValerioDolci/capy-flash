@@ -474,16 +474,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                    : 0;
                 }
             } else {
-                // Base slots, then the elastic columns.
-                const auto planes = execution::Qwen4OffloadExperts::pool_plane_bytes(
-                    cache_layers, q.expert_slots + q.elastic_columns);
-                for (std::size_t plane = 0; plane < planes.size(); ++plane) {
-                    q.cache_pool[plane] = (elastic ? elastic_builder : builder)
-                                              .add(static_cast<std::size_t>(planes[plane]),
-                                                   kArenaAlign, "Qwen4Exp expert slot pool");
-                    q.cache_pool_bytes += static_cast<std::size_t>(planes[plane]);
-                    const std::int64_t stride = execution::Qwen4OffloadExperts::plane_slot_bytes(
+                // The slot-major pool in region 0 (regions 1..3 are placeholders, bind_pool):
+                // base slots, then the elastic columns.
+                for (std::size_t plane = 0; plane < 4; ++plane) {
+                    const std::int64_t stride = execution::Qwen4OffloadExperts::region_slot_bytes(
                         static_cast<std::int32_t>(plane));
+                    const std::size_t region =
+                        plane == 0 ? static_cast<std::size_t>(
+                                         static_cast<std::int64_t>(cache_layers) *
+                                         (q.expert_slots + q.elastic_columns) * stride)
+                                   : kArenaAlign;
+                    q.cache_pool[plane] =
+                        (elastic ? elastic_builder : builder)
+                            .add(region, kArenaAlign, "Qwen4Exp expert slot pool");
+                    q.cache_pool_bytes += region;
                     q.elastic_first[plane] = static_cast<std::size_t>(
                         static_cast<std::int64_t>(cache_layers) * q.expert_slots * stride);
                     q.elastic_bytes[plane] = static_cast<std::size_t>(
@@ -1439,9 +1443,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         std::max<std::uint32_t>(experts.stream_ring_slots, 512)),
                     static_cast<std::int32_t>(layer_base.size()),
                     static_cast<std::int32_t>(experts.elastic_columns)) > 0;
-            // The workspace is the lent layers' slots of the gate/up code plane (one contiguous
-            // region of the planar pool), the layers just below the ring.
-            constexpr auto lend_bytes = execution::Qwen4OffloadExperts::kLendPlaneBytes;
+            // The workspace is the lent layers' whole slots (one contiguous region of the
+            // slot-major pool), the layers just below the ring.
+            constexpr auto lend_bytes = execution::Qwen4OffloadExperts::kLendSlotBytes;
             const auto need_for       = [&](std::uint32_t width) {
                 SequencePlanImpl wide    = *impl;
                 wide.prefill_chunk       = width;
@@ -1852,6 +1856,11 @@ std::array<std::byte*, 4> Qwen4PersistentLayout::bind_pool(DeviceSpan backing) c
     std::array<std::byte*, 4> planes{};
     for (std::size_t q = 0; q < planes.size(); ++q) {
         planes[q] = static_cast<std::byte*>(cache_pool[q].bind(backing).data);
+    }
+    if (!gguf) {
+        // NVFP4: plane q of slot 0 inside the slot-major region 0.
+        const auto offsets = execution::Qwen4OffloadExperts::slot_plane_offsets();
+        for (std::size_t q = 1; q < planes.size(); ++q) { planes[q] = planes[0] + offsets[q]; }
     }
     return planes;
 }
