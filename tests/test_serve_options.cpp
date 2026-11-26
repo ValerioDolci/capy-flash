@@ -617,10 +617,11 @@ int main() {
     }
     // Hardware knobs (each also set by its NINFER_* variable when the flag is absent).
     {
-        failures += check(defaults.expert_cpus.empty() && !defaults.expert_exclusive_layers &&
-                              !defaults.gguf_hybrid_cost && defaults.kv_ram_region_tokens == 0 &&
-                              defaults.kv_ram_cache_blocks == 0,
-                          "a hardware knob is set by default");
+        failures +=
+            check(defaults.expert_cpus.empty() && !defaults.expert_exclusive_layers &&
+                      !defaults.gguf_hybrid_cost && !defaults.expert_half_life &&
+                      defaults.kv_ram_region_tokens == 0 && defaults.kv_ram_cache_blocks == 0,
+                  "a hardware knob is set by default");
         const auto h = parse({"ninfer-serve", "model.ninfer", "--expert-cpus", "0-3,8",
                               "--expert-exclusive-layers", "20", "--gguf-hybrid-cost", "30,2.5,80",
                               "--kv-ram-region-tokens", "131072", "--kv-ram-cache-blocks", "8192"});
@@ -637,6 +638,10 @@ int main() {
         failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-exclusive-layers", "0"})
                                   .expert_exclusive_layers == 0U,
                           "--expert-exclusive-layers 0 is not an explicit off");
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer", "--expert-half-life", "256"}).expert_half_life ==
+                256.0F,
+            "--expert-half-life did not reach serving options");
         int rejected = 0;
         for (const auto& bad : {std::vector<std::string>{"--expert-cpus", "1-"},
                                 std::vector<std::string>{"--expert-cpus", "x"},
@@ -645,14 +650,18 @@ int main() {
                                 std::vector<std::string>{"--gguf-hybrid-cost", "35,3.6,0"},
                                 std::vector<std::string>{"--gguf-hybrid-cost", "35,3.6,100,"},
                                 std::vector<std::string>{"--kv-ram-region-tokens", "0"},
-                                std::vector<std::string>{"--kv-ram-cache-blocks", "0"}}) {
+                                std::vector<std::string>{"--kv-ram-cache-blocks", "0"},
+                                std::vector<std::string>{"--expert-half-life", "0"},
+                                std::vector<std::string>{"--expert-half-life", "-128"},
+                                std::vector<std::string>{"--expert-half-life", "inf"},
+                                std::vector<std::string>{"--expert-half-life", "x"}}) {
             std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
             args.insert(args.end(), bad.begin(), bad.end());
             try {
                 (void)parse(args);
             } catch (const std::invalid_argument&) { ++rejected; }
         }
-        failures += check(rejected == 8, "an invalid hardware knob was accepted");
+        failures += check(rejected == 12, "an invalid hardware knob was accepted");
     }
     // Lossy prefill switches: off unless asked (each also set by its NINFER_* variable).
     {
