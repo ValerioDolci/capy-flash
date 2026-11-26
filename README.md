@@ -132,14 +132,19 @@ fails alone with a 400 that names the flag; the other requests keep their speed.
 Inkling 2 Mini (`Inkling2LoopForConditionalGeneration`) is a 128-expert mixture-of-experts model with a looped core.
 capy-flash runs its text part on two 16 GB GPUs from the original checkpoint: the NVFP4
 experts of layers 0-19 and the MXFP8 experts of layers 20-23 are copied into the artifact as they are, the dense
-weights keep their BF16 values, and nothing is requantized. The checkpoint's DSpark drafter is imported in BF16 the
-same way. The drafter leaves the generated text unchanged.
+weights keep their BF16 values, and nothing is requantized. The published artifact carries a fine-tuned version of the
+checkpoint's DSpark drafter (BF16, same architecture; 26 Nov 2026): decode +16 to +23 % on Italian prose and +5 to
++18 % on Italian coding requests, unchanged within 1.5 % in English
+([model card](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash)). The drafter leaves the generated text
+unchanged.
 
 - **What you need:** two `sm_120` GPUs with 16 GB, as for the other models; no special RAM or CPU (no expert runs
   on the CPU). Linux; the Windows and MSVC builds of this code are not verified.
 - **Weights:** `install.sh --model inkling2-mini` downloads the release and the artifact
-  [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash) (19.7 GB, with the drafter). To build
-  the same file yourself, convert the checkpoint
+  [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash) (19.7 GB, with the fine-tuned drafter).
+  Converting the checkpoint yourself gives the same file with the checkpoint's original drafter (revision
+  [`7c6104e`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash/tree/7c6104e983567bf4078f64c5b6bb3bbbb3531499)
+  of that repository): convert
   [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on the CPU (about half a
   minute), 20.2 GB for the checkpoint plus 19.7 GB for the artifact with the drafter; Python 3.11 with PyTorch
   and NumPy, from the repository root ([weight conversion](docs/weight-conversion.md#start-with-an-official-recipe)):
@@ -195,7 +200,7 @@ same way. The drafter leaves the generated text unchanged.
   [serving guide](docs/serving/capy-flash.md#on-inkling-2-mini).
 - **What it does:** chat over the same OpenAI and Anthropic endpoints, streaming, reasoning in its own field, tool
   calls, thinking budgets, stop strings, temperature / top-k (up to 20) / top-p / min-p and penalties, reuse of
-  the previous conversation's prefix (on the GPUs only), and speculative decoding with the checkpoint's drafter.
+  the previous conversation's prefix (on the GPUs only), and speculative decoding with the drafter.
   Reasoning cannot be switched off: `enable_thinking=false` selects the lowest effort. The chat template is the
   checkpoint's own.
 - **What it does not do (yet):** images (`--vision` is refused); `--spec dflash2` and `--lm-head-draft` (refused);
@@ -305,10 +310,10 @@ Ready to serve on Hugging Face (`install.sh --model` downloads one of these; eac
   (19.2 GB, the 27B for two GPUs with the DFlash2 drafter, `qwen3_8_27b_quasar_nvfp4_dflash2.ninfer`; the earlier 17.4 GB file
   without it stays there and decodes with MTP; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
 - [`Feyd89/Inkling-2-Mini-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Inkling-2-Mini-NVFP4-capy-flash)
-  (19.7 GB, Inkling 2 Mini with its drafter, for two GPUs): the released weights of
+  (19.7 GB, Inkling 2 Mini with a fine-tuned drafter, for two GPUs): the released weights of
   [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache-2.0)
-  repackaged without requantizing; the recipe `inkling2_mini` with `--components text,mtp` builds the same file
-  ([above](#inkling-2-mini)).
+  repackaged without requantizing; the recipe `inkling2_mini` with `--components text,mtp` builds the same file with
+  the checkpoint's original drafter ([above](#inkling-2-mini)).
 
 How the engine runs these models, every server flag, the RAM tiers, the chat template and the CPU threads:
 [docs/serving/capy-flash.md](docs/serving/capy-flash.md). Environment variables and diagnostics:
@@ -413,7 +418,8 @@ Strata reports), which is why it leads on the short benchmark. v0.6 against the 
 (2026-10-17): replay total 212 → 177 s, decode 118 → 155 tok/s.
 
 **Inkling 2 Mini.** Every Inkling number here is measured with the checkpoint's own weights: the NVFP4 and MXFP8
-experts as released and the dense weights in BF16, with no further quantization of weights, activations or KV.
+experts as released and the dense weights in BF16, with no further quantization of weights, activations or KV; the
+numbers with the drafter predate its fine-tune (26 Nov 2026) and use the checkpoint's drafter.
 Against llama.cpp on our machine, same day, two GPUs: capy-flash v0.16.0 from the server with those weights,
 llama.cpp `29b52d3` with `llama-bench -ngl 99 -fa on -ts 1/3` and the requantized `IQ4_NL` GGUF from ggml-org
 (measured in the morning session):
