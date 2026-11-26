@@ -30,6 +30,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -448,7 +449,8 @@ public:
 
     // grouped = true: moe_grouped_nvfp4 over the whole call; false: moe_slots_nvfp4 in slices.
     std::vector<float> run(const Call& c, const ops::MoeSlotPool& pool, bool grouped, int& failures,
-                           const std::string& label, bool benchmark = false) {
+                           const std::string& label, bool benchmark = false,
+                           const ops::MoeGroupedPieceDone* piece_done = nullptr) {
         const int T = c.tokens;
         table_.copy_from_host(c.table.data(), c.table.size() * sizeof(int));
         std::vector<std::uint16_t> xb(c.x.size());
@@ -463,7 +465,12 @@ public:
             Tensor tx(dx.p, DType::BF16, {kH, T}), ti(di.p, DType::I32, {kK, T}),
                 tw(dw.p, DType::FP32, {kK, T}), to(out.data(), DType::FP32, {kH, T});
             auto launch = [&] {
-                ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+                if (piece_done != nullptr) {
+                    ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_,
+                                           *piece_done);
+                } else {
+                    ops::moe_grouped_nvfp4(tx, ti, tw, l, pool, to, workspace_, stream_);
+                }
             };
             launch();
             if (benchmark) {
@@ -617,6 +624,41 @@ int piece_case(const Model& m, Runner& runner, const DevicePool& pool,
     return failures;
 }
 
+// (4b) Piece reports: a call with `piece_done` gives the bits of the call without it and reports
+// its pieces once each, in column order ([0, P), [P, 2P), [2P, T)); a call of at most one piece
+// reports [0, T) once.
+int piece_done_case(const Model& m, Runner& runner, const DevicePool& pool,
+                    const std::vector<std::vector<int>>& place) {
+    int failures = 0;
+    const int P  = ops::kMoeGroupedChunkColumns;
+    for (const int T : {2 * P + 77, 200}) {
+        Call c           = make_call(m, T, 620U + T);
+        c.table          = table_from(m, place);
+        c.a1             = 2688.0F / 4.5F * kDivisorJitter;
+        c.a2             = 2688.0F / 60.0F;
+        const auto plain = runner.run(c, pool.pool, true, failures, "reports plain");
+        std::vector<std::pair<int, int>> got;
+        const ops::MoeGroupedPieceDone done = [&](std::int32_t first, std::int32_t count) {
+            got.emplace_back(first, count);
+        };
+        const auto reported = runner.run(c, pool.pool, true, failures, "reports", false, &done);
+        failures += verify_exact(("piece reports T=" + std::to_string(T) + " == plain").c_str(),
+                                 reported, plain);
+        std::vector<std::pair<int, int>> want;
+        if (T <= P) {
+            want.emplace_back(0, T);
+        } else {
+            for (int b = 0; b < T; b += P) want.emplace_back(b, std::min(P, T - b));
+        }
+        if (got != want) {
+            std::cerr << "FAIL: piece reports T=" << T << ": " << got.size() << " reports, want "
+                      << want.size() << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 // (5) CUDA graph: one call captured; replays after the table, x and routing change reproduce the
 // eager results bit for bit.
 int graph_case(const Model& m, Runner& runner, const DevicePool& pool,
@@ -755,6 +797,7 @@ int main(int argc, char** argv) {
         failures += missing_case(m, runner, pool, place);
         failures += piece_case(m, runner, pool, place, 77, 600U);
         failures += piece_case(m, runner, pool, place, 0, 610U);
+        failures += piece_done_case(m, runner, pool, place);
         failures += graph_case(m, runner, pool, place);
         failures += validation_cases(m, runner, pool, place);
         if (failures != 0) {

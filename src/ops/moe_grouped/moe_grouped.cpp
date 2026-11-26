@@ -140,6 +140,13 @@ std::size_t moe_grouped_nvfp4_workspace_bytes(std::int32_t max_tokens) {
 void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
                        const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
                        WorkspaceArena& workspace, cudaStream_t stream) {
+    moe_grouped_nvfp4(x, routed_ids, routed_weights, layer, pool, out, workspace, stream, {});
+}
+
+void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& routed_weights,
+                       const MoeSlotsLayer& layer, const MoeSlotPool& pool, Tensor& out,
+                       WorkspaceArena& workspace, cudaStream_t stream,
+                       const MoeGroupedPieceDone& piece_done) {
     require_dense(x, DType::BF16, "x");
     const std::int32_t tokens = x.ne[1];
     require(tokens >= 1, "T must be positive");
@@ -233,7 +240,7 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         w.piece_job_columns = reinterpret_cast<std::int32_t*>(at(l.piece_job_columns));
         w.piece_job_slots   = reinterpret_cast<std::int32_t*>(at(l.piece_job_slots));
         w.piece_job_count   = reinterpret_cast<std::int32_t*>(at(l.piece_job_count));
-        detail::moe_grouped_wide_launch(w, stream);
+        detail::moe_grouped_wide_launch(w, stream, piece_done);
         return;
     }
     for (std::int32_t begin = 0; begin < tokens; begin += chunk) {
@@ -271,6 +278,7 @@ void moe_grouped_nvfp4(const Tensor& x, const Tensor& routed_ids, const Tensor& 
         c.grouped               = reinterpret_cast<float*>(base + layout.grouped);
         detail::moe_grouped_launch(c, stream);
     }
+    if (piece_done) { piece_done(0, tokens); }
 }
 
 } // namespace ninfer::ops

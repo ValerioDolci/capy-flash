@@ -770,7 +770,9 @@ void moe_grouped_launch(const MoeGroupedPiece& c, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
+void moe_grouped_wide_launch(
+    const MoeGroupedWide& w, cudaStream_t stream,
+    const std::function<void(std::int32_t first, std::int32_t count)>& piece_done) {
     const MoeGroupedPiece& c = w.call;
     const Jobs jobs{c.job_experts, c.job_columns, c.job_slots, c.job_count};
     group_launch(c.ids, c.columns, c.table, c.slots, c.counts, c.rank, c.offsets, jobs,
@@ -801,6 +803,7 @@ void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
         moe_grouping_merge_kernel<H, K><<<columns, H / 8, 0, stream>>>(
             c.grouped, w.piece_index, c.weights + k0, c.out + static_cast<std::int64_t>(begin) * H);
         CUDA_CHECK(cudaGetLastError());
+        if (piece_done) { piece_done(begin, columns); }
     }
 }
 
