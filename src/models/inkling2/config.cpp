@@ -218,10 +218,9 @@ bool is_inkling2(const artifact::Directory& directory) {
 
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     try {
-        if (options.vision || (options.speculative != SpeculativeBackend::None &&
-                               options.speculative != SpeculativeBackend::Mtp)) {
-            throw ArtifactError("only the Text backbone and its mtp drafter are implemented (no "
-                                "Vision or other speculative backend)");
+        if (options.vision) {
+            throw ArtifactError("only the Text backbone and its drafters are implemented (no "
+                                "Vision)");
         }
         if (options.purpose != EnginePurpose::Generation &&
             options.purpose != EnginePurpose::CausalScoring) {
@@ -229,12 +228,23 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         Config out{with_loop_contrast(parse_text_config(directory.component("text").config),
                                       options.loop_contrast),
-                   std::nullopt};
-        if (options.speculative == SpeculativeBackend::Mtp) {
-            // An artifact without the drafter decodes without it.
-            if (directory.components.contains("mtp")) {
-                out.draft = draft::parse_draft_config(directory.component("mtp").config, out.text);
-            }
+                   std::nullopt, std::nullopt};
+        // An artifact without the selected drafter decodes without it; --spec auto chooses between
+        // the two and needs both.
+        const bool paired = options.speculative == SpeculativeBackend::Auto;
+        if (paired &&
+            (!directory.components.contains("mtp") || !directory.components.contains("dflash2"))) {
+            throw ArtifactError("--spec auto needs an artifact with both drafters (the mtp and "
+                                "dflash2 components)");
+        }
+        if ((options.speculative == SpeculativeBackend::Mtp || paired) &&
+            directory.components.contains("mtp")) {
+            out.draft = draft::parse_draft_config(directory.component("mtp").config, out.text);
+        }
+        if ((options.speculative == SpeculativeBackend::DFlash2 || paired) &&
+            directory.components.contains("dflash2")) {
+            out.dflash2 =
+                draft::parse_dflash2_config(directory.component("dflash2").config, out.text);
         }
         return out;
     } catch (const std::exception& error) {

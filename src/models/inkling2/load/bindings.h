@@ -50,6 +50,9 @@ private:
 // The drafter of the `mtp` component (weights.h, mtp/ names).
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const draft::DraftConfig& config,
                                       const TextConfig& text);
+// The DFlash2 drafter of the `dflash2` component (weights.h, dflash2/ names).
+[[nodiscard]] DFlash2Weights bind_dflash2(Bindings& bindings, const draft::DFlash2Config& config,
+                                          const TextConfig& text);
 
 // The views of one device; a HostFile parameter keeps an empty view, as below.
 [[nodiscard]] std::vector<BoundWeight>

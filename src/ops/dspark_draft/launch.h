@@ -68,8 +68,8 @@ void context_kv_store_launch(const StoreLayers& layers, int count_layers, int kv
                              float eps, cudaStream_t stream);
 void block_attention_launch(const void* qkv, int rows, int query_heads, int kv_heads, int block,
                             const void* k_cache, const void* v_cache, int capacity,
-                            const int* frontier, int window, float scale, float* partial, void* out,
-                            cudaStream_t stream);
+                            const int* frontier, int window, bool sliding, float scale,
+                            float* partial, void* out, cudaStream_t stream);
 void add_rmsnorm_launch(void* residual, const void* y, const void* weight, int hidden, int tokens,
                         float eps, void* out, cudaStream_t stream);
 void recurrent_head_context_launch(const void* weight, int in, int rank, const void* bias,

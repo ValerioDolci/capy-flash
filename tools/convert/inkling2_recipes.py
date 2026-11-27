@@ -18,12 +18,17 @@ its rows of every block, in this order.
 The DSpark drafter (component ``mtp``) keeps its BF16 words and stacks, per layer, the query, key
 and value rows (one input), the context key and value rows (one input) and the MLP gate and up
 rows (one input), with the same head- or half-split per block.
+
+The DFlash2 drafter (component ``dflash2``) stores its projections Q8 (``q8_g32_fp16``, group absmax),
+as the official Qwen recipes store theirs, except the convolution kernel projections and the
+selector's hidden projection (BF16). Per layer the query, key and value rows form one parent (the
+key and value rows also project the context) and the MLP gate and up rows another.
 """
 
 from __future__ import annotations
 
-from tools.convert.methods import import_encoded
-from tools.convert.official_recipes import MXFP8, import_verbatim
+from tools.convert.methods import grouped_absmax, import_encoded
+from tools.convert.official_recipes import MXFP8, Q8, import_verbatim
 
 
 def inkling2_mini(model, recipe, sources):
@@ -54,4 +59,13 @@ def inkling2_mini(model, recipe, sources):
         a = prefix + "/attention/"
         recipe.group([a + "query", a + "key", a + "value"])
         recipe.group([a + "context_key", a + "context_value"])
+        recipe.group([prefix + "/mlp/gate", prefix + "/mlp/up"])
+    dflash2 = [name for name in model.parameters if name.startswith("dflash2/")]
+    for name in dflash2:
+        if model.parameters[name].projection and not name.endswith(
+            ("/kernel_projection", "/candidate_selector/hidden_projection")
+        ):
+            recipe.assign(name, format=Q8, method=grouped_absmax)
+    for prefix in sorted({name.rsplit("/attention/", 1)[0] for name in dflash2 if "/attention/" in name}):
+        recipe.group([prefix + "/attention/" + role for role in ("query", "key", "value")])
         recipe.group([prefix + "/mlp/gate", prefix + "/mlp/up"])

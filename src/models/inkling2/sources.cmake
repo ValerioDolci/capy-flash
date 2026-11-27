@@ -11,7 +11,9 @@ target_sources(ninfer_model_loading PRIVATE
 )
 
 target_sources(ninfer_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/draft/dflash2.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/draft/draft.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/draft/paired.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/draft/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"

@@ -16,15 +16,17 @@
 //   (iii) no common prefix: an unrelated request evicts the resident sequence and starts from root
 //
 // With --spec K the Program decodes by speculative rounds with the artifact's drafter (--spec mtp
-// --draft-tokens K): the anchor image and the endpoint then carry the drafter's context too, and
-// the criterion is the same (the target verifies every token).
+// --draft-tokens K; with --dflash2 1 its DFlash2 drafter, --spec dflash2; with --auto 1 both,
+// --spec auto): the anchor image and the endpoint then carry the drafters' contexts too, and the
+// criterion is the same (the target verifies every token).
 //
 // With --loopcd MODE [--loopcd-omega W] [--loopcd-pass B] the model runs with that loop contrast
 // (EngineOptions::loop_contrast; W as in ninfer-serve): the Logits contrast's reference slots are
 // part of the images.
 //
 // Usage: ninfer_inkling2_prefix_reuse_test --artifact X.ninfer [--tp 2] [--prefill-chunk N]
-//        [--spec K] [--loopcd hidden|logits|adaptive [--loopcd-omega W] [--loopcd-pass B]].
+//        [--spec K [--dflash2 1 | --auto 1]] [--loopcd hidden|logits|adaptive [--loopcd-omega W]
+//        [--loopcd-pass B]].
 // Without --artifact it skips (77).
 
 #include "ninfer/engine.h"
@@ -107,6 +109,8 @@ int main(int argc, char** argv) {
     int tp                      = 2;
     std::uint32_t prefill_chunk = 1024;
     std::uint32_t draft_tokens  = 0;
+    bool dflash2                = false;
+    bool paired                 = false;
     LoopContrastOptions contrast;
     std::optional<float> omega;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -119,6 +123,10 @@ int main(int argc, char** argv) {
             prefill_chunk = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
         } else if (option == "--spec") {
             draft_tokens = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+        } else if (option == "--dflash2") {
+            dflash2 = std::atoi(argv[i + 1]) != 0;
+        } else if (option == "--auto") {
+            paired = std::atoi(argv[i + 1]) != 0;
         } else if (option == "--loopcd") {
             const std::string_view mode = argv[i + 1];
             contrast.mode     = mode == "hidden" ? LoopContrast::Hidden : LoopContrast::Logits;
@@ -151,7 +159,9 @@ int main(int argc, char** argv) {
     options.prefill_chunk   = prefill_chunk;
     options.loop_contrast   = contrast;
     if (draft_tokens > 0) {
-        options.speculative.backend      = SpeculativeBackend::Mtp;
+        options.speculative.backend      = paired    ? SpeculativeBackend::Auto
+                                           : dflash2 ? SpeculativeBackend::DFlash2
+                                                     : SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = draft_tokens;
     }
     strict_bits = prefill_chunk == 1;

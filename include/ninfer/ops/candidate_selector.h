@@ -19,10 +19,11 @@ namespace ninfer::ops {
  *
  * For K in [1,15] and B in [1,8], the inputs are contiguous candidate_ids I32 [16,K,B],
  * unary_scores FP32 [16,K,B], projected_hidden BF16 [256,K,B], anchors I32 [B],
- * predecessor_codebook and successor_codebook BF16 [256,248320], base_positions I32 [B], and a
- * device-resident SamplingConfig[B]. Candidate rank is the fastest axis. The 16 candidate ids in
- * each row are distinct, and all candidate and anchor token ids lie in [0,248077); the registered
- * vocabulary, artifact binding, and linear_topk producer establish that trusted value contract.
+ * predecessor_codebook and successor_codebook BF16 [256,Vc] (one Vc, the vocabulary's codebook
+ * rows: 248320 for the Qwen DFlash2 drafters), base_positions I32 [B], and a device-resident
+ * SamplingConfig[B]. Candidate rank is the fastest axis. The 16 candidate ids in each row are
+ * distinct, and all candidate and anchor token ids lie in [0,Vc); the registered vocabulary,
+ * artifact binding, and candidate producer establish that trusted value contract.
  *
  * Starting with predecessor=anchors[b], each position i in [0,K) computes:
  *

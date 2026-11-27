@@ -85,6 +85,20 @@ constexpr std::array kShapes{
     ShapeEntry{4304, 1152, select_q8_generic},
     ShapeEntry{1152, 4304, select_q8_generic},
     ShapeEntry{1152, 1536, select_q8_generic},
+    // The Inkling 2 Mini DFlash2 drafter (H 2304), on the generic routes: feature projection, then
+    // query|key|value, context key|value, attention output, gate|up and down at one device and
+    // the tp 2 shards.
+    ShapeEntry{2304, 9216, select_q8_generic},
+    ShapeEntry{6144, 2304, select_q8_generic},
+    ShapeEntry{2048, 2304, select_q8_generic},
+    ShapeEntry{2304, 4096, select_q8_generic},
+    ShapeEntry{13824, 2304, select_q8_generic},
+    ShapeEntry{2304, 6912, select_q8_generic},
+    ShapeEntry{3072, 2304, select_q8_generic},
+    ShapeEntry{1024, 2304, select_q8_generic},
+    ShapeEntry{2304, 2048, select_q8_generic},
+    ShapeEntry{6912, 2304, select_q8_generic},
+    ShapeEntry{2304, 3456, select_q8_generic},
 };
 } // namespace
 

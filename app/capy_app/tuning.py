@@ -1,7 +1,8 @@
-"""Tune the engine to this machine: measure the settings that do not change the output, keep what is faster.
+"""Tune the engine to this machine: measure the settings that keep the precision, keep what is faster.
 
-Policy: only lossless settings are ever tried (catalog.LOSSLESS_SETTINGS). The speed switches that change the
-numbers (catalog.LOSSY_ENV) are never set.
+Policy: only lossless settings are ever tried (catalog.LOSSLESS_SETTINGS): they keep the precision of the weights
+and of every operation, and can change the output's bits only through the order of the operations or where they
+run (one or two GPUs). The speed switches that lower a precision (catalog.LOSSY_ENV) are never set.
 
 The benchmark is short and fixed: the same prompts every time, temperature 0, thinking off, and the server's own
 timings (prefill and decode rates from `timings`), so two runs on one machine are comparable.

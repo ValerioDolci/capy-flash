@@ -57,4 +57,43 @@ public:
 // KV heads and the MLP width divided by tp.
 [[nodiscard]] DraftConfig shard_draft_config(const DraftConfig& config, int tp);
 
+// The DFlash2 drafter's operands on one rank. At tp 2 a rank holds its query and KV heads of every
+// layer (query|key|value rows, output columns) and half of the MLP; the context's key|value rows
+// are the same parent's rows. Everything else is replicated: the feature projection, the norms, the
+// convolutions, the selector's projection and codebooks.
+struct DFlash2ConvParameters {
+    Tensor base_kernel;                 // BF16 [2, 2, H] (ne {H, taps, sides})
+    LinearParameters kernel_projection; // BF16 [4G, H]
+};
+
+struct DFlash2LayerParameters {
+    Tensor input_norm, post_attention_norm; // BF16 [H]
+    Tensor query_norm, key_norm;            // BF16 [D]
+    // The rank's query|key|value rows [(nh_r + 2 nkv_r) D, H] and, of the same parent, its
+    // key|value rows [2 nkv_r D, H] (the context projection).
+    LinearParameters attention_input, context;
+    LinearParameters output;        // [H, nh_r D]
+    LinearParameters gate_up, down; // [2 F_r, H], [H, F_r]
+    DFlash2ConvParameters attention_conv, mlp_conv;
+};
+
+class DFlash2Parameters {
+public:
+    // Requires the Model to carry the DFlash2 drafter. `config` is the rank's geometry
+    // (shard_dflash2_config).
+    DFlash2Parameters(const Model& source, int device, const DFlash2Config& config);
+    DFlash2Parameters(const DFlash2Parameters&)            = delete;
+    DFlash2Parameters& operator=(const DFlash2Parameters&) = delete;
+
+    const Model& model;
+    const int device;
+    LinearParameters feature_projection; // Q8 [H, 4H]
+    Tensor context_norm, final_norm;     // BF16 [H]
+    std::vector<DFlash2LayerParameters> layers;
+    LinearParameters hidden_projection;              // BF16 [r, H]
+    Tensor predecessor_codebook, successor_codebook; // BF16 [V, r]
+};
+
+[[nodiscard]] DFlash2Config shard_dflash2_config(const DFlash2Config& config, int tp);
+
 } // namespace ninfer::models::inkling2::draft

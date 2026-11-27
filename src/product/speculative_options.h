@@ -11,6 +11,7 @@ namespace ninfer::product {
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "auto") { return SpeculativeBackend::Auto; }
     if (value == "off" || value == "none") { return SpeculativeBackend::None; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
@@ -32,6 +33,8 @@ inline void set_speculative_backend(SpeculativeOptions& options, std::string_vie
         return "mtp";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::Auto:
+        return "auto";
     }
     return "unknown";
 }
@@ -73,6 +76,16 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         if (options.adaptive_drafts != 0 && options.adaptive_drafts < options.draft_tokens) {
             throw std::invalid_argument("--adaptive-draft must be at least --draft-tokens");
+        }
+        return;
+    case SpeculativeBackend::Auto:
+        if (options.draft_tokens == 0 || options.draft_tokens > 7) {
+            throw std::invalid_argument("--spec auto requires --draft-tokens in [1,7]");
+        }
+        if (options.prompt_lookup || options.adaptive_drafts != 0 ||
+            options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument(
+                "--spec auto takes no --prompt-lookup, --adaptive-draft or --lm-head-draft");
         }
         return;
     }

@@ -168,14 +168,61 @@ LogicalShard draft_shard(std::string_view name, const artifact::Shape& shape,
     reject(name, "has no placement for this parameter");
 }
 
+LogicalShard dflash2_shard(std::string_view name, const artifact::Shape& shape,
+                           const draft::DFlash2Config* d, int tp) {
+    if (d == nullptr) { reject(name, "names a DFlash2 parameter without the drafter's config"); }
+    constexpr std::string_view layers = "dflash2/layers/";
+    if (name.starts_with(layers)) {
+        const auto slash = name.find('/', layers.size());
+        if (slash == std::string_view::npos ||
+            number(name, name.substr(layers.size(), slash - layers.size())) >= d->num_layers) {
+            reject(name, "names no drafter layer");
+        }
+        const auto leaf = name.substr(slash + 1);
+        if (leaf == "attention/query") {
+            return even(name, ShardAxis::Rows, leading(name, shape), d->num_attention_heads, tp);
+        }
+        if (leaf == "attention/key" || leaf == "attention/value") {
+            return even(name, ShardAxis::Rows, leading(name, shape), d->num_key_value_heads, tp);
+        }
+        if (leaf == "attention/output") {
+            return even(name, ShardAxis::Columns, trailing(name, shape), d->num_attention_heads,
+                        tp);
+        }
+        if (leaf == "mlp/gate" || leaf == "mlp/up") {
+            const auto rows = leading(name, shape);
+            return even(name, ShardAxis::Rows, rows, rows, tp);
+        }
+        if (leaf == "mlp/down") {
+            const auto columns = trailing(name, shape);
+            return even(name, ShardAxis::Columns, columns, columns, tp);
+        }
+        if (leaf == "input_norm" || leaf == "post_attention_norm" ||
+            leaf == "attention/query_norm" || leaf == "attention/key_norm" ||
+            leaf.starts_with("attention_conv/") || leaf.starts_with("mlp_conv/")) {
+            return whole(ShardAxis::Replicated);
+        }
+        reject(name, "has no placement for this parameter");
+    }
+    if (name == "dflash2/feature_projection" || name == "dflash2/context_norm" ||
+        name == "dflash2/final_norm" || name.starts_with("dflash2/candidate_selector/")) {
+        return whole(ShardAxis::Replicated);
+    }
+    reject(name, "has no placement for this parameter");
+}
+
 LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, const TextConfig& c,
-                        const LoadOptions& options, const draft::DraftConfig* draft) {
-    if (options.embedding_host && name == "text/token_embedding") {
+                        const LoadOptions& options, const draft::DraftConfig* draft,
+                        const draft::DFlash2Config* dflash2) {
+    if (options.embedding_host && (name == "text/token_embedding" ||
+                                   name == "dflash2/candidate_selector/predecessor_codebook" ||
+                                   name == "dflash2/candidate_selector/successor_codebook")) {
         return whole(ShardAxis::HostMapped);
     }
     const int tp = options.tp;
     if (tp == 1) { return {}; }
     if (name.starts_with("mtp/")) { return draft_shard(name, shape, draft, tp); }
+    if (name.starts_with("dflash2/")) { return dflash2_shard(name, shape, dflash2, tp); }
     if (name == "text/token_embedding" || name == "text/embedding_norm" ||
         name == "text/final_queries" || name == "text/final_norm") {
         return whole(ShardAxis::Replicated);
@@ -265,15 +312,16 @@ void merge_axis(ParentState& state, const LogicalShard& shard, const std::string
 
 LogicalShard logical_shard(std::string_view name, const artifact::Shape& shape,
                            const TextConfig& config, const LoadOptions& options,
-                           const draft::DraftConfig* draft) {
+                           const draft::DraftConfig* draft, const draft::DFlash2Config* dflash2) {
     validate_tp(options);
-    return shard_rule(name, shape, config, options, draft);
+    return shard_rule(name, shape, config, options, draft, dflash2);
 }
 
 std::vector<std::optional<artifact::ShardPlacement>>
 parent_placements(std::span<const PendingWeight> weights, std::size_t object_count,
                   const GeometryLookup& geometry, const TextConfig& config,
-                  const LoadOptions& options, const draft::DraftConfig* draft) {
+                  const LoadOptions& options, const draft::DraftConfig* draft,
+                  const draft::DFlash2Config* dflash2) {
     validate_tp(options);
     std::vector<ParentState> states(object_count);
     std::vector<std::string> ids(object_count);
@@ -282,7 +330,7 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
         // The routed experts are mapped from the file and cut by the model (expert_banks.h).
         if (reference.residency == artifact::Residency::HostFile) { continue; }
         const auto& name      = reference.name;
-        const auto shard      = shard_rule(name, reference.shape, config, options, draft);
+        const auto shard      = shard_rule(name, reference.shape, config, options, draft, dflash2);
         const auto row        = row_elements(reference.shape);
         std::uint64_t logical = 0; // Logical element offset of the current part.
         for (std::size_t i = 0; i < reference.binding.parts.size(); ++i) {
@@ -354,7 +402,7 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
 
 void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWeight> weights,
                             const TextConfig& config, const LoadOptions& options,
-                            const draft::DraftConfig* draft) {
+                            const draft::DraftConfig* draft, const draft::DFlash2Config* dflash2) {
     if (options.tp == 1 && !options.embedding_host) { return; }
     if (binder.device_count() != options.tp) {
         throw std::logic_error("Binder device count differs from tensor parallelism");
@@ -365,7 +413,7 @@ void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWei
         [&](artifact::ObjectHandle object) -> const WeightGeometry& {
             return reader.geometry(object);
         },
-        config, options, draft);
+        config, options, draft, dflash2);
     binder.set_shard_resolver([placements = std::move(placements),
                                &reader](artifact::ObjectHandle object, const WeightGeometry&) {
         const auto& placement = placements.at(object.index);

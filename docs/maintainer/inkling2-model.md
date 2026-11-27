@@ -23,7 +23,7 @@ The upstream authority is the Transformers implementation `models/inkling2_loop`
 |---|---|
 | Text generation and CausalScoring through the public Engine (`ninfer-serve`, `ninfer-perplexity`) | Vision (`--vision` is refused at startup) |
 | `--tp 1` and `--tp 2`; the released model's weights need two 16 GB boards, synthetic checkpoints run at either width | `--kv-dtype` other than `bf16` |
-| Speculative decoding with the checkpoint's DSpark drafter (artifact component `mtp`): `--spec mtp --draft-tokens K` (off by default in the server, K = 3 in `capy-serve-inkling2-mini.sh`), on greedy and sampled rows | `--spec dflash2`, `--lm-head-draft` |
+| Speculative decoding with the checkpoint's DSpark drafter (artifact component `mtp`): `--spec mtp --draft-tokens K` (off by default in the server, K = 3 in `capy-serve-inkling2-mini.sh`), or with a DFlash2 drafter (component `dflash2`): `--spec dflash2 --draft-tokens K`, or with both and the one that proposes (or none) chosen every round: `--spec auto --draft-tokens K`; on greedy and sampled rows | `--lm-head-draft`, `--adaptive-draft` |
 | One request at a time (`--max-concurrency 1`); further requests queue | Concurrent requests, decode batches of more than one row |
 | Prefix reuse on the one lane: the finished sequence's endpoint and its prompt-end anchor, device only | Shared prefixes, several catalogued conversations, `Retain` sources, Host and disk tiers (`--disk-cache-dir` is refused) |
 | Greedy decoding and host sampling (temperature, top-k up to 20, top-p, min-p, presence and frequency penalties) | Structured output and grammars |
@@ -35,9 +35,11 @@ The upstream authority is the Transformers implementation `models/inkling2_loop`
 The refusals live in `parse_config` ([`config.cpp`](../../src/models/inkling2/config.cpp)),
 `validate_options` ([`instance.cpp`](../../src/models/inkling2/instance.cpp)) and the frontend.
 The Program accepts K from 1 to 7 (the drafter's block of 8 holds the anchor and 7 proposals);
-the server's command line accepts 1 to 5 for `--spec mtp`, as for the Qwen models
+the server's command line accepts 1 to 5 for `--spec mtp`, as for the Qwen models, 1 to 15 for
+`--spec dflash2` and 1 to 7 for `--spec auto`
 ([`speculative_options.h`](../../src/product/speculative_options.h)). An artifact without the
-`mtp` component starts with `--spec mtp` and decodes without a drafter.
+selected component (`mtp`, `dflash2`) starts and decodes without a drafter; `--spec auto` refuses an
+artifact without both.
 
 ## Configuration
 
@@ -297,6 +299,17 @@ output projection by columns, `mlp/gate` and `mlp/up` by rows and `mlp/down` by 
 `markov/folded_{output,bias}` by vocabulary rows like `text/output_head`; norms, mixing weights,
 the mask embedding, the recurrent token embedding and the recurrence are replicated.
 
+A DFlash2 block drafter (`incoai/Inkling-2-Mini-DFlash2`) converts from its own checkpoint as the
+optional component `dflash2` (`--components text,dflash2 --source dflash2=DIR`;
+`DFlash2DraftModel`, `inkling2_dflash2`). `parse_dflash2_config` checks the supported geometry
+(D 128, block 8, two convolution taps in groups of 16, selector rank 256 over 16 candidates, the
+Text component's soft cap after the selector's correction, sliding attention on every layer) and
+reads the same four states as DSpark. The recipe stores its projections Q8 (`q8_g32_fp16`) except
+the convolutions' kernel projections and the selector's hidden projection (BF16), and stacks
+`query|key|value` (the key and value rows are also the context's projection: two uses) and
+`mlp/gate|up` per layer. At tp 2 its layers split like DSpark's; the feature projection, norms,
+convolutions and selector are replicated.
+
 ### Regenerating and checking an artifact
 
 `inkling2_mini` is an official recipe (`tools/convert/official_recipes.py`, which delegates to
@@ -338,7 +351,7 @@ block in order.
 | Rows by vocabulary (100,029 per rank) | `text/output_head` |
 | Rows / columns by intermediate channels | `moe/experts/*`: every expert at half its intermediate width F on each rank (gate and up rows [r·F/2, (r+1)·F/2), the matching `down` columns), cut by the model at load (`load/expert_banks.h`) |
 | Replicated | embedding and norms, block-residual, message and final queries, message gates, router and bias, `relative_profile`, post-attention and post-FFN convolutions |
-| HostMapped (`--embedding-host`, at tp 1 too) | `text/token_embedding`: one copy in mapped page-locked host memory that both ranks read in place |
+| HostMapped (`--embedding-host`, at tp 1 too) | `text/token_embedding` and the DFlash2 selector's codebooks: one copy in mapped page-locked host memory that both ranks read in place |
 
 At tp 1 every parameter is whole on device 0 and the rank holds both banks.
 `shard_text_config` ([`execution/tp.cpp`](../../src/models/inkling2/execution/tp.cpp)) halves the
@@ -524,9 +537,74 @@ one device or split over two ranks; its Ops are in
 - **Prefix reuse.** The prompt anchor's image also holds the drafter's local rings and its
   recurrent state; the global layer's cache is per position, like the target's global K/V.
 
+### The DFlash2 drafter
+
+[`draft/dflash2.h`](../../src/models/inkling2/draft/dflash2.h) holds the DFlash2 drafter in the
+same form (both implement [`draft/proposer.h`](../../src/models/inkling2/draft/proposer.h), the
+round's and the execution's view of a drafter); its own Ops are in
+[`dflash2_draft.h`](../../include/ninfer/ops/dflash2_draft.h).
+
+- **Context.** The pending features of a column, concatenated, go through the feature projection
+  and its norm into one context vector per position; every layer projects it by its key and value
+  rows, norms and rotates the keys (`context_kv_store`, RoPE θ 10⁴) into a ring of
+  `sliding_window` (2048) positions.
+- **Proposal.** One forward of [anchor, mask × 7] (the Text component's normed embeddings) through
+  five layers: around attention and MLP the input norm, the kernel projection of the normed input,
+  its grouped dynamic convolution (`dynamic_conv_input`), the sublayer and the output-side
+  convolution added to the residual (`dynamic_conv_output_add`). Attention is non-causal over the
+  block, and column b at P + b sees the cached positions p with P + b − p < 2048
+  (`sliding_block_attention`). Columns 1 .. 7 after the final norm score the output head; their 16
+  best rows (`vocab_top16_slots`/`_merge`) and the selector's projection walk greedily from the
+  anchor (`candidate_selector_path`). The soft cap after the selector's correction is monotone,
+  so the walk does not apply it.
+- **Tensor parallelism.** Heads, MLP halves and the output head's vocabulary rows per rank; the
+  output and down projections exchange once each, the candidates once (each rank's 16 best of each
+  column as FP32 pairs in an all-reduce). Both ranks walk the same candidates.
+- **Prefix reuse.** The prompt anchor's image holds every layer's ring.
+
+### Both drafters (`--spec auto`)
+
+With both components the execution builds both drafters, the DFlash2 one on the DSpark one's
+pending features (the forward writes them once), and a
+[`PairedProposer`](../../src/models/inkling2/draft/paired.h) per proposing drafter with its own
+verification round: one drafter proposes, the other follows (`Proposer::follow`: it takes the same
+pending features as context in the same graph, 0.05-0.08 ms per round), so either can propose the
+next round. Prefill, catch-up and anchor images reach both.
+
+Per lane, [`DrafterChoice`](../../src/models/inkling2/program/drafter_choice.h) picks the proposer
+of every round on the Host. DSpark proposes better exactly when the output copies text that only the
+context beyond the DFlash2 window (2048) holds, which its global layer sees; DFlash2 proposes better
+on free text and code at any context length. The signal is the share, over the last 16 generated
+tokens, of those whose 4-gram last occurred more than 2048 positions back; a request starts with
+DSpark when its prompt holds at least 2048 tokens, DFlash2 otherwise, moves to DSpark from a share of
+0.2 and back to DFlash2 at 0.05 or below. The constants come from a simulation over per-anchor traces
+of both drafters and the measured round costs; one hash map per lane (4-gram to its last position)
+holds the bookkeeping. The pair costs device memory: about 0.41 GiB more weights per rank (the
+DFlash2 drafter, its selector's codebooks replicated); with `--embedding-host` the codebooks (196
+MiB) move to the host copy ([Embedding in host memory](embedding-host.md)) and the largest
+context with LoopCD and `--prefill-chunk 4096` stays at 229,376, as with `--spec mtp` (221,184
+with the codebooks in VRAM).
+
+The third choice is no drafter. Each drafter keeps an exponential mean (weight 0.1) of the drafts
+its rounds accepted; after 8 rounds of the drafter that ran, a lane takes ordinary steps while one
+plus that mean is below 0.91 times the time of a K = 3 round over an ordinary step's (2.03 at short
+contexts, 2.16 from about 4k tokens, measured on two RTX 5070 Ti with LoopCD), and every 16 ordinary
+steps one round of the drafter chosen above renews the mean. Sampled free writing at 11k-22k tokens
+accepts about 0.9 drafts per round, where a round costs more than the tokens it gains: there the
+lane decodes as fast as without a drafter, and it drafts again when the drafts are accepted.
+
+Ordinary steps feed both drafters, so that any round can follow them. The decode step of a paired
+execution (its graph, or the same body eagerly without CUDA Graphs) writes the token's four states
+into a one-column staging buffer and appends them to the shared pending features at the pending
+count (a device word the step increments, then both drafters' counts take it): the drafters
+materialize every pending column at the next round, inside its graph when there are at most
+K + 1 of them, otherwise eagerly before it (`Proposer::catch_up`, as before a prefill call).
+Materializing at every step would cost 0.13 ms per step (2 % at long contexts); the append costs
+a few microseconds and the catch-up about 0.3 ms per 16 steps.
+
 ### Speculative decoding
 
-With a drafter (`--spec mtp --draft-tokens K` and an artifact with `mtp`), `ForwardExecution`
+With a drafter (`--spec mtp|dflash2 --draft-tokens K` and an artifact with the component), `ForwardExecution`
 owns the drafter and one `VerifyRound` of fixed K, whose graph also runs the drafter: it
 materializes the context the last call licensed, writes the K proposals over the record's drafts,
 and the forward fills the next pending features. `ProgramImpl::speculative_extent` decides per

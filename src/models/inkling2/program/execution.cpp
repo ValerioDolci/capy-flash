@@ -4,7 +4,9 @@
 #include "core/device.h"
 #include "core/device_scope.h"
 #include "core/layout.h"
+#include "models/inkling2/draft/dflash2.h"
 #include "models/inkling2/draft/draft.h"
+#include "models/inkling2/draft/paired.h"
 #include "models/inkling2/draft/parameters.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
@@ -17,11 +19,14 @@
 #include "core/decode_graph.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/peer_mailbox.h"
+#include "ninfer/ops/scalar.h"
+#include "ninfer/ops/scatter.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -226,7 +231,7 @@ public:
             CUDA_CHECK(cudaStreamSynchronize(stream(r)));
         }
         if (drafter_) { drafter_->clear_pending(); }
-        pending_width_ = 0;
+        forget_pending();
     }
 
     void save_image(std::uint32_t lane) override {
@@ -237,22 +242,34 @@ public:
     void restore_image(std::uint32_t lane) override {
         copy_image(lane, false);
         if (drafter_) { drafter_->restore_image(); }
-        pending_width_ = 0;
+        forget_pending();
     }
 
     std::uint32_t draft_tokens() const noexcept override {
         return drafter_ ? layout_.draft_tokens : 0U;
     }
 
+    bool paired_drafters() const noexcept override { return pairs_[1] != nullptr; }
+
+    std::optional<StartupCosts> startup_costs() const override { return startup_costs_; }
+
     std::vector<TokenId> speculate(std::uint32_t lane, TokenId anchor, std::uint32_t frontier,
                                    std::uint32_t extent, const ResolvedSamplingParameters& select,
-                                   std::span<const TokenId> generated) override {
+                                   std::span<const TokenId> generated,
+                                   SpeculativeBackend drafter) override {
         require_lane(lane);
         if (!drafter_ || extent > layout_.draft_tokens ||
             frontier + layout_.draft_tokens + 1U > layout_.capacity) {
             throw std::logic_error("Inkling 2 speculative round outside its planned extent");
         }
-        if (!round_) {
+        // Paired drafters: round 0 is DSpark's (pairs_[0], also drafter_), round 1 DFlash2's. The
+        // round materializes at most its own width of pending columns; ordinary steps may have
+        // left more.
+        const std::size_t which =
+            paired_drafters() && drafter == SpeculativeBackend::DFlash2 ? 1 : 0;
+        if (pending_columns_ > std::int32_t(layout_.draft_tokens) + 1) { catch_up(frontier); }
+        auto& round = rounds_[which];
+        if (!round) {
             transport();
             std::array<speculative::RoundRank, 2> ranks{};
             for (int r = 0; r < tp_; ++r) {
@@ -264,19 +281,23 @@ public:
                                 .state      = state_[at(r)].get(),
                                 .prefetch   = prefetch_[at(r)].get()};
             }
-            round_ = std::make_unique<speculative::VerifyRound>(
+            round = std::make_unique<speculative::VerifyRound>(
                 config_, ranks, tp_,
                 exec::ForwardCollectives{&execution_, events_ ? &*events_ : nullptr},
                 bridge_ ? &*bridge_ : nullptr, layout_.draft_tokens,
-                std::int32_t(layout_.forward_tokens), max_logits_, drafter_.get());
+                std::int32_t(layout_.forward_tokens), max_logits_,
+                which == 1 ? pairs_[1].get() : drafter_.get());
         }
-        speculative::VerifyIngress& in = round_->ingress();
+        last_round_                    = round.get();
+        speculative::VerifyIngress& in = round->ingress();
         in.anchor                      = anchor;
         in.frontier                    = static_cast<std::int32_t>(frontier);
         in.extent                      = static_cast<std::int32_t>(extent);
-        round_->launch(layout_.cuda_graph);
+        round->launch(layout_.cuda_graph);
         pending_width_                       = std::int32_t(layout_.draft_tokens) + 1;
-        const speculative::VerifyEgress& out = round_->egress();
+        fed_synced_                          = false;
+        const speculative::VerifyEgress& out = round->egress();
+        pending_columns_                     = out.count;
         if (!host_choice(select)) {
             return {out.licensed.begin(), out.licensed.begin() + out.count};
         }
@@ -290,7 +311,7 @@ public:
                                           V * (std::size_t(extent) + 1U));
         {
             const ScopedCurrentDevice scope(execution_.dev[0]->device);
-            CUDA_CHECK(cudaMemcpy(sampled_->data(), round_->capped().data, host.size() * 4,
+            CUDA_CHECK(cudaMemcpy(sampled_->data(), round->capped().data, host.size() * 4,
                                   cudaMemcpyDeviceToHost));
         }
         std::vector<TokenId> history(generated.begin(), generated.end());
@@ -303,15 +324,19 @@ public:
             history.push_back(token);
         }
         if (static_cast<std::int32_t>(taken.size()) != out.count) {
-            round_->recommit(static_cast<std::int32_t>(taken.size()));
+            round->recommit(static_cast<std::int32_t>(taken.size()));
+            pending_columns_ = static_cast<std::int32_t>(taken.size());
         }
         return taken;
     }
 
     void settle(std::uint32_t lane, std::uint32_t committed) override {
         require_lane(lane);
-        if (!round_) { throw std::logic_error("Inkling 2 settle without a speculative round"); }
-        round_->recommit(static_cast<std::int32_t>(committed));
+        if (last_round_ == nullptr) {
+            throw std::logic_error("Inkling 2 settle without a speculative round");
+        }
+        last_round_->recommit(static_cast<std::int32_t>(committed));
+        pending_columns_ = static_cast<std::int32_t>(committed);
     }
 
     std::optional<TokenId> prefill(std::uint32_t lane, std::span<const TokenId> tokens,
@@ -328,7 +353,7 @@ public:
                    const ResolvedSamplingParameters& select,
                    std::span<const TokenId> generated) override {
         require_lane(lane);
-        if (tokens.size() == 1 && layout_.cuda_graph) {
+        if (tokens.size() == 1 && (layout_.cuda_graph || paired_drafters())) {
             replay(tokens.front(), position);
             return choose(select, generated, position, true);
         }
@@ -428,8 +453,13 @@ public:
     TpTransportStatus tp_transport() const override {
         TpTransportStatus out;
         if (drafter_) {
-            out.drafter = "DSpark (mtp), " + std::to_string(layout_.draft_tokens) +
-                          " drafts per round" +
+            out.drafter = std::string(layout_.draft_backend == SpeculativeBackend::Auto
+                                          ? "DSpark (mtp) and DFlash2 (dflash2), chosen per round "
+                                            "(or neither), "
+                                      : layout_.draft_backend == SpeculativeBackend::DFlash2
+                                          ? "DFlash2 (dflash2), "
+                                          : "DSpark (mtp), ") +
+                          std::to_string(layout_.draft_tokens) + " drafts per round" +
                           (tp_ == 2 ? ", split by heads and vocabulary over 2 ranks" : "");
         }
         if (tp_ != 2) { return out; }
@@ -475,8 +505,69 @@ private:
         }
     }
 
-    // The drafter of the artifact's mtp component (--spec mtp), split like the target at tp 2.
+    // The drafter of the artifact's mtp component (--spec mtp) or dflash2 component (--spec
+    // dflash2), split like the target at tp 2; with --spec auto both, the DFlash2 drafter on the
+    // DSpark drafter's pending features, and one PairedProposer per proposing drafter.
     void create_drafter() {
+        if (layout_.draft_backend == SpeculativeBackend::Auto) {
+            create_dspark();
+            std::array<Tensor, 2> features;
+            for (int r = 0; r < tp_; ++r) {
+                features[at(r)] = parts_[0]->sink(r, max_draft_width())->features;
+            }
+            create_dflash2(features);
+            pairs_[0] = std::make_unique<draft::PairedProposer>(*parts_[0], *parts_[1]);
+            pairs_[1] = std::make_unique<draft::PairedProposer>(*parts_[1], *parts_[0]);
+            drafter_  = std::move(pairs_[0]);
+            for (int r = 0; r < tp_; ++r) {
+                const ScopedCurrentDevice scope(execution_.dev[at(r)]->device);
+                const Tensor& pending = features[at(r)];
+                features_[at(r)]      = pending;
+                staging_[at(r)] =
+                    std::make_unique<DeviceBuffer>(std::size_t(pending.ne[0]) * 4 * 2);
+                fed_[at(r)] = std::make_unique<DeviceBuffer>(8);
+                const std::array<std::int32_t, 2> words{0, 4};
+                fed_[at(r)]->copy_from_host(words.data(), sizeof(words));
+                fed_sinks_[at(r)] = {
+                    parts_[0]->sink(r, 1)->visits,
+                    Tensor(staging_[at(r)]->p, DType::BF16, {pending.ne[0], 1, 4})};
+            }
+            return;
+        }
+        if (layout_.draft_backend == SpeculativeBackend::DFlash2) {
+            create_dflash2({});
+            drafter_ = std::move(parts_[1]);
+            return;
+        }
+        create_dspark();
+        drafter_ = std::move(parts_[0]);
+    }
+
+    [[nodiscard]] std::int32_t max_draft_width() const {
+        return std::max<std::int32_t>(std::int32_t(layout_.prefill_chunk), 8);
+    }
+
+    void create_dflash2(std::array<Tensor, 2> features) {
+        const auto& dflash2 = parameters_[0]->model.config().dflash2;
+        if (!dflash2) { throw std::logic_error("Inkling 2 draft tokens without a drafter"); }
+        dflash2_config_ = draft::shard_dflash2_config(*dflash2, tp_);
+        std::array<draft::DFlash2Rank, 2> ranks{};
+        for (int r = 0; r < tp_; ++r) {
+            const ScopedCurrentDevice scope(execution_.dev[at(r)]->device);
+            dflash2_parameters_[at(r)] = std::make_unique<draft::DFlash2Parameters>(
+                parameters_[at(r)]->model, r, dflash2_config_);
+            ranks[at(r)] = {&dflash2_config_, dflash2_parameters_[at(r)].get(), parameters_[at(r)],
+                            stream(r), execution_.dev[at(r)]->device};
+        }
+        parts_[1] = std::make_unique<draft::DFlash2Drafter>(
+            *dflash2, ranks, tp_,
+            exec::ForwardCollectives{&execution_, events_ ? &*events_ : nullptr},
+            std::max<std::int32_t>(std::int32_t(layout_.prefill_chunk),
+                                   std::int32_t(dflash2->block_size)),
+            layout_.context_cache, features);
+    }
+
+    void create_dspark() {
         const auto& draft = parameters_[0]->model.config().draft;
         if (!draft) { throw std::logic_error("Inkling 2 draft tokens without a drafter"); }
         draft_config_ = draft::shard_draft_config(*draft, tp_);
@@ -488,7 +579,7 @@ private:
             ranks[at(r)] = {&draft_config_, draft_parameters_[at(r)].get(), parameters_[at(r)],
                             stream(r), execution_.dev[at(r)]->device};
         }
-        drafter_ = std::make_unique<draft::Drafter>(
+        parts_[0] = std::make_unique<draft::Drafter>(
             *draft, config_, ranks, tp_,
             exec::ForwardCollectives{&execution_, events_ ? &*events_ : nullptr},
             std::max<std::int32_t>(std::int32_t(layout_.prefill_chunk),
@@ -542,11 +633,8 @@ private:
                                        .positions  = &position_tensors[at(r)],
                                        .prefetch   = prefetch_[at(r)].get()};
         }
-        // The drafter's context of the last round first: this call's features replace them.
-        if (feed && drafter_ && pending_width_ > 0) {
-            drafter_->catch_up(std::int32_t(position), pending_width_);
-            pending_width_ = 0;
-        }
+        // The drafter's context of the last calls first: this call's features replace them.
+        if (feed && drafter_ && pending_width_ > 0) { catch_up(position); }
         for (int r = 0; feed && drafter_ && r < tp_; ++r) {
             ranks[at(r)].features = drafter_->sink(r, T);
         }
@@ -563,7 +651,26 @@ private:
             const ScopedCurrentDevice rank(execution_.dev[at(r)]->device);
             CUDA_CHECK(cudaStreamSynchronize(stream(r)));
         }
-        if (feed && drafter_) { drafter_->append(std::int32_t(position), T); }
+        if (feed && drafter_) {
+            drafter_->append(std::int32_t(position), T);
+            forget_pending();
+        }
+    }
+
+    // Eager: every pending column (the last round's licensed ones, then the ordinary steps')
+    // becomes context of the drafters, ending at `frontier`.
+    void catch_up(std::uint32_t frontier) {
+        if (std::uint32_t(pending_columns_) > frontier) {
+            throw std::logic_error("Inkling 2 pending drafter features beyond their frontier");
+        }
+        if (pending_width_ > 0) { drafter_->catch_up(std::int32_t(frontier), pending_width_); }
+        forget_pending();
+    }
+
+    void forget_pending() {
+        pending_width_   = 0;
+        pending_columns_ = 0;
+        fed_synced_      = false;
     }
 
     // Startup, before the first request: one eager prompt block as wide as a prefill chunk with
@@ -588,7 +695,11 @@ private:
         (void)decode(0, next, width, greedy, {});
         // The speculative round's graph, captured here like the decode step's.
         if (drafter_ && width + 1U + layout_.draft_tokens + 1U <= layout_.capacity) {
-            (void)speculate(0, 0, width + 1U, 0, greedy, {});
+            (void)speculate(0, 0, width + 1U, 0, greedy, {}, SpeculativeBackend::Mtp);
+            if (paired_drafters()) {
+                (void)speculate(0, 0, width + 1U, 0, greedy, {}, SpeculativeBackend::DFlash2);
+                if (layout_.cuda_graph) { time_steps(width + 1U); }
+            }
         }
         reset(0);
         if (!layout_.cuda_graph) { return; }
@@ -601,27 +712,76 @@ private:
         }
     }
 
+    // The startup's timing of the paired execution's steps at `position` (startup_costs()): eight
+    // fed ordinary steps, then eight rounds of each drafter, each block's median after its first
+    // two. Every call runs at the same position, so nothing is left pending between two of them
+    // (the features of repeated calls at one position would end there and be caught up before it).
+    // The state is reset afterwards.
+    void time_steps(std::uint32_t position) {
+        using Clock = std::chrono::steady_clock;
+        const ResolvedSamplingParameters greedy;
+        const std::array<TokenId, 1> token{0};
+        const auto median = [&](const auto& call) {
+            std::vector<double> ms;
+            for (int i = 0; i < 8; ++i) {
+                drafter_->clear_pending();
+                forget_pending();
+                const auto begin = Clock::now();
+                call();
+                if (i >= 2) {
+                    ms.push_back(
+                        std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
+                }
+            }
+            std::nth_element(ms.begin(), ms.begin() + std::ptrdiff_t(ms.size() / 2), ms.end());
+            return ms[ms.size() / 2];
+        };
+        const std::uint32_t K = layout_.draft_tokens;
+        StartupCosts out;
+        out.position    = position;
+        out.step_ms     = median([&] { (void)decode(0, token, position, greedy, {}); });
+        out.round_ms[0] = median(
+            [&] { (void)speculate(0, 0, position, K, greedy, {}, SpeculativeBackend::Mtp); });
+        out.round_ms[1] = median(
+            [&] { (void)speculate(0, 0, position, K, greedy, {}, SpeculativeBackend::DFlash2); });
+        startup_costs_ = out;
+    }
+
     // One decode step from the captured graph: the token and its position go to the fixed device
     // buffers the graph reads; the state advances inside it.
+    // With paired drafters (--spec auto) the step feeds both drafters (decode_body), also without
+    // CUDA Graphs, where the same body runs eagerly.
     void replay(TokenId token, std::uint32_t position) {
         if (position + 1U > layout_.capacity) {
             throw std::logic_error("Inkling 2 decode exceeds its planned extent");
         }
-        if (!graph_.ready()) { capture_decode(position); }
+        const bool fed = paired_drafters();
+        if (fed && pending_columns_ >= max_draft_width()) { catch_up(position); }
+        if (layout_.cuda_graph && !graph_.ready()) { capture_decode(position); }
         const auto at_position = static_cast<std::int32_t>(position);
         for (int r = 0; r < tp_; ++r) {
             const ScopedCurrentDevice scope(execution_.dev[at(r)]->device);
             CUDA_CHECK(cudaStreamSynchronize(stream(r)));
             ids_[at(r)]->copy_from_host(&token, 4);
             positions_[at(r)]->copy_from_host(&at_position, 4);
+            if (fed && !fed_synced_) { fed_[at(r)]->copy_from_host(&pending_columns_, 4); }
         }
         const ScopedCurrentDevice scope(execution_.dev[0]->device);
-        if (tp_ == 2) { bridge_->gate_launch(stream(1), stream(0)); }
-        graph_.launch(stream(0));
-        if (tp_ == 2) { bridge_->gate_peer_after_launch(stream(1), stream(0)); }
+        if (!layout_.cuda_graph) {
+            decode_body(position);
+        } else {
+            if (tp_ == 2) { bridge_->gate_launch(stream(1), stream(0)); }
+            graph_.launch(stream(0));
+            if (tp_ == 2) { bridge_->gate_peer_after_launch(stream(1), stream(0)); }
+        }
         for (int r = 0; r < tp_; ++r) {
             const ScopedCurrentDevice rank(execution_.dev[at(r)]->device);
             CUDA_CHECK(cudaStreamSynchronize(stream(r)));
+        }
+        if (fed) {
+            fed_synced_ = true;
+            ++pending_columns_;
+            pending_width_ = std::max(pending_width_, pending_columns_);
         }
     }
 
@@ -633,6 +793,32 @@ private:
     // reads the position from its device buffer.
     void capture_decode(std::uint32_t position) {
         transport();
+        for (int r = 0; r < tp_; ++r) {
+            const ScopedCurrentDevice scope(execution_.dev[at(r)]->device);
+            CUDA_CHECK(cudaStreamSynchronize(stream(r)));
+        }
+        const ScopedCurrentDevice scope(execution_.dev[0]->device);
+        const auto body = [&] { decode_body(position); };
+        if (tp_ == 2) {
+            definition_.capture(stream(0), body, DecodeGraphPeerCapture{&*bridge_, stream(1)});
+        } else {
+            definition_.capture(stream(0), body);
+        }
+        graph_.instantiate(definition_);
+        graph_.upload(stream(0));
+        for (int r = 0; r < tp_; ++r) {
+            const ScopedCurrentDevice rank(execution_.dev[at(r)]->device);
+            CUDA_CHECK(cudaStreamSynchronize(stream(r)));
+        }
+    }
+
+    // The decode step's work (stream ordered, captured by capture_decode): the forward of the
+    // token in ids_ at the position in positions_ (`position` only bounds the call), its logits,
+    // soft cap and argmax. With paired drafters the forward writes the token's four states into
+    // the staging column, which joins the shared pending features after the pending ones (at the
+    // count in fed_ word 0); both drafters' pending count grows by one.
+    void decode_body(std::uint32_t position) {
+        const bool fed = paired_drafters();
         std::array<exec::ForwardRank<WorkspaceArena>, 2> ranks{};
         std::array<Tensor, 2> ids;
         std::array<Tensor, 2> position_tensors;
@@ -646,6 +832,7 @@ private:
                                        .device     = execution_.dev[at(r)]->device,
                                        .state      = state_[at(r)].get(),
                                        .positions  = &position_tensors[at(r)],
+                                       .features   = fed ? &fed_sinks_[at(r)] : nullptr,
                                        .prefetch   = prefetch_[at(r)].get()};
         }
         exec::Forward<WorkspaceArena> forward(config_, ranks, tp_,
@@ -654,28 +841,23 @@ private:
         const auto V = static_cast<std::int32_t>(config_.unpadded_vocab_size);
         logits_      = Tensor(logits_mem_->p, DType::BF16, {V, 1});
         capped_      = Tensor(capped_mem_->p, DType::FP32, {V, 1});
-        for (int r = 0; r < tp_; ++r) {
-            const ScopedCurrentDevice scope(execution_.dev[at(r)]->device);
-            CUDA_CHECK(cudaStreamSynchronize(stream(r)));
-        }
-        const ScopedCurrentDevice scope(execution_.dev[0]->device);
-        const auto body = [&] {
-            forward.run(ids, exec::ForwardColumns{1, std::int32_t(position), 1},
-                        exec::ForwardLogits{&logits_, &capped_});
-            Tensor out(argmax_mem_->p, DType::I32, {1});
-            ops::argmax(logits_, out, V, stream(0));
-        };
-        if (tp_ == 2) {
-            definition_.capture(stream(0), body, DecodeGraphPeerCapture{&*bridge_, stream(1)});
-        } else {
-            definition_.capture(stream(0), body);
-        }
-        graph_.instantiate(definition_);
-        graph_.upload(stream(0));
+        forward.run(ids, exec::ForwardColumns{1, std::int32_t(position), 1},
+                    exec::ForwardLogits{&logits_, &capped_});
+        Tensor out(argmax_mem_->p, DType::I32, {1});
+        ops::argmax(logits_, out, V, stream(0));
+        if (!fed) { return; }
+        std::array<Tensor, 2> counts;
         for (int r = 0; r < tp_; ++r) {
             const ScopedCurrentDevice rank(execution_.dev[at(r)]->device);
-            CUDA_CHECK(cudaStreamSynchronize(stream(r)));
+            const Tensor& staged = fed_sinks_[at(r)].features;
+            const Tensor source(staged.data, DType::BF16, {staged.ne[0], 4, 1});
+            Tensor destination = features_[at(r)].permute({0, 2, 1, 3});
+            counts[at(r)]      = Tensor(fed_[at(r)]->p, DType::I32, {1});
+            const Tensor four(static_cast<std::int32_t*>(fed_[at(r)]->p) + 1, DType::I32, {1});
+            ops::scatter_bf16_batch(source, counts[at(r)], four, destination, stream(r));
+            ops::increment_i32_scalar(counts[at(r)], stream(r));
         }
+        drafter_->commit(counts);
     }
 
     // The token of the last logit column: argmax of the BF16 logits for a greedy row without
@@ -732,15 +914,34 @@ private:
     std::array<std::unique_ptr<exec::PrefetchLane>, 2> prefetch_;
     std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, argmax_mem_;
     Tensor logits_, capped_;
-    // The drafter and its round (--spec mtp with the artifact's mtp component).
+    // The drafter and its round (--spec mtp or dflash2 with the artifact's component).
     draft::DraftConfig draft_config_;
     std::array<std::unique_ptr<draft::Parameters>, 2> draft_parameters_;
-    std::unique_ptr<draft::Drafter> drafter_;
-    std::unique_ptr<speculative::VerifyRound> round_;
+    draft::DFlash2Config dflash2_config_;
+    std::array<std::unique_ptr<draft::DFlash2Parameters>, 2> dflash2_parameters_;
+    // The drafters (DSpark, DFlash2) the artifact's components give: with one, it is drafter_;
+    // with both (--spec auto) drafter_ is the pair DSpark proposes in and pairs_[1] the one
+    // DFlash2 proposes in, each with its verification round (rounds_[0], rounds_[1]).
+    std::array<std::unique_ptr<draft::Proposer>, 2> parts_;
+    std::array<std::unique_ptr<draft::PairedProposer>, 2> pairs_;
+    std::unique_ptr<draft::Proposer> drafter_;
+    std::array<std::unique_ptr<speculative::VerifyRound>, 2> rounds_;
+    speculative::VerifyRound* last_round_ = nullptr;
     // The soft-capped logits of a sampled round's columns on the Host.
     std::unique_ptr<PinnedHostBuffer> sampled_;
-    // Columns of the last round whose features the drafter has not consumed (0: none).
-    std::int32_t pending_width_ = 0;
+    // The width of the calls whose features the drafter has not consumed (0: none), and how many
+    // of their columns are pending (the drafters' device count).
+    std::int32_t pending_width_   = 0;
+    std::int32_t pending_columns_ = 0;
+    // Paired drafters: the ordinary step's staging column of target states (BF16 [H, 1, 4]) and
+    // its sink, the shared pending features (BF16 [H, max width, 4]), and per rank the pending
+    // count the step appends at (I32, then the constant 4); fed_synced_: fed_ holds
+    // pending_columns_.
+    std::array<std::unique_ptr<DeviceBuffer>, 2> staging_, fed_;
+    std::array<exec::FeatureSink, 2> fed_sinks_{};
+    std::array<Tensor, 2> features_;
+    bool fed_synced_ = false;
+    std::optional<StartupCosts> startup_costs_;
 };
 
 [[nodiscard]] const std::optional<draft::DraftConfig>& logical_draft(const exec::Parameters& p) {
@@ -777,7 +978,12 @@ SequenceLayout plan_sequence_layout(const exec::Parameters& parameters,
         ranks[at(r)].device     = r;
     }
     const auto& draft         = logical_draft(parameters);
-    const bool drafted        = options.speculative.backend == SpeculativeBackend::Mtp && draft;
+    const auto& dflash2       = parameters.model.config().dflash2;
+    const auto backend        = options.speculative.backend;
+    const bool paired         = backend == SpeculativeBackend::Auto && draft && dflash2;
+    const bool dspark         = (backend == SpeculativeBackend::Mtp || paired) && draft;
+    const bool blocked        = (backend == SpeculativeBackend::DFlash2 || paired) && dflash2;
+    const bool drafted        = dspark || blocked;
     const std::uint32_t round = drafted ? options.speculative.draft_tokens + 1U : 0U;
     layout.forward_tokens     = std::max(options.prefill_chunk, round);
     layout.logit_columns =
@@ -794,18 +1000,33 @@ SequenceLayout plan_sequence_layout(const exec::Parameters& parameters,
     layout.cuda_graph            = options.use_cuda_graph;
     layout.image_bytes           = layout.context_cache ? image_bytes(state) : 0;
     layout.graph_allowance_bytes = layout.cuda_graph ? kGraphAllowanceBytes : 0;
-    if (drafted) {
+    // Paired (--spec auto): both drafters, the DFlash2 one on the DSpark one's pending features,
+    // and a verification round each.
+    if (blocked) {
+        layout.draft_tokens  = options.speculative.draft_tokens;
+        layout.draft_backend = paired ? SpeculativeBackend::Auto : SpeculativeBackend::DFlash2;
+        layout.draft_bytes += draft::DFlash2Drafter::planned_bytes(
+                                  *dflash2, draft::shard_dflash2_config(*dflash2, tp),
+                                  static_cast<std::int32_t>(V / std::size_t(tp)),
+                                  std::max<std::int32_t>(std::int32_t(options.prefill_chunk),
+                                                         std::int32_t(dflash2->block_size)),
+                                  options.context_cache.enabled, !paired) +
+                              kRoundAllowanceBytes;
+    }
+    if (dspark) {
         const draft::DraftConfig rank_draft = draft::shard_draft_config(*draft, tp);
         layout.draft_tokens                 = options.speculative.draft_tokens;
-        layout.draft_bytes                  = draft::Drafter::planned_bytes(
-                                 *draft, rank_draft, static_cast<std::int32_t>(V / std::size_t(tp)),
-                                 static_cast<std::int32_t>(rank_draft.head_dim *
-                                                                            (rank_draft.num_attention_heads +
-                                                            2 * rank_draft.num_key_value_heads)),
-                                 std::max<std::int32_t>(std::int32_t(options.prefill_chunk),
-                                                                         std::int32_t(draft->block_size)),
-                                 options.max_context, layout.context_cache) +
-                             kRoundAllowanceBytes;
+        layout.draft_backend = paired ? SpeculativeBackend::Auto : SpeculativeBackend::Mtp;
+        layout.draft_bytes +=
+            draft::Drafter::planned_bytes(
+                *draft, rank_draft, static_cast<std::int32_t>(V / std::size_t(tp)),
+                static_cast<std::int32_t>(
+                    rank_draft.head_dim *
+                    (rank_draft.num_attention_heads + 2 * rank_draft.num_key_value_heads)),
+                std::max<std::int32_t>(std::int32_t(options.prefill_chunk),
+                                       std::int32_t(draft->block_size)),
+                options.max_context, layout.context_cache) +
+            kRoundAllowanceBytes;
     }
     layout.fixed_bytes = state.bytes - std::min(state.bytes, global_kv) + layout.workspace_bytes +
                          io + layout.image_bytes + layout.graph_allowance_bytes +

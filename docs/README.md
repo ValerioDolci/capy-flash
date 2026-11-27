@@ -54,7 +54,8 @@ other references own narrower contracts:
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Qwen3.8-Flash-Next mathematics (hyper-connections, QSA, PLE, MTP, the dense FFN), its artifact names and loading residency, and the one Text forward every model runs (Qwen3.8-27B included) |
-| [Inkling 2 model](maintainer/inkling2-model.md) | Inkling 2 Mini mathematics (48 visits, block attention residuals, cross-pass messages, relative-sink attention, sigmoid-routed MoE), its artifact, two-rank placement, per-sequence state, forward, DSpark drafter and speculative decoding, Program and frontend |
+| [Inkling 2 model](maintainer/inkling2-model.md) | Inkling 2 Mini mathematics (48 visits, block attention residuals, cross-pass messages, relative-sink attention, sigmoid-routed MoE), its artifact, two-rank placement, per-sequence state, forward, DSpark and DFlash2 drafters, `--spec auto` and speculative decoding, Program and frontend |
+| [Tuning `--spec auto`](maintainer/inkling2-auto-tuning.md) | Inkling 2's choice between its two drafters: what adapts by itself, what to retune, `tools/inkling2_tune` (`tune.sh`, `check.sh`) |
 | [DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |

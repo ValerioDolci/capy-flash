@@ -32,15 +32,20 @@ namespace ninfer::models::inkling2::loading {
 //   Replicated  everything else: embedding and norms, block-residual and message queries, message
 //               gates, router and its bias, post-attention and post-FFN convolutions,
 //               attention/relative_profile, final norm and queries.
-//   HostMapped  text/token_embedding with options.embedding_host, at tp 1 too: one copy in mapped
-//               page-locked host memory that every rank's gather (the prefill, the decode and the
-//               drafter's anchor) reads in place over PCIe.
+//   HostMapped  with options.embedding_host, at tp 1 too, the vocabulary tables read a few rows
+//               per call: text/token_embedding (the gathers of the prefill, the decode and the
+//               drafter's anchor) and the DFlash2 drafter's dflash2/candidate_selector/
+//               {predecessor,successor}_codebook (17 rows per proposal). One copy in mapped
+//               page-locked host memory that every rank reads in place over PCIe.
 //
 // The drafter (mtp/, given its config) splits like a Text layer: Rows attention/query by query
 // heads, attention/{key,value,context_key,context_value} by KV heads, mlp/{gate,up} in halves,
 // markov/{folded_output,folded_bias} by the output head's vocabulary rows; Columns
 // attention/output by query heads, mlp/down in halves; every norm, fuse_weight, mask_embedding,
-// markov/{token_embedding,recurrence,recurrence_bias} Replicated.
+// markov/{token_embedding,recurrence,recurrence_bias} Replicated. The DFlash2 drafter (dflash2/,
+// given its config) splits its layers the same way (attention/{query,key,value}, mlp/{gate,up},
+// attention/output, mlp/down); feature_projection, the norms, the convolutions and the candidate
+// selector are Replicated (its codebooks HostMapped with options.embedding_host).
 struct LogicalShard {
     artifact::ShardAxis axis = artifact::ShardAxis::Replicated;
     int device               = 0; // Holder under SingleDevice.
@@ -51,7 +56,8 @@ struct LogicalShard {
 // for a head count or expert count that does not divide by options.tp.
 [[nodiscard]] LogicalShard logical_shard(std::string_view name, const artifact::Shape& shape,
                                          const TextConfig& config, const LoadOptions& options,
-                                         const draft::DraftConfig* draft = nullptr);
+                                         const draft::DraftConfig* draft     = nullptr,
+                                         const draft::DFlash2Config* dflash2 = nullptr);
 
 using GeometryLookup = std::function<const WeightGeometry&(artifact::ObjectHandle)>;
 
@@ -62,12 +68,14 @@ using GeometryLookup = std::function<const WeightGeometry&(artifact::ObjectHandl
 [[nodiscard]] std::vector<std::optional<artifact::ShardPlacement>>
 parent_placements(std::span<const PendingWeight> weights, std::size_t object_count,
                   const GeometryLookup& geometry, const TextConfig& config,
-                  const LoadOptions& options, const draft::DraftConfig* draft = nullptr);
+                  const LoadOptions& options, const draft::DraftConfig* draft = nullptr,
+                  const draft::DFlash2Config* dflash2 = nullptr);
 
 // Installs the combined placements on a Binder planned for options.tp devices; no-op at tp 1
 // unless options.embedding_host, whose HostMapped parent needs the resolver there too.
 void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWeight> weights,
                             const TextConfig& config, const LoadOptions& options,
-                            const draft::DraftConfig* draft = nullptr);
+                            const draft::DraftConfig* draft     = nullptr,
+                            const draft::DFlash2Config* dflash2 = nullptr);
 
 } // namespace ninfer::models::inkling2::loading

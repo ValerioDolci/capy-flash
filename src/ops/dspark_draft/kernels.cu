@@ -156,7 +156,18 @@ __device__ __forceinline__ int block_attention_chunk_keys(int total, int chunks)
     return max(kBlockAttentionMinKeys, (total + chunks - 1) / chunks);
 }
 
-template <int G>
+// The first cached position the block's queries read: the block's [lo, P) or, Sliding, the first
+// query's (the query of column b at P + b sees the cached positions p > P + b - window).
+template <bool Sliding>
+__device__ __forceinline__ int block_attention_lo(int P, int window) {
+    if constexpr (Sliding) {
+        return max(0, P - window + 1);
+    } else {
+        return window > 0 ? max(0, P - window) : 0;
+    }
+}
+
+template <int G, bool Sliding>
 __global__ void __launch_bounds__(128)
     block_attention_partial_kernel(const __nv_bfloat16* __restrict__ qkv, int rows, int query_heads,
                                    int kv_heads, int block,
@@ -176,7 +187,7 @@ __global__ void __launch_bounds__(128)
     const auto p_s   = [&](int w, int q, int k) -> float& { return scratch[(w * Q + q) * 32 + k]; };
     const auto acc_s = [&](int q, int d) -> float& { return scratch[q * kD + d]; };
     const int P      = *frontier;
-    const int lo     = window > 0 ? max(0, P - window) : 0;
+    const int lo     = block_attention_lo<Sliding>(P, window);
     const int n_ctx  = P - lo;
     const int total  = n_ctx + block;
     const int len    = block_attention_chunk_keys(total, gridDim.y);
@@ -233,6 +244,17 @@ __global__ void __launch_bounds__(128)
 #pragma unroll
                     for (int i = 0; i < 8; ++i)
                         score[q] = fmaf(q_s[q][d8 * 8 + i], k8[i], score[q]);
+                }
+            }
+            if constexpr (Sliding) {
+                // A cached key past a query's window weighs nothing once that query meets a key it
+                // sees (every query sees the block): a finite floor keeps the running maxima
+                // finite.
+                if (j < n_ctx) {
+#pragma unroll
+                    for (int q = 0; q < Q; ++q) {
+                        if (lo + j <= P + q / G - window) score[q] = -1.0e30F;
+                    }
                 }
             }
         }
@@ -316,7 +338,7 @@ __global__ void __launch_bounds__(128)
     }
 }
 
-template <int G>
+template <int G, bool Sliding>
 __global__ void block_attention_combine_kernel(const float* __restrict__ partial, int chunks,
                                                int query_heads, int block,
                                                const int* __restrict__ frontier, int window,
@@ -326,7 +348,7 @@ __global__ void block_attention_combine_kernel(const float* __restrict__ partial
     if (q >= G * block) return;
     // The chunks the partial kernel wrote (the same cut).
     const int P     = *frontier;
-    const int total = P - (window > 0 ? max(0, P - window) : 0) + block;
+    const int total = P - block_attention_lo<Sliding>(P, window) + block;
     const int len   = block_attention_chunk_keys(total, chunks);
     const int used  = min(chunks, (total + len - 1) / len);
     float M         = -INFINITY;
@@ -563,8 +585,8 @@ void context_kv_store_launch(const StoreLayers& layers, int count_layers, int kv
 
 void block_attention_launch(const void* qkv, int rows, int query_heads, int kv_heads, int block,
                             const void* k_cache, const void* v_cache, int capacity,
-                            const int* frontier, int window, float scale, float* partial, void* out,
-                            cudaStream_t stream) {
+                            const int* frontier, int window, bool sliding, float scale,
+                            float* partial, void* out, cudaStream_t stream) {
     const int group = query_heads / kv_heads;
     const dim3 grid{unsigned(kv_heads), unsigned(kBlockAttentionChunks)};
     const auto* q  = static_cast<const __nv_bfloat16*>(qkv);
@@ -572,14 +594,17 @@ void block_attention_launch(const void* qkv, int rows, int query_heads, int kv_h
     const auto* vc = static_cast<const __nv_bfloat16*>(v_cache);
     auto* o        = static_cast<__nv_bfloat16*>(out);
     const dim3 combine{unsigned(kv_heads), unsigned(group * block)};
+    const auto run = [&]<int G, bool Sliding>() {
+        block_attention_partial_kernel<G, Sliding>
+            <<<grid, 128, 0, stream>>>(q, rows, query_heads, kv_heads, block, kc, vc, capacity,
+                                       frontier, window, scale, partial);
+        block_attention_combine_kernel<G, Sliding><<<combine, kD, 0, stream>>>(
+            partial, kBlockAttentionChunks, query_heads, block, frontier, window, o);
+    };
     switch (group) {
 #define NINFER_BLOCK_ATTENTION(G)                                                                  \
     case G:                                                                                        \
-        block_attention_partial_kernel<G>                                                          \
-            <<<grid, 128, 0, stream>>>(q, rows, query_heads, kv_heads, block, kc, vc, capacity,    \
-                                       frontier, window, scale, partial);                          \
-        block_attention_combine_kernel<G><<<combine, kD, 0, stream>>>(                             \
-            partial, kBlockAttentionChunks, query_heads, block, frontier, window, o);              \
+        sliding ? run.template operator()<G, true>() : run.template operator()<G, false>();        \
         break;
         NINFER_BLOCK_ATTENTION(1)
         NINFER_BLOCK_ATTENTION(2)

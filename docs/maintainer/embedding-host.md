@@ -17,6 +17,14 @@ under the same option, at tp 1 too; the prefill and decode gathers and the draft
 gather (`ops::embedding` → `embed_gather_dense_kernel`) read 4.5 KiB per token from it. The
 drafter's own `mtp/markov/token_embedding` stays replicated.
 
+The same option places the DFlash2 drafter's candidate selector codebooks
+(`dflash2/candidate_selector/{predecessor,successor}_codebook`, BF16 [201,024, 256] each,
+205,848,576 B together, replicated otherwise) HostMapped: `candidate_selector_path` reads 17 rows
+of 512 B per proposal (the predecessor and the 16 candidates). With LoopCD and `--prefill-chunk
+4096` this brings the largest `--spec auto` context from 221,184 back to 229,376 tokens; the
+drafter's c_d grows by 0.013 ms at K = 3 (decode within noise, +0.1-0.2 %) and by 0.14 ms at
+K = 7 (measured on two RTX 5070 Ti, PCIe gen5 x8).
+
 ## Placement
 
 The table gets its own placement kind, `artifact::ShardAxis::HostMapped`

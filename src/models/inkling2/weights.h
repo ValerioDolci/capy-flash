@@ -66,6 +66,23 @@ namespace ninfer::models::inkling2 {
 //     output projection of the recurrent latent folded into output_head rows in FP64
 //
 // The drafter's query|key|value, context_key|context_value and gate|up are stacked parents.
+//
+// The DFlash2 drafter (component dflash2, draft/config.h DFlash2Config; <i> its layer, G = H / 16
+// convolution groups, r the selector rank), Q8 projections except the convolution kernel
+// projections and the selector's hidden projection (BF16). Under dflash2/:
+//
+//   feature_projection [H, 4H] @ target_features; context_norm [H]; final_norm [H]
+//   layers/<i>/input_norm [H], post_attention_norm [H]
+//   layers/<i>/attention/query [nh*D,H] @ attention/input; key, value [nkv*D,H] @ attention/input
+//     and @ dflash2/context (the context's keys and values)
+//   layers/<i>/attention/query_norm [D], key_norm [D]; attention/output [H,nh*D] @ output_input
+//   layers/<i>/mlp/gate [F,H], up [F,H] @ mlp/input; mlp/down [H,F] @ mlp/product
+//   layers/<i>/{attention_conv,mlp_conv}/base_kernel [2,2,H] (side, tap, channel) and
+//     kernel_projection [4G,H] @ <branch>/input: rows (side * 2 + tap) * G + group
+//   candidate_selector/hidden_projection [r,H] @ final_hidden; candidate_selector/
+//     predecessor_codebook, successor_codebook [V,r]
+//
+// Per layer query|key|value and gate|up are stacked parents.
 
 struct WeightId {
     std::size_t index                          = std::numeric_limits<std::size_t>::max();
@@ -158,9 +175,27 @@ struct DraftWeights {
     WeightId folded_output, folded_bias;
 };
 
+struct DFlash2ConvWeights {
+    WeightId base_kernel, kernel_projection;
+};
+
+struct DFlash2LayerWeights {
+    WeightId input_norm, post_attention_norm;
+    WeightId query, key, value, query_norm, key_norm, output;
+    WeightId gate, up, down;
+    DFlash2ConvWeights attention_conv, mlp_conv;
+};
+
+struct DFlash2Weights {
+    WeightId feature_projection, context_norm, final_norm;
+    std::vector<DFlash2LayerWeights> layers;
+    WeightId hidden_projection, predecessor_codebook, successor_codebook;
+};
+
 struct ModelWeights {
     TextWeights text;
-    std::optional<DraftWeights> draft; // with the speculative backend
+    std::optional<DraftWeights> draft;     // with the speculative backend
+    std::optional<DFlash2Weights> dflash2; // with its backend
 };
 
 } // namespace ninfer::models::inkling2

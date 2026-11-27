@@ -52,7 +52,7 @@ VerifyRound::VerifyRound(const TextConfig& config, std::array<RoundRank, 2> rank
                          execution::ForwardCollectives collectives,
                          const DecodeGraphPeerBridge* bridge, std::uint32_t drafts,
                          std::int32_t max_tokens, std::int32_t max_logit_columns,
-                         draft::Drafter* drafter)
+                         draft::Proposer* drafter)
     : config_(config), ranks_(ranks), width_(width), collectives_(collectives), bridge_(bridge),
       drafts_(drafts), max_tokens_(max_tokens), max_logit_columns_(max_logit_columns),
       drafter_(drafter) {

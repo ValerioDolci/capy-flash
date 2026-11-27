@@ -44,6 +44,7 @@ set(ninfer_op_tests
   short_conv
   short_conv_record
   dspark_draft
+  dflash2_draft
   depth_attention
   message_gate
   message_gate_batch

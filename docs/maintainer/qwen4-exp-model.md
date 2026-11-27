@@ -463,8 +463,9 @@ Program-owned inputs and taps in `execution/forward_runtime.h`), entry points in
   - **Mapped**: every expert read in place from its host-mapped bank by `moe_slots_nvfp4` (slot
     table = identity), W4A4; the M1 reference route.
   W4A4 uses one activation divisor per layer and projection input (the smallest of the layer's
-  experts); the CPU path quantizes activations to int8 per 16 values (W4A8), so an expert's result
-  depends on where it runs (closer to the BF16 reference on the CPU).
+  experts); the CPU path quantizes its activations with the same A4 codec and BF16 roundings
+  (`HostMoeExecutor::Options::a4`), so an expert's result depends on where it runs only through
+  the order of the sums.
 - **Measurement aids** (off by default): `NINFER_QWEN4_EXPERT_TRACE=<file>` (one JSON line per
   window: hits, CPU experts and time, fills, device stamps) and `NINFER_QWEN4_ROUTING_DUMP=<file>`
   (every observed layer's routing, binary).

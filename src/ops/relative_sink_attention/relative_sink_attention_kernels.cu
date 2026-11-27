@@ -1542,6 +1542,455 @@ __global__ void __cluster_dims__(kDecodeBlocks, 1, 1) __launch_bounds__(kDecodeT
     if (!alone) cluster.sync();
 }
 
+// Decode route for 2 <= T <= kDecodeMaxTokens tokens of a row (verification rounds and short
+// blocks on the model's rings; see decode_tokens_route): the whole call in one launch of one
+// cluster of kDecodeBlocks blocks per (row, KV head). The work is the pairs (token t, chunk c of
+// t), t's chunks starting at its own first visible key lo_t (lo_t - lo_0 <= t). Up to
+// kDecodeBlocks pairs, block i takes pair i in token order (short contexts: a block per token);
+// more, block b takes chunk b of every token, whose keys lie in its kDecodeRows rows from
+// lo_0 + 128 b. A block prepares q' and r' of its tokens and k', v' of the call's keys among its
+// rows; the older keys come from the ring. Per token the logits, statistics, value sums and
+// their order are decode_kernel's, so each token gives the bits of its one-token decode. Tokens
+// are taken one at a time (the code stays the size of decode_kernel's). The call's K/V rows
+// reach the ring when no block still reads its rows: after the statistics' barrier, or, a block
+// per token, because the ring holds window + T - 1 positions (decode_tokens_route).
+constexpr int kDecodeMaxTokens = 4;
+constexpr int kDecodeRows      = kChunkUnit + kDecodeMaxTokens - 1;
+
+template <int HB>
+struct DecodeTokensShared {
+    float q[kDecodeMaxTokens][HB][kWarp * 4];
+    float rel[kDecodeMaxTokens][HB][kWarp];
+    __align__(16) __half value[kDecodeRows][kWarp * 4]; // row r: key base + r
+
+    union {
+        // K rows as in DecodeShared, for the logits.
+        __align__(16) __nv_bfloat16 keys[kDecodeRows][kWarp * 4 + 8];
+
+        // After the logits: warp partials of every token, and this block's chunk sums, read by
+        // the cluster.
+        struct {
+            float partial[kDecodeMaxTokens][kKeyWarps][HB][kWarp * 4];
+            float chunk_out[kDecodeMaxTokens][HB][kWarp * 4];
+        } sums;
+    };
+
+    // Bias columns: [j][r] is element j of distance column_base + r (see stage_columns), so the
+    // lanes of a warp, at consecutive distances, read consecutive elements.
+    __nv_bfloat16 column[kWarp][kDecodeRows];
+    __nv_bfloat16 logit[kDecodeMaxTokens][kDecodeThreads<HB>]; // each thread's, per token
+    float warp_m[kKeyWarps][kDecodeMaxTokens][HB];
+    float warp_z[kKeyWarps][kDecodeMaxTokens][HB];
+    float chunk_m[kDecodeMaxTokens][HB];
+    float chunk_z[kDecodeMaxTokens][HB];
+    float all_m[kDecodeBlocks][kDecodeMaxTokens][HB];
+    float all_z[kDecodeBlocks][kDecodeMaxTokens][HB];
+};
+
+// The tokens and chunk of one block of decode_tokens_kernel: tokens first .. last (none when
+// first > last), chunk `chunk` of each.
+struct DecodeTokensWork {
+    int first, last, chunk;
+};
+
+// Token t of the call is at position p0 + t (positions are sequential within a row).
+template <class Cache>
+__device__ __forceinline__ int decode_chunks(const Cache& cache, int p) {
+    const int visible = p - cache.first_visible(p) + 1;
+    const int span    = kChunkUnit * kRelativeSinkMaxChunks;
+    const int chunk   = kChunkUnit * ((visible + span - 1) / span);
+    return (visible + chunk - 1) / chunk;
+}
+
+// Pairs in token order: the block of pair (t, c) is pairs_before(t) + c up to kDecodeBlocks
+// pairs; else block c.
+template <class Cache>
+__device__ __forceinline__ int decode_pairs_before(const Cache& cache, int p0, int t) {
+    int pairs = 0;
+    for (int u = 0; u < t; ++u) pairs += decode_chunks(cache, p0 + u);
+    return pairs;
+}
+
+template <class Cache>
+__device__ __forceinline__ DecodeTokensWork decode_tokens_work(const Cache& cache, int p0, int T,
+                                                               int rank) {
+    if (decode_pairs_before(cache, p0, T) > kDecodeBlocks) return {0, T - 1, rank};
+    int before = 0;
+    for (int t = 0; t < T; ++t) {
+        const int chunks = decode_chunks(cache, p0 + t);
+        if (rank < before + chunks) return {t, t, rank - before};
+        before += chunks;
+    }
+    return {1, 0, 0};
+}
+
+// The bias columns of a block whose first token is at p and chunk is c: distances from
+// e - 128 c - 127 (e = p - lo of that token: its chunk's last key) on, zero where there is no
+// bias. Weights only.
+template <int HB, class Cache>
+__device__ __forceinline__ void stage_columns(const RelativeSinkOperands& op, const Cache& cache,
+                                              int p, int c, DecodeTokensShared<HB>& sh) {
+    constexpr int kLoads = (kDecodeRows * kWarp + kDecodeThreads<HB> - 1) / kDecodeThreads<HB>;
+    const int base       = p - cache.first_visible(p) - c * kChunkUnit - (kChunkUnit - 1);
+    const int dr         = op.params.relative_dim;
+    const int R          = op.params.relative_extent;
+    // Every load is issued before any store.
+    __nv_bfloat16 value[kLoads];
+#pragma unroll
+    for (int k = 0; k < kLoads; ++k) {
+        const int i = static_cast<int>(threadIdx.x) + k * kDecodeThreads<HB>;
+        const int r = i % kDecodeRows, j = i / kDecodeRows;
+        const int d = base + r;
+        value[k]    = i < kDecodeRows * kWarp && j < dr && d >= 0 && d < R
+                          ? op.rel_proj[d + static_cast<std::int64_t>(R) * j]
+                          : __float2bfloat16_rn(0.0f);
+    }
+#pragma unroll
+    for (int k = 0; k < kLoads; ++k) {
+        const int i = static_cast<int>(threadIdx.x) + k * kDecodeThreads<HB>;
+        if (i < kDecodeRows * kWarp) sh.column[i / kDecodeRows][i % kDecodeRows] = value[k];
+    }
+}
+
+template <int HB, class Cache>
+__global__ void __cluster_dims__(kDecodeBlocks, 1, 1) __launch_bounds__(kDecodeThreads<HB>)
+    decode_tokens_kernel(RelativeSinkOperands op, Cache cache) {
+    namespace cg                    = cooperative_groups;
+    const cg::cluster_group cluster = cg::this_cluster();
+    extern __shared__ __align__(16) unsigned char decode_shared[];
+    auto& sh        = *reinterpret_cast<DecodeTokensShared<HB>*>(decode_shared);
+    const int lane  = threadIdx.x % kWarp;
+    const int warp  = threadIdx.x / kWarp;
+    const int group = warp % kKeyWarps;     // the warp's 32 keys
+    const int hh    = warp / kKeyWarps;     // the warp's head
+    const int index = group * kWarp + lane; // the lane's key in a chunk
+    const int rank  = static_cast<int>(cluster.block_rank());
+    const int b     = blockIdx.y;
+    const int slice = blockIdx.x / kDecodeBlocks;
+    const int T     = op.tokens;
+    const int first = T * b; // the row's first token
+    const int D     = op.head_dim;
+    const int Hq    = op.query_heads;
+    const int R     = op.params.relative_extent;
+
+    // Before the wait: the guessed first position and row give the block's work, its bias columns
+    // (weights) and the L2 prefetch of its cache rows.
+    const int guess                   = __ldcg(op.positions + first);
+    const int guess_row               = __ldcg(op.rows + b);
+    const DecodeTokensWork guess_work = decode_tokens_work(cache, guess, T, rank);
+    if (guess_work.first <= guess_work.last) {
+        const int p = guess + guess_work.first;
+        stage_columns<HB>(op, cache, p, guess_work.chunk, sh);
+        const int guess_base = cache.first_visible(p) + guess_work.chunk * kChunkUnit;
+        const int lines      = (D * 2 + 127) / 128;
+        for (int i = threadIdx.x; i < 2 * kDecodeRows * lines; i += blockDim.x) {
+            const int key = i / lines % kDecodeRows, line = i % lines;
+            if (guess_base + key >= guess) continue;
+            const void* row =
+                i < kDecodeRows * lines
+                    ? static_cast<const void*>(cache.key(guess_row, slice, guess_base + key))
+                    : static_cast<const void*>(cache.value(guess_row, slice, guess_base + key));
+            prefetch_line(static_cast<const char*>(row) + 128 * line);
+        }
+    }
+    pdl_enter();
+
+    const Query query = make_query<HB>(op, cache, first, slice); // token 0
+    const int L       = query.L;
+    const auto p_of   = [&](int t) { return query.p + t; };
+    const auto lo_of  = [&](int t) { return cache.first_visible(query.p + t); };
+    const int pairs   = decode_pairs_before(cache, query.p, T);
+    const bool spread = pairs <= kDecodeBlocks;
+    // Every token in one chunk: a block per token, no cluster exchange.
+    const bool alone          = pairs == T;
+    const DecodeTokensWork wk = decode_tokens_work(cache, query.p, T, rank);
+    // The block of token t's chunk c.
+    const auto block_of = [&](int t, int c) {
+        return spread ? decode_pairs_before(cache, query.p, t) + c : c;
+    };
+    if (alone && wk.first > wk.last) return;
+    // A stale guess: each thread restages the same elements it staged.
+    if (wk.first <= wk.last && (query.p != guess || wk.first != guess_work.first ||
+                                wk.last != guess_work.last || wk.chunk != guess_work.chunk))
+        stage_columns<HB>(op, cache, p_of(wk.first), wk.chunk, sh);
+    const int c           = wk.chunk;
+    const int base        = lo_of(wk.first) + c * kChunkUnit; // key of row 0
+    const int column_base = p_of(wk.first) - lo_of(wk.first) - c * kChunkUnit - (kChunkUnit - 1);
+    if (wk.first <= wk.last) {
+        // The rows of the ring's keys (below L), consecutive threads on consecutive 16 bytes.
+        const int vectors = D / 8;
+        const int all     = kDecodeRows * vectors;
+        for (int i = threadIdx.x; i < 2 * all; i += blockDim.x) {
+            const int key = i % all / vectors, u = i % vectors;
+            const int s = base + key;
+            if (s >= L) continue;
+            if (i < all)
+                __pipeline_memcpy_async(&sh.keys[key][u * 8],
+                                        cache.key(query.row, query.g, s) + u * 8, 16);
+            else
+                __pipeline_memcpy_async(&sh.value[key][u * 8],
+                                        cache.value(query.row, query.g, s) + u * 8, 16);
+        }
+    }
+    __pipeline_commit();
+
+    // The warp's head and the thread's output element.
+    const int outs   = query.heads * D;
+    const int output = static_cast<int>(threadIdx.x);
+    const int head   = query.h0 + min(hh, query.heads - 1);
+
+    // Prologue: q' then r' of the block's tokens' HB heads, then k' and v' of the call's keys
+    // among the block's rows up to its last token; item j to warp j % warps, every load of a warp
+    // issued before any is used.
+    if (wk.first <= wk.last) {
+        const int warps    = static_cast<int>(blockDim.x) / kWarp;
+        const int tokens   = wk.last - wk.first + 1;
+        const int kv_first = max(L, base);
+        const int kv_count = max(0, min(p_of(wk.last) + 1, base + kDecodeRows) - kv_first);
+        const int items    = 2 * HB * tokens + 2 * kv_count;
+        constexpr int kItems =
+            (2 * HB * kDecodeMaxTokens + 2 * kDecodeMaxTokens + 4 * HB - 1) / (4 * HB);
+        PrologueItem item[kItems];
+        int token[kItems];
+        float x[kItems][kMaxPerLane];
+#pragma unroll
+        for (int k = 0; k < kItems; ++k) {
+            const int j = warp + warps * k;
+            if (j >= items) continue;
+            if (j < 2 * HB * tokens) {
+                const int t = wk.first + j / (2 * HB), r = j % (2 * HB);
+                const int h = query.h0 + min(r % HB, query.heads - 1);
+                item[k]     = prologue_item(op, r < HB ? 0 : 1, h, first + t);
+                token[k]    = t;
+            } else {
+                const int i = (j - 2 * HB * tokens) / 2; // the call's key kv_first + i
+                token[k]    = kv_first + i - L;
+                item[k] =
+                    prologue_item(op, 2 + (j - 2 * HB * tokens) % 2, query.g, first + token[k]);
+            }
+            prologue_load(item[k], lane, x[k]);
+        }
+#pragma unroll
+        for (int k = 0; k < kItems; ++k) {
+            const int j = warp + warps * k;
+            if (j >= items) continue;
+            const int t = token[k];
+            prologue_finish(op.params, item[k], position_scale(op.params, p_of(t)), lane, x[k]);
+            if (item[k].kind <= 1) {
+                const int r = j % (2 * HB);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = lane + kWarp * i;
+                    if (item[k].kind == 0)
+                        sh.q[t][r][d] = x[k][i];
+                    else if (i == 0)
+                        sh.rel[t][r - HB][d] = x[k][0];
+                }
+            } else {
+                const int row = L + t - base;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int d = lane + kWarp * i;
+                    if (d >= D) continue;
+                    if (item[k].kind == 2)
+                        sh.keys[row][d] = __float2bfloat16_rn(x[k][i]);
+                    else
+                        sh.value[row][d] = __float2half_rn(x[k][i]);
+                }
+            }
+        }
+    }
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    // Per token of the block (one at a time: the code stays the size of decode_kernel's): the
+    // lane's logit for the warp's head, kept as BF16 (it is a BF16 value), and the warp's
+    // statistics.
+#pragma unroll 1
+    for (int t = wk.first; t <= wk.last; ++t) {
+        const int lo_t = lo_of(t), p_t = p_of(t);
+        const int s = lo_t + c * kChunkUnit + index;
+        float x = -INFINITY, m = -INFINITY, z = 0.0f;
+        if (s < min(lo_t + c * kChunkUnit + kChunkUnit, p_t + 1)) {
+            float dot       = 0.0f;
+            const float* q  = sh.q[t][hh];
+            const auto* row = reinterpret_cast<const uint4*>(sh.keys[s - base]);
+#pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                if (u * 8 >= D) break;
+                const uint4 key  = row[u];
+                const auto* pair = reinterpret_cast<const __nv_bfloat162*>(&key);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 k = __bfloat1622float2(pair[j]);
+                    dot            = __fmaf_rn(q[u * 8 + 2 * j], k.x, dot);
+                    dot            = __fmaf_rn(q[u * 8 + 2 * j + 1], k.y, dot);
+                }
+            }
+            const int distance = p_t - s;
+            const bool biased  = distance < R;
+            float bias         = 0.0f;
+            if (biased) {
+                const int r = distance - column_base;
+#pragma unroll
+                for (int j = 0; j < kWarp; ++j)
+                    if (j < op.params.relative_dim)
+                        bias = __fmaf_rn(sh.rel[t][hh][j], load(sh.column[j][r]), bias);
+            }
+            x = round_bf16(__fmul_rn(round_bf16(dot), op.params.scale));
+            if (biased) x = round_bf16(__fadd_rn(x, round_bf16(bias)));
+            online_update(m, z, x);
+        }
+        sh.logit[t][threadIdx.x] = __float2bfloat16_rn(x);
+        for (int offset = kWarp / 2; offset > 0; offset >>= 1)
+            merge_stats(m, z, __shfl_xor_sync(0xffffffffU, m, offset),
+                        __shfl_xor_sync(0xffffffffU, z, offset));
+        if (lane == 0) {
+            sh.warp_m[group][t][hh] = m;
+            sh.warp_z[group][t][hh] = z;
+        }
+    }
+    __syncthreads();
+    // The chunk's statistics of a token (warps in order); with several chunks, published to the
+    // cluster and gathered.
+    const auto chunk_stats_of = [&](int t, float& chunk_m, float& chunk_z) {
+        chunk_m = sh.warp_m[0][t][hh], chunk_z = sh.warp_z[0][t][hh];
+        for (int w = 1; w < kKeyWarps; ++w)
+            merge_stats(chunk_m, chunk_z, sh.warp_m[w][t][hh], sh.warp_z[w][t][hh]);
+    };
+    if (!alone) {
+        if (group == 0 && lane == 0) {
+#pragma unroll 1
+            for (int t = wk.first; t <= wk.last; ++t)
+                chunk_stats_of(t, sh.chunk_m[t][hh], sh.chunk_z[t][hh]);
+        }
+        cluster.sync();
+        // One remote read per thread (the chunks of the block's tokens), then combine_stats from
+        // this block's copy.
+        const int most = decode_chunks(cache, p_of(T - 1));
+        if (static_cast<int>(threadIdx.x) < most * kDecodeMaxTokens * HB) {
+            const int k = threadIdx.x / (kDecodeMaxTokens * HB);
+            const int t = threadIdx.x / HB % kDecodeMaxTokens, h = threadIdx.x % HB;
+            if (t >= wk.first && t <= wk.last && k < decode_chunks(cache, p_of(t))) {
+                const DecodeTokensShared<HB>* other = cluster.map_shared_rank(&sh, block_of(t, k));
+                sh.all_m[k][t][h]                   = other->chunk_m[t][h];
+                sh.all_z[k][t][h]                   = other->chunk_z[t][h];
+            }
+        }
+        __syncthreads();
+    }
+
+    // The call's K/V rows, each written by the block holding it in a chunk of the last token.
+    if (wk.last == T - 1) {
+        const int vectors = D / 8;
+        const int t       = static_cast<int>(threadIdx.x) / (2 * vectors);
+        const int u       = static_cast<int>(threadIdx.x) % (2 * vectors);
+        const int s       = L + t;
+        const int begin   = lo_of(T - 1) + c * kChunkUnit;
+        if (t < T && s >= begin && s < begin + kChunkUnit && cache.retains(s, L + T)) {
+            if (u < vectors)
+                reinterpret_cast<uint4*>(cache.key(query.row, query.g, s))[u] =
+                    reinterpret_cast<const uint4*>(sh.keys[s - base])[u];
+            else
+                reinterpret_cast<uint4*>(cache.value(query.row, query.g, s))[u - vectors] =
+                    reinterpret_cast<const uint4*>(&sh.value[s - base][0])[u - vectors];
+        }
+    }
+    __syncthreads(); // the key rows are read; their space takes the sums
+
+    // Per token, sum_s bf16(p_s) v_s over the warp's keys in lane order for the warp's head; lane
+    // l takes the elements 4l .. 4l + 3.
+    const int d0  = 4 * lane;
+    const bool on = d0 < D;
+#pragma unroll 1
+    for (int t = wk.first; t <= wk.last; ++t) {
+        const int lo_t = lo_of(t), p_t = p_of(t);
+        const float sink_t = load(op.sink[head + Hq * (first + t)]);
+        float top, norm;
+        if (alone) {
+            // combine_stats over the one chunk.
+            float chunk_m, chunk_z;
+            chunk_stats_of(t, chunk_m, chunk_z);
+            top  = fmaxf(sink_t, chunk_m);
+            norm = expf(sink_t - top);
+            if (chunk_z > 0.0f) norm = __fadd_rn(norm, __fmul_rn(chunk_z, expf(chunk_m - top)));
+        } else {
+            combine_stats(sink_t, &sh.all_m[0][t][hh], &sh.all_z[0][t][hh],
+                          decode_chunks(cache, p_t), kDecodeMaxTokens * HB, top, norm);
+        }
+        const int begin = lo_t + c * kChunkUnit;
+        const int end   = min(begin + kChunkUnit, p_t + 1);
+        const int count = max(0, min(kWarp, end - begin - group * kWarp));
+        const float probability =
+            begin + index < end
+                ? round_bf16(__fdiv_rn(expf(load(sh.logit[t][threadIdx.x]) - top), norm))
+                : 0.0f;
+        const int row0 = begin + group * kWarp - base;
+        float acc[4]   = {};
+#pragma unroll
+        for (int source = 0; source < kWarp; ++source) {
+            const float pk = __shfl_sync(0xffffffffU, probability, source);
+            if (source < count && on) {
+                const uint2 raw   = *reinterpret_cast<const uint2*>(&sh.value[row0 + source][d0]);
+                const float2 low  = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+                const float2 high = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+                acc[0]            = __fmaf_rn(pk, low.x, acc[0]);
+                acc[1]            = __fmaf_rn(pk, low.y, acc[1]);
+                acc[2]            = __fmaf_rn(pk, high.x, acc[2]);
+                acc[3]            = __fmaf_rn(pk, high.y, acc[3]);
+            }
+        }
+        if (on)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sh.sums.partial[t][group][hh][d0 + e] = acc[e];
+    }
+    __syncthreads();
+    // Warp partials added in warp order, then chunk sums in chunk order by the block of the
+    // token's chunk 0.
+    const int oh = output / D, od = output % D;
+    const auto out_at = [&](int t) {
+        return static_cast<std::int64_t>(D) * (query.h0 + oh + Hq * (first + t)) + od;
+    };
+    const auto write_out = [&](int t, float sum) {
+        const float gate  = op.gate != nullptr ? load(op.gate[out_at(t)]) : 0.0f;
+        op.out[out_at(t)] = gated_value(sum, op.gate != nullptr, gate);
+    };
+    if (output < outs) {
+#pragma unroll 1
+        for (int t = wk.first; t <= wk.last; ++t) {
+            float sum = sh.sums.partial[t][0][oh][od];
+            for (int w = 1; w < kKeyWarps; ++w) sum = __fadd_rn(sum, sh.sums.partial[t][w][oh][od]);
+            if (alone)
+                write_out(t, sum);
+            else
+                sh.sums.chunk_out[t][oh][od] = sum;
+        }
+    }
+    if (alone) return;
+    cluster.sync();
+    if (output < outs && (spread ? wk.chunk == 0 : rank == 0)) {
+#pragma unroll 1
+        for (int t = wk.first; t <= wk.last; ++t) {
+            // Every remote read is issued before the sums, which stay in chunk order.
+            const int chunks_t = decode_chunks(cache, p_of(t));
+            float sum          = sh.sums.chunk_out[t][oh][od];
+            float part[kDecodeBlocks];
+#pragma unroll
+            for (int k = 1; k < kDecodeBlocks; ++k)
+                part[k] =
+                    k < chunks_t
+                        ? cluster.map_shared_rank(&sh, block_of(t, k))->sums.chunk_out[t][oh][od]
+                        : 0.0f;
+#pragma unroll
+            for (int k = 1; k < kDecodeBlocks; ++k)
+                if (k < chunks_t) sum = __fadd_rn(sum, part[k]);
+            write_out(t, sum);
+        }
+    }
+    // No block leaves while another may still read its shared memory.
+    cluster.sync();
+}
+
 // Where the decode route applies: one token per row on a ring whose window fits the cluster's
 // chunks (the model's local layers at T = 1). Longer calls take the split route, paged calls too
 // (the host cannot know how many keys a captured call will see).
@@ -1550,6 +1999,16 @@ bool decode_route(const RingAccess& access, int tokens) {
 }
 
 bool decode_route(const PageAccess&, int) { return false; }
+
+// Where the decode route takes a call of several tokens per row: 2 to kDecodeMaxTokens tokens on
+// such a ring that also holds window + T - 1 positions (verification rounds of up to three
+// drafts on the model's rings of window + kVisitStateMaxDrafts).
+bool decode_tokens_route(const RingAccess& access, int tokens) {
+    return tokens >= 2 && tokens <= kDecodeMaxTokens && access.ring.window <= kDecodeMaxKeys &&
+           access.ring.capacity >= access.ring.window + tokens - 1;
+}
+
+bool decode_tokens_route(const PageAccess&, int) { return false; }
 
 // Sequential route: one block per (token, KV head slice) walks the same chunks in order.
 template <int HB, int E, class Cache>
@@ -1951,6 +2410,16 @@ void launch_routes(const RelativeSinkOperands& op, const Cache& cache, cudaStrea
             launch_maybe_dependent(true, dim3(kDecodeBlocks * op.kv_heads, tokens),
                                    dim3(kDecodeThreads<HB>), kBytes, stream,
                                    decode_kernel<HB, Cache>, op, cache);
+            return;
+        }
+        if (group <= HB && decode_tokens_route(cache, op.tokens)) {
+            constexpr int kBytes = sizeof(DecodeTokensShared<HB>);
+            static FuncAttrPerDevice attribute;
+            attribute.ensure(decode_tokens_kernel<HB, Cache>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
+            launch_maybe_dependent(true, dim3(kDecodeBlocks * op.kv_heads, op.batch),
+                                   dim3(kDecodeThreads<HB>), kBytes, stream,
+                                   decode_tokens_kernel<HB, Cache>, op, cache);
             return;
         }
     }

@@ -93,6 +93,8 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash2,
+    // Both of the artifact's drafters, the one that proposes chosen per round (Inkling 2).
+    Auto,
 };
 
 struct SpeculativeOptions {

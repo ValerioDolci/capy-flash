@@ -138,7 +138,9 @@ def main(argv=None):
         sources = SourceInputs(base, paths, stack)
         companions = {"dflash2": sources["dflash2"]} if "dflash2" in components else {}
         if is_inkling2(base.config):
-            model = build_inkling2_model(base, components=components, resource_overrides=overrides)
+            model = build_inkling2_model(
+                base, components=components, companions=companions, resource_overrides=overrides
+            )
         elif is_qwen4_exp(base.config):
             if companions:
                 raise ValueError("Qwen4Exp has no DFlash companions")

@@ -1313,6 +1313,8 @@ void validate_target_options(const execution::Parameters& parameters,
             throw std::invalid_argument("DFlash2 draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::Auto:
+        throw std::invalid_argument("--spec auto is the Inkling 2 drafters' choice");
     }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");

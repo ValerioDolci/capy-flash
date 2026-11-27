@@ -118,7 +118,9 @@ C/C++/CUDA, ruff for Python), checks Python errors and spelling (ruff, typos), t
 (`tools/check_docs.py`) and the ratchets (`tools/check_ratchets.py`), the same hooks CI runs on a
 pull request. A change that can alter generated
 tokens also needs the model-level quality check described in [`AGENTS.md`](AGENTS.md)
-(GSM8K and MMLU-Pro, paired per question), unless its output is proven bit-identical.
+(GSM8K and MMLU-Pro, paired per question): a light one when only the order of the operations or
+where they run changes, the full one when it lowers a precision. A change proven bit-identical needs
+none.
 
 ### Rules that keep the code small
 

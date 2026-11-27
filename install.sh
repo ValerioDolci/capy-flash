@@ -7,7 +7,7 @@
 #   --dir DIR          where the release and the model go (default ~/capy-flash)
 #   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
 #                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 19.2 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
-#                      or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
+#                      or inkling2-mini (Inkling 2 Mini, two GPUs, 20.3 GB, text only)
 #   --version vX.Y.Z   release tag (default: the latest release)
 #   --check            only check the machine, download nothing
 #   --no-model         download the release only
@@ -20,7 +20,7 @@ usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb|i
   --dir DIR          where the release and the model go (default ~/capy-flash)
   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
                      108.9 GB), 27b (Qwen3.8-27B, two GPUs, 19.2 GB), 27b-16gb (one GPU, 3-bit, 12.5 GB)
-                     or inkling2-mini (Inkling 2 Mini, two GPUs, 19.7 GB, text only)
+                     or inkling2-mini (Inkling 2 Mini, two GPUs, 20.3 GB, text only)
   --version vX.Y.Z   release tag (default: the latest release)
   --check            only check the machine, download nothing
   --no-model         download the release only
@@ -223,7 +223,8 @@ $( [ "$model" = flash-next-64gb ] && echo "
 $( case "$model" in 27b|27b-16gb) echo "
 (text only, more room for the KV: NINFER_VISION=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;;
   inkling2-mini) echo "
-(the drafter is on, same text; to turn it off: NINFER_DRAFTER=0 $dir/current/$launcher $dir/models/$model/$artifact)
+(the DSpark drafter is on, same text; to turn it off: NINFER_DRAFTER=0 $dir/current/$launcher $dir/models/$model/$artifact)
+(both drafters, opt-in: NINFER_DRAFTER=auto $dir/current/$launcher $dir/models/$model/$artifact)
 (LoopCD, opt-in for agentic coding: NINFER_LOOPCD=1 $dir/current/$launcher $dir/models/$model/$artifact)
 (one 32 GB GPU, not verified: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;; esac )
 

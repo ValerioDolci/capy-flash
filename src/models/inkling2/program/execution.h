@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -23,6 +24,14 @@ class Parameters;
 namespace detail {
 
 struct SequenceLayout;
+
+// With paired drafters: what one fed ordinary step and one round of each drafter (DSpark, DFlash2)
+// took at startup at context `position`, from the captured graphs (median of a few after two).
+struct StartupCosts {
+    std::uint32_t position = 0;
+    double step_ms         = 0.0;
+    std::array<double, 2> round_ms{};
+};
 
 // The model execution the Program drives: per-lane visit state, the forward over prompt chunks and
 // single decode tokens on every rank, and token selection from the rank-0 logits. Lanes are
@@ -53,6 +62,11 @@ public:
                                          std::span<const TokenId> generated) = 0;
     // The drafts per speculative round, 0 without a drafter.
     [[nodiscard]] virtual std::uint32_t draft_tokens() const noexcept = 0;
+    // Whether the execution holds both of the artifact's drafters (--spec auto): speculate() then
+    // runs the round of the drafter it is given.
+    [[nodiscard]] virtual bool paired_drafters() const noexcept = 0;
+    // With paired drafters and CUDA Graphs, the startup's step and round times; otherwise none.
+    [[nodiscard]] virtual std::optional<StartupCosts> startup_costs() const = 0;
     // One speculative round: `anchor` (the last committed token, not yet executed) at position
     // `frontier` and `extent` (0 .. draft_tokens()) of the drafter's proposals verified in one
     // call; returns the licensed tokens (accepted proposals, then the correction or bonus), all
@@ -61,10 +75,12 @@ public:
     // the token the decode step's Host sampler draws at position frontier + j, with `generated`
     // and the tokens taken before it as the penalties' history, and the round stops at the first
     // token that is not the column's proposal: each token is the one an ordinary decode step
-    // draws there (the same logits, history and draw).
+    // draws there (the same logits, history and draw). With paired drafters, `drafter` (Mtp or
+    // DFlash2) proposes and the other's context follows; otherwise it is not read.
     [[nodiscard]] virtual std::vector<TokenId>
     speculate(std::uint32_t lane, TokenId anchor, std::uint32_t frontier, std::uint32_t extent,
-              const ResolvedSamplingParameters& select, std::span<const TokenId> generated) = 0;
+              const ResolvedSamplingParameters& select, std::span<const TokenId> generated,
+              SpeculativeBackend drafter) = 0;
     // After speculate(), when only the first `committed` licensed tokens are kept: the state
     // holds frontier + committed positions instead.
     virtual void settle(std::uint32_t lane, std::uint32_t committed) = 0;

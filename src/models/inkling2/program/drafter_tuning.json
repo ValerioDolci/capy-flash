@@ -1,0 +1,561 @@
+{
+ "constants": {
+  "kWindow": 2048,
+  "kRecent": 16,
+  "kLongPrompt": 2048,
+  "kEnter": 0.1,
+  "kLeave": 0.0,
+  "kWeight": 0.05,
+  "kEvidence": 3,
+  "kMargin": 0.09,
+  "kProbe": 16,
+  "kCompare": 1,
+  "kHysteresis": 0.0,
+  "kPriorWins": 1,
+  "kStart": 8,
+  "kExplore": 64,
+  "kOtherWeight": 0.5,
+  "kSettle": 1.0
+ },
+ "k": 3,
+ "table_condition": "off",
+ "conditions": [
+  "off",
+  "on"
+ ],
+ "traces_sha256": "da1341632ea461004e59bfd1a2115ac39bc51476c15291a6b0903bc7d436e7a5",
+ "texts": {
+  "off": 63,
+  "on": 63
+ },
+ "worst_against_best": -0.04159434986252075,
+ "worst_against_dspark": -0.027083490122654097,
+ "expected": {
+  "off": {
+   "agentic": {
+    "auto": 153.17144920289098,
+    "dspark": 150.77104673744853,
+    "dflash2": 146.9977373215294,
+    "none": 115.06588038989
+   },
+   "essay_131072": {
+    "auto": 134.7865227491499,
+    "dspark": 131.55909280654834,
+    "dflash2": 133.23085545747435,
+    "none": 120.65790331334313
+   },
+   "essay_32768": {
+    "auto": 186.49388915270382,
+    "dspark": 185.12786655198917,
+    "dflash2": 182.89395739364713,
+    "none": 170.18250813895955
+   },
+   "essay_4096": {
+    "auto": 226.43633505329194,
+    "dspark": 217.91097753187304,
+    "dflash2": 232.6422755831151,
+    "none": 196.55184606366717
+   },
+   "essay_8192": {
+    "auto": 208.66943154370514,
+    "dspark": 202.91720369499328,
+    "dflash2": 210.80236723494377,
+    "none": 191.6921505888584
+   },
+   "code-en_greedy": {
+    "auto": 302.7017871735194,
+    "dspark": 280.80583673680997,
+    "dflash2": 304.0228961852863,
+    "none": 203.82384964467047
+   },
+   "en_greedy": {
+    "auto": 248.73685639284184,
+    "dspark": 218.38611872760097,
+    "dflash2": 249.94148457056846,
+    "none": 204.2629747208856
+   },
+   "it_greedy": {
+    "auto": 262.3732031240601,
+    "dspark": 212.03972988002454,
+    "dflash2": 263.5239008690156,
+    "none": 204.27248419856832
+   },
+   "code-it_greedy": {
+    "auto": 278.4704520583771,
+    "dspark": 236.4288275058855,
+    "dflash2": 279.69121976687666,
+    "none": 204.23143461829858
+   },
+   "code-en_sampled": {
+    "auto": 284.1759076246735,
+    "dspark": 261.7950835595743,
+    "dflash2": 285.3757300294508,
+    "none": 196.162491502225
+   },
+   "en_sampled": {
+    "auto": 246.37892451607684,
+    "dspark": 217.0519315760342,
+    "dflash2": 246.46506700678634,
+    "none": 196.54703957425028
+   },
+   "it_sampled": {
+    "auto": 221.9178456720771,
+    "dspark": 186.97469643849675,
+    "dflash2": 221.4155341130718,
+    "none": 196.58390890796645
+   },
+   "code-it_sampled": {
+    "auto": 212.11899876111104,
+    "dspark": 185.5480622312745,
+    "dflash2": 205.90406426301067,
+    "none": 196.5399832483979
+   },
+   "long_greedy": {
+    "auto": 184.5475941883419,
+    "dspark": 155.81774946294766,
+    "dflash2": 192.46882596136186,
+    "none": 181.76072305172963
+   },
+   "long_sampled": {
+    "auto": 170.57299985580067,
+    "dspark": 148.22554492858976,
+    "dflash2": 170.80416222517562,
+    "none": 175.6433284453567
+   },
+   "m4": {
+    "auto": 291.3508482864692,
+    "dspark": 297.5564787072597,
+    "dflash2": 233.14891155193203,
+    "none": 195.4000350104986
+   },
+   "summary_131072": {
+    "auto": 138.82934613569134,
+    "dspark": 130.30940608045725,
+    "dflash2": 144.85447379799655,
+    "none": 120.65762383479299
+   },
+   "summary_32768": {
+    "auto": 187.0093600804405,
+    "dspark": 191.17287249268682,
+    "dflash2": 181.20554522040743,
+    "none": 170.18177771604866
+   },
+   "summary_4096": {
+    "auto": 210.51128092664408,
+    "dspark": 212.55508299650054,
+    "dflash2": 211.10595148514057,
+    "none": 196.5499786344355
+   },
+   "summary_8192": {
+    "auto": 242.5599327973241,
+    "dspark": 248.17886879801645,
+    "dflash2": 207.49475597271893,
+    "none": 191.69101910249563
+   }
+  },
+  "on": {
+   "agentic": {
+    "auto": 131.36076717952642,
+    "dspark": 134.13957325224303,
+    "dflash2": 125.23300926117551,
+    "none": 104.05067966554282
+   },
+   "essay_131072": {
+    "auto": 106.25235119833219,
+    "dspark": 99.80517856735447,
+    "dflash2": 110.32989952621399,
+    "none": 106.99426678355407
+   },
+   "essay_32768": {
+    "auto": 156.78972734804853,
+    "dspark": 149.49142567627675,
+    "dflash2": 156.18828839226225,
+    "none": 150.5507007994902
+   },
+   "essay_4096": {
+    "auto": 207.27833832424824,
+    "dspark": 199.90306382653932,
+    "dflash2": 206.70491241594888,
+    "none": 173.8040273043153
+   },
+   "essay_8192": {
+    "auto": 167.55589725485015,
+    "dspark": 160.3735172692617,
+    "dflash2": 173.47927923818895,
+    "none": 169.59911406776303
+   },
+   "code-en_greedy": {
+    "auto": 298.1520548914642,
+    "dspark": 275.43696537703215,
+    "dflash2": 299.3207560150815,
+    "none": 180.27563399054858
+   },
+   "en_greedy": {
+    "auto": 226.54424755549087,
+    "dspark": 189.792784063077,
+    "dflash2": 227.31550809052217,
+    "none": 180.67016236729071
+   },
+   "it_greedy": {
+    "auto": 225.5164946427544,
+    "dspark": 183.40963905706084,
+    "dflash2": 226.40502468523636,
+    "none": 180.67029125677243
+   },
+   "code-it_greedy": {
+    "auto": 206.19865382604303,
+    "dspark": 179.2102132850378,
+    "dflash2": 206.4847346983572,
+    "none": 180.63785877013112
+   },
+   "code-en_sampled": {
+    "auto": 228.71302791759382,
+    "dspark": 211.5242158294926,
+    "dflash2": 228.12482993281162,
+    "none": 174.19625765893122
+   },
+   "en_sampled": {
+    "auto": 194.54707755435857,
+    "dspark": 172.5544349367179,
+    "dflash2": 198.31215973725094,
+    "none": 174.57902111897957
+   },
+   "it_sampled": {
+    "auto": 193.20688627269672,
+    "dspark": 159.96411092728815,
+    "dflash2": 190.5570764434757,
+    "none": 174.60644294191505
+   },
+   "code-it_sampled": {
+    "auto": 177.46552481347734,
+    "dspark": 154.11527587970494,
+    "dflash2": 175.0763693128514,
+    "none": 174.53444107664535
+   },
+   "long_greedy": {
+    "auto": 162.6559046023519,
+    "dspark": 131.60709523980842,
+    "dflash2": 160.15101300998984,
+    "none": 161.02062521300869
+   },
+   "long_sampled": {
+    "auto": 145.3461484856972,
+    "dspark": 123.87565442505051,
+    "dflash2": 137.78216153381035,
+    "none": 156.15302298764877
+   },
+   "m4": {
+    "auto": 242.3090900420471,
+    "dspark": 244.23408676424833,
+    "dflash2": 214.16211905260778,
+    "none": 172.59664611991101
+   },
+   "summary_131072": {
+    "auto": 116.96961722992519,
+    "dspark": 108.58757223266916,
+    "dflash2": 119.92482680843956,
+    "none": 106.99401728380504
+   },
+   "summary_32768": {
+    "auto": 173.8213815795533,
+    "dspark": 176.67523978633008,
+    "dflash2": 168.6668142268281,
+    "none": 150.5500526038906
+   },
+   "summary_4096": {
+    "auto": 241.17917583320127,
+    "dspark": 247.8929829894719,
+    "dflash2": 186.53641548659056,
+    "none": 173.8022246861864
+   },
+   "summary_8192": {
+    "auto": 227.31365191462885,
+    "dspark": 229.80960764045474,
+    "dflash2": 185.3708843369085,
+    "none": 169.59820072093984
+   }
+  }
+ },
+ "grid": {
+  "kWindow": [
+   256,
+   2048
+  ],
+  "kRecent": [
+   16
+  ],
+  "kLongPrompt": [
+   2048
+  ],
+  "kEnter": [
+   0.1,
+   0.2
+  ],
+  "kLeave": [
+   0.0,
+   0.05
+  ],
+  "kWeight": [
+   0.05
+  ],
+  "kEvidence": [
+   3
+  ],
+  "kMargin": [
+   0.09,
+   0.15
+  ],
+  "kProbe": [
+   16
+  ],
+  "kCompare": [
+   1
+  ],
+  "kHysteresis": [
+   0.0,
+   0.1
+  ],
+  "kPriorWins": [
+   1
+  ],
+  "kStart": [
+   0,
+   4,
+   8
+  ],
+  "kExplore": [
+   32,
+   64
+  ],
+  "kOtherWeight": [
+   0.5,
+   0.75
+  ],
+  "kSettle": [
+   1.0,
+   0.3
+  ]
+ },
+ "top": [
+  {
+   "worst_against_best": -0.04159434986252075,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.09,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04159434986252075,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.15,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04159434986252075,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.05,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.09,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04159434986252075,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.05,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.15,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04376523905876284,
+   "worst_against_dspark": -0.028272722893844193,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.09,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.1,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04376523905876284,
+   "worst_against_dspark": -0.028272722893844193,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.05,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.09,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.1,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04574437743521054,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.15,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.1,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04574437743521054,
+   "worst_against_dspark": -0.027083490122654097,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.1,
+    "kLeave": 0.05,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.15,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.1,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04588767818464656,
+   "worst_against_dspark": -0.04216290423718583,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.2,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.09,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  },
+  {
+   "worst_against_best": -0.04588767818464656,
+   "worst_against_dspark": -0.04216290423718583,
+   "constants": {
+    "kWindow": 2048,
+    "kRecent": 16,
+    "kLongPrompt": 2048,
+    "kEnter": 0.2,
+    "kLeave": 0.0,
+    "kWeight": 0.05,
+    "kEvidence": 3,
+    "kMargin": 0.15,
+    "kProbe": 16,
+    "kCompare": 1,
+    "kHysteresis": 0.0,
+    "kPriorWins": 1,
+    "kStart": 8,
+    "kExplore": 64,
+    "kOtherWeight": 0.5,
+    "kSettle": 1.0
+   }
+  }
+ ]
+}

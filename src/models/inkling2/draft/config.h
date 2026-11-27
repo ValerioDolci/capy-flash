@@ -57,4 +57,58 @@ struct DraftConfig {
 // by the head-input sentinel (the visit count).
 [[nodiscard]] DraftConfig parse_draft_config(const artifact::Json& value, const TextConfig& text);
 
+// The DFlash2 block drafter (the artifact's `dflash2` component, the drafter checkpoint's
+// config.json). It reads the same four states as the DSpark drafter and projects them into one
+// context vector per position (feature projection, context norm), whose keys and values every layer
+// keeps over a sliding window; it proposes `block_size - 1` tokens from one non-causal forward of
+// `num_layers` layers (grouped dynamic convolutions around attention and MLP) over the block
+// [anchor, mask x (block_size - 1)], whose last hidden states score the output head's top
+// candidates and walk them with the candidate selector.
+inline constexpr std::string_view kDFlash2Architecture = "DFlash2DraftModel";
+inline constexpr std::string_view kDFlash2ModelType    = "inkling2_dflash2";
+
+struct DFlash2Config {
+    std::uint32_t hidden_size         = 0;
+    std::uint32_t num_layers          = 0;
+    std::uint32_t num_attention_heads = 0;
+    std::uint32_t num_key_value_heads = 0;
+    std::uint32_t head_dim            = 0;
+    std::uint32_t intermediate_size   = 0;
+    std::uint32_t sliding_window      = 0; // a query at q sees the keys at p with q - p < window
+    std::uint32_t block_size          = 0; // anchor + proposals
+    std::uint32_t mask_token_id       = 0;
+    std::uint32_t conv_taps           = 0;
+    std::uint32_t conv_group_size     = 0;
+    std::uint32_t selector_rank       = 0;
+    std::uint32_t selector_top_k      = 0;
+    float rms_norm_eps                = 0;
+    float rope_theta                  = 0;
+    // The selector's scores are soft-capped after its correction (selector_softcap_mode
+    // after_correction): a monotone map, so the greedy walk does not depend on it.
+    float selector_softcap = 0;
+    std::array<std::uint32_t, 3> feature_visits{}; // execution indices whose inputs are read
+
+    [[nodiscard]] std::uint32_t proposals() const noexcept { return block_size - 1; }
+
+    [[nodiscard]] std::uint64_t query_width() const noexcept {
+        return std::uint64_t(num_attention_heads) * head_dim;
+    }
+
+    [[nodiscard]] std::uint64_t key_width() const noexcept {
+        return std::uint64_t(num_key_value_heads) * head_dim;
+    }
+
+    // Rows of a convolution's kernel projection: (side, tap, group) for the input and output sides.
+    [[nodiscard]] std::uint64_t conv_coefficients() const noexcept {
+        return std::uint64_t(2) * conv_taps * (hidden_size / conv_group_size);
+    }
+};
+
+// The `dflash2` component config. Every member is read or checked against the one supported
+// value: hidden size and vocabulary the Text component's, target_layer_ids as for the DSpark
+// drafter, two convolution taps in groups of 16, a selector of rank 256 over 16 candidates with the
+// Text component's soft cap after the correction, sliding attention on every layer.
+[[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Json& value,
+                                                 const TextConfig& text);
+
 } // namespace ninfer::models::inkling2::draft

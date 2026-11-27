@@ -126,9 +126,10 @@ MODELS: List[Dict[str, Any]] = [
     },
     {
         # Text only, one request at a time; verified on two 16 GB GPUs (one 32 GB GPU is not verified, so the app
-        # offers two). The artifact holds the text model and its DSpark drafter, which the launcher turns on (same
-        # text as without it): the released weights repackaged without requantizing. Its launcher ships only
-        # in the releases that serve Inkling, so a release without it still verifies (Installer._verify_release).
+        # offers two). The artifact holds the text model and two drafters (DSpark, which the launcher turns on, and
+        # DFlash2; same text as without them): the released weights repackaged without requantizing. Its launcher
+        # ships only in the releases that serve Inkling, so a release without it still verifies
+        # (Installer._verify_release).
         "key": "inkling2-mini",
         "family": "inkling2",
         "title": "Inkling 2 Mini",
@@ -143,7 +144,7 @@ MODELS: List[Dict[str, Any]] = [
         "need_ram_gib": 8,
         "need_disk_gb": 23,
         "need_simd": False,
-        "size_gb": 19.7,
+        "size_gb": 20.3,
         "context": 253952,
         "vision": False,
         "flags": [],
@@ -155,7 +156,7 @@ MODELS: List[Dict[str, Any]] = [
 # "Pick a model" in the README, as an order of preference for each number of usable GPUs.
 PREFERENCE = {2: ["flash-next", "flash-next-64gb", "27b", "27b-16gb"], 1: ["flash-next-64gb", "27b-16gb"]}
 
-# The speed switches that change the numbers (README, "Optional speed switches"). The app never sets them and
+# The speed switches that lower a precision (README, "Optional speed switches"). The app never sets them and
 # removes them from the engine's environment; the page shows this table under "Advanced".
 LOSSY_SWITCHES = [
     {
@@ -182,7 +183,9 @@ LOSSY_SWITCHES = [
 ]
 LOSSY_ENV = tuple(s["env"] for s in LOSSY_SWITCHES)
 
-# The settings that leave the output unchanged: the only ones the tuner tries and a profile (tuning.json) may hold,
+# The settings that keep the precision of the weights and of every operation (the output's bits can change only
+# through the order of the operations or where they run, as with one or two GPUs): the only ones the tuner tries
+# and a profile (tuning.json) may hold,
 # in the order they are tried. key: the profile's field; flag: the engine's (None: the GPU count, which goes into
 # NINFER_DEVICES); range or choices: the values a profile may hold (choices None: the model's GPU counts); tries:
 # what the tuner measures (None: worked out from the machine); family, experts: the models it applies to (None:

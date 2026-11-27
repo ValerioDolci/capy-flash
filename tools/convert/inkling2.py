@@ -26,6 +26,13 @@ reads the Text component's embedding, embedding norm and output head. The recurr
 ``hidden_out`` is stored folded into the output head rows as SGLang and vLLM fold it:
 ``folded_output = bf16(f64(unembed[:Vu]) @ f64(hidden_out.weight))`` ``[Vu, r]`` and
 ``folded_bias = bf16(f64(unembed[:Vu]) @ f64(hidden_out.bias))`` ``[Vu]``.
+
+The optional ``dflash2`` component is a DFlash2 block drafter read from its own checkpoint (the
+``dflash2`` source, e.g. ``incoai/Inkling-2-Mini-DFlash2``): five sliding-window layers with grouped
+dynamic convolutions and a candidate selector over the output head's top candidates. It reads the
+DSpark drafter's four target states, the Text component's embedding, embedding norm and output
+head. Its tensors keep their words under ``dflash2/`` names; each layer's key and value rows also
+project the drafter's context (the uses ``attention/input`` and ``dflash2/context``).
 """
 
 from __future__ import annotations
@@ -50,6 +57,8 @@ TEXT_MODEL_TYPE = "inkling2_loop_text"
 MTP_ARCHITECTURE = "Inkling2DSpark"
 MTP_MODEL_TYPE = "inkling2_dspark"
 MTP_FILE = "mtp.safetensors"
+DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
+DFLASH2_MODEL_TYPE = "inkling2_dflash2"
 # The reference derives the layer schedule from the index alone: every sixth layer is global.
 GLOBAL_LAYER_PERIOD = 6
 MESSAGE_ROLES = ("query", "key", "value", "ffn")
@@ -81,6 +90,43 @@ def mtp_config(source: dict) -> dict:
         raise ValueError("mtp: the checkpoint has no mtp_config")
     config = {"architectures": [MTP_ARCHITECTURE], "model_type": MTP_MODEL_TYPE}
     config.update({key: value for key, value in raw.items() if key not in config})
+    return config
+
+
+def dflash2_config(raw: dict, g: dict) -> dict:
+    """The DFlash2 drafter's config.json with the drafter's architecture; the engine checks every member."""
+    if raw.get("architectures") != [DFLASH2_ARCHITECTURE]:
+        raise ValueError(f"dflash2: expected architectures [{DFLASH2_ARCHITECTURE!r}]")
+    for key, expected in (
+        ("hidden_size", g["hidden_size"]),
+        ("vocab_size", g["vocab_size"]),
+        ("hidden_act", "silu"),
+        ("attention_bias", False),
+        ("is_causal", False),
+    ):
+        if raw.get(key) != expected:
+            raise ValueError(f"dflash2.{key}: expected {expected!r}")
+    layers = raw.get("num_hidden_layers")
+    if raw.get("layer_types") != ["sliding_attention"] * layers:
+        raise ValueError("dflash2: every layer must be sliding_attention")
+    rope = raw.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default":
+        raise ValueError("dflash2: only the default RoPE is supported")
+    config = {"architectures": [DFLASH2_ARCHITECTURE], "model_type": DFLASH2_MODEL_TYPE}
+    for key in (
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "num_hidden_layers",
+        "sliding_window",
+        "rms_norm_eps",
+        "vocab_size",
+    ):
+        config[key] = raw.get(key)
+    config["rope_theta"] = rope.get("rope_theta", raw.get("rope_theta"))
+    config["dflash_config"] = dict(raw.get("dflash_config") or {})
     return config
 
 
@@ -393,6 +439,52 @@ class _Builder:
         self.add(m + "folded_output", folded_source(head, self.store, mp + "hidden_out.weight", h, rank, False))
         self.add(m + "folded_bias", folded_source(head, self.store, mp + "hidden_out.bias", h, rank, True))
 
+    def dflash2(self, config, g):
+        """The DFlash2 drafter (``self.store`` is the drafter's checkpoint)."""
+        h = g["hidden_size"]
+        nh, nkv, d = config["num_attention_heads"], config["num_key_value_heads"], config["head_dim"]
+        f, layers = config["intermediate_size"], config["num_hidden_layers"]
+        extra = config["dflash_config"]
+        features, rank = len(extra.get("target_layer_ids", ())), extra.get("selector_rank")
+        taps, group = extra.get("conv_kernel_size"), extra.get("conv_group_size")
+        if not features or not rank or not taps or not group or h % group:
+            raise ValueError("dflash2: invalid dflash_config")
+        coefficients = 2 * taps * (h // group)
+        self.tensor("dflash2/feature_projection", "fc.weight", (h, features * h), inputs=("dflash2/target_features",))
+        self.tensor("dflash2/context_norm", "hidden_norm.weight", (h,))
+        self.tensor("dflash2/final_norm", "norm.weight", (h,))
+        for layer in range(layers):
+            p, sp = f"dflash2/layers/{layer}/", f"layers.{layer}."
+            a, ap = p + "attention/", sp + "self_attn."
+            self.tensor(p + "input_norm", sp + "input_layernorm.weight", (h,))
+            self.tensor(p + "post_attention_norm", sp + "post_attention_layernorm.weight", (h,))
+            self.tensor(a + "query", ap + "q_proj.weight", (nh * d, h), inputs=(a + "input",))
+            for role, field in (("key", "k_proj"), ("value", "v_proj")):
+                self.tensor(a + role, ap + field + ".weight", (nkv * d, h), inputs=(a + "input", "dflash2/context"))
+            for role, field in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
+                self.tensor(a + role, ap + field + ".weight", (d,))
+            self.tensor(a + "output", ap + "o_proj.weight", (h, nh * d), inputs=(a + "output_input",))
+            for role, field in (("gate", "gate_proj"), ("up", "up_proj")):
+                self.tensor(p + "mlp/" + role, sp + "mlp." + field + ".weight", (f, h), inputs=(p + "mlp/input",))
+            self.tensor(p + "mlp/down", sp + "mlp.down_proj.weight", (h, f), inputs=(p + "mlp/product",))
+            for branch in ("attention_conv", "mlp_conv"):
+                self.tensor(p + branch + "/base_kernel", sp + branch + ".base_kernel", (2, taps, h))
+                self.tensor(
+                    p + branch + "/kernel_projection",
+                    sp + branch + ".kernel_projection.weight",
+                    (coefficients, h),
+                    inputs=(p + branch + "/input",),
+                )
+        s = "dflash2/candidate_selector/"
+        self.tensor(
+            s + "hidden_projection",
+            "candidate_selector.hidden_projection.weight",
+            (rank, h),
+            inputs=("dflash2/final_hidden",),
+        )
+        for role in ("predecessor_codebook", "successor_codebook"):
+            self.tensor(s + role, "candidate_selector." + role, (g["vocab_size"], rank))
+
     def layer(self, g, layer):
         h, taps = g["hidden_size"], g["sconv_kernel_size"]
         p, sp = f"text/layers/{layer}/", f"model.llm.layers.{layer}."
@@ -423,15 +515,21 @@ def build_model(
     base: SafetensorsSource,
     *,
     components: tuple[str, ...] = ("text",),
+    companions: Mapping[str, SafetensorsSource] | None = None,
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
-    if tuple(components) not in (("text",), ("text", "mtp")):
-        raise ValueError("Inkling 2 converts the text component and optionally mtp")
+    companions = dict(companions or {})
+    if components[:1] != ("text",) or not set(components[1:]) <= {"mtp", "dflash2"}:
+        raise ValueError("Inkling 2 converts the text component and optionally mtp and dflash2")
+    if ("dflash2" in components) != ("dflash2" in companions):
+        raise ValueError("Inkling 2 dflash2 requires its source (--source dflash2=PATH)")
     config = text_config(base.config)
     g = _geometry(config)
     records = {"text": {"config": config}}
     if "mtp" in components:
         records["mtp"] = {"config": mtp_config(base.config), "target": "text"}
+    if "dflash2" in components:
+        records["dflash2"] = {"config": dflash2_config(companions["dflash2"].config, g), "target": "text"}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=g["vocab_size"], overrides=resource_overrides
     )
@@ -451,4 +549,6 @@ def build_model(
     builder.add("text/output_head", head, inputs=("text/final_hidden",))
     if "mtp" in components:
         _Builder(model, SafetensorsSource(base.root / MTP_FILE)).mtp(records["mtp"]["config"], g, head)
+    if "dflash2" in components:
+        _Builder(model, companions["dflash2"]).dflash2(records["dflash2"]["config"], g)
     return model

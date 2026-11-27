@@ -116,6 +116,7 @@ struct TextConfig {
 struct Config {
     TextConfig text;
     std::optional<draft::DraftConfig> draft; // the `mtp` component, with the speculative backend
+    std::optional<draft::DFlash2Config> dflash2; // the `dflash2` component, with its backend
 };
 
 // The visits of `config` in execution order for its num_passes and contrast: parse_text_config
@@ -135,7 +136,7 @@ struct Config {
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 
 // The text component of an Inkling 2 artifact and, with options.speculative = Mtp, its `mtp`
-// component (the DSpark drafter). Vision and the other speculative backends are rejected.
+// component (the DSpark drafter), with DFlash2 its `dflash2` component. Vision is rejected.
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 
 // Whether the artifact's Text component names this implementation (architecture and model_type).

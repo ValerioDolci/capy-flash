@@ -55,8 +55,8 @@ Everything can be changed later from the status card at the bottom left.
   Hugging Face repositories only, over HTTPS, resume where they stopped, and every file is checked against its
   published SHA-256 before anything is used. The layout is `install.sh`'s (`~/capy-flash/current`,
   `~/capy-flash/models/<name>/`): what the command line installed is recognised, and the other way round.
-  Inkling 2 Mini (two 16 GB GPUs, text only) downloads like the others (19.7 GB, with its drafter). It needs a
-  release that ships `capy-serve-inkling2-mini.sh`, which turns the drafter on.
+  Inkling 2 Mini (two 16 GB GPUs, text only) downloads like the others (20.3 GB, with its two drafters). It needs a
+  release that ships `capy-serve-inkling2-mini.sh`, which turns the DSpark drafter on.
 - **Files that are already there are yours.** The app deletes or replaces only files it created itself (it keeps a
   record of each, with size, time and digest, in `~/capy-flash/.capy-app/`, where its temporary files live too). A
   model folder it finds is hashed first, as one unit: if every file matches the repository it is used as it is (and
@@ -66,8 +66,9 @@ Everything can be changed later from the status card at the bottom left.
   leading outside `~/capy-flash` is never written to, deleted from or read for verification: it can only be used as
   it is. The same holds for releases: one the app did not install and that fails its checksums is left alone.
 - **Tuning**: a short fixed benchmark (generation, prompt reading, first token of a short prompt; optionally a long
-  context) run on the settings that leave the answers unchanged — CPU threads for the experts, `--miss-split`,
-  `--stream-min-tokens`, one or two GPUs, `--kv-ram-active` — each on its own, after a discarded warm-up request.
+  context) run on the settings that keep the precision of the weights and of every operation (they can change the
+  bits of an answer only through the order of the sums or where they run) — CPU threads for the experts,
+  `--miss-split`, `--stream-min-tokens`, one or two GPUs, `--kv-ram-active` — each on its own, after a discarded warm-up request.
   The defaults are measured at the start and again at the end: the better of the two is the reference and their
   difference is the noise of the machine. A setting is kept only if it beats the reference by more than 3 % and by
   more than that noise, without making anything else slower; the kept ones are then measured together, and if together

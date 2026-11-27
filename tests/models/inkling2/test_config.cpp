@@ -4,7 +4,8 @@
 //    converter stores them (text_config plus the Text architecture): every dimension, and the
 //    48-visit schedule against an independent table (layer, pass, state slot, kind, messages).
 // 2. Rejections: unknown members, unsupported fixed values, a layer schedule or looped core this
-//    implementation does not run, options other than the Text backbone.
+//    implementation does not run, options other than the Text backbone; the DFlash2 drafter's
+//    component config and its rejections.
 // 3. The Qwen path does not accept the Inkling Text component.
 // 4. The loop contrast (with_loop_contrast): a zero strength is the model's own schedule, Hidden
 //    keeps it, Logits appends the reference coda on six slots after the others; options outside
@@ -14,6 +15,7 @@
 #include "models/inkling2/config.h"
 #include "models/qwen3_5/config.h"
 
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -156,11 +158,54 @@ void rejections() {
     rejects([&] { (void)inkling2::parse_config(directory, {.vision = true}); }, "Vision accepted");
     require(!inkling2::parse_config(directory, {.speculative = SpeculativeBackend::Mtp}).draft,
             "MTP without the mtp component: no drafter");
-    rejects(
-        [&] {
-            (void)inkling2::parse_config(directory, {.speculative = SpeculativeBackend::DFlash2});
-        },
-        "DFlash2 accepted");
+    require(
+        !inkling2::parse_config(directory, {.speculative = SpeculativeBackend::DFlash2}).dflash2,
+        "DFlash2 without the dflash2 component: no drafter");
+    // The DFlash2 component (incoai/Inkling-2-Mini-DFlash2 as the converter stores it).
+    const Json dflash2                   = {{"architectures", {"DFlash2DraftModel"}},
+                                            {"model_type", "inkling2_dflash2"},
+                                            {"hidden_size", 2304},
+                                            {"intermediate_size", 6912},
+                                            {"num_attention_heads", 32},
+                                            {"num_key_value_heads", 8},
+                                            {"head_dim", 128},
+                                            {"num_hidden_layers", 5},
+                                            {"sliding_window", 2048},
+                                            {"rms_norm_eps", 1e-6},
+                                            {"vocab_size", 201024},
+                                            {"rope_theta", 10000.0},
+                                            {"dflash_config",
+                                             {{"block_size", 8},
+                                              {"conv_group_size", 16},
+                                              {"conv_kernel_size", 2},
+                                              {"final_logit_softcapping", 30.0},
+                                              {"mask_token_id", 200056},
+                                              {"selector_rank", 256},
+                                              {"selector_softcap_mode", "after_correction"},
+                                              {"selector_top_k", 16},
+                                              {"target_layer_ids", {5, 23, 41, 48}}}}};
+    artifact::Directory drafted          = directory;
+    drafted.components["dflash2"].config = dflash2;
+    const auto read = inkling2::parse_config(drafted, {.speculative = SpeculativeBackend::DFlash2});
+    require(read.dflash2 && read.dflash2->proposals() == 7 && read.dflash2->num_layers == 5 &&
+                read.dflash2->conv_coefficients() == 576 && read.dflash2->mask_token_id == 200056 &&
+                read.dflash2->feature_visits == std::array<std::uint32_t, 3>{5, 23, 41},
+            "DFlash2 config");
+    const auto broken_dflash2 = [&](auto edit, const char* label) {
+        artifact::Directory d = drafted;
+        edit(d.components["dflash2"].config);
+        rejects(
+            [&] { (void)inkling2::parse_config(d, {.speculative = SpeculativeBackend::DFlash2}); },
+            label);
+    };
+    broken_dflash2(
+        [](Json& v) { v["dflash_config"]["selector_softcap_mode"] = "before_correction"; },
+        "softcap before the correction accepted");
+    broken_dflash2([](Json& v) { v["dflash_config"]["conv_kernel_size"] = 3; },
+                   "three taps accepted");
+    broken_dflash2([](Json& v) { v["dflash_config"]["target_layer_ids"] = {5, 23, 41, 47}; },
+                   "no head-input sentinel accepted");
+    broken_dflash2([](Json& v) { v["hidden_size"] = 2048; }, "foreign hidden size accepted");
     // The Qwen path refuses the component: it is never read as a Qwen model.
     try {
         (void)qwen3_5::parse_config(directory, {});

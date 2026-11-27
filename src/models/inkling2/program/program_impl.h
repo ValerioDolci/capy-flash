@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/inkling2/program/drafter_choice.h"
 #include "models/inkling2/program/execution.h"
 #include "models/inkling2/frontend/frontend.h"
 #include "models/inkling2/program/program.h"
@@ -30,9 +31,10 @@ struct SequenceLayout {
     std::size_t graph_allowance_bytes = 0; // per rank, warmup and decode graph; in fixed_bytes
     bool context_cache                = false;
     bool cuda_graph                   = false; // single-token decode replays one captured graph
-    // Drafts per speculative round (--spec mtp --draft-tokens K with the artifact's drafter);
-    // 0: no drafter, every decode step is ordinary.
-    std::uint32_t draft_tokens = 0;
+    // Drafts per speculative round (--spec mtp|dflash2 --draft-tokens K with the artifact's
+    // drafter of that backend); 0: no drafter, every decode step is ordinary.
+    std::uint32_t draft_tokens       = 0;
+    SpeculativeBackend draft_backend = SpeculativeBackend::None;
     // The forward's planned bounds: columns of a call (the prefill chunk, or a speculative
     // round's K + 1 when wider) and logit columns (scoring blocks, or K + 1 when wider).
     std::uint32_t forward_tokens = 0;
@@ -181,6 +183,8 @@ private:
         ResolvedSamplingParameters sampling;
         GenerationTimings timings;
         SpeculativeStats speculative;
+        DrafterChoice drafters;   // with paired drafters (--spec auto): which proposes
+        bool after_steps = false; // the last decode step was an ordinary one
         Clock::time_point started;
         Clock::time_point first_token;
     };
@@ -234,6 +238,8 @@ private:
 
     SequencePlanImpl plan_;
     std::unique_ptr<ProgramExecution> execution_;
+    // With paired drafters: the measured cost of each kind of decode step, across requests.
+    StepCosts costs_;
     std::vector<Lane> lanes_;
     std::optional<OpenMaterialization> transaction_;
     std::optional<Resident> resident_;

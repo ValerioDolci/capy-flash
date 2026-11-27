@@ -105,6 +105,21 @@ void block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t k
                                                           std::int32_t block);
 
 /**
+ * Op: non-causal block attention over a sliding context window
+ *
+ * Math: block_attention's, except for the cached keys each query sees: with P = *frontier, the
+ * query of block column t (position P + t) sees the cached positions p with P + t - p < window,
+ * i.e. [max(0, P + t - window + 1), P), and all B block keys (the DFlash2 window: a key is visible
+ * when the query is at most window - 1 positions past it).
+ * Supported: as block_attention, window >= 2, capacity >= window (no live slot reused).
+ * Workspace: block_attention_workspace_bytes(Hq, B). Capturable (P read on the device).
+ */
+void sliding_block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t kv_heads,
+                             const DraftKVCacheView& cache, const Tensor& frontier,
+                             std::int32_t window, float scale, WorkspaceArena& workspace,
+                             Tensor& out, cudaStream_t stream);
+
+/**
  * Op: residual add with RMSNorm of the unrounded sum
  *
  * Math: s = f32(residual) + f32(y) (FP32); residual = bf16(s); out = bf16(rms(s, weight)).

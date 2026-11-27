@@ -52,6 +52,13 @@ public:
         return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows));
     }
 
+    // The same for parameters with several uses: each through the named use.
+    [[nodiscard]] LinearParameters stacked(std::initializer_list<WeightUseId> uses) const {
+        std::vector<ops::WeightInput> rows;
+        for (const auto use : uses) { rows.push_back(model_.input(use, device_)); }
+        return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows));
+    }
+
 private:
     const Model& model_;
     int device_;
@@ -109,6 +116,65 @@ Parameters::Parameters(const Model& source, int device, const DraftConfig& confi
                 2 * D * static_cast<std::int32_t>(config.num_key_value_heads) ||
             layer.gate_up.weight.n != 2 * static_cast<std::int32_t>(config.intermediate_size)) {
             throw std::invalid_argument("drafter layer shards do not match the rank geometry");
+        }
+        layers.push_back(layer);
+    }
+}
+
+DFlash2Config shard_dflash2_config(const DFlash2Config& config, int tp) {
+    if (tp != 1 && tp != 2) {
+        throw std::invalid_argument("drafter tensor parallelism must be 1 or 2");
+    }
+    const auto parts = static_cast<std::uint32_t>(tp);
+    if (config.num_key_value_heads % parts || config.intermediate_size % parts) {
+        throw std::invalid_argument("drafter heads and MLP width must divide by tp");
+    }
+    DFlash2Config out = config;
+    out.num_attention_heads /= parts;
+    out.num_key_value_heads /= parts;
+    out.intermediate_size /= parts;
+    return out;
+}
+
+DFlash2Parameters::DFlash2Parameters(const Model& source, int device, const DFlash2Config& config)
+    : model(source), device(device) {
+    const auto& weights = source.weights().dflash2;
+    if (!weights) {
+        throw std::invalid_argument("the Model was loaded without the DFlash2 drafter");
+    }
+    const Prepare p(source, device);
+    feature_projection   = p.linear(weights->feature_projection);
+    context_norm         = p.tensor(weights->context_norm);
+    final_norm           = p.tensor(weights->final_norm);
+    hidden_projection    = p.linear(weights->hidden_projection);
+    predecessor_codebook = p.tensor(weights->predecessor_codebook);
+    successor_codebook   = p.tensor(weights->successor_codebook);
+    const auto D         = static_cast<std::int32_t>(config.head_dim);
+    for (const auto& w : weights->layers) {
+        DFlash2LayerParameters layer;
+        layer.input_norm          = p.tensor(w.input_norm);
+        layer.post_attention_norm = p.tensor(w.post_attention_norm);
+        layer.query_norm          = p.tensor(w.query_norm);
+        layer.key_norm            = p.tensor(w.key_norm);
+        // The key and value rows' uses: 0 the attention input, 1 the context (load/draft.cpp).
+        layer.attention_input =
+            p.stacked({WeightUseId{w.query, 0}, WeightUseId{w.key, 0}, WeightUseId{w.value, 0}});
+        layer.context = p.stacked({WeightUseId{w.key, 1}, WeightUseId{w.value, 1}});
+        layer.output  = p.linear(w.output);
+        layer.gate_up = p.stacked({w.gate, w.up});
+        layer.down    = p.linear(w.down);
+        for (auto [conv, source_conv] : {std::pair{&layer.attention_conv, &w.attention_conv},
+                                         std::pair{&layer.mlp_conv, &w.mlp_conv}}) {
+            conv->base_kernel       = p.tensor(source_conv->base_kernel);
+            conv->kernel_projection = p.linear(source_conv->kernel_projection);
+        }
+        if (layer.attention_input.weight.n !=
+                D * static_cast<std::int32_t>(config.num_attention_heads +
+                                              2 * config.num_key_value_heads) ||
+            layer.context.weight.n !=
+                2 * D * static_cast<std::int32_t>(config.num_key_value_heads) ||
+            layer.gate_up.weight.n != 2 * static_cast<std::int32_t>(config.intermediate_size)) {
+            throw std::invalid_argument("DFlash2 layer shards do not match the rank geometry");
         }
         layers.push_back(layer);
     }

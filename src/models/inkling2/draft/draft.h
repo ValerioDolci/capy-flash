@@ -33,6 +33,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/draft/config.h"
 #include "models/inkling2/draft/parameters.h"
+#include "models/inkling2/draft/proposer.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
 #include "ninfer/ops/dspark_draft.h"
@@ -56,7 +57,7 @@ struct DraftRank {
     int device                          = 0;
 };
 
-class Drafter {
+class Drafter final : public Proposer {
 public:
     // `config` is the logical drafter config; `max_width` the widest call whose features the
     // drafter consumes (prefill blocks and verification calls); `max_context` the sequence
@@ -64,19 +65,17 @@ public:
     Drafter(const DraftConfig& config, const TextConfig& text, std::array<DraftRank, 2> ranks,
             int width, execution::ForwardCollectives collectives, std::int32_t max_width,
             std::uint32_t max_context, bool with_image = false);
-    ~Drafter();
-    Drafter(const Drafter&)            = delete;
-    Drafter& operator=(const Drafter&) = delete;
+    ~Drafter() override;
 
-    [[nodiscard]] std::uint32_t proposals() const noexcept { return config_.proposals(); }
+    [[nodiscard]] std::uint32_t proposals() const noexcept override { return config_.proposals(); }
 
     // Rank r's sink for a target call of `width` columns: the call writes its four states into the
     // pending features, which the next materialization consumes.
-    [[nodiscard]] const execution::FeatureSink* sink(int rank, std::int32_t width);
+    [[nodiscard]] const execution::FeatureSink* sink(int rank, std::int32_t width) override;
 
     // Eager: the pending features of the last call (`width` columns at positions first..) become
     // context; then nothing is pending.
-    void append(std::int32_t first, std::int32_t width);
+    void append(std::int32_t first, std::int32_t width) override;
 
     // In a round (stream-ordered, capturable), every rank from its own device scalars: the pending
     // features of the last call (count = the last commit()) become context at positions
@@ -86,22 +85,24 @@ public:
     // proposals the round verifies (its chain is causal, so they do not depend on the rest).
     // `width` is the width of the call whose features are pending (a round's verification calls).
     void propose(const std::array<Tensor, 2>& anchor, const std::array<Tensor, 2>& frontier,
-                 const std::array<Tensor, 2>& drafts, std::int32_t width, std::int32_t proposals);
+                 const std::array<Tensor, 2>& drafts, std::int32_t width,
+                 std::int32_t proposals) override;
 
     // In a round after acceptance: the last call licensed `count` (I32 [1] per rank) columns.
-    void commit(const std::array<Tensor, 2>& count);
+    void follow(const std::array<Tensor, 2>& frontier, std::int32_t width) override;
+    void commit(const std::array<Tensor, 2>& count) override;
 
     // The anchor image of the drafter's context that a position-ordered resume cannot rebuild:
     // the local layers' rings and f_rnn, on every rank (the global layer's cache is per position,
     // like the target's global K/V). save_image keeps them, restore_image puts them back and
     // leaves nothing pending. Requires an image (with_image at construction).
-    void save_image();
-    void restore_image();
+    void save_image() override;
+    void restore_image() override;
     // Nothing pending: the next round materializes no context (a new sequence or a resume).
-    void clear_pending();
+    void clear_pending() override;
     // Eager: the pending features of the last round (a call of `width` columns, the device's
     // pending count of them, ending at position `frontier`) become context; then none is pending.
-    void catch_up(std::int32_t frontier, std::int32_t width);
+    void catch_up(std::int32_t frontier, std::int32_t width) override;
 
     // Device bytes per rank of the state (with the image when `image`) and of the workspace of a
     // drafter of rank geometry `rank` (shard_draft_config of `config`) over `rows` folded rows.
@@ -112,9 +113,9 @@ public:
                                                    std::uint32_t max_context, bool image);
 
     // Device bytes the drafter's state holds on each rank (caches, pending features, buffers).
-    [[nodiscard]] std::size_t state_bytes() const noexcept { return state_bytes_; }
+    [[nodiscard]] std::size_t state_bytes() const noexcept override { return state_bytes_; }
 
-    [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
+    [[nodiscard]] std::size_t workspace_bytes() const noexcept override { return workspace_bytes_; }
 
 private:
     struct Rank;

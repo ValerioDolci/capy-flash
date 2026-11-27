@@ -148,10 +148,12 @@ std::size_t block_attention_workspace_bytes(std::int32_t query_heads, std::int32
            detail::kBlockAttentionMaxBlock * (kHeadDim + 2) * sizeof(float);
 }
 
-void block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t kv_heads,
-                     const DraftKVCacheView& cache, const Tensor& frontier, std::int32_t window,
-                     float scale, WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    constexpr const char* op = "block_attention";
+namespace {
+
+void block_attention_checked(const char* op, const Tensor& qkv, std::int32_t query_heads,
+                             std::int32_t kv_heads, const DraftKVCacheView& cache,
+                             const Tensor& frontier, std::int32_t window, bool sliding, float scale,
+                             WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     require_dense(qkv, DType::BF16, op, "qkv");
     const std::int32_t B = qkv.ne[1];
     require(kv_heads > 0 && query_heads % kv_heads == 0 && query_heads / kv_heads <= 4 && B >= 1 &&
@@ -173,7 +175,25 @@ void block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t k
         workspace.alloc_bytes(block_attention_workspace_bytes(query_heads, B)).data);
     detail::block_attention_launch(
         qkv.data, qkv.ne[0], query_heads, kv_heads, B, cache.k.data, cache.v.data, cache.capacity,
-        static_cast<const int*>(frontier.data), window, scale, partial, out.data, stream);
+        static_cast<const int*>(frontier.data), window, sliding, scale, partial, out.data, stream);
+}
+
+} // namespace
+
+void block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t kv_heads,
+                     const DraftKVCacheView& cache, const Tensor& frontier, std::int32_t window,
+                     float scale, WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    block_attention_checked("block_attention", qkv, query_heads, kv_heads, cache, frontier, window,
+                            false, scale, workspace, out, stream);
+}
+
+void sliding_block_attention(const Tensor& qkv, std::int32_t query_heads, std::int32_t kv_heads,
+                             const DraftKVCacheView& cache, const Tensor& frontier,
+                             std::int32_t window, float scale, WorkspaceArena& workspace,
+                             Tensor& out, cudaStream_t stream) {
+    require(window >= 2, "sliding_block_attention", "window must be at least 2");
+    block_attention_checked("sliding_block_attention", qkv, query_heads, kv_heads, cache, frontier,
+                            window, true, scale, workspace, out, stream);
 }
 
 void add_rmsnorm(Tensor& residual, const Tensor& y, const Tensor& weight, float eps, Tensor& out,

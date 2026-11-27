@@ -152,6 +152,59 @@ add_test(NAME ninfer_inkling2_prefix_reuse_spec_test
   COMMAND ninfer_inkling2_prefix_reuse_test ${inkling2_real_args} --tp 2 --prefill-chunk 1 --spec 3)
 set_tests_properties(ninfer_inkling2_prefix_reuse_spec_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The DFlash2 drafter and the pair of both drafters on an artifact with the mtp and dflash2
+# components (tools/convert/inkling2.py --components text,mtp,dflash2 --source dflash2=DIR): the
+# verification rounds with the drafter proposing against the greedy without it (ids and every
+# committed column's logits, bit for bit, K = 1, 3, 7), with the paired drafters' proposer changing
+# every three rounds, and prefix reuse with their rounds. Without the artifact they skip (77).
+set(NINFER_TEST_INKLING2_DF2_ARTIFACT "" CACHE FILEPATH
+  "Inkling 2 Mini artifact with the mtp and dflash2 components for the DFlash2 drafter tests")
+set(inkling2_df2_args)
+if(NINFER_TEST_INKLING2_DF2_ARTIFACT)
+  set(inkling2_df2_args --artifact "${NINFER_TEST_INKLING2_DF2_ARTIFACT}")
+endif()
+add_test(NAME ninfer_inkling2_dflash2_round_tp2_real_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_df2_args}
+  --ids "${CMAKE_CURRENT_LIST_DIR}/greedy_fixture.json" --mode spec --tp 2 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --dflash2)
+add_test(NAME ninfer_inkling2_prefix_reuse_dflash2_test
+  COMMAND ninfer_inkling2_prefix_reuse_test ${inkling2_df2_args} --tp 2 --prefill-chunk 1 --spec 3
+  --dflash2 1)
+add_test(NAME ninfer_inkling2_paired_round_tp2_real_test
+  COMMAND ninfer_inkling2_tf_driver ${inkling2_df2_args}
+  --ids "${CMAKE_CURRENT_LIST_DIR}/greedy_fixture.json" --mode spec --tp 2 --block 16
+  --max-new 64 --draft-tokens 1,3,7 --auto --proposer dflash2 --switch-every 3)
+add_test(NAME ninfer_inkling2_prefix_reuse_auto_test
+  COMMAND ninfer_inkling2_prefix_reuse_test ${inkling2_df2_args} --tp 2 --prefill-chunk 1 --spec 3
+  --auto 1)
+# Ordinary steps that feed both drafters (--spec auto) between rounds of either, from the decode
+# graph against eager: the same bytes and tokens after every call (test_decode_graph.cpp --auto).
+add_test(NAME ninfer_inkling2_auto_decode_graph_tp2_real_test
+  COMMAND ninfer_inkling2_decode_graph_tp2_test ${inkling2_df2_args} --tp 2 --auto 3)
+set_tests_properties(ninfer_inkling2_dflash2_round_tp2_real_test
+  ninfer_inkling2_prefix_reuse_dflash2_test
+  ninfer_inkling2_paired_round_tp2_real_test
+  ninfer_inkling2_prefix_reuse_auto_test
+  ninfer_inkling2_auto_decode_graph_tp2_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK ninfer_gpu_memory)
+
+# The choice between the paired drafters (program/drafter_choice.h) on constructed sequences: the
+# start by prompt length, DSpark while the output copies text only the context beyond the DFlash2
+# window holds, DFlash2 again when it stops, nothing for copies inside the window (CPU only).
+ninfer_add_test(ninfer_inkling2_drafter_choice_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_drafter_choice.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/inkling2/program/drafter_choice.cpp"
+          "${PROJECT_SOURCE_DIR}/src/models/inkling2/program/drafter_costs.cpp"
+  LIBRARIES ninfer_core)
+# The same choice replayed over a recorded trace for the tuning tool's parity check
+# (tools/inkling2_tune/parity.py: the simulator against the engine's code, step by step).
+add_executable(ninfer_inkling2_drafter_replay
+  "${CMAKE_CURRENT_LIST_DIR}/drafter_replay.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/inkling2/program/drafter_choice.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/inkling2/program/drafter_costs.cpp")
+ninfer_test_includes(ninfer_inkling2_drafter_replay)
+target_link_libraries(ninfer_inkling2_drafter_replay PRIVATE ninfer_core ninfer::json)
+
 # The decode step from the captured CUDA Graph against the same step run eagerly, through the
 # Program's execution (test_decode_graph.cpp): visit state and soft-capped logits byte for byte
 # after every step, on the synthetic artifact at tp 1 and tp 2 and on the real one at tp 2.

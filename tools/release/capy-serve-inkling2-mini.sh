@@ -5,7 +5,11 @@
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1)  NINFER_MAX_CONTEXT (253952)
 #   NINFER_PREFILL_CHUNK (4096: prompt tokens per prefill block, a multiple of 128)
 #   NINFER_MODEL_ID (inkling-2-mini: the `model` name requests must use)
-#   NINFER_DRAFTER=0 turns the drafter off (no --spec mtp --draft-tokens 3)
+#   NINFER_DRAFTER=0 turns the drafter off (no --spec mtp --draft-tokens 3); NINFER_DRAFTER=auto
+#   uses both of the artifact's drafters with the one that proposes, or none, chosen every round
+#   (--spec auto --draft-tokens 3: an artifact with the dflash2 component; with one whose
+#   converter report beside it lists no dflash2 the launcher keeps --spec mtp and says so),
+#   NINFER_DRAFTER=dflash2 the DFlash2 drafter alone (--spec dflash2 --draft-tokens 3)
 #   NINFER_LOOPCD=1 turns LoopCD on (--loopcd adaptive: contrastive decoding against the looped
 #   core's first pass, off by default), NINFER_LOOPCD_OMEGA its strength (--loopcd-omega, else
 #   the server's default)
@@ -21,7 +25,9 @@
 # Speculative decoding with the checkpoint's DSpark drafter is on (--spec mtp --draft-tokens 3): the
 # text is the same as without it, and it takes VRAM from the context. An artifact without the mtp
 # component (tools.convert --components text) starts and decodes without a drafter. `--spec off`
-# or another `--draft-tokens` after the artifact wins.
+# or another `--draft-tokens` after the artifact wins. NINFER_DRAFTER=auto decodes faster than the
+# default on prose, code and long writing and slower on answers about long documents (the release
+# notes' table); at 253,952 tokens both drafters leave about 130 MiB free per board.
 # Extra flags are appended and win over these. Run it under a supervisor that restarts on a
 # non-zero exit: the server exits with status 2 once the Engine fails (docs/serving/endpoints.md).
 set -euo pipefail
@@ -43,7 +49,19 @@ case $devices in
     parallel=(--device "$devices") ;;
 esac
 drafter=(--spec mtp --draft-tokens 3)
-[ "${NINFER_DRAFTER:-1}" = 0 ] && drafter=()
+case ${NINFER_DRAFTER:-1} in
+  0) drafter=() ;;
+  1 | mtp) ;;
+  dflash2) drafter=(--spec dflash2 --draft-tokens 3) ;;
+  auto)
+    if [ -f "$artifact.conversion.json" ] && ! grep -q '"dflash2"' "$artifact.conversion.json"; then
+      echo "$0: NINFER_DRAFTER=auto needs an artifact with the dflash2 component; using --spec mtp" >&2
+    else
+      drafter=(--spec auto --draft-tokens 3)
+    fi
+    ;;
+  *) echo "$0: NINFER_DRAFTER takes 0, 1, mtp, dflash2 or auto (got ${NINFER_DRAFTER})" >&2; exit 2 ;;
+esac
 loopcd=()
 if [ "${NINFER_LOOPCD:-0}" = 1 ]; then
   loopcd=(--loopcd adaptive)

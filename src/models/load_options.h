@@ -54,6 +54,8 @@ struct LoadOptions {
             return "mtp";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::Auto: // both drafters' components (Inkling 2), no single one
+            return {};
         }
         return {};
     }

@@ -758,6 +758,20 @@ int qualify(Totals& totals) {
                   808, totals);
         fails += run_sequence(h, 1500, {1, 2, 4, 8, 16, 7}, {true, true, true, true, true, true});
     }
+    // Verification widths on the model's ring (one launch for 2-4 tokens): tokens on both sides of
+    // a chunk boundary (128 visible keys), and the window filling up inside a call.
+    {
+        Harness h({"windowed-12/4-ring1031-chunks", Mode::Windowed, G{128, 12, 4}, 16, 1024, 1024,
+                   1031, 0.0f, 8192.0f, 200},
+                  909, totals);
+        fails += run_sequence(h, 126, {4, 3, 2, 4}, {true, true, true, true});
+    }
+    {
+        Harness h({"windowed-12/4-ring1031-fill", Mode::Windowed, G{128, 12, 4}, 16, 1024, 1024,
+                   1031, 0.0f, 8192.0f, 1100},
+                  910, totals);
+        fails += run_sequence(h, 1021, {4, 4, 3, 2}, {true, true, true, true});
+    }
     return fails;
 }
 

@@ -2,9 +2,13 @@
 // executions over one loaded model, one with CUDA Graphs and one without, run the same prompt and
 // the same sampled decode steps. After the prompt and after every step the visit state of every
 // rank and the soft-capped FP32 logits of the step must be the same bytes, and so the tokens.
-// Usage: --artifact PATH [--tp 1|2] [--steps N] [--loopcd hidden|logits|adaptive [--loopcd-omega W]
-// [--loopcd-pass B]] (the model loaded with that loop contrast, W as in ninfer-serve); without an
-// artifact it skips (77).
+// With --auto K (an artifact with both drafters, --spec auto with K drafts) the decode mixes
+// rounds of either drafter with runs of ordinary steps, which feed both drafters' contexts: runs
+// that leave 1 .. K + 1 columns pending for the next round and longer ones, which the round
+// catches up first; after every round the licensed tokens must be the same too.
+// Usage: --artifact PATH [--tp 1|2] [--steps N] [--auto K] [--loopcd hidden|logits|adaptive
+// [--loopcd-omega W] [--loopcd-pass B]] (the model loaded with that loop contrast, W as in
+// ninfer-serve); without an artifact it skips (77).
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -46,7 +50,7 @@ std::optional<std::size_t> first_difference(const std::vector<std::uint8_t>& a,
     return std::nullopt;
 }
 
-int run(const std::filesystem::path& path, int tp, std::uint32_t steps,
+int run(const std::filesystem::path& path, int tp, std::uint32_t steps, std::uint32_t paired,
         const LoopContrastOptions& contrast) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < tp) {
@@ -54,7 +58,11 @@ int run(const std::filesystem::path& path, int tp, std::uint32_t steps,
         return 77;
     }
     artifact::Reader reader(path);
-    auto plan = ink::plan_load(reader, models::LoadOptions{.tp = tp, .loop_contrast = contrast});
+    auto plan = ink::plan_load(
+        reader, models::LoadOptions{.speculative   = paired > 0 ? SpeculativeBackend::Auto
+                                                                : SpeculativeBackend::None,
+                                    .tp            = tp,
+                                    .loop_contrast = contrast});
     std::vector<int> ids;
     for (int device = 0; device < tp; ++device) { ids.push_back(device); }
     ExecutionContext execution(ids);
@@ -70,6 +78,10 @@ int run(const std::filesystem::path& path, int tp, std::uint32_t steps,
     options.prefill_chunk         = kContext;
     options.context_cache.enabled = false;
     options.use_cuda_graph        = true;
+    if (paired > 0) {
+        options.speculative.backend      = SpeculativeBackend::Auto;
+        options.speculative.draft_tokens = paired;
+    }
     const auto graph_layout = ink::detail::plan_sequence_layout(parameters, peer.get(), options);
     options.use_cuda_graph  = false;
     const auto eager_layout = ink::detail::plan_sequence_layout(parameters, peer.get(), options);
@@ -104,6 +116,77 @@ int run(const std::filesystem::path& path, int tp, std::uint32_t steps,
         return 1;
     }
     std::vector<TokenId> generated{*first_graph};
+    if (paired > 0) {
+        // The startup's timing of the paired steps (graphs only, and only where a round fits after
+        // the warmup's prompt block: a third execution with half-context blocks): a round costs
+        // more than a step.
+        EngineOptions timing  = options;
+        timing.use_cuda_graph = true;
+        timing.prefill_chunk  = kContext / 2;
+        const auto timed =
+            ink::detail::make_program_execution(
+                parameters, peer.get(),
+                ink::detail::plan_sequence_layout(parameters, peer.get(), timing), execution)
+                ->startup_costs();
+        if (!timed || graph->startup_costs() || eager->startup_costs() || !(timed->step_ms > 0.0) ||
+            !(timed->round_ms[0] > timed->step_ms) || !(timed->round_ms[1] > timed->step_ms)) {
+            std::cerr << "startup costs: missing where a round fits, present where it does not, or "
+                         "out of order\n";
+            ++failures;
+        } else {
+            std::printf("startup costs at %u: step %.3f ms, DSpark round %.3f ms, DFlash2 round "
+                        "%.3f ms\n",
+                        timed->position, timed->step_ms, timed->round_ms[0], timed->round_ms[1]);
+        }
+
+        // Rounds (a drafter) and runs of ordinary steps (a count), in turn until the context
+        // ends; the anchor generated.back() sits at `position`.
+        struct Call {
+            SpeculativeBackend drafter;
+            std::uint32_t steps;
+        };
+
+        const SpeculativeBackend M = SpeculativeBackend::Mtp, D = SpeculativeBackend::DFlash2;
+        const std::vector<Call> pattern{{D, 0},          {D, 0}, {M, 1},  {D, 3}, {D, paired + 1},
+                                        {M, paired + 2}, {D, 0}, {M, 20}, {D, 2}, {M, 0}};
+        std::uint32_t position = kPrompt, rounds = 0, accepted = 0, ordinary = 0;
+        for (std::size_t i = 0; failures == 0 && position + paired + 2U < kContext; ++i) {
+            const Call& call           = pattern[i % pattern.size()];
+            const std::uint32_t extent = std::min(paired, kContext - position - 2U);
+            const auto from_graph      = graph->speculate(0, generated.back(), position, extent,
+                                                          sampling, generated, call.drafter);
+            const auto from_eager      = eager->speculate(0, generated.back(), position, extent,
+                                                          sampling, generated, call.drafter);
+            check("round", rounds);
+            if (from_graph != from_eager) {
+                std::cerr << "round " << rounds << ": the licensed tokens differ\n";
+                ++failures;
+                break;
+            }
+            ++rounds;
+            accepted += std::uint32_t(from_graph.size()) - 1U;
+            position += std::uint32_t(from_graph.size());
+            generated.insert(generated.end(), from_graph.begin(), from_graph.end());
+            for (std::uint32_t s = 0; s < call.steps && position + paired + 2U < kContext; ++s) {
+                const std::vector<TokenId> token{generated.back()};
+                const TokenId graph_token = graph->decode(0, token, position, sampling, generated);
+                const TokenId eager_token = eager->decode(0, token, position, sampling, generated);
+                check("ordinary step", ordinary);
+                if (graph_token != eager_token) {
+                    std::cerr << "ordinary step " << ordinary << ": tokens differ\n";
+                    ++failures;
+                    break;
+                }
+                ++ordinary;
+                ++position;
+                generated.push_back(graph_token);
+            }
+        }
+        std::printf("tp %d, both drafters K %u: %u rounds (%u drafts accepted), %u ordinary steps "
+                    "compared\n",
+                    tp, paired, rounds, accepted, ordinary);
+        return failures;
+    }
     for (std::uint32_t step = 0; step < steps && kPrompt + step + 1U < kContext; ++step) {
         const std::vector<TokenId> token{generated.back()};
         const std::uint32_t position = kPrompt + step;
@@ -129,7 +212,7 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path path;
         int tp              = 2;
-        std::uint32_t steps = 24;
+        std::uint32_t steps = 24, paired = 0;
         LoopContrastOptions contrast;
         std::optional<float> omega;
         for (int i = 1; i < argc; ++i) {
@@ -140,6 +223,8 @@ int main(int argc, char** argv) {
                 tp = std::stoi(argv[++i]);
             } else if (arg == "--steps" && i + 1 < argc) {
                 steps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--auto" && i + 1 < argc) {
+                paired = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             } else if (arg == "--loopcd" && i + 1 < argc) {
                 const std::string mode(argv[++i]);
                 contrast.mode     = mode == "hidden" ? LoopContrast::Hidden : LoopContrast::Logits;
@@ -149,8 +234,8 @@ int main(int argc, char** argv) {
             } else if (arg == "--loopcd-pass" && i + 1 < argc) {
                 contrast.reference_pass = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             } else {
-                std::cerr << "usage: --artifact PATH [--tp 1|2] [--steps N] [--loopcd MODE "
-                             "[--loopcd-omega W] [--loopcd-pass B]]\n";
+                std::cerr << "usage: --artifact PATH [--tp 1|2] [--steps N] [--auto K] [--loopcd "
+                             "MODE [--loopcd-omega W] [--loopcd-pass B]]\n";
                 return 2;
             }
         }
@@ -165,7 +250,7 @@ int main(int argc, char** argv) {
             std::cout << "SKIP: supply --artifact (an Inkling 2 artifact)\n";
             return 77;
         }
-        const int failures = run(path, tp, steps, contrast);
+        const int failures = run(path, tp, steps, paired, contrast);
         if (failures == 77) { return 77; }
         std::cout << (failures ? "FAIL" : "OK") << " inkling2 decode graph against eager, tp " << tp
                   << '\n';

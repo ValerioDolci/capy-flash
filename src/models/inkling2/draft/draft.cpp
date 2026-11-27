@@ -258,6 +258,14 @@ void Drafter::catch_up(std::int32_t frontier, std::int32_t width) {
     clear_pending();
 }
 
+void Drafter::follow(const std::array<Tensor, 2>& frontier, std::int32_t width) {
+    if (width <= 0 || width > max_width_) {
+        throw std::invalid_argument("Inkling 2 drafter: pending width out of range");
+    }
+    each([&](int r) { rank_[at(r)]->work->reset(); });
+    materialize(frontier, width);
+}
+
 void Drafter::save_image() { copy_image(true); }
 
 void Drafter::restore_image() {

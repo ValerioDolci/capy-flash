@@ -131,10 +131,18 @@ Choose the affected checks, rather than running this table as a checklist:
 | Serving | affected schema tests and observable request/stream behavior |
 
 A change that can alter generated tokens (kernels, quantization, routing, expert placement, sampling,
-prefill chunking, speculative decoding) also needs a model-level quality check before release:
-GSM8K (1,319 questions) and MMLU-Pro (1,008 questions) against the recorded reference, paired per
-question (McNemar), not only a perplexity or a smoke prompt. Changes whose output is bit-identical
-(proved by exact comparison of the produced values) need not repeat it; say which case applies.
+prefill chunking, speculative decoding) falls in one of three cases before release; say which applies:
+
+- **Bit-identical**, proved by exact comparison of the produced values: no model-level check.
+- **Same precision, different bits**: the weights, activations, accumulators and exchanged values keep
+  their formats, and the bits change only through the order of the operations or where they run
+  (summation order, chunking or tiling, one or two GPUs, which experts are resident). A light
+  model-level check: the first 330 GSM8K and the first 252 MMLU-Pro questions against the recorded
+  reference, paired per question (McNemar).
+- **Lower precision**: fewer bits in weights, activations, accumulators or exchanged values (for
+  example an int8 all-reduce payload, int8 activations, FP16 accumulation). The full check: GSM8K
+  (1,319 questions) and MMLU-Pro (1,008 questions), paired per question, not only a perplexity or a
+  smoke prompt. Such a change stays opt-in, off by default, with its measured loss documented.
 
 Record the target, relevant hardware/toolchain, workload or command, and summarized result needed
 to interpret a material claim. Hashes, clean worktrees, full command transcripts, raw report

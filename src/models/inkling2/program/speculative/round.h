@@ -15,7 +15,7 @@
 //   5. rank 1 pulls the licensed count; every rank folds its convolution tails after it
 //   6. one device-to-host copy of the egress record (licensed tokens and count) on rank 0
 //
-// With a drafter (draft/draft.h) the round proposes its own drafts in the same graph: after the
+// With a drafter (draft/proposer.h) the round proposes its own drafts in the same graph: after the
 // upload every rank's drafter materializes the context the last call licensed and writes the
 // proposals over the record's drafts, the forward fills the drafter's pending features, and the
 // licensed count becomes the drafter's next pending count. Without one, the record's drafts are
@@ -36,7 +36,7 @@
 #include "core/decode_graph.h"
 #include "core/tensor.h"
 #include "models/inkling2/config.h"
-#include "models/inkling2/draft/draft.h"
+#include "models/inkling2/draft/proposer.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/state/conv_record.h"
 #include "models/inkling2/state/visit_state.h"
@@ -96,7 +96,7 @@ public:
     VerifyRound(const TextConfig& config, std::array<RoundRank, 2> ranks, int width,
                 execution::ForwardCollectives collectives, const DecodeGraphPeerBridge* bridge,
                 std::uint32_t drafts, std::int32_t max_tokens, std::int32_t max_logit_columns,
-                draft::Drafter* drafter = nullptr);
+                draft::Proposer* drafter = nullptr);
     ~VerifyRound();
 
     VerifyRound(const VerifyRound&)            = delete;
@@ -145,7 +145,7 @@ private:
     const DecodeGraphPeerBridge* bridge_;
     std::uint32_t drafts_;
     std::int32_t max_tokens_, max_logit_columns_;
-    draft::Drafter* drafter_;
+    draft::Proposer* drafter_;
     std::array<std::unique_ptr<Rank>, 2> rank_;
     std::unique_ptr<PinnedHostBuffer> host_;
     std::unique_ptr<DeviceBuffer> logits_mem_, capped_mem_, accept_mem_;

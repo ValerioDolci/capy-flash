@@ -43,6 +43,11 @@ ProgramImpl::ProgramImpl(SequencePlanImpl plan, std::unique_ptr<ProgramExecution
         throw std::logic_error("Inkling 2 Program plan is invalid");
     }
     transport_ = execution_->tp_transport();
+    if (const auto timed = execution_->startup_costs()) {
+        costs_.calibrate(StepKind::Ordinary, timed->position, timed->step_ms);
+        costs_.calibrate(StepKind::RoundMtp, timed->position, timed->round_ms[0]);
+        costs_.calibrate(StepKind::RoundDFlash2, timed->position, timed->round_ms[1]);
+    }
 }
 
 std::vector<PrefixDigest> prefix_digests(std::span<const TokenId> tokens) {
@@ -372,11 +377,12 @@ ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancella
     lane.sampling      = plan.sampling;
     if (const std::uint32_t K = execution_->draft_tokens(); K > 0) {
         lane.speculative =
-            SpeculativeStats{.backend               = SpeculativeBackend::Mtp,
+            SpeculativeStats{.backend               = plan_.layout.draft_backend,
                              .enabled               = true,
                              .draft_window          = K,
                              .accepted_per_position = std::vector<std::uint64_t>(K, 0)};
     }
+    lane.drafters.start(lane.prompt_tokens);
     lane.started     = Clock::now();
     open.published   = true;
     result.status    = runtime::ContextTransactionStatus::Published;
@@ -458,8 +464,9 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
 // visits' keys, and the drafter's own global attention grows with the context. On two RTX 5070 Ti
 // (K = 3, rounds that read the paged keys once for all their columns) drafting still decodes faster
 // at 196k tokens and breaks even near 247k. Beyond it rows take ordinary steps, which do not feed
-// the drafter's context: a sequence's frontier only grows, and a resume below the limit restarts at
-// a prompt anchor or an endpoint whose context the drafter already holds. The choice depends on the
+// the drafter's context (with paired drafters they do, since the lane's choice may return to a
+// round): a sequence's frontier only grows, and a resume below the limit restarts at a prompt
+// anchor or an endpoint whose context the drafter already holds. The choice depends on the
 // position alone, and both kinds of step give the target's tokens.
 constexpr std::uint32_t kSpeculativeContextLimit = 245760;
 
@@ -506,19 +513,39 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
         }
         const auto row_begin = Clock::now();
         TokenId* out         = pending_.tokens.data() + row * pending_.row_stride;
+        // The kind of step whose time teaches the step costs (paired drafters only): not a round
+        // that first catches up after ordinary steps, nor a step over forced tokens.
+        std::optional<StepKind> timed;
+        const std::uint32_t position = lane->executed;
         try {
-            if (const auto extent = speculative_extent(*lane, budgets[row])) {
+            // With paired drafters the lane's choice may also be an ordinary step.
+            std::optional<std::uint32_t> extent = speculative_extent(*lane, budgets[row]);
+            SpeculativeBackend drafter          = SpeculativeBackend::None;
+            if (extent && execution_->paired_drafters()) {
+                drafter = lane->drafters.choose(lane->tokens, costs_);
+                if (drafter == SpeculativeBackend::None) { extent.reset(); }
+            }
+            if (extent) {
+                const std::uint32_t frontier        = lane->executed;
                 const std::vector<TokenId> licensed = execution_->speculate(
-                    Access::lane(sequences[row]).value, lane->tokens.back(), lane->executed,
-                    *extent, lane->sampling,
-                    std::span<const TokenId>(lane->tokens).subspan(lane->prompt_tokens));
+                    Access::lane(sequences[row]).value, lane->tokens.back(), frontier, *extent,
+                    lane->sampling,
+                    std::span<const TokenId>(lane->tokens).subspan(lane->prompt_tokens), drafter);
                 std::copy(licensed.begin(), licensed.end(), out);
                 pending_.row_counts[row]  = static_cast<std::int32_t>(licensed.size());
                 pending_.speculative[row] = true;
-                pending_.frontier[row]    = lane->executed;
+                pending_.frontier[row]    = frontier;
                 lane->executed += static_cast<std::uint32_t>(licensed.size());
                 SpeculativeStats& stats = lane->speculative;
                 const auto accepted     = static_cast<std::uint32_t>(licensed.size()) - 1U;
+                if (drafter != SpeculativeBackend::None) {
+                    lane->drafters.observe(drafter, accepted, frontier, costs_);
+                    if (!lane->after_steps) {
+                        timed = drafter == SpeculativeBackend::Mtp ? StepKind::RoundMtp
+                                                                   : StepKind::RoundDFlash2;
+                    }
+                    lane->after_steps = false;
+                }
                 stats.rounds += 1;
                 stats.drafted_tokens += *extent;
                 stats.accepted_tokens += accepted;
@@ -526,6 +553,12 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
                     stats.accepted_per_position[i] += 1;
                 }
             } else {
+                if (execution_->paired_drafters()) {
+                    if (lane->tokens.size() == std::size_t(lane->executed) + 1U) {
+                        timed = StepKind::Ordinary;
+                    }
+                    lane->after_steps = true;
+                }
                 out[0] = execution_->decode(
                     Access::lane(sequences[row]).value,
                     std::span<const TokenId>(lane->tokens).subspan(lane->executed), lane->executed,
@@ -542,7 +575,9 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
             }
             throw;
         }
-        lane->timings.decode_seconds += seconds_between(row_begin, Clock::now());
+        const double seconds = seconds_between(row_begin, Clock::now());
+        lane->timings.decode_seconds += seconds;
+        if (timed) { costs_.observe(*timed, position, seconds * 1e3); }
     }
     runtime::ExecutionTiming timing;
     timing.device_wait_ns = nanoseconds_between(begin, Clock::now());

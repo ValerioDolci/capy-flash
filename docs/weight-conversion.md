@@ -104,9 +104,13 @@ Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`, text only) converts with `ink
 own formats are kept, nothing is requantized: NVFP4 and MXFP8 experts are imported as stored, dense
 weights stay BF16 or FP32 ([Inkling 2 model](maintainer/inkling2-model.md)). `--components text,mtp` adds the
 checkpoint's DSpark drafter (`mtp.safetensors`, BF16 words kept; its head's output projection is stored folded into
-the output head), which `--spec mtp` (on in the launcher) uses; with the default `text` the artifact has no drafter. The text component
-alone converts on the CPU in a minute or less (1 GB of RAM) into 19.0 GB; with the drafter the artifact is 19.7 GB. The
-checkpoint takes 20.2 GB:
+the output head), which `--spec mtp` (on in the launcher) uses; with the default `text` the artifact has no drafter.
+`--components text,dflash2 --source dflash2=DIR` adds a DFlash2 drafter from its own checkpoint (e.g.
+`incoai/Inkling-2-Mini-DFlash2`, projections stored Q8), which `--spec dflash2` uses; `--components text,mtp,dflash2`
+keeps both drafters, which `--spec auto` needs (the published artifact is this, with the fine-tuned DSpark drafter in
+place of the checkpoint's `mtp.safetensors`). The text component alone converts on the CPU in a minute or less (1 GB
+of RAM) into 19.0 GB; with the DSpark drafter the artifact is 19.7 GB, with both drafters 20.3 GB. The checkpoint
+takes 20.2 GB:
 
 ```bash
 hf download thinkingmachines/Inkling-2-Mini --local-dir /path/to/Inkling-2-Mini

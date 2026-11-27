@@ -41,15 +41,15 @@ void validate_options(const EngineOptions& options, const ExecutionContext& exec
         throw std::invalid_argument("Inkling 2 context cache has no disk tier: remove "
                                     "--disk-cache-dir");
     }
-    // --spec mtp: the artifact's DSpark drafter (component mtp), K drafts per round; an artifact
-    // without the component decodes without it.
-    if (options.speculative.backend == SpeculativeBackend::DFlash2 ||
-        (options.speculative.backend == SpeculativeBackend::Mtp &&
-         (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 7 ||
-          options.speculative.proposal_head != ProposalHead::Full))) {
+    // --spec mtp: the artifact's DSpark drafter (component mtp), --spec dflash2: its DFlash2
+    // drafter (component dflash2); K drafts per round. An artifact without the component decodes
+    // without it.
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 7 ||
+         options.speculative.proposal_head != ProposalHead::Full)) {
         throw std::invalid_argument(
-            "Inkling 2 speculative decoding is --spec mtp --draft-tokens 1..7 (the artifact's "
-            "drafter), without --lm-head-draft");
+            "Inkling 2 speculative decoding is --spec mtp|dflash2 --draft-tokens 1..7 (the "
+            "artifact's drafter), without --lm-head-draft");
     }
     if (options.enable_vision) {
         throw std::invalid_argument("Inkling 2 is text only: start without --vision");

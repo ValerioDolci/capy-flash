@@ -63,8 +63,13 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->config.draft) {
         out->weights.draft = loading::bind_draft(bindings, *out->config.draft, out->config.text);
     }
+    if (out->config.dflash2) {
+        out->weights.dflash2 =
+            loading::bind_dflash2(bindings, *out->config.dflash2, out->config.text);
+    }
     loading::install_shard_resolver(binder, bindings.weights, out->config.text, options,
-                                    out->config.draft ? &*out->config.draft : nullptr);
+                                    out->config.draft ? &*out->config.draft : nullptr,
+                                    out->config.dflash2 ? &*out->config.dflash2 : nullptr);
     out->pending              = std::move(bindings.weights);
     out->materialization      = std::move(binder).finish();
     out->info.name            = reader.directory().metadata.value("name", "inkling2");

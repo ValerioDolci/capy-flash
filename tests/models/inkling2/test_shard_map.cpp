@@ -6,7 +6,8 @@
 // 2. The rank config (12/4 heads, half the output rows) and the rejections: a parameter without
 //    a rule, a layer outside the model, tensor parallelism 3, indivisible heads, an expert width
 //    that does not halve into 64-column parts.
-// 3. With embedding_host, text/token_embedding alone is HostMapped, at tp 1 and tp 2.
+// 3. With embedding_host, text/token_embedding alone among the text parameters is HostMapped, at
+//    tp 1 and tp 2, and so are the DFlash2 selector's two codebooks.
 
 #include "artifact/fixture.h"
 #include "models/inkling2/config.h"
@@ -152,8 +153,16 @@ void released() {
                 throw std::runtime_error(name + ": unexpected placement with embedding_host");
             }
         }
+        for (const char* codebook : {"dflash2/candidate_selector/predecessor_codebook",
+                                     "dflash2/candidate_selector/successor_codebook"}) {
+            const artifact::Shape shape{c.vocab_size, 256};
+            require(loading::logical_shard(codebook, shape, c, host).axis == ShardAxis::HostMapped,
+                    "the DFlash2 codebooks are HostMapped with embedding_host");
+        }
     }
-    std::printf("  embedding_host: text/token_embedding HostMapped at tp 1 and 2\n");
+    std::printf(
+        "  embedding_host: text/token_embedding and the DFlash2 codebooks HostMapped at tp 1 "
+        "and 2\n");
     const auto rank = inkling2::execution::shard_text_config(c, 2);
     require(rank.num_attention_heads == 12 && rank.num_key_value_heads == 4 &&
                 rank.unpadded_vocab_size == 100029 && rank.num_experts == 128 &&

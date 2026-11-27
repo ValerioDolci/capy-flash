@@ -17,7 +17,7 @@ since v0.16 also **Inkling 2 Mini** (text only) on two 16 GB boards. Source and 
 | `serve-flash-next.sh` | launcher with the Qwen3.8-Flash-Next profile |
 | `serve-tp2.sh` | launcher with the Qwen3.8-27B two-GPU production profile (as in ninfer-tp2) |
 | `serve-27b-16gb.sh` | launcher for the 3-bit Qwen3.8-27B on one 16 GB board (`--profile 27b-16gb`) |
-| `capy-serve-inkling2-mini.sh` | launcher for Inkling 2 Mini on two 16 GB boards (text only, one request at a time, 253,952-token context with 4096-token prefill blocks, its drafter on; `NINFER_LOOPCD=1` adds LoopCD) |
+| `capy-serve-inkling2-mini.sh` | launcher for Inkling 2 Mini on two 16 GB boards (text only, one request at a time, 253,952-token context with 4096-token prefill blocks, its DSpark drafter on; `NINFER_DRAFTER=auto` uses both of its drafters, opt-in; `NINFER_LOOPCD=1` adds LoopCD) |
 | `chat_templates/` | `qwen3_8.jinja` (NInfer's Qwen3.8 chat template, which the launchers pass with `--chat-template`; it accepts the `developer` role and Responses `instructions`, needed by Codex CLI) and its `LICENSE` |
 | `SHA256SUMS` | digests of every file above; check with `sha256sum -c SHA256SUMS` |
 
@@ -49,14 +49,20 @@ NINFER_DEVICES=0 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.n
 ./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4_dflash2.ninfer                   # Qwen3.8-27B
 ./serve-27b-16gb.sh /path/to/qwen3_8_27b_gsq3.ninfer                              # Qwen3.8-27B 3-bit, one GPU
 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer       # Inkling 2 Mini, two GPUs
-NINFER_DRAFTER=0 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                 # without its drafter
+NINFER_DRAFTER=auto ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer              # both drafters (opt-in)
+NINFER_DRAFTER=0 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                 # without a drafter
 NINFER_LOOPCD=1 ./capy-serve-inkling2-mini.sh /path/to/capy-flash-inkling2-mini-nvfp4.ninfer                  # with LoopCD (opt-in)
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```
 The launchers add `--chat-template chat_templates/qwen3_8.jinja`, the model id and the profile; extra flags win
 over the profile (the Inkling launcher passes no template or profile: its artifact carries its own template, and it
-passes `--spec mtp --draft-tokens 3`: the drafter of an artifact converted with `--components text,mtp`, with the
-same text as without it; an artifact without the drafter decodes without it). Requests
+passes `--spec mtp --draft-tokens 3`: the DSpark drafter of an artifact converted with `--components text,mtp`, with
+the same text as without it; an artifact without the drafter decodes without it). `NINFER_DRAFTER=auto` passes
+`--spec auto --draft-tokens 3` instead: both drafters of the published artifact (`--components text,mtp,dflash2`)
+and, at every step, the one that proposes or none, with the same text; faster on prose, code and long writing, up
+to 4 % slower than the default on some answers about long documents (the release notes have the numbers), so it is
+opt-in. On an artifact whose converter report lists no `dflash2` the launcher keeps `--spec mtp` and says so. With
+`NINFER_LOOPCD=1` it needs `NINFER_MAX_CONTEXT=229376`. `NINFER_DRAFTER=dflash2` uses the DFlash2 drafter alone. Requests
 name the model `capy-flash` (Flash-Next), `qwen3.8-27b` (27B) or `inkling-2-mini`; `NINFER_MODEL_ID` or
 `--model-id` changes it:
 ```bash

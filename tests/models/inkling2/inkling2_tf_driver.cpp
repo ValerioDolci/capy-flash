@@ -45,6 +45,18 @@
 //   features  the drafter's feature sinks (forward.h FeatureSink) over the ids in blocks: each
 //             rank's features equal its tapped visit inputs and head input bit for bit, the ranks
 //             agree and the logits are those of the same blocks without sinks; --out writes them.
+//   oracle    the drafter's seven proposals at the anchors of samples of a recorded dataset
+//             (--data ROOT --samples DIR/K,..., the ink_dataset_driver layout per DIR: prompt.i32,
+//             prompt.feat.bf16 [n, 4, H], s<K>.gen.i32 [G], s<K>.feat.bf16 [G - 1, 4, H]) from the
+//             recorded target states, without running the target: the context is the features of
+//             the window before the first anchor (with --first 0 every prompt position, appended in
+//             calls of --block columns as a prefill appends), then every anchor P in [n, n + G - 2]
+//             (every --stride-th) proposes and the feature of P becomes context; --out DIR gets one
+//             JSON {sample, anchors, drafts} per sample.
+// --drafter uses the artifact's mtp component (DSpark), --dflash2 its dflash2 component, --auto
+// both (the DFlash2 drafter on the DSpark drafter's pending features, draft/paired.h): in spec,
+// --proposer dspark|dflash2 proposes the first round and the other follows, and with
+// --switch-every N the proposer changes every N rounds of a request.
 // Ids: a whitespace-separated text file, or a reference JSON whose prompt_ids (+ generated_ids
 // when scoring) are used. --embedding-host loads every mode's model with the token embedding in
 // one mapped page-locked host copy (LoadOptions::embedding_host). --passes N runs the model with N
@@ -62,7 +74,9 @@
 #include "core/device.h"
 #include "core/device_scope.h"
 #include "core/layout.h"
+#include "models/inkling2/draft/dflash2.h"
 #include "models/inkling2/draft/draft.h"
+#include "models/inkling2/draft/paired.h"
 #include "models/inkling2/draft/parameters.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
@@ -380,6 +394,10 @@ bool embedding_host = false;
 // artifact's num_passes).
 std::uint32_t passes = 0;
 
+// --dflash2: the drafter of every Session with one is the artifact's DFlash2 drafter; --auto: both.
+bool dflash2_drafter = false;
+bool paired_drafters = false;
+
 // --loopcd MODE --loopcd-omega W --loopcd-pass B: every Session's loop contrast.
 LoopContrastOptions contrast;
 
@@ -410,7 +428,10 @@ public:
         reader_.emplace(artifact);
         models::LoadOptions options{};
         options.tp             = tp;
-        options.speculative    = drafter ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
+        options.speculative    = !drafter          ? SpeculativeBackend::None
+                                 : paired_drafters ? SpeculativeBackend::Auto
+                                 : dflash2_drafter ? SpeculativeBackend::DFlash2
+                                                   : SpeculativeBackend::Mtp;
         options.embedding_host = embedding_host;
         options.loop_contrast  = contrast;
         auto plan              = ink::plan_load(*reader_, options);
@@ -460,26 +481,65 @@ public:
                 reference_mem_ = std::make_unique<DeviceBuffer>(std::size_t(V) * max_logits * 4);
             }
         }
-        if (drafter) {
-            const auto& draft = *model_->config().draft;
-            draft_config_     = ink::draft::shard_draft_config(draft, tp);
-            std::array<ink::draft::DraftRank, 2> ranks{};
+        if (drafter && (dflash2_drafter || paired_drafters)) {
+            if (paired_drafters) { make_dspark(max_block, max_context); }
+            std::array<Tensor, 2> features;
+            for (int r = 0; paired_drafters && r < tp; ++r) {
+                const auto& dspark = *model_->config().draft;
+                features[r]        = parts_[0]
+                                  ->sink(r, std::max<std::int32_t>(max_block,
+                                                                   std::int32_t(dspark.block_size)))
+                                  ->features;
+            }
+            const auto& draft = *model_->config().dflash2;
+            dflash2_config_   = ink::draft::shard_dflash2_config(draft, tp);
+            std::array<ink::draft::DFlash2Rank, 2> ranks{};
             for (int r = 0; r < tp; ++r) {
                 const ScopedCurrentDevice scope(r);
-                draft_parameters_[r] =
-                    std::make_unique<ink::draft::Parameters>(*model_, r, draft_config_);
-                ranks[r] = {&draft_config_, draft_parameters_[r].get(), parameters_[r].get(),
+                dflash2_parameters_[r] =
+                    std::make_unique<ink::draft::DFlash2Parameters>(*model_, r, dflash2_config_);
+                ranks[r] = {&dflash2_config_, dflash2_parameters_[r].get(), parameters_[r].get(),
                             stream(r), r};
             }
             if (tp == 2) { transport(); }
-            drafter_ = std::make_unique<ink::draft::Drafter>(
-                draft, config_, ranks, tp,
+            parts_[1] = std::make_unique<ink::draft::DFlash2Drafter>(
+                draft, ranks, tp,
                 exec::ForwardCollectives{&*execution_, events_ ? &*events_ : nullptr},
-                std::max<std::int32_t>(max_block, std::int32_t(draft.block_size)), max_context);
+                std::max<std::int32_t>(max_block, std::int32_t(draft.block_size)), false, features);
+            if (paired_drafters) {
+                pairs_[0] = std::make_unique<ink::draft::PairedProposer>(*parts_[0], *parts_[1]);
+                pairs_[1] = std::make_unique<ink::draft::PairedProposer>(*parts_[1], *parts_[0]);
+                drafter_  = std::move(pairs_[0]);
+            } else {
+                drafter_ = std::move(parts_[1]);
+            }
+        } else if (drafter) {
+            make_dspark(max_block, max_context);
+            drafter_ = std::move(parts_[0]);
         }
     }
 
-    [[nodiscard]] ink::draft::Drafter* drafter() const { return drafter_.get(); }
+    // The artifact's DSpark drafter into parts_[0].
+    void make_dspark(std::int32_t max_block, std::uint32_t max_context) {
+        const int tp      = tp_;
+        const auto& draft = *model_->config().draft;
+        draft_config_     = ink::draft::shard_draft_config(draft, tp);
+        std::array<ink::draft::DraftRank, 2> ranks{};
+        for (int r = 0; r < tp; ++r) {
+            const ScopedCurrentDevice scope(r);
+            draft_parameters_[r] =
+                std::make_unique<ink::draft::Parameters>(*model_, r, draft_config_);
+            ranks[r] = {&draft_config_, draft_parameters_[r].get(), parameters_[r].get(), stream(r),
+                        r};
+        }
+        if (tp == 2) { transport(); }
+        parts_[0] = std::make_unique<ink::draft::Drafter>(
+            draft, config_, ranks, tp,
+            exec::ForwardCollectives{&*execution_, events_ ? &*events_ : nullptr},
+            std::max<std::int32_t>(max_block, std::int32_t(draft.block_size)), max_context);
+    }
+
+    [[nodiscard]] ink::draft::Proposer* drafter() const { return drafter_.get(); }
 
     // A prefill block that also feeds the drafter's context (its feature sinks, then append).
     void step_drafted(const std::vector<std::int32_t>& ids) {
@@ -577,9 +637,10 @@ public:
         bridge_.emplace(0, 1);
     }
 
-    // A verification round of `drafts` drafts over this session's state (round.h).
-    [[nodiscard]] std::unique_ptr<ink::speculative::VerifyRound> round(std::uint32_t drafts,
-                                                                       bool drafted = true) {
+    // A verification round of `drafts` drafts over this session's state (round.h); with paired
+    // drafters (--auto), `second` makes the DFlash2 drafter the proposer.
+    [[nodiscard]] std::unique_ptr<ink::speculative::VerifyRound>
+    round(std::uint32_t drafts, bool drafted = true, bool second = false) {
         transport();
         std::array<ink::speculative::RoundRank, 2> ranks{};
         for (int r = 0; r < tp_; ++r) {
@@ -595,7 +656,9 @@ public:
             config_, ranks, tp_,
             exec::ForwardCollectives{&*execution_, events_ ? &*events_ : nullptr},
             bridge_ ? &*bridge_ : nullptr, drafts, max_block_, max_logits_,
-            drafted ? drafter_.get() : nullptr);
+            !drafted ? nullptr
+            : second ? static_cast<ink::draft::Proposer*>(pairs_[1].get())
+                     : drafter_.get());
     }
 
     [[nodiscard]] std::int32_t position() const { return position_; }
@@ -733,10 +796,14 @@ private:
     std::optional<DecodeGraphPeerBridge> bridge_;
     DecodeGraphDefinition definition_;
     DecodeGraphExecutable graph_;
-    // The drafter (--drafter).
+    // The drafter (--drafter, --dflash2).
     ink::draft::DraftConfig draft_config_;
     std::array<std::unique_ptr<ink::draft::Parameters>, 2> draft_parameters_;
-    std::unique_ptr<ink::draft::Drafter> drafter_;
+    ink::draft::DFlash2Config dflash2_config_;
+    std::array<std::unique_ptr<ink::draft::DFlash2Parameters>, 2> dflash2_parameters_;
+    std::array<std::unique_ptr<ink::draft::Proposer>, 2> parts_;
+    std::array<std::unique_ptr<ink::draft::PairedProposer>, 2> pairs_;
+    std::unique_ptr<ink::draft::Proposer> drafter_;
 };
 
 struct Options {
@@ -765,6 +832,17 @@ struct Options {
     std::string draft_rules  = "right";
     bool eager               = false;
     bool drafter             = false; // spec: the artifact's drafter proposes the drafts
+    // oracle: the dataset root, its samples (DIR/K, comma-separated) and the stride over anchors.
+    fs::path data;
+    std::string samples;
+    std::int32_t stride = 1;
+    std::int32_t first  = -1; // oracle: the first prompt position fed (-1: the window's)
+    // spec with --auto: DFlash2 proposes first (--proposer dflash2), the proposer changes every
+    // switch_every rounds (0: never).
+    bool second_proposer      = false;
+    std::int32_t switch_every = 0;
+    // drafts: the round's drafts (1 .. 7).
+    std::int32_t drafts_k = 7;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -1124,8 +1202,10 @@ int run_spec(const Options& o) {
     for (const std::string& k_text : split_list(o.draft_tokens)) {
         const auto K = static_cast<std::uint32_t>(std::stoul(k_text));
         auto round   = session.round(K, false);
-        std::unique_ptr<spec::VerifyRound> drafted;
+        std::unique_ptr<spec::VerifyRound> drafted, drafted_second;
         if (o.drafter) { drafted = session.round(K); }
+        if (o.drafter && paired_drafters) { drafted_second = session.round(K, true, true); }
+        std::size_t proposer_changes   = 0;
         std::vector<std::string> rules = split_list(o.draft_rules);
         if (o.drafter && std::find(rules.begin(), rules.end(), "drafter") == rules.end()) {
             rules = {"drafter"};
@@ -1147,6 +1227,15 @@ int run_spec(const Options& o) {
             std::size_t rounds = 0, wrong_counts = 0, columns = 0, identical_columns = 0;
             const bool profile = o.profile_steps > 0 && !profiled;
             while (static_cast<std::int32_t>(out.size()) < N && out.back() != o.eos) {
+                // Paired drafters: the proposer of this round (--proposer, --switch-every).
+                if (rule == "drafter" && drafted_second) {
+                    const bool flipped =
+                        o.switch_every > 0 && (rounds / std::size_t(o.switch_every)) % 2 == 1;
+                    spec::VerifyRound* next =
+                        (o.second_proposer != flipped) ? drafted_second.get() : drafted.get();
+                    proposer_changes += rounds > 0 && next != round_of_rule;
+                    round_of_rule = next;
+                }
                 // out[m] is the anchor; a round licenses at most P + 1 of the N - m - 1 left.
                 const auto m   = static_cast<std::int32_t>(out.size()) - 1;
                 auto& in       = round_of_rule->ingress();
@@ -1210,6 +1299,9 @@ int run_spec(const Options& o) {
                         reached - accepted_at[i]; // rounds that accepted draft i + 1
                     line += " " + std::to_string(accepted) + "/" + std::to_string(reached);
                     reached = accepted;
+                }
+                if (drafted_second) {
+                    std::printf("paired drafters: %zu proposer changes\n", proposer_changes);
                 }
                 std::printf("drafter K=%u accepted per round:", K);
                 for (std::uint32_t a = 0; a <= K; ++a) { std::printf(" %zu", accepted_at[a]); }
@@ -1353,46 +1445,209 @@ int run_features(const Options& o) {
 
 // The drafter's proposals at every anchor of a fixed sequence (prompt_ids + generated_ids of --ids,
 // e.g. a reference greedy): the prompt is prefilled with the drafter's context, then every position
-// m of the continuation is one round of K = 1 with extent 0 at anchor = the sequence's token there,
-// which commits exactly that token (teacher forcing) and records the 7 proposals. Writes --out as
-// JSON {anchors, drafts, tokens, n_prompt} (the reference's drafts files,
-// tools/ref_ink/draft_ref.py).
+// m of the continuation is one round of K = --drafts-k (default 7; the drafter proposes as many as
+// a round verifies) with extent 0 at anchor = the sequence's token there, which commits exactly
+// that token (teacher forcing) and records the K proposals. Writes --out as
+// JSON {anchors, drafts, tokens, n_prompt, round_ms} (the reference's drafts files,
+// tools/ref_ink/draft_ref.py; round_ms the median wall time of the sequence's rounds, which end
+// synchronized). --ids may list several files (comma-separated): one session serves them all and
+// --out is then a directory with one JSON per file (its name).
 int run_drafts(const Options& o) {
-    namespace spec                = ink::speculative;
-    const Ids ids                 = read_ids(o.ids);
-    std::vector<std::int32_t> seq = ids.prompt;
-    seq.insert(seq.end(), ids.continuation.begin(), ids.continuation.end());
-    const auto prompt = static_cast<std::int32_t>(ids.prompt.size());
-    const auto N      = static_cast<std::int32_t>(seq.size());
-    const auto block  = std::min(o.block, prompt);
-    const auto width  = static_cast<std::int32_t>(spec::kMaxWidth);
-    Session session(o.artifact, o.tp, std::max(block, width), width,
-                    static_cast<std::uint32_t>(N + width), true);
-    (void)prefill_prompt(session, ids.prompt, block, true);
-    auto round = session.round(1);
-    std::string anchors, drafts;
-    for (std::int32_t p = prompt; p + 1 < N; ++p) {
-        auto& in    = round->ingress();
-        in.anchor   = seq[std::size_t(p)];
-        in.frontier = session.position();
-        in.extent   = 0;
-        round->launch(!o.eager);
-        const auto& eg = round->egress();
-        session.advance(eg.count);
-        anchors += (anchors.empty() ? "" : ",") + std::to_string(p);
-        drafts += std::string(drafts.empty() ? "" : ",") + "[";
-        for (std::size_t i = 0; i < eg.drafts.size(); ++i) {
-            drafts += (i ? "," : "") + std::to_string(eg.drafts[i]);
-        }
-        drafts += "]";
+    namespace spec = ink::speculative;
+    std::vector<fs::path> files;
+    {
+        std::stringstream list(o.ids.string());
+        std::string item;
+        while (std::getline(list, item, ',')) { files.emplace_back(item); }
     }
-    std::string tokens;
-    for (const auto id : seq) { tokens += (tokens.empty() ? "" : ",") + std::to_string(id); }
-    std::ofstream out(o.out);
-    out << "{\"anchors\": [" << anchors << "], \"drafts\": [" << drafts << "], \"tokens\": ["
-        << tokens << "], \"n_prompt\": " << prompt << "}\n";
-    std::printf("drafts: %d anchors written to %s\n", N - 1 - prompt, o.out.c_str());
-    return out ? 0 : 1;
+    std::vector<Ids> all;
+    std::int32_t longest = 0, widest = 0;
+    for (const auto& file : files) {
+        all.push_back(read_ids(file));
+        const auto& ids = all.back();
+        longest         = std::max<std::int32_t>(
+            longest, static_cast<std::int32_t>(ids.prompt.size() + ids.continuation.size()));
+        widest = std::max<std::int32_t>(widest, static_cast<std::int32_t>(ids.prompt.size()));
+    }
+    const auto width = static_cast<std::int32_t>(spec::kMaxWidth);
+    const auto block = std::min(o.block, widest);
+    Session session(o.artifact, o.tp, std::max(block, width), width,
+                    static_cast<std::uint32_t>(longest + width), true);
+    if (o.drafts_k < 1 || o.drafts_k > std::int32_t(spec::kMaxDrafts)) {
+        throw std::invalid_argument("--drafts-k takes 1 .. 7");
+    }
+    auto round = session.round(static_cast<std::uint32_t>(o.drafts_k));
+    if (files.size() > 1) { fs::create_directories(o.out); }
+    for (std::size_t f = 0; f < files.size(); ++f) {
+        const Ids& ids                = all[f];
+        std::vector<std::int32_t> seq = ids.prompt;
+        seq.insert(seq.end(), ids.continuation.begin(), ids.continuation.end());
+        const auto prompt = static_cast<std::int32_t>(ids.prompt.size());
+        const auto N      = static_cast<std::int32_t>(seq.size());
+        (void)prefill_prompt(session, ids.prompt, std::min(block, prompt), true);
+        std::string anchors, drafts;
+        std::vector<double> round_ms;
+        for (std::int32_t p = prompt; p + 1 < N; ++p) {
+            auto& in      = round->ingress();
+            in.anchor     = seq[std::size_t(p)];
+            in.frontier   = session.position();
+            in.extent     = 0;
+            const auto t0 = Clock::now();
+            round->launch(!o.eager);
+            round_ms.push_back(1e3 * seconds(t0, Clock::now()));
+            const auto& eg = round->egress();
+            session.advance(eg.count);
+            anchors += (anchors.empty() ? "" : ",") + std::to_string(p);
+            drafts += std::string(drafts.empty() ? "" : ",") + "[";
+            for (std::size_t i = 0; i < eg.drafts.size(); ++i) {
+                drafts += (i ? "," : "") + std::to_string(eg.drafts[i]);
+            }
+            drafts += "]";
+        }
+        std::string tokens;
+        for (const auto id : seq) { tokens += (tokens.empty() ? "" : ",") + std::to_string(id); }
+        const fs::path path = files.size() > 1 ? o.out / files[f].filename() : o.out;
+        std::ofstream out(path);
+        out << "{\"anchors\": [" << anchors << "], \"drafts\": [" << drafts << "], \"tokens\": ["
+            << tokens << "], \"n_prompt\": " << prompt << ", \"round_ms\": " << median(round_ms)
+            << "}\n";
+        if (!out) { throw std::runtime_error("cannot write " + path.string()); }
+        std::printf("drafts: %d anchors written to %s\n", N - 1 - prompt, path.c_str());
+    }
+    return 0;
+}
+
+// A little-endian binary file of T values (the dataset's prompt.i32, s<k>.gen.i32).
+template <class T>
+std::vector<T> read_binary(const fs::path& path, std::size_t offset = 0, std::size_t count = 0) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { throw std::runtime_error("cannot read " + path.string()); }
+    in.seekg(0, std::ios::end);
+    const auto bytes = static_cast<std::size_t>(in.tellg());
+    if (count == 0) { count = bytes / sizeof(T) - offset; }
+    if ((offset + count) * sizeof(T) > bytes) {
+        throw std::runtime_error(path.string() + ": shorter than expected");
+    }
+    std::vector<T> out(count);
+    in.seekg(static_cast<std::streamoff>(offset * sizeof(T)));
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(count * sizeof(T)));
+    return out;
+}
+
+// The drafter's proposals from recorded target states (mode oracle, see the top). One drafter
+// serves every sample: each feeds every position before its anchors (the window's), so the rings
+// hold nothing of the previous one where the block's attention reads.
+int run_oracle(const Options& o) {
+    const std::int32_t kChunk = std::max(o.block, 8);
+    Session session(o.artifact, o.tp, kChunk, 8, 4096, true);
+    ink::draft::Proposer& drafter = *session.drafter();
+    const auto H                  = static_cast<std::int32_t>(session.config().hidden_size);
+    const std::size_t row         = std::size_t(4) * H; // one position's four states [4, H]
+    // Writes positions [first, first + T) of the recorded features (rows of [., 4, H]) into every
+    // rank's pending features ([H, T, 4] blocks) and appends them.
+    const auto feed = [&](const fs::path& file, std::size_t file_row, std::int32_t first,
+                          std::int32_t T) {
+        const auto host = read_binary<std::uint16_t>(file, file_row * row, std::size_t(T) * row);
+        std::vector<std::uint16_t> blocks(host.size());
+        for (std::int32_t t = 0; t < T; ++t) {
+            for (std::int32_t j = 0; j < 4; ++j) {
+                std::memcpy(&blocks[(std::size_t(j) * T + t) * H],
+                            &host[(std::size_t(t) * 4 + j) * H], std::size_t(H) * 2);
+            }
+        }
+        for (int r = 0; r < o.tp; ++r) {
+            const ScopedCurrentDevice scope(r);
+            const Tensor& features = drafter.sink(r, T)->features;
+            for (std::int32_t j = 0; j < 4; ++j) {
+                CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(features.data) +
+                                          std::size_t(j) * std::size_t(features.nb[2]),
+                                      &blocks[std::size_t(j) * T * H], std::size_t(T) * H * 2,
+                                      cudaMemcpyHostToDevice));
+            }
+        }
+        drafter.append(first, T);
+    };
+    std::array<std::unique_ptr<DeviceBuffer>, 2> scalars;
+    std::array<Tensor, 2> anchor, frontier, drafts;
+    for (int r = 0; r < o.tp; ++r) {
+        const ScopedCurrentDevice scope(r);
+        scalars[r]  = std::make_unique<DeviceBuffer>(64);
+        anchor[r]   = Tensor(scalars[r]->p, DType::I32, {1});
+        frontier[r] = Tensor(static_cast<std::byte*>(scalars[r]->p) + 4, DType::I32, {1});
+        drafts[r]   = Tensor(static_cast<std::byte*>(scalars[r]->p) + 16, DType::I32, {7});
+    }
+    fs::create_directories(o.out);
+    std::stringstream list(o.samples);
+    std::string item;
+    double propose_seconds = 0;
+    std::int32_t proposals = 0;
+    while (std::getline(list, item, ',')) {
+        const auto slash = item.rfind('/');
+        if (slash == std::string::npos) { throw std::invalid_argument("--samples takes DIR/K"); }
+        const fs::path dir               = o.data / item.substr(0, slash);
+        const std::string k              = item.substr(slash + 1);
+        const auto prompt                = read_binary<std::int32_t>(dir / "prompt.i32");
+        const auto gen                   = read_binary<std::int32_t>(dir / ("s" + k + ".gen.i32"));
+        const auto n                     = static_cast<std::int32_t>(prompt.size());
+        const auto G                     = static_cast<std::int32_t>(gen.size());
+        std::vector<std::int32_t> tokens = prompt;
+        tokens.insert(tokens.end(), gen.begin(), gen.end());
+        // The window before the first anchor, from the prompt's features.
+        const std::int32_t window = 2048;
+        const std::int32_t from   = o.first >= 0 ? std::min(o.first, n) : std::max(0, n - window);
+        for (std::int32_t first = from; first < n; first += kChunk) {
+            feed(dir / "prompt.feat.bf16", std::size_t(first), first, std::min(kChunk, n - first));
+        }
+        std::string anchors_json, drafts_json;
+        std::int32_t written = 0;
+        for (std::int32_t P = n; P + 1 < n + G; ++P) {
+            if ((P - n) % o.stride == 0) {
+                for (int r = 0; r < o.tp; ++r) {
+                    const ScopedCurrentDevice scope(r);
+                    const std::int32_t values[2] = {tokens[std::size_t(P)], P};
+                    CUDA_CHECK(cudaMemcpy(scalars[r]->p, values, 8, cudaMemcpyHostToDevice));
+                }
+                const auto begin = Clock::now();
+                drafter.propose(anchor, frontier, drafts, 1, 7);
+                std::array<std::int32_t, 7> out{};
+                {
+                    const ScopedCurrentDevice scope(0);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(cudaMemcpy(out.data(), drafts[0].data, 28, cudaMemcpyDeviceToHost));
+                }
+                if (o.tp == 2) {
+                    std::array<std::int32_t, 7> peer{};
+                    const ScopedCurrentDevice scope(1);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(cudaMemcpy(peer.data(), drafts[1].data, 28, cudaMemcpyDeviceToHost));
+                    if (peer != out) {
+                        throw std::runtime_error("the ranks proposed different drafts");
+                    }
+                }
+                propose_seconds += seconds(begin, Clock::now());
+                ++proposals;
+                drafter.clear_pending();
+                anchors_json += (anchors_json.empty() ? "" : ",") + std::to_string(P);
+                drafts_json += std::string(drafts_json.empty() ? "" : ",") + "[";
+                for (std::size_t i = 0; i < out.size(); ++i) {
+                    drafts_json += (i ? "," : "") + std::to_string(out[i]);
+                }
+                drafts_json += "]";
+                ++written;
+            }
+            feed(dir / ("s" + k + ".feat.bf16"), std::size_t(P - n), P, 1);
+        }
+        const fs::path file = o.out / (dir.filename().string() + "_s" + k + ".json");
+        std::ofstream out(file);
+        out << "{\"sample\": \"" << dir.filename().string() << "/s" << k << "\", \"anchors\": ["
+            << anchors_json << "], \"drafts\": [" << drafts_json << "]}\n";
+        if (!out) { throw std::runtime_error("cannot write " + file.string()); }
+        std::printf("oracle: %d anchors of %s written to %s\n", written, item.c_str(),
+                    file.c_str());
+    }
+    std::printf("oracle: %d proposals, %.3f ms each (eager, with the host copies)\n", proposals,
+                proposals ? 1e3 * propose_seconds / proposals : 0.0);
+    return 0;
 }
 
 int run_tp_parity(const Options& o) {
@@ -1512,6 +1767,30 @@ int main(int argc, char** argv) {
                 o.draft_rules = next();
             } else if (arg == "--drafter") {
                 o.drafter = true;
+            } else if (arg == "--dflash2") {
+                o.drafter       = true;
+                dflash2_drafter = true;
+            } else if (arg == "--data") {
+                o.data = next();
+            } else if (arg == "--samples") {
+                o.samples = next();
+            } else if (arg == "--stride") {
+                o.stride = std::stoi(next());
+            } else if (arg == "--first") {
+                o.first = std::stoi(next());
+            } else if (arg == "--auto") {
+                o.drafter       = true;
+                paired_drafters = true;
+            } else if (arg == "--proposer") {
+                const std::string which = next();
+                if (which != "dspark" && which != "dflash2") {
+                    throw std::invalid_argument("--proposer takes dspark|dflash2");
+                }
+                o.second_proposer = which == "dflash2";
+            } else if (arg == "--switch-every") {
+                o.switch_every = std::stoi(next());
+            } else if (arg == "--drafts-k") {
+                o.drafts_k = std::stoi(next());
             } else if (arg == "--eager") {
                 o.eager = true;
             } else if (arg == "--context") {
@@ -1536,7 +1815,9 @@ int main(int argc, char** argv) {
             } else {
                 std::cerr
                     << "usage: --artifact PATH --ids FILE [--mode score|generate|tp-parity|"
-                       "blocks|spec|features|drafts] [--drafter] [--tp 1|2] [--block N] [--out "
+                       "blocks|spec|features|drafts|oracle] [--drafter|--dflash2] [--tp 1|2] "
+                       "[--block N] [--data ROOT --samples DIR/K,... --stride N] [--auto "
+                       "[--proposer dspark|dflash2] [--switch-every N]] [--drafts-k K] [--out "
                        "PATH] [--rows SPEC] "
                        "[--logit-rows SPEC] [--parts LIST] [--max-new N] [--eos ID] "
                        "[--context N] [--kl-mean X --kl-max X] [--identical] [--profile-block K] "
@@ -1554,7 +1835,7 @@ int main(int argc, char** argv) {
         } else if (contrast.mode != LoopContrast::Off) {
             throw std::invalid_argument("--loopcd hidden and logits need --loopcd-omega");
         }
-        if (o.artifact.empty() || o.ids.empty()) {
+        if (o.artifact.empty() || (o.ids.empty() && o.mode != "oracle")) {
             std::cout << "SKIP: supply --artifact and --ids\n";
             return 77;
         }
@@ -1581,6 +1862,13 @@ int main(int argc, char** argv) {
         } else if (o.mode == "drafts") {
             if (o.out.empty()) { throw std::invalid_argument("drafts needs --out"); }
             rc = run_drafts(o);
+        } else if (o.mode == "oracle") {
+            if (o.out.empty() || o.data.empty() || o.samples.empty() || !o.drafter ||
+                o.stride < 1) {
+                throw std::invalid_argument(
+                    "oracle needs --out, --data, --samples, a drafter and --stride >= 1");
+            }
+            rc = run_oracle(o);
         } else {
             throw std::invalid_argument("unknown mode " + o.mode);
         }
