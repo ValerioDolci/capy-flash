@@ -211,10 +211,11 @@ its projections stored in 8 bits). `--spec auto`, opt-in, chooses between them a
   prompts of the corpus its constants were tuned on): Italian +24 / +23 % at temperature 0 and +19 / +21 % sampled,
   English +14 / +20 %, code +8 to +18 %, long free writing (11-22k tokens) +20 / +23 %; a technical explanation of a
   4.5k-token text −1.9 / −0.7 %, agentic turns at 107-152k tokens +0.1 / −2.2 %. On summaries and essays of documents
-  from 4k to 247k tokens (requests outside that corpus, as the code below) the faster drafter changes from text to
-  text and inside an answer, and 256 tokens leave too few rounds to measure both: there it is −4 to +12 % against
-  DSpark and up to 11 % below the better of the two (a summary of a 16k-token document without LoopCD, where it stays
-  on DSpark and DFlash2 is faster). On C++ code with 5.5k-70k tokens of context it is within −3.5 to +4.7 % of DSpark.
+  from 4k to 247k tokens (the same documents and instructions as part of that corpus, cut at other lengths or with
+  another run prefix, so not independent of it) the faster drafter changes from text to text and inside an answer, and
+  256 tokens leave too few rounds to measure both: there it is −4 to +12 % against DSpark and up to 11 % below the
+  better of the two (a summary of a 16k-token document without LoopCD, where it stays on DSpark and DFlash2 is
+  faster). On C++ code with 5.5k-70k tokens of context (outside the corpus) it is within −3.5 to +4.7 % of DSpark.
   Prefill is 0.3-1.1 % slower. That is why the launcher keeps `--spec mtp`. Sampled long free writing still decodes
   faster without a drafter: `--spec auto` 2 / 7 % below none, DSpark 14 / 18 %.
 - **Retuning `--spec auto`:** its constants live in one generated file. `tools/inkling2_tune/tune.sh` regenerates it
@@ -426,7 +427,7 @@ prompt, 512 tokens).
 | Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | prefill 247k tokens | 5,078 tok/s (v0.16.0: 1,413) |
 | Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | decode, the launcher's DSpark drafter → `--spec auto` (opt-in), LoopCD off, temperature 0, 4 prompts each (in the corpus `--spec auto` was tuned on): Italian / English / Italian code / English code | 215.5 → 267.6 / 218.9 → 249.7 / 237.8 → 281.2 / 276.7 → 299.5 tok/s |
 | Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | the same: explaining a 4.5k-token text / agentic turns at 107-152k tokens / long free writing (11-22k tokens) | 305.4 → 299.6 / 152.8 → 153.0 / 160.0 → 192.5 tok/s |
-| Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | the same, summary of a 4k / 16k / 130k-token document, not in that corpus (256 tokens; DFlash2 alone in brackets) | 215.5 → 209.6 (209.8) / 212.0 → 208.8 (234.5) / 132.3 → 141.0 (145.2) tok/s |
+| Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | the same, summary of a 4k / 16k / 130k-token document, documents also in that corpus with another run prefix or length (256 tokens; DFlash2 alone in brackets) | 215.5 → 209.6 (209.8) / 212.0 → 208.8 (234.5) / 132.3 → 141.0 (145.2) tok/s |
 | Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | VRAM per GPU at 253,952 tokens of context with v0.16.0's launcher (2048-token blocks, embedding on the GPUs), without / with the drafter | 14.2 / 15.2 GiB |
 
 More on the 27B NVFP4 (`--profile 27b`, MTP; 280 prompts in three languages, v0.6): the same tokens as v0.5.4 on 280 of
@@ -551,8 +552,8 @@ second drafter, Inco's DFlash2, and `--spec auto`, opt-in; the launcher's defaul
   none. On 2 × RTX 5070 Ti against the DSpark drafter, LoopCD off, on prompts of its tuning corpus: Italian
   +24 / +19 % (temperature 0 / sampled), English +14 / +14 %, code +8 to +18 %, long free writing +20 / +14 %; a technical
   explanation of a 4.5k-token text −1.9 %, agentic turns at 107-152k tokens +0.1 % (−2.2 % with LoopCD). On answers
-  about long documents (outside that corpus) it stays up to 11 % below the better of the two drafters, so the launcher
-  keeps `--spec mtp` ([details](#inkling-2-mini)).
+  about long documents (documents also in that corpus, with another run prefix or length) it stays up to 11 % below
+  the better of the two drafters, so the launcher keeps `--spec mtp` ([details](#inkling-2-mini)).
 - Verification rounds of 2-4 tokens run their local attention in one launch (a round of 4 tokens −0.27 ms), same bits;
   `--embedding-host` also keeps DFlash2's selector codebooks (196 MiB) in host memory; `tools/inkling2_tune` retunes
   `--spec auto` in one command and checks it in six minutes.
