@@ -158,6 +158,11 @@ public:
     }
 
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    [[nodiscard]] SpeculativeTotals speculative_totals() const noexcept {
+        return speculative_totals_;
+    }
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -248,6 +253,7 @@ private:
     std::uint64_t next_transaction_ = 1;
     std::uint64_t next_epoch_       = 1;
     runtime::ProgramResourceRevision revision_{.value = 1};
+    SpeculativeTotals speculative_totals_;
     TpTransportStatus transport_;
 };
 

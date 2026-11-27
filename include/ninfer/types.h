@@ -1321,6 +1321,124 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+// Where a request that holds an Engine lane is (RuntimeStats::active_requests).
+enum class ActiveRequestPhase : std::uint8_t {
+    Waiting,       // in a lane, not yet prefilling (a capture or admission step is pending)
+    Materializing, // its cached context is being placed into the lane
+    Prefill,
+    Decode,
+    Finishing, // the model finished; the output is being settled
+};
+
+[[nodiscard]] inline constexpr const char*
+active_request_phase_name(ActiveRequestPhase phase) noexcept {
+    switch (phase) {
+    case ActiveRequestPhase::Waiting:
+        return "waiting";
+    case ActiveRequestPhase::Materializing:
+        return "materializing";
+    case ActiveRequestPhase::Prefill:
+        return "prefill";
+    case ActiveRequestPhase::Decode:
+        return "decode";
+    case ActiveRequestPhase::Finishing:
+        return "finishing";
+    }
+    return "unknown";
+}
+
+// One active request at the last published boundary: live progress for monitoring. Its final
+// figures are its GenerationResult's.
+struct ActiveRequestStats {
+    std::uint64_t id                     = 0; // GenerationHandle::request_id()
+    ActiveRequestPhase phase             = ActiveRequestPhase::Waiting;
+    std::uint32_t prompt_tokens          = 0;
+    std::uint32_t reused_prompt_tokens   = 0; // known once admitted
+    std::uint32_t computed_prompt_tokens = 0; // prefilled so far; reused tokens excluded
+    std::uint32_t generated_tokens       = 0;
+    // std::chrono::steady_clock time since its epoch; 0 until reached.
+    std::int64_t submitted_ns   = 0;
+    std::int64_t first_token_ns = 0;
+};
+
+// Draft positions RuntimeStats counts acceptance at (a draft window is at most 15 tokens).
+inline constexpr std::size_t kMaximumDraftPositions = 16;
+
+// A Program's speculative rounds since it was built, over every request: what each request's
+// SpeculativeStats counts, summed as the rounds are verified (RuntimeStats publishes it).
+struct SpeculativeTotals {
+    std::uint64_t rounds          = 0;
+    std::uint64_t drafted_tokens  = 0;
+    std::uint64_t accepted_tokens = 0;
+    std::uint64_t fallback_steps  = 0;
+    // RuntimeStats::speculative_reached_per_position and _accepted_per_position.
+    std::array<std::uint64_t, kMaximumDraftPositions> reached{};
+    std::array<std::uint64_t, kMaximumDraftPositions> accepted{};
+
+    // One round that verified `extent` drafts and accepted the first `taken` of them.
+    void record(std::uint32_t extent, std::uint32_t taken) noexcept {
+        rounds += 1;
+        drafted_tokens += extent;
+        accepted_tokens += taken;
+        const std::size_t positions =
+            extent < kMaximumDraftPositions ? extent : kMaximumDraftPositions;
+        for (std::size_t i = 0; i < positions && i <= taken; ++i) {
+            reached[i] += 1;
+            if (i < taken) { accepted[i] += 1; }
+        }
+    }
+};
+
+// The routed-expert slot cache of a model whose experts live in host memory (Qwen3.8 Flash-Next),
+// summed since the Engine was built over every tensor-parallel rank's backend. `present` is false
+// for a model without one.
+struct ExpertCacheRuntimeStats {
+    bool present                 = false;
+    std::uint64_t windows        = 0; // expert windows (one per decode round or prompt chunk)
+    std::uint64_t routes         = 0; // (token, top-k) routes
+    std::uint64_t device_hits    = 0; // routes served from a GPU slot
+    std::uint64_t missing        = 0; // distinct experts per layer and window not in a slot
+    std::uint64_t inserts        = 0; // experts the policy admitted to a slot
+    std::uint64_t fills          = 0; // experts copied into slots
+    std::uint64_t fill_bytes     = 0;
+    std::uint64_t shrink_evicted = 0; // experts dropped when the KV took elastic columns
+    // Decode windows only (the miss split): routes, those served from a slot, and the missing
+    // experts the GPU computed over PCIe or the CPU computed.
+    std::uint64_t decode_routes      = 0;
+    std::uint64_t decode_device_hits = 0;
+    std::uint64_t decode_gpu_experts = 0;
+    std::uint64_t decode_cpu_experts = 0;
+    std::uint32_t base_slots         = 0; // per layer and GPU
+    std::uint32_t elastic_columns    = 0; // one more slot in every layer each
+    std::uint32_t active_columns     = 0; // backed now (the KV holds the others)
+    // Elastic KV: KV pages backed now (per GPU), and the column releases and returns.
+    std::uint32_t elastic_kv_pages = 0;
+    std::uint64_t elastic_shrinks  = 0;
+    std::uint64_t elastic_returns  = 0;
+};
+
+// The execution unit the Engine worker is running (RuntimeStats::open_unit).
+enum class RuntimeUnitKind : std::uint8_t {
+    Idle,
+    Prefill,
+    Decode,
+    Control,
+};
+
+[[nodiscard]] inline constexpr const char* runtime_unit_kind_name(RuntimeUnitKind kind) noexcept {
+    switch (kind) {
+    case RuntimeUnitKind::Idle:
+        return "idle";
+    case RuntimeUnitKind::Prefill:
+        return "prefill";
+    case RuntimeUnitKind::Decode:
+        return "decode";
+    case RuntimeUnitKind::Control:
+        return "control";
+    }
+    return "unknown";
+}
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1408,6 +1526,30 @@ struct RuntimeStats {
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;
+
+    // Speculative decoding summed over every request's verified rounds (SpeculativeStats): rounds
+    // that verified drafts, the drafts they verified and accepted, and rounds that verified none.
+    std::uint64_t speculative_rounds          = 0;
+    std::uint64_t speculative_drafted_tokens  = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
+    std::uint64_t speculative_fallback_steps  = 0;
+    // By draft position: rounds that verified a draft there with every earlier one accepted
+    // (reached), and of those the ones that accepted it.
+    std::array<std::uint64_t, kMaximumDraftPositions> speculative_reached_per_position{};
+    std::array<std::uint64_t, kMaximumDraftPositions> speculative_accepted_per_position{};
+
+    ExpertCacheRuntimeStats expert_cache;
+
+    // The requests that hold a lane, and the one being materialized into a lane: the first
+    // active_request_count entries, in lane order (the materializing one last).
+    std::array<ActiveRequestStats, kMaximumConcurrency + 1> active_requests{};
+    std::uint32_t active_request_count = 0;
+
+    // Read when the snapshot is taken, not at the last boundary: the unit the worker runs now and
+    // how long it has run. A prefill unit can run for seconds and publishes its counters only
+    // when it ends.
+    RuntimeUnitKind open_unit          = RuntimeUnitKind::Idle;
+    std::uint64_t open_unit_elapsed_ns = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

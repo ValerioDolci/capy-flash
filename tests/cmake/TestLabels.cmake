@@ -45,6 +45,7 @@ set(NINFER_CPU_TESTS
   ninfer_json_schema_oracle_test
   ninfer_json_schema_test
   ninfer_kv_capacity_test
+  ninfer_live_stats_test
   ninfer_materialization_budget_test
   ninfer_media_decode_test
   ninfer_openai_responses_store_test

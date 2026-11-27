@@ -35,6 +35,10 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    // The prepared prompt's tokens and the Engine's id of the request (GET /stats joins the
+    // Engine's live progress by it; 0 when the request never reached the Engine queue).
+    int prompt_tokens               = 0;
+    std::uint64_t engine_request_id = 0;
 };
 
 struct RequestLogMetadata {

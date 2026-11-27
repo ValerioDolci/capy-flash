@@ -1,9 +1,10 @@
 #pragma once
 
-// GPU clock, power and temperature samples for the request JSONL `throughput` event. The NVIDIA
-// Management Library is loaded at run time (dlopen of libnvidia-ml.so.1, installed with the
-// driver), so the build needs no NVML headers or link dependency and a host without it simply
-// records no samples. Sampling runs on the statistics thread, never on the request path.
+// GPU clock, power, temperature, utilization and memory samples for the request JSONL `throughput`
+// event and GET /stats. The NVIDIA Management Library is loaded at run time (dlopen of
+// libnvidia-ml.so.1, installed with the driver), so the build needs no NVML headers or link
+// dependency and a host without it simply records no samples. Sampling runs on the statistics
+// threads (each with its own GpuTelemetry), never on the request path.
 
 #include <cstdint>
 #include <memory>
@@ -30,6 +31,14 @@ struct GpuTelemetrySample {
     std::optional<std::uint32_t> temperature_celsius;
     // NVML clocks-event (throttle) reason bits active at the end of the interval.
     std::optional<std::uint64_t> clock_event_reasons;
+    // For GET /stats: the driver's utilization over its last sample period, device memory, the
+    // first fan's speed and the enforced power limit.
+    std::optional<std::uint32_t> utilization_percent;
+    std::optional<std::uint32_t> memory_utilization_percent;
+    std::optional<std::uint64_t> memory_used_bytes;
+    std::optional<std::uint64_t> memory_total_bytes;
+    std::optional<std::uint32_t> fan_percent;
+    std::optional<double> power_limit_watts;
 };
 
 // Stable names of the NVML clocks-event reason bits, lowest bit first; an undefined bit is named
@@ -46,6 +55,9 @@ public:
 
     // False when libnvidia-ml.so.1 or nvmlInit is unavailable.
     [[nodiscard]] bool available() const noexcept;
+
+    // The board's name ("NVIDIA GeForce RTX 5080"), in construction order; empty when unknown.
+    [[nodiscard]] std::vector<std::string> names() const;
 
     // One sample per configured device, in construction order; nullopt when NVML is unavailable.
     // energy_joules covers the time since the previous call, so the first call only sets the

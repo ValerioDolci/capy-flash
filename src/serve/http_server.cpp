@@ -5,10 +5,12 @@
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
 #include "serve/request_validation.h"
+#include "product/speculative_options.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -559,23 +562,27 @@ void HttpServer::serve_generation(const httplib::Request& req, httplib::Response
 void HttpServer::record_request_start(const RequestLogContext& context) {
     request_jsonl_.write_request_start(context);
     operational_log_.request_start(context);
+    live_stats_.request_started(context);
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
+    live_stats_.request_rejected(context);
 }
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
+    live_stats_.request_finished(context, outcome);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
+    live_stats_.request_failed(context, failure);
     // An internal generation failure that left the Engine unavailable is the Engine-wide failure
     // (the worker threw and failed every request): its text is the Engine's own diagnostic, the
     // reason the server stops, so the first request it failed logs it once.
@@ -807,6 +814,9 @@ void HttpServer::register_routes() {
             transition(res, service_->load("POST /load"));
         });
     }
+    server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_stats(req, res);
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -872,6 +882,32 @@ void HttpServer::reply_anthropic_error(const httplib::Request& req, httplib::Res
     write_anthropic_error(res, error, request_id);
 }
 
+void HttpServer::handle_stats(const httplib::Request& req, httplib::Response& res) const {
+    std::optional<std::uint64_t> since;
+    if (req.has_param("since")) {
+        const std::string value = req.get_param_value("since");
+        std::uint64_t parsed    = 0;
+        const auto [end, error] =
+            std::from_chars(value.data(), value.data() + value.size(), parsed);
+        if (error != std::errc{} || end != value.data() + value.size()) {
+            ApiError api_error;
+            api_error.status  = 400;
+            api_error.type    = "invalid_request_error";
+            api_error.code    = "invalid_parameter";
+            api_error.param   = "since";
+            api_error.message = "since must be a non-negative integer";
+            reply_openai_error(req, res, api_error);
+            return;
+        }
+        since = parsed;
+    }
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(
+        live_stats_.render(LiveStats::SteadyClock::now(), LiveStats::SystemClock::now(), since)
+            .dump(),
+        "application/json");
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
@@ -907,20 +943,53 @@ void HttpServer::attach(GenerationService& service) {
     service_                    = &service;
     service.set_transition_log(
         [this](const std::string& line) { operational_log_.engine_transition(line); });
-    if (request_jsonl_.enabled() && options_.log_stats_interval_ms != 0) {
-        const ninfer::EngineOptions& engine = service.engine_options();
-        const std::vector<int> devices =
-            engine.devices.empty() ? std::vector<int>{engine.device} : engine.devices;
-        std::vector<GpuTelemetryDevice> identities;
-        for (const int device : devices) {
-            identities.push_back(GpuTelemetryDevice{
-                .device = device, .uuid = query_server_log_environment(device).gpu_uuid});
-        }
-        gpu_telemetry_ = std::make_unique<GpuTelemetry>(std::move(identities));
+    const ninfer::EngineOptions& engine = service.engine_options();
+    std::vector<GpuTelemetryDevice> identities;
+    for (const int device :
+         engine.devices.empty() ? std::vector<int>{engine.device} : engine.devices) {
+        identities.push_back(GpuTelemetryDevice{
+            .device = device, .uuid = query_server_log_environment(device).gpu_uuid});
     }
-    request_jsonl_.write_server_start(options_, service.engine_options(),
-                                      service.sampling_defaults(), public_model_id_, load,
-                                      service.memory_summary());
+    if (request_jsonl_.enabled() && options_.log_stats_interval_ms != 0) {
+        gpu_telemetry_ = std::make_unique<GpuTelemetry>(identities);
+    }
+    const ninfer::MemorySummary memory = service.memory_summary();
+    request_jsonl_.write_server_start(options_, engine, service.sampling_defaults(),
+                                      public_model_id_, load, memory);
+
+    // GET /stats: its own NVML handle (GpuTelemetry::sample keeps a per-caller energy baseline),
+    // sampled by the live statistics thread.
+    live_gpu_telemetry_ = std::make_unique<GpuTelemetry>(std::move(identities));
+    LiveServerInfo info{
+        .model                  = public_model_id_,
+        .max_concurrency        = engine.max_concurrency,
+        .max_context            = engine.max_context,
+        .kv_capacity_tokens     = memory.kv_capacity,
+        .kv_capacity_pages      = memory.kv_capacity_page_groups,
+        .host_kv_capacity_bytes = memory.host_kv_capacity_bytes,
+        .tensor_parallel        = static_cast<std::uint32_t>(engine.tp),
+    };
+    if (engine.speculative.backend != ninfer::SpeculativeBackend::None) {
+        info.speculative_backend = product::speculative_backend_name(engine.speculative.backend);
+        info.draft_tokens        = engine.speculative.draft_tokens;
+    }
+    LiveGpuSource gpus;
+    if (live_gpu_telemetry_->available()) {
+        gpus.names  = live_gpu_telemetry_->names();
+        gpus.sample = [telemetry = live_gpu_telemetry_.get()] { return telemetry->sample(); };
+    }
+    live_host_telemetry_ = std::make_unique<HostTelemetry>();
+    live_stats_.configure(
+        std::move(info),
+        [&service] {
+            // The Engine's published snapshot: a lock of its own, never the worker's.
+            LiveEngineReading reading;
+            reading.generation   = service.engine_generation();
+            reading.stats        = service.runtime_stats();
+            reading.engine_state = engine_state_name(service.engine_state());
+            return reading;
+        },
+        std::move(gpus), [telemetry = live_host_telemetry_.get()] { return telemetry->sample(); });
 }
 
 // ENGINE WATCH. After an Engine-wide failure (an error thrown by the worker, e.g. a timed-out
@@ -967,12 +1036,15 @@ bool HttpServer::listen() {
     }
     watch_stopping_ = false;
     watch_thread_   = std::thread([this] { run_engine_watch(); });
+    live_stats_.start();
     try {
         const bool result = server_.listen_after_bind();
+        live_stats_.stop();
         stop_engine_watch();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        live_stats_.stop();
         stop_engine_watch();
         stop_stats_reporter();
         throw;

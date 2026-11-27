@@ -160,6 +160,11 @@ public:
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
 
+        // The Engine's id of the request (RuntimeStats::active_requests); 0 once consumed.
+        [[nodiscard]] std::uint64_t request_id() const noexcept {
+            return request_ != nullptr ? request_->id : 0;
+        }
+
     private:
         Submission(EngineCore& owner, std::shared_ptr<Request> request) noexcept
             : owner_(&owner), request_(std::move(request)) {}
@@ -277,8 +282,21 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats out;
+        {
+            std::lock_guard lock(stats_mutex_);
+            out = published_stats_;
+        }
+        // The unit running now, which the boundary-published snapshot cannot carry: a prefill
+        // unit publishes its progress only when it ends.
+        const std::int64_t started = open_unit_started_ns_.load(std::memory_order_acquire);
+        out.open_unit = static_cast<RuntimeUnitKind>(open_unit_.load(std::memory_order_acquire));
+        if (out.open_unit != RuntimeUnitKind::Idle && started != 0) {
+            const std::int64_t now = steady_ns(Clock::now());
+            out.open_unit_elapsed_ns =
+                now > started ? static_cast<std::uint64_t>(now - started) : 0;
+        }
+        return out;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -566,7 +584,21 @@ private:
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
+            snapshot.active_requests[snapshot.active_request_count++] =
+                active_request_stats(*slots_[lane], false);
         }
+        if (materializing_.has_value() && materializing_->request != nullptr) {
+            snapshot.active_requests[snapshot.active_request_count++] =
+                active_request_stats(*materializing_->request, true);
+        }
+        const SpeculativeTotals speculative        = instance_.program->speculative_totals();
+        snapshot.speculative_rounds                = speculative.rounds;
+        snapshot.speculative_drafted_tokens        = speculative.drafted_tokens;
+        snapshot.speculative_accepted_tokens       = speculative.accepted_tokens;
+        snapshot.speculative_fallback_steps        = speculative.fallback_steps;
+        snapshot.speculative_reached_per_position  = speculative.reached;
+        snapshot.speculative_accepted_per_position = speculative.accepted;
+        snapshot.expert_cache                      = instance_.program->expert_cache_stats();
         detail_range.reset();
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
                       &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
@@ -575,6 +607,40 @@ private:
         snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
+    }
+
+    [[nodiscard]] static ActiveRequestStats active_request_stats(const Request& request,
+                                                                 bool materializing) noexcept {
+        ActiveRequestStats out;
+        out.id            = request.id;
+        out.phase         = materializing             ? ActiveRequestPhase::Materializing
+                            : request.terminal_reason ? ActiveRequestPhase::Finishing
+                            : request.is_prefilling() ? ActiveRequestPhase::Prefill
+                            : request.is_decode_ready() || request.is_control_ready()
+                                ? ActiveRequestPhase::Decode
+                            : request.is_model_finished() ? ActiveRequestPhase::Finishing
+                                                          : ActiveRequestPhase::Waiting;
+        out.prompt_tokens = request.prompt_summary.prompt_tokens;
+        if (request.admitted_begin) {
+            out.reused_prompt_tokens = request.admitted_begin->reused_prompt_tokens;
+        }
+        out.computed_prompt_tokens = request.computed_prompt_tokens;
+        out.generated_tokens       = static_cast<std::uint32_t>(std::min<std::size_t>(
+            request.generated.size(), std::numeric_limits<std::uint32_t>::max()));
+        out.submitted_ns           = steady_ns(request.submitted);
+        if (request.first_token) { out.first_token_ns = steady_ns(*request.first_token); }
+        return out;
+    }
+
+    [[nodiscard]] static std::int64_t steady_ns(Clock::time_point at) noexcept {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count();
+    }
+
+    // The unit the worker starts (Idle once it ended), for runtime_stats() readers.
+    void open_unit(RuntimeUnitKind kind) noexcept {
+        open_unit_started_ns_.store(kind == RuntimeUnitKind::Idle ? 0 : steady_ns(Clock::now()),
+                                    std::memory_order_release);
+        open_unit_.store(static_cast<std::uint8_t>(kind), std::memory_order_release);
     }
 
     void record_prefix_selection(const RequestPlanSummary& summary) noexcept {
@@ -2417,7 +2483,9 @@ private:
                 if (!control_membership.empty()) {
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                    open_unit(RuntimeUnitKind::Control);
                     run_control_batch(control_membership);
+                    open_unit(RuntimeUnitKind::Idle);
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -2438,7 +2506,9 @@ private:
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     const auto unit_started = Clock::now();
+                    open_unit(RuntimeUnitKind::Prefill);
                     run_prefill_step(cancelled_at_unit_start);
+                    open_unit(RuntimeUnitKind::Idle);
                     decode_owed =
                         static_cast<double>(decode_share_) *
                         std::chrono::duration<double>(Clock::now() - unit_started).count();
@@ -2449,7 +2519,9 @@ private:
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     const auto round_started = Clock::now();
+                    open_unit(RuntimeUnitKind::Decode);
                     run_decode_round(membership, cancelled_at_unit_start);
+                    open_unit(RuntimeUnitKind::Idle);
                     decode_owed -=
                         std::chrono::duration<double>(Clock::now() - round_started).count();
                     previous_unit_was_decode = true;
@@ -2458,6 +2530,7 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
             } catch (...) {
+                open_unit(RuntimeUnitKind::Idle);
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
                 const bool recovered           = recover_peer_transport_locked(error);
@@ -2506,6 +2579,9 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    // open_unit(): the running unit's RuntimeUnitKind and its start (steady clock ns; 0 idle).
+    std::atomic<std::uint8_t> open_unit_{static_cast<std::uint8_t>(RuntimeUnitKind::Idle)};
+    std::atomic<std::int64_t> open_unit_started_ns_{0};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

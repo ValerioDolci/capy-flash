@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/gpu_telemetry.h"
+#include "serve/live_stats.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -165,6 +166,7 @@ private:
     void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
+    void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
@@ -195,11 +197,16 @@ private:
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
+    // GET /stats: sampled while listen() runs.
+    LiveStats live_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     // Owned by the statistics thread once listen() starts; created by attach() only when the
     // JSONL log and the statistics interval are both enabled.
     std::unique_ptr<GpuTelemetry> gpu_telemetry_;
+    // Owned by the live statistics thread (GET /stats) while listen() runs.
+    std::unique_ptr<GpuTelemetry> live_gpu_telemetry_;
+    std::unique_ptr<HostTelemetry> live_host_telemetry_;
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
     std::thread stats_thread_;

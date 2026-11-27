@@ -128,8 +128,11 @@ public:
     template <class Submission>
     Impl(std::shared_ptr<void> keep_alive, Submission submission,
          ResolvedSamplingParameters sampling)
-        : state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
+        : request_id_(submission_request_id(submission)),
+          state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
           sampling_(sampling) {}
+
+    [[nodiscard]] std::uint64_t request_id() const noexcept { return request_id_; }
 
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
@@ -140,6 +143,17 @@ public:
     }
 
 private:
+    template <class Submission>
+    [[nodiscard]] static std::uint64_t
+    submission_request_id(const Submission& submission) noexcept {
+        if constexpr (requires { submission.request_id(); }) {
+            return submission.request_id();
+        } else {
+            return 0;
+        }
+    }
+
+    std::uint64_t request_id_ = 0;
     std::unique_ptr<Concept> state_;
     ResolvedSamplingParameters sampling_;
 };
@@ -156,6 +170,10 @@ GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
 const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
     static const ResolvedSamplingParameters empty;
     return impl_ != nullptr ? impl_->resolved_sampling() : empty;
+}
+
+std::uint64_t GenerationHandle::request_id() const noexcept {
+    return impl_ != nullptr ? impl_->request_id() : 0;
 }
 
 GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView& cancellation) {
