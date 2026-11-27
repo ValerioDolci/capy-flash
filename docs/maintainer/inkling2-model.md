@@ -572,26 +572,32 @@ pending features as context in the same graph, 0.05-0.08 ms per round), so eithe
 next round. Prefill, catch-up and anchor images reach both.
 
 Per lane, [`DrafterChoice`](../../src/models/inkling2/program/drafter_choice.h) picks the proposer
-of every round on the Host. DSpark proposes better exactly when the output copies text that only the
-context beyond the DFlash2 window (2048) holds, which its global layer sees; DFlash2 proposes better
-on free text and code at any context length. The signal is the share, over the last 16 generated
+of every round on the Host; its constants are generated into
+[`drafter_tuning.h`](../../src/models/inkling2/program/drafter_tuning.h) by `tools/inkling2_tune`
+([Tuning `--spec auto`](inkling2-auto-tuning.md)). DSpark's global layer sees the whole context,
+DFlash2 the last 2048 positions. A prior watches the output: the share, over the last 16 generated
 tokens, of those whose 4-gram last occurred more than 2048 positions back; a request starts with
-DSpark when its prompt holds at least 2048 tokens, DFlash2 otherwise, moves to DSpark from a share of
-0.2 and back to DFlash2 at 0.05 or below. The constants come from a simulation over per-anchor traces
-of both drafters and the measured round costs; one hash map per lane (4-gram to its last position)
-holds the bookkeeping. The pair costs device memory: about 0.41 GiB more weights per rank (the
-DFlash2 drafter, its selector's codebooks replicated); with `--embedding-host` the codebooks (196
-MiB) move to the host copy ([Embedding in host memory](embedding-host.md)) and the largest
-context with LoopCD and `--prefill-chunk 4096` stays at 229,376, as with `--spec mtp` (221,184
-with the codebooks in VRAM).
+DSpark when its prompt holds at least 2048 tokens, DFlash2 otherwise, and the prior moves to DSpark
+from a share of 0.1 and back to DFlash2 at 0. The choice itself is measured: each drafter keeps a
+mean of the drafts its rounds accepted (the running mean, then exponential with weight 0.05, 0.5 for
+a round of the drafter not chosen), and once both hold 3 rounds the drafter with the better rate,
+(1 + mean) per millisecond of its round, proposes; far copies still give DSpark. On a prompt of at
+least 2048 tokens the first 16 rounds alternate between the drafters and then every 64th round is
+the other drafter's (real rounds, verified like any other). The round and step costs are timed
+while the engine runs (`StepCosts`), starting from the generated table, so another board or faster
+kernels enter the choice by themselves. One hash map per lane (4-gram to its last position) holds
+the bookkeeping. The pair costs device memory: about 0.41 GiB more weights per rank (the DFlash2
+drafter, its selector's codebooks replicated); with `--embedding-host` the codebooks (196 MiB) move
+to the host copy ([Embedding in host memory](embedding-host.md)) and the largest context with LoopCD
+and `--prefill-chunk 4096` stays at 229,376, as with `--spec mtp` (221,184 with the codebooks in
+VRAM).
 
-The third choice is no drafter. Each drafter keeps an exponential mean (weight 0.1) of the drafts
-its rounds accepted; after 8 rounds of the drafter that ran, a lane takes ordinary steps while one
-plus that mean is below 0.91 times the time of a K = 3 round over an ordinary step's (2.03 at short
-contexts, 2.16 from about 4k tokens, measured on two RTX 5070 Ti with LoopCD), and every 16 ordinary
-steps one round of the drafter chosen above renews the mean. Sampled free writing at 11k-22k tokens
-accepts about 0.9 drafts per round, where a round costs more than the tokens it gains: there the
-lane decodes as fast as without a drafter, and it drafts again when the drafts are accepted.
+The third choice is no drafter. Once some drafter holds 3 rounds, a lane takes ordinary steps while
+the best measured rate is below 0.91 per millisecond of an ordinary step, and every 16 ordinary
+steps one round renews the means. Sampled free writing at long contexts accepts about 0.9 drafts
+per round, where a round costs more than the tokens it gains: there the lane takes mostly ordinary
+steps (on the release bench, 11k-22k tokens, 2 % below no drafter at all with LoopCD off and 7 %
+with LoopCD on).
 
 Ordinary steps feed both drafters, so that any round can follow them. The decode step of a paired
 execution (its graph, or the same body eagerly without CUDA Graphs) writes the token's four states
