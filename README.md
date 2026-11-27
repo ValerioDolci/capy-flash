@@ -385,61 +385,27 @@ conditions (paired, p 1.0). Details in [docs/capy-flash/diagnostics.md](docs/cap
 
 ## Benchmarks
 
-Our machine: AMD Ryzen 9 9900X (12 cores), 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P),
-Ubuntu, CUDA 13.1, full clocks. Decode is the server-side rate. v0.8.0 runs at the speed of v0.7.7 (the
-[release notes](https://github.com/ValerioDolci/capy-flash/releases/tag/v0.8.0) have the comparison). The agentic
-replay is [bench/capy_flash](bench/capy_flash): 3 synthetic coding-agent sessions, 53 turns, prompts growing to ~81k tokens with
-~90 % prefix reuse, 256 output tokens per turn, temperature 0. LocalMaxxing is the reasoning-v1 benchmark (short
-prompt, 512 tokens).
+Every speed measurement of v0.16.6 on our machine (AMD Ryzen 9 9900X, 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0
+x8 + x8 without P2P, free clocks) is in the [speed report](docs/reports/capy-flash-v0.16.6-speed-report.pdf) (PDF) and its
+[interactive guide](https://valeriodolci.github.io/capy-flash/), by engine part: the measured ceilings of the machine and
+how close each model gets to them, where the decode time goes, drafters at one request and with concurrent clients,
+prefill and long context, memory and start-up, llama.cpp on the same machine, and the version history. The main numbers:
 
-**Ours** (one GPU = one RTX 5070 Ti):
-
-| model, edition | GPUs | version, date | measured | result |
+| model, edition | GPUs | decode, one request: no drafter → launcher default | 8 concurrent clients: highest throughput | prefill at ~131k tokens (time to first token) |
 |---|---|---|---|---|
-| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | agentic replay: decode median / total time / time to first token, median (p90) | 155 tok/s / 177 s / 1.48 s (2.62 s) |
-| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | prefill, cold, ~3.5k / ~15k / ~55k-token prompts | 2,422 / 4,615 / 4,828 tok/s |
-| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | LocalMaxxing reasoning-v1 | 178 tok/s |
-| Flash-Next NVFP4 | 2 | v0.7.0, 2026-10-22 | agentic replay decode median | 155 tok/s (as v0.6) |
-| Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | agentic replay decode median | 182 tok/s |
-| Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7d5d03o3rf01ex9g9wiw) | 234 tok/s |
-| Flash-Next 64 GB | 2 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 2,168 / 3,924 / 3,994 tok/s |
-| Flash-Next 64 GB | 2 | v0.13.1, 2026-11-15 | prefill, cold, 30k / 200k-token source-code prompts | 4,876 / 4,359 tok/s (v0.13.0: 4,541 / 4,041) |
-| Flash-Next 64 GB | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7dm603o7rf01i54inoup) | 121 tok/s |
-| Flash-Next 64 GB | 1 | v0.7.1, 2026-10-22 | agentic replay: decode median / total time / time to first token, median / prompt tokens from cache | 104 tok/s / 276 s / 1.9 s / 83 % |
-| Flash-Next 64 GB | 1 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 1,671 / 2,838 / 2,921 tok/s |
-| Flash-Next 64 GB | 1 | v0.13.1, 2026-11-15 | prefill, cold, 30k / 200k-token source-code prompts | 3,738 / 3,505 tok/s (v0.13.0: 3,306 / 3,040) |
-| Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | decode, 8k-token real-text prompt, MTP | 139 tok/s |
-| Qwen3.8-27B 3-bit | 1 | v0.7.0 | prefill 4k / 16k | 3,401 / 3,211 tok/s |
-| Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7ebb03ofrf01mkfqs948) | 174 tok/s |
-| Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | decode, 8k-token real-text prompt, MTP | 230 tok/s |
-| Qwen3.8-27B 3-bit | 2 | v0.7.0 | prefill 4k / 16k / 64k | 5,787 / 5,567 / 4,304 tok/s |
-| Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7emi03oirf01vyxuhulr) | 288 tok/s |
-| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.6.0 | prefill 4k / 16k / 64k, `--profile 27b` | 9,343 / 9,234 / 6,287 tok/s |
-| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | decode, `--profile 27b` (DFlash2 7): conversation / JSON / code edit / Italian essay / quoting from 30K | 277 / 415 / 520 / 140 / 385 tok/s |
-| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.16.2, 2026-11-23 | agentic replay decode (53 turns, up to 81K tokens), `--profile 27b` | 234 tok/s (MTP 3: 205) |
-| Qwen3.8-27B 3-bit | 1 | v0.16.2, 2026-11-23 | decode, `--profile 27b-16gb` (prompt lookup): conversation / JSON / code edit / Italian essay / quoting | 145 / 212 / 318 / 106 / 304 tok/s |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode without the drafter, 68-token / 12.8k-token prompt | 204.5 / 185.9 tok/s (v0.16.0: 127.5 / 112.8) |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode with `--spec mtp --draft-tokens 3` (the launcher's default), temperature 0: 68-token / 12.8k-token prompt / a coding task | 209.8 / 239.6 / 255.8 tok/s (v0.16.0: 149.0 / 166.6 / 193.9) |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode with the drafter, temperature 0, reasoning capped at 32 tokens (`--default-thinking-budget 32`), after a ~4k-token prompt: writing code / an essay | 307.6 / 205.1 tok/s (v0.16.0: 230.2 / 149.2) |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | decode, summarizing a 130k / 247k-token document (the drafter stops at 245,760 tokens of context) | 140.4 / 87.5 tok/s (v0.16.0: 72.6 / 53.4) |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | decode with the drafter and the model's default sampling (one seed): 68-token prompt / an essay / a coding task | 146.1 / 129.6 / 173.9 tok/s (124.7 / 124.4 / 124.9 without the drafter) |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | prefill 512 / 4k / 12.8k / 99k tokens | 5,020 / 8,209 / 7,804 / 6,610 tok/s (v0.16.0: 4,002 / 5,032 / 4,524 / 2,522) |
-| Inkling 2 Mini | 2 | v0.16.3, 2026-11-24 | prefill 247k tokens | 5,078 tok/s (v0.16.0: 1,413) |
-| Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | decode, the launcher's DSpark drafter → `--spec auto` (opt-in), LoopCD off, temperature 0, 4 prompts each (in the corpus `--spec auto` was tuned on): Italian / English / Italian code / English code | 215.5 → 267.6 / 218.9 → 249.7 / 237.8 → 281.2 / 276.7 → 299.5 tok/s |
-| Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | the same: explaining a 4.5k-token text / agentic turns at 107-152k tokens / long free writing (11-22k tokens) | 305.4 → 299.6 / 152.8 → 153.0 / 160.0 → 192.5 tok/s |
-| Inkling 2 Mini | 2 | v0.16.6, 2026-11-27 | the same, summary of a 4k / 16k / 130k-token document, documents also in that corpus with another run prefix or length (256 tokens; DFlash2 alone in brackets) | 215.5 → 209.6 (209.8) / 212.0 → 208.8 (234.5) / 132.3 → 141.0 (145.2) tok/s |
-| Inkling 2 Mini | 2 | v0.16.0, 2026-11-21 | VRAM per GPU at 253,952 tokens of context with v0.16.0's launcher (2048-token blocks, embedding on the GPUs), without / with the drafter | 14.2 / 15.2 GiB |
+| Qwen3.8-27B NVFP4 | 2 | 93.2 → 169.2 tok/s (DFlash2 7) | prose 778.9 tok/s (MTP 3); code rewriting 1,354.2 (DFlash2 7) | 4,088 tok/s (32.04 s) |
+| Qwen3.8-27B 3-bit | 2 | 118.3 → 213.4 (MTP 3) | 628.3 (no drafter) | |
+| Qwen3.8-27B 3-bit | 1 | 64.1 → 124.4 (MTP 3 + prompt lookup) | | 2,501 at 58,809 tokens (23.5 s) |
+| Flash-Next NVFP4 | 2 | 113.2 → 158.8 (MTP 3) | 193.2 (no drafter) | 6,691 (19.58 s) |
+| Flash-Next NVFP4 | 1 | 70.5 → 82.1 (MTP 3) | | |
+| Flash-Next 64 GB | 2 | 136.2 → 197.5 (MTP 3) | 369.1 (no drafter) | 5,915 (22.1 s) |
+| Flash-Next 64 GB | 1 | 85.0 → 112.2 (MTP 3) | | 4,154 (31.5 s) |
+| Inkling 2 Mini | 2 | 205.0 → 205.0 (DSpark 3); 255.1 with DFlash2 or `--spec auto` | one request at a time | |
 
-More on the 27B NVFP4 (`--profile 27b`, MTP; 280 prompts in three languages, v0.6): the same tokens as v0.5.4 on 280 of
-280 answers (and with DFlash2), decode +5 % (Italian 168 → 176 tok/s), prefill at 4k / 16k / 64k 5,777 / 5,585 / 4,352
-→ 9,343 / 9,234 / 6,287 tok/s with MTP and 5,719 / 5,530 / 4,316 → 9,205 / 9,052 / 6,198 with DFlash2; concurrent decode (NInfer's `decode-saturation`
-suite, MTP3, 8,192 tokens per request) 175 / 326 / 560 / 927 tok/s aggregate at 1 / 2 / 4 / 8 requests. On an agentic
-replay of the 27B (3 interleaved sessions and 11 subagents, 4 lanes), the v0.5.4 context cache took the median time to
-first token from 2.14 to 0.98 s and the prompt tokens served from cache from 67 to 78 %, decode unchanged.
-Flash-Next decode stays flat with context: 168 / 165 / 171 / 165 tok/s with 0 / 14k / 61k / 118k tokens of prompt
-(v0.6), and a cold 382-token prompt answers in 1.35 s. A cold start of the Flash-Next server takes 26-29 s here
-(v0.5.3), most of it reading the 64.6 GiB of experts. The 64 GB edition peaks at 55.2 GiB of RSS inside a 64 GiB
-memory cgroup without swap (57 GiB used with one GPU); its speeds were measured on the 96 GB machine.
+One request: 8 prose prompts, 256-token answers, temperature 0, total tokens over total decode time. Concurrent
+clients: each sends its next prompt as soon as its answer ends, throughput over a 40 s window; with more clients the
+best draft window gets narrower (report §7). Prefill: cold source-code prompts, the launcher's flags. Empty cells were
+not measured in that configuration.
 
 **Reported by users** (not reproduced by us):
 
@@ -448,44 +414,6 @@ memory cgroup without swap (57 GiB used with one GPU); its speeds were measured 
 | AMD EPYC 7F52 16 cores (Zen 2, AVX2), 2x RTX 5080 (overclocked) | Flash-Next NVFP4 | v0.7.2 built with CUDA 13.4 | agentic replay (53 turns, greedy): decode median | 141.3 tok/s with automatic threads; 144.4 with `--expert-cpu-threads 15` and `taskset -c 0-15`; release tarball (CUDA 13.1) 137.6; v0.7.1 tarball 121.8 | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
 | same | same | same | own measurement, not greedy | prefill at 131k 5,541 tok/s; time to first token 22.1 s at 131k, 1.15 s at 1k | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
 | AMD Threadripper PRO 5975WX (AVX2), 2x RTX PRO 4000 Blackwell 24 GB (145 W), Proxmox LXC | Flash-Next 64 GB (GSQ-RCO) | v0.7.1 built from source, CUDA 13.3 | decode / prefill / local aider coding benchmark | decode ~100-114 tok/s on prose, ~140-155 on reasoning; prefill at 40k ~3,300 tok/s; aider 145-146 of 148 | [issue #22](https://github.com/ValerioDolci/capy-flash/issues/22) |
-
-**Against Strata.** [Strata](https://github.com/Niko1221/Strata) 0.1.45 on our machine, same day (2026-10-18), two GPUs,
-capy-flash v0.6.0:
-
-| | **capy-flash**, NVFP4 | Strata, same NVFP4 weights | Strata, 3-bit IQ3_S (tuned) |
-|---|---:|---:|---:|
-| agentic replay, 53 turns up to 81k tokens: total time | **177 s** | 268 s | 197 s |
-| agentic replay: decode, server side (median) | **155 tok/s** | 98 tok/s | 151 tok/s |
-| agentic replay: time to first token, median (p90) | **1.48 s (2.62)** | 2.35 s (4.17) | 1.60 s (3.69) |
-| prefill, ~3.5k-token prompt | **2,422 tok/s** | 1,519 tok/s | 2,216 tok/s |
-| prefill, ~15k-token prompt | **4,615 tok/s** | 3,513 tok/s | 3,811 tok/s |
-| prefill, ~55k-token prompt | 4,828 tok/s | 4,849 tok/s | **5,233 tok/s** |
-| LocalMaxxing reasoning-v1 (short prompt, 512 tokens) | 178 tok/s | 119 tok/s | **195 tok/s** |
-
-Strata's IQ3_S experts are 26 % smaller than NVIDIA's NVFP4 ones (lower quality: KL 0.144 vs 0.070 for NVFP4, as
-Strata reports), which is why it leads on the short benchmark. v0.6 against the build before the v0.6 work
-(2026-10-17): replay total 212 → 177 s, decode 118 → 155 tok/s.
-
-**Inkling 2 Mini.** Every Inkling number here is measured with the checkpoint's own weights: the NVFP4 and MXFP8
-experts as released and the dense weights in BF16, with no further quantization of weights, activations or KV; the
-numbers with the drafter before v0.16.6 predate its fine-tune (26 Nov 2026) and use the checkpoint's drafter.
-Against llama.cpp on our machine, same day, two GPUs: capy-flash v0.16.0 from the server with those weights,
-llama.cpp `29b52d3` with `llama-bench -ngl 99 -fa on -ts 1/3` and the requantized `IQ4_NL` GGUF from ggml-org
-(measured in the morning session):
-
-| | **capy-flash** | llama.cpp |
-|---|---:|---:|
-| decode, short prompt | 127.5 (149.0 with the drafter) | 44.0 |
-| prefill, 512-token prompt | 4,002 | 1,268 |
-| prefill, 12,800-token prompt | 4,524 | 1,033 |
-
-**Comparing decode with other engines.** capy-flash computes every routed expert the model selects; an expert that
-misses the VRAM cache is computed on the CPU, never skipped. Strata's "route tail skip" skips low-ranked experts that
-miss the cache, which changes the output slightly and saves CPU work. A decode-speed gap against Strata, especially on
-a slower CPU, most likely comes from that. Measured here with the same GSQ-RCO IQ3_S experts on both (one RTX 5070 Ti,
-LocalMaxxing decode, 2026-10-23): Strata 138 tok/s with the skip, 116.6 with `STRATA_ROUTE_TAIL_SKIP=0`, capy-flash
-129.8. On two GPUs (capy-flash v0.7.0 against Strata 0.2.2, 2026-10-22) the agentic replay decode median was 200.9
-against 171.3 tok/s; Strata finished that replay sooner overall (189 against 200 s) thanks to its faster prefill.
 
 **Quality** against the GB300 reference (NVIDIA's NVFP4 checkpoint served by vLLM on a GB300, same prompts, paired):
 
@@ -502,16 +430,17 @@ few questions. The 3-bit 27B loses MMLU-Pro points mostly because more answers r
 tokens while reasoning; the v0.7 empty-reply guards bring back the ones that stopped inside their reasoning (9 of 9,
 all correct: about +3.6 points, estimated on those questions). Agent tasks (2026-10-14 build): 5 multi-step coding
 tasks of a private task bank, 4 runs each, OpenCode with the model's sampling: 20/20 solved, 42.9k generated tokens per
-run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 26.5k), no malformed tool call in 1,124.
+run (the GB300 reference: 26.5k), no malformed tool call in 1,124.
 
 ## Known limits
 - Flash-Next's profiles serve one request at a time (`--max-concurrency 1`) and only the machine above is tested. With
-  `--max-concurrency 2` to `4` (with or without `--kv-ram-active` and `--elastic`) the decode of the requests is
-  batched: two requests of 32k-100k tokens decode 1.2-1.4x the tokens per second of one, four only 1.1-1.2x (four
-  MTP windows exceed the 8-token fast path of the expert kernels; with `--draft-tokens 1` four requests decode
-  1.3x the tokens of one request with MTP 3, at the cost of 10 % for a request alone). RAM is the limit: with Flash-Next loaded about
-  10 GB of the 96 GB stay free, about 400k tokens of int8 KV in RAM at tp 2. The server accepts up to 8
-  (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
+  `--max-concurrency 2` to `8` the decode of the requests is batched (v0.16.6, [speed report](docs/reports/capy-flash-v0.16.6-speed-report.pdf)
+  §7 and §12): on short prompts no drafter gives the highest throughput at 8 clients (193.2 tok/s on the NVFP4 edition,
+  369.1 on the 64 GB one), and with MTP 3 the NVFP4 edition decodes fewer tokens per second in all at 4 and 8 clients
+  than at one. Four requests of 30-32k tokens with the launcher's flags and `--max-concurrency 4` stop at admission
+  with `std::bad_alloc` (an internal pool, not system RAM); the `flash-next-multi` profile (KV in RAM) ran three such
+  requests without error. RAM is the limit: with Flash-Next loaded about 10 GB of the 96 GB stay free, about 400k tokens
+  of int8 KV in RAM at tp 2. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
 - With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
   conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
   `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
@@ -603,7 +532,7 @@ and DFlash2, a streaming fix for benchmark clients; the defaults decode as in v0
   against the reference with the exact weights).
 - Decode without the drafter 127.5 → 204.5 tok/s on a short prompt (a decode step takes 4.87 ms: reading the weights at the
   cards' 896 GB/s is now 65 % of the step, from 40 %). With the drafter, after a 4k-token prompt: writing code 230 → 308,
-  an essay 149 → 205; summarizing a 130k-token document 73 → 140 ([benchmarks](#benchmarks)).
+  an essay 149 → 205; summarizing a 130k-token document 73 → 140.
 - Prefill 5,032 → 8,209 tok/s at 4k tokens, 2,522 → 6,610 at 99k, 1,413 → 5,078 at 247k.
 - How: every selected expert is split across the two GPUs by its intermediate size (both cards read half of each, none
   waits for the other); wider expert kernels at prefill (128 × 128 tiles, 4-bit weights decoded in registers); a
