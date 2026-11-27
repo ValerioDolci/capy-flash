@@ -24,6 +24,12 @@ benchmarks.
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
 
+## Measurements
+
+| Document | Purpose |
+|---|---|
+| [Speed report, v0.16.6](reports/capy-flash-v0.16.6-speed-report.pdf) (PDF) | every speed measurement of v0.16.6 on one workstation (2× RTX 5070 Ti), by engine part: bandwidth ceilings and how close each model gets, drafters at one request and under concurrency, prefill and long context, memory; [interactive guide](https://valeriodolci.github.io/capy-flash/) |
+
 ## Model artifacts
 
 The artifacts `install.sh` and the launchers use, with what each needs: [Pick a model](../README.md#pick-a-model) and

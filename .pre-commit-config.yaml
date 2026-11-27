@@ -8,7 +8,7 @@ repos:
     hooks:
       - id: check-added-large-files
         args: [--maxkb=1024]
-        exclude: ^tools/freq_corpus/fixtures/ranking/ # token rankings, one i64 per vocabulary entry
+        exclude: ^(tools/freq_corpus/fixtures/ranking/|docs/reports/.*\.pdf$) # token rankings (one i64 per vocabulary entry); measurement reports
       - id: check-merge-conflict
       - id: detect-private-key
       - id: check-yaml
