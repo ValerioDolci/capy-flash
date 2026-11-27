@@ -615,6 +615,14 @@ public:
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
 
+    [[nodiscard]] SpeculativeTotals speculative_totals() const noexcept {
+        return speculative_totals_;
+    }
+
+    [[nodiscard]] ninfer::ExpertCacheRuntimeStats expert_cache_stats() const noexcept {
+        return qwen4_routed.stats();
+    }
+
     [[nodiscard]] std::optional<std::uint32_t>
     device_kv_lease_settlement_tokens(SequenceHandle sequence,
                                       std::uint32_t forced_span_tokens) const noexcept;
@@ -932,6 +940,7 @@ private:
     }
 
     runtime::ProgramResourceRevision resource_revision_{.value = 1};
+    SpeculativeTotals speculative_totals_;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
 

@@ -34,6 +34,9 @@ public:
     void observe_window(const ProgramImpl& program);
     void end_window(const ProgramImpl& program);
     void abandon_window(const ProgramImpl& program) noexcept;
+    // The slot cache's counters summed over both ranks' offload backends, and the elastic KV's
+    // (RuntimeStats::expert_cache); not present without an offload backend.
+    [[nodiscard]] ninfer::ExpertCacheRuntimeStats stats() const noexcept;
 
     std::unique_ptr<execution::Qwen4RoutedExperts> experts;
     std::uint32_t expert_slots      = 0;

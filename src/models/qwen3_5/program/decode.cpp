@@ -239,14 +239,17 @@ void record_accepted_length(RequestControl& request, std::uint8_t length) noexce
 }
 
 // Speculative statistics of one verified row: `extent` drafts verified, `accepted` of them taken.
-// A row verified without drafts is a fallback step.
-void record_speculative_row(RequestControl& request, std::uint32_t extent, std::int32_t accepted) {
+// A row verified without drafts is a fallback step. `totals` sums them over every request.
+void record_speculative_row(RequestControl& request, SpeculativeTotals& totals,
+                            std::uint32_t extent, std::int32_t accepted) {
     if (extent == 0) {
         request.speculative_stats.fallback_steps += 1;
+        totals.fallback_steps += 1;
     } else {
         request.speculative_stats.rounds += 1;
         request.speculative_stats.drafted_tokens += extent;
         request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted);
+        totals.record(extent, static_cast<std::uint32_t>(accepted));
         for (std::int32_t i = 0; i < accepted; ++i) {
             request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] += 1;
         }
@@ -954,7 +957,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     .avail = chances ? policy_avail : 0,
                 };
             }
-            record_speculative_row(request, pcur, accepted_i);
+            record_speculative_row(request, speculative_totals_, pcur, accepted_i);
             set_round_pending(request, PendingKind::Speculative, base_E, base_S,
                               static_cast<std::uint32_t>(count_i), seconds);
         }
@@ -1177,7 +1180,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::chrono::duration<double>(Clock::now() - round_start).count(),
                 };
             }
-            record_speculative_row(request, extent, accepted_i);
+            record_speculative_row(request, speculative_totals_, extent, accepted_i);
             sequence.dflash_context_frontier = base_E;
             set_round_pending(request, PendingKind::Speculative, base_E, base_S,
                               static_cast<std::uint32_t>(count_i), seconds);

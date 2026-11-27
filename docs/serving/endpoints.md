@@ -3,6 +3,7 @@
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | Engine readiness |
+| `GET /stats` | live rates, active and finished requests, and the last hour, for a dashboard ([below](#live-statistics)) |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -22,6 +23,61 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 `--unload-endpoints` or `--idle-unload-seconds` the body also carries the Engine's state, `"engine"`:
 `loaded`, `unloading`, `unloaded` or `loading`; an unloaded Engine is a healthy server (HTTP 200),
 and the next generation or token-count request loads it.
+
+## Live statistics
+
+`GET /stats` answers what the server is doing now and did over the last hour, as one JSON object, for
+a dashboard or a monitor that polls it (twice a second is cheap). It requires the API key when one
+is set. Reading it never waits for the Engine worker: everything comes from the counters the Engine
+publishes at its step boundaries, the GPUs' NVML telemetry (read once a second when the driver's
+`libnvidia-ml.so.1` is there), the host's `/proc` and `/sys` (once a second) and the request
+lifecycle the server already logs.
+
+`now` is the present:
+
+- the Engine's state; requests `running` (`prefilling`, `decoding`), `waiting` and
+  `materializing`; `unit`, the execution unit running at this instant and for how long (a prefill
+  chunk can run for seconds and publishes its tokens only when it ends);
+- `rates` over the last `1s`, `10s` and `60s`: prefill and decode tokens per second, decode rounds
+  per second, the mean decode batch, tokens per decode step, the decode step's time and its host
+  share, the prefill unit's time, `draft_acceptance` (drafts accepted over drafts verified),
+  accepted drafts per round and the mean draft window, the prefix-cache hit ratio (prompt tokens
+  reused over reused and computed), KV and state bytes copied to and from the GPUs per second, and
+  for a model with offloaded experts the expert-slot hit ratio (all windows, and decode alone),
+  experts copied into slots (count and bytes) and missing experts the CPU and the GPU computed per
+  second;
+- `kv`: device KV pages in use and reserved, the pages elastic KV backs now, the capacity
+  (`page_tokens` per page), state slots, and the host KV tier's bytes and capacity;
+- `prefix_cache`: reused and computed prompt tokens since start, how each admission reused its
+  prefix (`selections`), and what memory pressure degraded, evicted or dropped;
+- `speculation`: rounds, drafted, accepted, fallback steps, and `by_position`, how often each draft
+  position was reached (every earlier draft accepted) and accepted;
+- `experts` (`null` without offloaded experts): the slot cache since start, its base slots and
+  elastic columns, and the decode windows' miss split;
+- `transfers`: bytes copied since start, by kind and direction;
+- `gpus`: per GPU, utilization, memory, power and its limit, temperature, fan, clocks and the active
+  slowdown reasons (`gpu_idle` left out);
+- `host`: how busy the CPUs are and how many of them this process keeps busy (the routed experts
+  that are not in a GPU slot are computed there), the CPU package and hottest-core temperature
+  (Intel `coretemp`, AMD `k10temp`), the mean CPU frequency, and memory: available, swap in use and
+  the process's resident bytes;
+- `requests`: requests done, failed by class and rejected by error code since the server started.
+
+`requests` lists every request between its start and its answer, with the Engine's live progress
+joined to it: `phase` (`queued`, `waiting`, `materializing`, `prefill`, `decode`, `finishing`),
+prompt and cached tokens, `prefill_progress` over the tokens to compute, output tokens, time to
+first token and the decode rate so far. `finished` is the last 100 requests, newest first, with the
+figures of their `req#N done` log line, or the error of a failed or rejected one.
+
+`history` is one point a second for the last hour, column-wise: `t` in Unix seconds, prefill and
+decode tokens per second, decode batch, draft acceptance, decode step time in milliseconds, prefix
+and expert-slot hit ratios, expert fill and KV transfer bytes per second, running and waiting
+requests, device KV pages, CPU utilization, temperature and the CPUs this process keeps busy, and
+per GPU its utilization and power. `next` is the sequence number of
+the newest point; `GET /stats?since=N` returns only the points after `N`, so a page fetches the
+hour once and then only what is new. A restarted server numbers its points from 1 again.
+
+The Engine's figures restart with it after `POST /unload` and `POST /load`; no rate spans the two.
 
 ## Unload and load
 

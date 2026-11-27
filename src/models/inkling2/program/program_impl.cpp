@@ -549,6 +549,7 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
                 stats.rounds += 1;
                 stats.drafted_tokens += *extent;
                 stats.accepted_tokens += accepted;
+                speculative_totals_.record(*extent, accepted);
                 for (std::uint32_t i = 0; i < accepted; ++i) {
                     stats.accepted_per_position[i] += 1;
                 }
@@ -566,7 +567,10 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> sequences,
                     std::span<const TokenId>(lane->tokens).subspan(lane->prompt_tokens));
                 lane->executed           = static_cast<std::uint32_t>(lane->tokens.size());
                 pending_.row_counts[row] = 1;
-                if (K > 0) { lane->speculative.fallback_steps += 1; }
+                if (K > 0) {
+                    lane->speculative.fallback_steps += 1;
+                    speculative_totals_.fallback_steps += 1;
+                }
             }
         } catch (...) {
             lane->poisoned = true;

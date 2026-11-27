@@ -39,6 +39,23 @@ using TotalEnergyFn  = NvmlReturn (*)(NvmlDevice, unsigned long long*);
 using TemperatureFn  = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
 using EventReasonsFn = NvmlReturn (*)(NvmlDevice, unsigned long long*);
 
+struct NvmlUtilization { // nvmlUtilization_t
+    unsigned int gpu;
+    unsigned int memory;
+};
+
+struct NvmlMemory { // nvmlMemory_t (v1)
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
+
+using UtilizationFn = NvmlReturn (*)(NvmlDevice, NvmlUtilization*);
+using MemoryInfoFn  = NvmlReturn (*)(NvmlDevice, NvmlMemory*);
+using FanSpeedFn    = NvmlReturn (*)(NvmlDevice, unsigned int*);
+using PowerLimitFn  = NvmlReturn (*)(NvmlDevice, unsigned int*);
+using NameFn        = NvmlReturn (*)(NvmlDevice, char*, unsigned int);
+
 template <class Function>
 Function symbol(void* handle, const char* name) {
     return reinterpret_cast<Function>(::dlsym(handle, name));
@@ -56,6 +73,11 @@ struct GpuTelemetry::Library {
     TotalEnergyFn total_energy    = nullptr;
     TemperatureFn temperature     = nullptr;
     EventReasonsFn event_reasons  = nullptr;
+    UtilizationFn utilization     = nullptr;
+    MemoryInfoFn memory_info      = nullptr;
+    FanSpeedFn fan_speed          = nullptr;
+    PowerLimitFn power_limit      = nullptr;
+    NameFn name                   = nullptr;
 
     Library() {
         handle = ::dlopen(kNvmlLibrary, RTLD_NOW | RTLD_LOCAL);
@@ -78,6 +100,11 @@ struct GpuTelemetry::Library {
             event_reasons =
                 symbol<EventReasonsFn>(handle, "nvmlDeviceGetCurrentClocksThrottleReasons");
         }
+        utilization = symbol<UtilizationFn>(handle, "nvmlDeviceGetUtilizationRates");
+        memory_info = symbol<MemoryInfoFn>(handle, "nvmlDeviceGetMemoryInfo");
+        fan_speed   = symbol<FanSpeedFn>(handle, "nvmlDeviceGetFanSpeed");
+        power_limit = symbol<PowerLimitFn>(handle, "nvmlDeviceGetEnforcedPowerLimit");
+        name        = symbol<NameFn>(handle, "nvmlDeviceGetName");
     }
 
     ~Library() {
@@ -128,6 +155,20 @@ GpuTelemetry::~GpuTelemetry() = default;
 
 bool GpuTelemetry::available() const noexcept { return library_->initialized; }
 
+std::vector<std::string> GpuTelemetry::names() const {
+    std::vector<std::string> out;
+    for (const Device& device : devices_) {
+        char buffer[96] = {};
+        if (library_->initialized && library_->name != nullptr && device.handle != nullptr &&
+            library_->name(device.handle, buffer, sizeof(buffer)) == kNvmlSuccess) {
+            out.emplace_back(buffer);
+        } else {
+            out.emplace_back();
+        }
+    }
+    return out;
+}
+
 std::optional<std::vector<GpuTelemetrySample>> GpuTelemetry::sample() {
     if (!library_->initialized) { return std::nullopt; }
     const Library& nvml = *library_;
@@ -168,6 +209,26 @@ std::optional<std::vector<GpuTelemetrySample>> GpuTelemetry::sample() {
                     static_cast<double>(*energy - *device.previous_energy_mj) * 1.0e-3;
             }
             device.previous_energy_mj = energy;
+            NvmlUtilization utilization{};
+            if (nvml.utilization != nullptr &&
+                nvml.utilization(device.handle, &utilization) == kNvmlSuccess) {
+                sample.utilization_percent        = utilization.gpu;
+                sample.memory_utilization_percent = utilization.memory;
+            }
+            NvmlMemory memory{};
+            if (nvml.memory_info != nullptr &&
+                nvml.memory_info(device.handle, &memory) == kNvmlSuccess) {
+                sample.memory_used_bytes  = memory.used;
+                sample.memory_total_bytes = memory.total;
+            }
+            if (nvml.fan_speed != nullptr &&
+                nvml.fan_speed(device.handle, &value) == kNvmlSuccess) {
+                sample.fan_percent = value;
+            }
+            if (nvml.power_limit != nullptr &&
+                nvml.power_limit(device.handle, &value) == kNvmlSuccess) {
+                sample.power_limit_watts = static_cast<double>(value) * 1.0e-3;
+            }
         }
         samples.push_back(sample);
     }

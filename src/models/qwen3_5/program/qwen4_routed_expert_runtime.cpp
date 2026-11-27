@@ -6,6 +6,7 @@
 #include "ops/host_moe/host_moe_executor.h"
 #include "core/nvtx.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -346,5 +347,44 @@ void Qwen4RoutedExpertRuntime::abandon_window(const ProgramImpl& program) noexce
     }
 }
 
+ninfer::ExpertCacheRuntimeStats Qwen4RoutedExpertRuntime::stats() const noexcept {
+    ninfer::ExpertCacheRuntimeStats out;
+    const auto count = [](std::int64_t value) noexcept {
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0U;
+    };
+    for (const auto* backend : {experts.get(), peer_experts.get()}) {
+        const auto* offload = dynamic_cast<const execution::Qwen4OffloadExperts*>(backend);
+        if (offload == nullptr) { continue; }
+        const expert_cache::CacheCounters& cache         = offload->counters();
+        const execution::Qwen4OffloadSplitCounters split = offload->split_counters();
+        if (!out.present) {
+            // Both ranks run the same windows over their halves of the experts.
+            out.windows    = count(cache.windows);
+            out.base_slots = static_cast<std::uint32_t>(std::max(0, offload->base_slots()));
+            out.elastic_columns =
+                static_cast<std::uint32_t>(std::max(0, offload->elastic_columns()));
+            out.active_columns = static_cast<std::uint32_t>(std::max(0, offload->active_columns()));
+        }
+        out.present = true;
+        out.routes += count(cache.accesses);
+        out.device_hits += count(cache.device_hits);
+        out.missing += count(cache.missing);
+        out.inserts += count(cache.inserts);
+        out.fills += count(cache.fills_issued);
+        out.fill_bytes += count(cache.fill_bytes);
+        out.shrink_evicted += count(cache.shrink_evicted);
+        out.decode_routes += count(split.accesses);
+        out.decode_device_hits += count(split.device_hits);
+        out.decode_gpu_experts += count(split.gpu_experts);
+        out.decode_cpu_experts += count(split.cpu_experts);
+    }
+    if (elastic != nullptr) {
+        const Qwen4ElasticVram::Stats& vram = elastic->stats();
+        out.elastic_kv_pages                = vram.text_pages;
+        out.elastic_shrinks                 = count(vram.shrinks);
+        out.elastic_returns                 = count(vram.returns);
+    }
+    return out;
+}
 
 } // namespace ninfer::models::qwen3_5::detail

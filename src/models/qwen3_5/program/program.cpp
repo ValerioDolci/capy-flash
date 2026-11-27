@@ -618,6 +618,14 @@ runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
+SpeculativeTotals Program::speculative_totals() const noexcept {
+    return impl_->speculative_totals();
+}
+
+ExpertCacheRuntimeStats Program::expert_cache_stats() const noexcept {
+    return impl_->expert_cache_stats();
+}
+
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }

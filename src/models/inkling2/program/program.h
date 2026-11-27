@@ -1093,6 +1093,11 @@ public:
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    [[nodiscard]] SpeculativeTotals speculative_totals() const noexcept;
+
+    // Inkling 2 keeps every expert on the GPU: no slot cache.
+    [[nodiscard]] ExpertCacheRuntimeStats expert_cache_stats() const noexcept { return {}; }
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
     [[nodiscard]] const TpTransportStatus& tp_transport() const noexcept;
